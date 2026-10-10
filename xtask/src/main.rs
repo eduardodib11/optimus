@@ -10,10 +10,10 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-/// Alvo provisório do kernel. O SDD nomeia `x86_64-optimus-kernel`, mas alvos
-/// próprios em JSON exigem `-Zbuild-std`, que não existe no Rust estável.
+/// Alvo do kernel no lugar de `x86_64-optimus-kernel`: alvos próprios em JSON
+/// exigem `-Zbuild-std`, que não existe no Rust estável (ADR 0025).
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-/// Alvo provisório de usuário, no lugar de `x86_64-optimus` (mesmo motivo).
+/// Alvo de usuário no lugar de `x86_64-optimus` (ADR 0025).
 const USER_TARGET: &str = "x86_64-unknown-none";
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 
