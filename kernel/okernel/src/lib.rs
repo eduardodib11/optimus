@@ -6,6 +6,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod acpi;
 pub mod log;
 pub mod mm;
 pub mod sync;
+pub mod time;
