@@ -1,0 +1,14 @@
+[package]
+name = "optboot"
+description = "Bootloader UEFI do Optimus OS."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "optboot"
+test = false
+bench = false
+
+[lints]
+workspace = true
