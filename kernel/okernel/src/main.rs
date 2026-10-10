@@ -1,15 +1,20 @@
 //! Optimus Kernel (`okernel`).
 //!
-//! Esqueleto do M1: ligado na metade alta por `linker.ld` e carregado pelo
-//! `optboot` (T-101). O salto para cá, com `BootInfo`, chega em T-102 e T-103.
+//! Esqueleto do M1: PIE ligado na metade alta por `linker.ld`, carregado pelo
+//! `optboot` com KASLR e chamado em `kernel_entry(&BootInfo)` (T-103).
 
 #![no_std]
 #![no_main]
 
+mod arch;
+
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use kabi::boot::BootInfo;
 use kabi::{SYSCALL_COUNT, Syscall};
+
+use arch::x86_64::{QemuExit, halt, qemu_exit};
 
 // Prova que a ABI compartilhada compila no kernel: a tabela de syscalls fecha.
 const _: () = assert!(SYSCALL_COUNT == Syscall::ThreadExit as usize + 1);
@@ -18,18 +23,20 @@ const _: () = assert!(SYSCALL_COUNT == Syscall::ThreadExit as usize + 1);
 /// um segmento RW- com memória zerada além do arquivo.
 static ENTRIES: AtomicU64 = AtomicU64::new(0);
 
-/// Ponto de entrada provisório do kernel, chamado pelo `optboot` a partir de T-103.
+/// Ponto de entrada do kernel, chamado pelo `optboot` com interrupções
+/// desligadas e `info` no mapa direto.
+///
+/// Por ora só confere a `BootInfo` e desliga o QEMU com sucesso ou falha.
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn kernel_entry() -> ! {
+pub extern "sysv64" fn kernel_entry(info: &'static BootInfo) -> ! {
     ENTRIES.fetch_add(1, Ordering::Relaxed);
-    loop {
-        core::hint::spin_loop();
+    if info.is_valid() && ENTRIES.load(Ordering::Relaxed) == 1 {
+        qemu_exit(QemuExit::Success)
     }
+    qemu_exit(QemuExit::Failure)
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
+    halt()
 }

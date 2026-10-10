@@ -208,6 +208,8 @@ fn kind(efi_type: u32) -> MemKind {
 
 /// Mapa de memória cru devolvido por `GetMemoryMap`.
 pub struct RawMap {
+    /// Chave para `ExitBootServices`.
+    pub key: usize,
     /// Bytes válidos em `buf`.
     pub size: usize,
     /// Tamanho de cada descritor (pode ser maior que `MemoryDescriptor`).
@@ -235,7 +237,11 @@ pub fn memory_map(bs: &BootServices, buf: &mut [u8]) -> Result<RawMap, Error> {
     if desc_size < size_of::<MemoryDescriptor>() {
         return Err(Error::BadSize(desc_size as u64));
     }
-    Ok(RawMap { size, desc_size })
+    Ok(RawMap {
+        key,
+        size,
+        desc_size,
+    })
 }
 
 /// Tamanho de buffer suficiente para o mapa atual mais folga para alocações.
