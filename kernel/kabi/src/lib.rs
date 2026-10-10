@@ -64,6 +64,8 @@ macro_rules! abi_enum {
     };
 }
 
+pub mod boot;
+
 abi_enum! {
 /// Números das syscalls da ABI v1 (seção 14.2), passados em `rax`.
 pub enum Syscall: u32, raw(n) => u64::from(n);
