@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "boot/optboot", "kernel/okernel", "lib/ostd"]
-# Só o xtask roda no host; as demais crates são compiladas por `cargo xtask build`.
+members = ["xtask", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/ostd"]
+# Só o xtask roda no host (os testes de `kabi` também); as demais crates são
+# compiladas por `cargo xtask build`.
 default-members = ["xtask"]
 
 [workspace.package]

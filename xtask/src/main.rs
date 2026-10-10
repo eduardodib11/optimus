@@ -20,6 +20,7 @@ const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 /// Crates do sistema e o alvo de cada uma.
 const CRATES: &[(&str, &str, &str)] = &[
     ("optboot", "boot/optboot/src/main.rs", UEFI_TARGET),
+    ("kabi", "kernel/kabi/src/lib.rs", KERNEL_TARGET),
     ("okernel", "kernel/okernel/src/main.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
 ];

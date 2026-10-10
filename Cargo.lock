@@ -3,8 +3,15 @@
 version = 4
 
 [[package]]
+name = "kabi"
+version = "0.1.0"
+
+[[package]]
 name = "okernel"
 version = "0.1.0"
+dependencies = [
+ "kabi",
+]
 
 [[package]]
 name = "optboot"
@@ -13,6 +20,9 @@ version = "0.1.0"
 [[package]]
 name = "ostd"
 version = "0.1.0"
+dependencies = [
+ "kabi",
+]
 
 [[package]]
 name = "xtask"

@@ -8,6 +8,11 @@
 
 use core::panic::PanicInfo;
 
+use kabi::{SYSCALL_COUNT, Syscall};
+
+// Prova que a ABI compartilhada compila no kernel: a tabela de syscalls fecha.
+const _: () = assert!(SYSCALL_COUNT == Syscall::ThreadExit as usize + 1);
+
 /// Ponto de entrada provisório do kernel.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
