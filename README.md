@@ -1,0 +1,27 @@
+# Optimus OS
+
+Sistema operacional escrito do zero em Rust, em que o usuário conversa com uma IA
+que se apresenta como o próprio sistema. Por baixo, um microkernel pequeno e
+determinístico com capabilities garante segurança e desempenho.
+
+A arquitetura está congelada no SDD v1.0; mudanças entram como nova ADR em
+`docs/adr/`.
+
+## Começando
+
+Requisitos no host: `rustup`, QEMU (`qemu-system-x86_64`) e OVMF.
+
+```sh
+cargo xtask build    # compila kernel, optboot e bibliotecas
+cargo xtask image    # monta a ESP em target/esp
+cargo xtask run      # dá boot no QEMU com serial no terminal
+cargo xtask test     # testes unitários + smoke test de boot
+cargo xtask check    # fmt, clippy e allowlist de unsafe
+```
+
+Se o OVMF não estiver num caminho conhecido, aponte `OVMF_CODE` e `OVMF_VARS`
+para os arquivos `.fd`.
+
+## Licença
+
+Apache-2.0. Contribuições exigem DCO; veja [CONTRIBUTING.md](CONTRIBUTING.md).
