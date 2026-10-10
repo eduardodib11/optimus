@@ -88,7 +88,7 @@ fn rejeita_cabecalho_invalido() {
     assert_eq!(parse_with(|d| d[5] = 2), Err(Error::NotLittleEndian));
     assert_eq!(parse_with(|d| d[6] = 0), Err(Error::BadVersion));
     assert_eq!(parse_with(|d| d[20] = 2), Err(Error::BadVersion));
-    assert_eq!(parse_with(|d| d[16] = 3), Err(Error::NotExecutable));
+    assert_eq!(parse_with(|d| d[16] = 4), Err(Error::NotExecutable));
     assert_eq!(parse_with(|d| d[18] = 40), Err(Error::BadMachine));
     assert_eq!(parse_with(|d| d[54] = 32), Err(Error::BadHeaderSize));
     assert_eq!(parse_with(|d| d[56] = 0), Err(Error::BadPhdrCount));
@@ -172,4 +172,88 @@ fn entrada_corrompida_nunca_entra_em_panico() {
             check(&d);
         }
     }
+}
+
+/// PIE: texto R-X e dados R-- com `.dynamic` em 0x2100 e `.rela.dyn` em 0x2200.
+fn pie(relas: &[(u64, u64, u64)], dynamic: &[(u64, u64)]) -> Vec<u8> {
+    let mut d = build(
+        BASE,
+        &[
+            load(R | X, 0x1000, BASE, 0x100, 0x100),
+            load(R, 0x2000, BASE + 0x1000, 0x400, 0x2000),
+            (PT_DYNAMIC, R, 0x2100, BASE + 0x1100, 0x100, 0x100, 8),
+        ],
+        0x2400,
+    );
+    d[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+    for (i, (tag, value)) in dynamic.iter().enumerate() {
+        let at = 0x2100 + i * 16;
+        d[at..at + 8].copy_from_slice(&tag.to_le_bytes());
+        d[at + 8..at + 16].copy_from_slice(&value.to_le_bytes());
+    }
+    for (i, (offset, info, addend)) in relas.iter().enumerate() {
+        let at = 0x2200 + i * 24;
+        for (j, v) in [offset, info, addend].iter().enumerate() {
+            d[at + j * 8..at + j * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    d
+}
+
+fn rela_dyn(count: u64) -> [(u64, u64); 3] {
+    [
+        (DT_RELA, BASE + 0x1200),
+        (DT_RELASZ, count * 24),
+        (DT_RELAENT, 24),
+    ]
+}
+
+#[test]
+fn pie_entrega_relocacoes_relativas() {
+    let relas = [(BASE + 0x1000, 8, BASE + 0x40), (BASE + 0x2ff8, 8, BASE)];
+    let d = pie(&relas, &rela_dyn(2));
+    let elf = Elf::parse(&d).unwrap();
+    assert!(elf.is_relocatable());
+    let got: Vec<_> = elf.relocations().map(|r| (r.vaddr, r.addend)).collect();
+    assert_eq!(got, [(BASE + 0x1000, BASE + 0x40), (BASE + 0x2ff8, BASE)]);
+    // Sem DT_RELA, ou em ET_EXEC, não há relocações.
+    assert_eq!(Elf::parse(&pie(&[], &[])).unwrap().relocations().count(), 0);
+    assert!(!Elf::parse(&kernel()).unwrap().is_relocatable());
+}
+
+#[test]
+fn pie_recusa_dinamico_invalido() {
+    let ok = (BASE + 0x1000, 8, 0);
+    let bad = |relas: &[(u64, u64, u64)], dynamic: &[(u64, u64)]| {
+        Elf::parse(&pie(relas, dynamic)).unwrap_err()
+    };
+    assert_eq!(
+        bad(&[(BASE + 0x1000, 1, 0)], &rela_dyn(1)),
+        Error::BadRelocation
+    );
+    let with_symbol = (BASE + 0x1000, (1 << 32) | 8, 0);
+    assert_eq!(bad(&[with_symbol], &rela_dyn(1)), Error::BadRelocation);
+    assert_eq!(
+        bad(&[(BASE + 0x2ff9, 8, 0)], &rela_dyn(1)),
+        Error::BadRelocation
+    );
+    assert_eq!(bad(&[(BASE - 8, 8, 0)], &rela_dyn(1)), Error::BadRelocation);
+    let mut wrong_ent = rela_dyn(1);
+    wrong_ent[2].1 = 16;
+    assert_eq!(bad(&[ok], &wrong_ent), Error::BadDynamic);
+    // `.rela.dyn` além da parte de arquivo do segmento.
+    assert_eq!(bad(&[ok], &rela_dyn(30)), Error::BadDynamic);
+    let mut outside = rela_dyn(1);
+    outside[0].1 = BASE + 0x2000;
+    assert_eq!(bad(&[ok], &outside), Error::BadDynamic);
+    for tag in DT_REJECTED {
+        assert_eq!(bad(&[], &[(tag, 0)]), Error::BadDynamic, "DT {tag}");
+    }
+    // Dois PT_DYNAMIC.
+    let mut two = pie(&[], &[]);
+    two[56..58].copy_from_slice(&4u16.to_le_bytes());
+    let at = 64 + 3 * 56;
+    let copy: Vec<u8> = two[64 + 2 * 56..at].to_vec();
+    two[at..at + 56].copy_from_slice(&copy);
+    assert_eq!(Elf::parse(&two).unwrap_err(), Error::BadDynamic);
 }
