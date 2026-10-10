@@ -29,7 +29,11 @@ const CRATES: &[(&str, &str, &str)] = &[
 const PROFILES: &[&str] = &["lite", "basic", "jarvis", "premium", "server"];
 
 /// Textos que o smoke test exige na serial.
-const BOOT_MARKERS: &[&str] = &["optboot", "optboot: kernel carregado"];
+const BOOT_MARKERS: &[&str] = &[
+    "optboot",
+    "optboot: kernel carregado",
+    "optboot: mapa de memória",
+];
 /// Prefixo das linhas em que o `optboot` descreve cada segmento carregado.
 const SEGMENT_PREFIX: &str = "optboot: seg ";
 const SMOKE_TIMEOUT: Duration = Duration::from_mins(1);
@@ -251,6 +255,8 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
         &opts.smp.to_string(),
     ])
     .args(["-display", "none", "-serial", "stdio", "-no-reboot"])
+    // Fonte do EFI_RNG_PROTOCOL do OVMF; a semente do optboot vem dele.
+    .args(["-device", "virtio-rng-pci"])
     .arg("-drive")
     .arg(format!(
         "if=pflash,format=raw,readonly=on,file={}",
@@ -462,7 +468,8 @@ mod tests {
         let ok = "Optimus OS \u{2014} optboot\r\n\
                   optboot: seg 0xffffffff80000000 -> 0x1000 0xcc R-X\r\n\
                   optboot: seg 0xffffffff80002000 -> 0x2000 0x8 RW-\r\n\
-                  optboot: kernel carregado, entrada 0xffffffff80000000\r\n";
+                  optboot: kernel carregado, entrada 0xffffffff80000000\r\n\
+                  optboot: mapa de memória: 24 regiões, 517896 KiB usáveis\r\n";
         assert_eq!(check_serial(ok), Ok(()));
         assert!(check_serial("Optimus OS \u{2014} optboot\r\n").is_err());
         assert!(check_serial(&ok.replace("R-X", "RWX")).is_err());

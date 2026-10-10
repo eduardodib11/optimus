@@ -1,9 +1,11 @@
 //! `optboot`: bootloader UEFI do Optimus OS.
 //!
 //! T-101: lê `\EFI\optimus\okernel.elf` da ESP de onde foi carregado, valida o
-//! ELF64 com `oelf` e copia cada segmento para páginas físicas próprias. Tabelas
-//! de página, `ExitBootServices` e o salto para o kernel vêm em T-103; por ora,
-//! depois de carregar, desliga a máquina.
+//! ELF64 com `oelf` e copia cada segmento para páginas físicas próprias.
+//! T-102: monta a `BootInfo` v1 (`kabi::boot`) com mapa de memória, GOP, RSDP
+//! e semente aleatória ([`firmware`]). Tabelas de página, `ExitBootServices` e
+//! o salto para o kernel vêm em T-103; por ora, depois de carregar, desliga a
+//! máquina.
 //!
 //! Só declara os campos da especificação UEFI 2.10 que usa; nenhuma crate externa
 //! entra na imagem (ADR 0003).
@@ -11,17 +13,24 @@
 #![no_std]
 #![no_main]
 
+mod arch;
+mod firmware;
+
 use core::ffi::c_void;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr::{self, null_mut};
 
+use kabi::boot::{BootInfo, MemKind, MemRegion};
 use oelf::{Elf, PAGE_SIZE};
+
+use firmware::{Entropy, KERNEL_MEMORY};
 
 type Status = usize;
 type Handle = *mut c_void;
 
 /// `EFI_GUID`.
+#[derive(PartialEq, Eq)]
 #[repr(C)]
 struct Guid(u32, u16, u16, [u8; 8]);
 
@@ -51,23 +60,37 @@ struct RuntimeServices {
         extern "efiapi" fn(kind: u32, status: Status, size: usize, data: *const c_void) -> !,
 }
 
-/// Início de `EFI_BOOT_SERVICES`, até `HandleProtocol`.
+/// Início de `EFI_BOOT_SERVICES`, até `LocateProtocol`.
 #[repr(C)]
 struct BootServices {
     hdr: TableHeader,
     tpl: [usize; 2],
     allocate_pages:
         unsafe extern "efiapi" fn(kind: u32, mem: u32, pages: usize, addr: *mut u64) -> Status,
-    free_pages_and_memory_map: [usize; 2],
+    free_pages: usize,
+    get_memory_map: unsafe extern "efiapi" fn(
+        size: *mut usize,
+        map: *mut u8,
+        key: *mut usize,
+        desc_size: *mut usize,
+        desc_version: *mut u32,
+    ) -> Status,
     allocate_pool: unsafe extern "efiapi" fn(mem: u32, size: usize, buf: *mut *mut u8) -> Status,
     free_pool: usize,
     events: [usize; 6],
     protocol_interfaces: [usize; 3],
     handle_protocol:
         unsafe extern "efiapi" fn(h: Handle, guid: *const Guid, out: *mut *mut c_void) -> Status,
+    reserved_to_exit: [usize; 10],
+    monotonic_count_to_locate_handle_buffer: [usize; 10],
+    locate_protocol: unsafe extern "efiapi" fn(
+        guid: *const Guid,
+        registration: *const c_void,
+        out: *mut *mut c_void,
+    ) -> Status,
 }
 
-/// Início de `EFI_SYSTEM_TABLE`, até `BootServices`.
+/// `EFI_SYSTEM_TABLE`.
 #[repr(C)]
 struct SystemTable {
     hdr: TableHeader,
@@ -81,6 +104,8 @@ struct SystemTable {
     std_err: *mut c_void,
     runtime_services: *const RuntimeServices,
     boot_services: *const BootServices,
+    number_of_table_entries: usize,
+    configuration_table: *const c_void,
 }
 
 /// Início de `EFI_LOADED_IMAGE_PROTOCOL`, até `DeviceHandle`.
@@ -135,8 +160,7 @@ const SIMPLE_FS_GUID: Guid = Guid(
 const RESET_SHUTDOWN: u32 = 2;
 /// `AllocateAnyPages`.
 const ALLOCATE_ANY_PAGES: u32 = 0;
-/// `EfiLoaderCode` e `EfiLoaderData`.
-const LOADER_CODE: u32 = 1;
+/// `EfiLoaderData`.
 const LOADER_DATA: u32 = 2;
 /// `EFI_FILE_MODE_READ`.
 const FILE_MODE_READ: u64 = 1;
@@ -277,15 +301,15 @@ fn load_segments(out: &mut Console, bs: &BootServices, elf: &Elf) -> Result<(), 
         let offset = seg.vaddr % PAGE_SIZE;
         let pages = (offset + seg.memsz).div_ceil(PAGE_SIZE);
         let bytes = usize::try_from(pages * PAGE_SIZE).map_err(|_| Error::BadSize(seg.memsz))?;
-        let kind = if seg.flags.executable() {
-            LOADER_CODE
-        } else {
-            LOADER_DATA
-        };
         let mut phys = 0;
         // SAFETY: AllocatePages só escreve o endereço devolvido em `phys`.
         efi("AllocatePages", unsafe {
-            (bs.allocate_pages)(ALLOCATE_ANY_PAGES, kind, bytes / 4096, &raw mut phys)
+            (bs.allocate_pages)(
+                ALLOCATE_ANY_PAGES,
+                KERNEL_MEMORY,
+                bytes / 4096,
+                &raw mut phys,
+            )
         })?;
         let start = usize::try_from(phys).map_err(|_| Error::BadSize(phys))?;
         // SAFETY: AllocatePages reservou `bytes` bytes em `phys` só para nós, e o
@@ -317,6 +341,97 @@ fn load_kernel(out: &mut Console, bs: &BootServices, image: Handle) -> Result<u6
     Ok(elf.entry())
 }
 
+/// Vetor de `T` zerado em páginas físicas novas do tipo de memória `kind`,
+/// com ao menos `count` elementos (o resto da última página também entra).
+///
+/// # Safety
+///
+/// Todos os bits zero precisam formar um `T` válido, e o alinhamento de `T`
+/// não pode passar de 4 KiB.
+unsafe fn alloc_zeroed<T>(
+    bs: &BootServices,
+    kind: u32,
+    count: usize,
+) -> Result<&'static mut [T], Error> {
+    let pages = (count * size_of::<T>()).div_ceil(4096).max(1);
+    let mut phys = 0;
+    // SAFETY: AllocatePages só escreve o endereço devolvido em `phys`.
+    efi("AllocatePages", unsafe {
+        (bs.allocate_pages)(ALLOCATE_ANY_PAGES, kind, pages, &raw mut phys)
+    })?;
+    let start = usize::try_from(phys).map_err(|_| Error::BadSize(phys))?;
+    let base = ptr::with_exposed_provenance_mut::<T>(start);
+    // SAFETY: as páginas são só nossas, alinhadas a 4 KiB e mapeadas em
+    // identidade pelo firmware; zero é um `T` válido (contrato do chamador).
+    unsafe {
+        base.cast::<u8>().write_bytes(0, pages * 4096);
+        Ok(core::slice::from_raw_parts_mut(
+            base,
+            pages * 4096 / size_of::<T>(),
+        ))
+    }
+}
+
+/// Aloca a `BootInfo` e preenche o que vem do firmware (seção 5.1, passo 5).
+fn gather(
+    out: &mut Console,
+    bs: &BootServices,
+    st: &SystemTable,
+) -> Result<&'static mut BootInfo, Error> {
+    // SAFETY: `BootInfo` só tem inteiros e um ponteiro cru; zero é válido.
+    let info = &mut unsafe { alloc_zeroed::<BootInfo>(bs, KERNEL_MEMORY, 1) }?[0];
+    *info = BootInfo::empty();
+    if let Some(fb) = firmware::framebuffer(bs) {
+        let _ = write!(
+            out,
+            "optboot: GOP {}x{} em {:#x}\r\n",
+            fb.width, fb.height, fb.base
+        );
+        info.framebuffer = fb;
+    } else {
+        let _ = out.write_str("optboot: sem GOP\r\n");
+    }
+    info.acpi_rsdp = firmware::acpi_rsdp(st).unwrap_or(0);
+    let _ = write!(out, "optboot: RSDP {:#x}\r\n", info.acpi_rsdp);
+    let source = firmware::entropy(bs, &mut info.rng_seed);
+    if matches!(source, Entropy::TscOnly) {
+        let _ = out.write_str("optboot: AVISO: sem RNG do firmware nem da CPU\r\n");
+    }
+    let _ = write!(out, "optboot: semente de 64 bytes via {source}\r\n");
+    Ok(info)
+}
+
+/// Lê e normaliza o mapa de memória em vetores próprios.
+fn memory_map(out: &mut Console, bs: &BootServices, info: &mut BootInfo) -> Result<(), Error> {
+    let size = firmware::memory_map_size(bs);
+    // SAFETY: zero é válido para bytes e para `MemRegion` (só inteiros).
+    let (raw_buf, regions) = unsafe {
+        (
+            alloc_zeroed::<u8>(bs, LOADER_DATA, size)?,
+            // Cada descritor UEFI tem ao menos 40 bytes; uma `MemRegion` tem 24.
+            alloc_zeroed::<MemRegion>(bs, KERNEL_MEMORY, size / size_of::<MemRegion>())?,
+        )
+    };
+    let raw = firmware::memory_map(bs, raw_buf)?;
+    let n = firmware::normalize(raw_buf, &raw, regions);
+    info.memory_map = regions.as_ptr();
+    info.memory_map_len = n as u64;
+    let total = |kind| -> u64 {
+        regions[..n]
+            .iter()
+            .filter(|r| r.kind() == kind)
+            .map(|r| r.len)
+            .sum()
+    };
+    let _ = write!(
+        out,
+        "optboot: mapa de memória: {n} regiões, {} KiB usáveis, {} KiB do kernel\r\n",
+        total(MemKind::Usable) >> 10,
+        total(MemKind::Kernel) >> 10
+    );
+    Ok(())
+}
+
 /// Ponto de entrada chamado pelo firmware UEFI.
 #[unsafe(export_name = "efi_main")]
 extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
@@ -326,10 +441,14 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
     let _ = out.write_str("Optimus OS \u{2014} optboot\r\n");
     // SAFETY: `boot_services` vem da System Table e vale até ExitBootServices.
     let bs = unsafe { &*st.boot_services };
-    let _ = match load_kernel(&mut out, bs, image) {
-        Ok(entry) => write!(out, "optboot: kernel carregado, entrada {entry:#x}\r\n"),
-        Err(e) => write!(out, "optboot: erro ao carregar o kernel: {e}\r\n"),
-    };
+    let result = load_kernel(&mut out, bs, image).and_then(|entry| {
+        let _ = write!(out, "optboot: kernel carregado, entrada {entry:#x}\r\n");
+        let info = gather(&mut out, bs, st)?;
+        memory_map(&mut out, bs, info)
+    });
+    if let Err(e) = result {
+        let _ = write!(out, "optboot: erro: {e}\r\n");
+    }
     // TODO(T-103): tabelas de página, ExitBootServices e salto para kernel_entry.
     // SAFETY: `runtime_services` vem da System Table e é válido durante todo o boot.
     let rt = unsafe { &*st.runtime_services };

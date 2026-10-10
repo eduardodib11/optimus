@@ -11,6 +11,7 @@ test = false
 bench = false
 
 [dependencies]
+kabi = { path = "../../kernel/kabi" }
 oelf = { path = "../../lib/oelf" }
 
 [lints]
