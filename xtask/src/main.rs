@@ -35,6 +35,9 @@ const BOOT_MARKERS: &[&str] = &[
     "optboot: mapa de memória",
     "optboot: KASLR",
     "saindo dos serviços de boot",
+    "okernel: hello",
+    "okernel: kaslr_slide",
+    "okernel: mapa de memória",
 ];
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
 const KERNEL_EXIT_OK: i32 = 33;
@@ -493,9 +496,13 @@ mod tests {
                   optboot: kernel carregado, entrada 0xffffffff80000000\r\n\
                   optboot: mapa de memória: 24 regiões, 517896 KiB usáveis\r\n\
                   optboot: KASLR: deslocamento 0x200000\r\n\
-                  optboot: tabelas de página prontas; saindo dos serviços de boot\r\n";
+                  optboot: tabelas de página prontas; saindo dos serviços de boot\r\n\
+                  info  okernel: hello\r\n\
+                  info  okernel: kaslr_slide 0x200000\r\n\
+                  info  okernel: mapa de memória com 24 faixas\r\n";
         assert_eq!(check_serial(ok), Ok(()));
         assert!(check_serial("Optimus OS \u{2014} optboot\r\n").is_err());
+        assert!(check_serial(&ok.replace("okernel: hello", "okernel")).is_err());
         assert!(check_serial(&ok.replace("R-X", "RWX")).is_err());
         assert!(check_serial(&ok.replace("optboot: seg", "x")).is_err());
     }
