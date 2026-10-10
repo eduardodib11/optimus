@@ -18,7 +18,7 @@ pub const KERNEL_CODE: u16 = 0x08;
 /// Seletor dos dados do kernel (índice 2, anel 0).
 pub const KERNEL_DATA: u16 = 0x10;
 /// Seletor da TSS (índices 3 e 4).
-const TSS_SELECTOR: u16 = 0x18;
+pub const TSS_SELECTOR: u16 = 0x18;
 
 /// Índices de IST (1 a 7; zero quer dizer "sem IST") usados na IDT.
 pub const IST_DOUBLE_FAULT: u8 = 1;
@@ -77,6 +77,11 @@ static mut GDT: [u64; 5] = [
     0,
     0,
 ];
+
+/// Endereço virtual da GDT, para conferir o que a CPU carregou.
+pub fn table_addr() -> u64 {
+    (&raw const GDT).addr() as u64
+}
 
 /// Descritor de sistema de 16 bytes para uma TSS de 64 bits disponível.
 fn tss_descriptor(base: u64) -> [u64; 2] {

@@ -15,7 +15,8 @@ Requisitos no host: `rustup`, QEMU (`qemu-system-x86_64`) e OVMF.
 cargo xtask build    # compila kernel, optboot e bibliotecas
 cargo xtask image    # monta a ESP em target/esp
 cargo xtask run      # dá boot no QEMU com serial no terminal
-cargo xtask test     # testes unitários + smoke test de boot
+cargo xtask test     # unitários, smoke test de boot e testes de kernel no QEMU
+cargo xtask test kernel  # só os testes de kernel (harness com isa-debug-exit)
 cargo xtask check    # fmt, clippy e allowlist de unsafe
 ```
 

@@ -108,7 +108,7 @@ fn parse(args: &[String]) -> Result<Options> {
             }
             "--mem" => opts.mem = value("--mem")?,
             "--cmdline" => opts.cmdline = value("--cmdline")?,
-            "unit" | "boot" | "all" => opts.suite.clone_from(arg),
+            "unit" | "boot" | "kernel" | "all" => opts.suite.clone_from(arg),
             other => return Err(format!("opção desconhecida: {other}")),
         }
     }
@@ -341,6 +341,8 @@ struct Scenario {
     /// `Some(código)`: o kernel desliga o QEMU com esse código. `None`: a CPU
     /// congela, e o xtask encerra o QEMU assim que todos os marcadores saem.
     exit: Option<i32>,
+    /// Confere e mostra o relatório do harness de testes de kernel (T-111).
+    ktest: bool,
 }
 
 const SCENARIOS: &[Scenario] = &[
@@ -350,6 +352,7 @@ const SCENARIOS: &[Scenario] = &[
         markers: BOOT_MARKERS,
         forbidden: &["okernel: FALTA", "PÂNICO"],
         exit: Some(KERNEL_EXIT_OK),
+        ktest: false,
     },
     Scenario {
         name: "falta proposital",
@@ -357,13 +360,29 @@ const SCENARIOS: &[Scenario] = &[
         markers: FAULT_MARKERS,
         forbidden: &["okernel: desligando"],
         exit: None,
+        ktest: false,
     },
 ];
 
+/// Testes de kernel (T-111): o kernel roda os testes registrados e sai com 33
+/// se todos passarem.
+const KERNEL_SCENARIO: Scenario = Scenario {
+    name: "testes de kernel",
+    cmdline: "test=kernel",
+    markers: &[KTEST_START, KTEST_END],
+    forbidden: &["ktest: FALHOU", "okernel: FALTA", "PÂNICO"],
+    exit: Some(KERNEL_EXIT_OK),
+    ktest: true,
+};
+/// Primeira linha do harness: `ktest: início, N testes`.
+const KTEST_START: &str = "ktest: início, ";
+/// Última linha do harness: `ktest: fim: N ok, M falharam`.
+const KTEST_END: &str = "ktest: fim: ";
+
 /// Dá boot em cada cenário e confere a serial com [`check_serial`].
-fn smoke(opts: &Options) -> Result {
+fn smoke(opts: &Options, scenarios: &[Scenario]) -> Result {
     build(opts)?;
-    for scenario in SCENARIOS {
+    for scenario in scenarios {
         boot_scenario(opts, scenario)?;
     }
     Ok(())
@@ -410,17 +429,30 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
     let _ = reader.join();
     raw.extend(rx.try_iter().flatten());
     let serial = String::from_utf8_lossy(&raw);
-    let result = check_serial(&serial, sc.markers, sc.forbidden).and_then(|()| match end {
-        Ok(code) if code.is_some() && code == sc.exit => Ok(()),
-        Ok(code) => Err(format!(
-            "QEMU terminou com {code:?}, esperado {:?}",
-            sc.exit
-        )),
-        Err(true) => Ok(()),
-        Err(false) => Err("tempo esgotado".into()),
-    });
+    let result = check_serial(&serial, sc.markers, sc.forbidden)
+        .and_then(|()| {
+            if sc.ktest {
+                check_ktest(&serial)
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|()| match end {
+            Ok(code) if code.is_some() && code == sc.exit => Ok(()),
+            Ok(code) => Err(format!(
+                "QEMU terminou com {code:?}, esperado {:?}",
+                sc.exit
+            )),
+            Err(true) => Ok(()),
+            Err(false) => Err("tempo esgotado".into()),
+        });
     match result {
         Ok(()) => {
+            if sc.ktest {
+                for line in serial.lines().filter_map(|l| l.split_once("ktest: ")) {
+                    println!("  {}", line.1.trim_end());
+                }
+            }
             println!("xtask: smoke test de boot ok ({})", sc.name);
             Ok(())
         }
@@ -429,6 +461,34 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
             sc.name
         )),
     }
+}
+
+/// Confere o relatório do harness: ao menos um teste, todos anunciados
+/// rodaram e passaram.
+fn check_ktest(serial: &str) -> Result {
+    let after = |prefix: &str| {
+        serial
+            .lines()
+            .find_map(|l| l.split_once(prefix).map(|(_, rest)| rest.trim_end()))
+    };
+    let number =
+        |text: Option<&str>| -> Option<usize> { text?.split_whitespace().next()?.parse().ok() };
+    let announced = number(after(KTEST_START)).ok_or("sem a linha de início do ktest")?;
+    let end = after(KTEST_END).ok_or("sem a linha de fim do ktest")?;
+    let passed = number(Some(end)).ok_or("linha de fim do ktest ilegível")?;
+    let ok_lines = serial.lines().filter(|l| l.contains("ktest: ok ")).count();
+    if announced == 0 {
+        return Err("nenhum teste de kernel registrado".into());
+    }
+    if !end.ends_with(", 0 falharam") {
+        return Err(format!("testes de kernel falharam: {end}"));
+    }
+    if passed != announced || ok_lines != announced {
+        return Err(format!(
+            "{announced} testes anunciados, {passed} contados e {ok_lines} linhas ok"
+        ));
+    }
+    Ok(())
 }
 
 /// Exige `markers`, recusa `forbidden` e exige ao menos um segmento do
@@ -470,7 +530,10 @@ fn test(opts: &Options) -> Result {
         status(cargo().args(["test", "--package", "okernel", "--lib"]))?;
     }
     if matches!(opts.suite.as_str(), "boot" | "all") {
-        smoke(opts)?;
+        smoke(opts, SCENARIOS)?;
+    }
+    if matches!(opts.suite.as_str(), "kernel" | "all") {
+        smoke(opts, &[KERNEL_SCENARIO])?;
     }
     Ok(())
 }
@@ -596,6 +659,22 @@ mod tests {
         assert!(check(&ok.replace("R-X", "RWX")).is_err());
         assert!(check(&ok.replace("optboot: seg", "x")).is_err());
         assert!(check(&format!("{ok}okernel: FALTA #GP\r\n")).is_err());
+    }
+
+    #[test]
+    fn relatorio_do_ktest() {
+        let ok = "info  ktest: início, 2 testes\r\n\
+                  info  ktest: ok a.b\r\n\
+                  info  ktest: ok a.c\r\n\
+                  info  ktest: fim: 2 ok, 0 falharam\r\n";
+        assert_eq!(check_ktest(ok), Ok(()));
+        assert!(check_ktest(&ok.replace("2 testes", "3 testes")).is_err());
+        assert!(check_ktest(&ok.replace("0 falharam", "1 falharam")).is_err());
+        assert!(check_ktest(&ok.replace("ktest: fim", "x")).is_err());
+        assert!(
+            check_ktest("info  ktest: início, 0 testes\r\nktest: fim: 0 ok, 0 falharam").is_err()
+        );
+        assert_eq!(parse(&args(&["kernel"])).unwrap().suite, "kernel");
     }
 
     #[test]

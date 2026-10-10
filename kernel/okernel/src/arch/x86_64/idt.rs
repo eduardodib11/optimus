@@ -156,6 +156,11 @@ pub unsafe fn init() {
     }
 }
 
+/// Endereço virtual da IDT, para conferir o que a CPU carregou.
+pub fn table_addr() -> u64 {
+    (&raw const IDT).addr() as u64
+}
+
 /// Lê CR0, CR2, CR3 e CR4.
 fn control_registers() -> [u64; 4] {
     let (cr0, cr2, cr3, cr4): (u64, u64, u64, u64);

@@ -6,6 +6,9 @@ use core::arch::{asm, global_asm};
 pub mod gdt;
 pub mod idt;
 pub mod serial;
+mod tests;
+
+pub use tests::TESTS;
 
 global_asm!(include_str!("entry.S"));
 global_asm!(include_str!("vectors.S"));

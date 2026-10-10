@@ -3,18 +3,22 @@
 //! Esqueleto do M1: PIE ligado na metade alta por `linker.ld` e carregado pelo
 //! `optboot` com KASLR (T-103). A entrada em assembly (`arch/x86_64/entry.S`)
 //! troca de pilha e chama [`kernel_main`] (T-104), que carrega GDT, TSS e IDT
-//! (T-105). Com `test=fault` na linha de comando, provoca um #UD de propósito.
+//! (T-105). Com `test=fault` na linha de comando, provoca um #UD de propósito;
+//! com `test=kernel`, roda os testes de kernel ([`ktest`], T-111).
 
 #![no_std]
 #![no_main]
 
 #[macro_use]
 mod klog;
+#[macro_use]
+mod ktest;
 mod arch;
+mod bootinfo;
 
 use core::panic::PanicInfo;
 
-use kabi::boot::{BootInfo, MemKind, MemRegion};
+use kabi::boot::BootInfo;
 use kabi::{SYSCALL_COUNT, Syscall};
 use okernel::log::{Level, level_from_cmdline, option};
 
@@ -22,42 +26,6 @@ use arch::x86_64::{QemuExit, qemu_exit};
 
 // Prova que a ABI compartilhada compila no kernel: a tabela de syscalls fecha.
 const _: () = assert!(SYSCALL_COUNT == Syscall::ThreadExit as usize + 1);
-
-/// Teto de faixas aceitas no mapa de memória, contra um `BootInfo` corrompido.
-const MAX_REGIONS: u64 = 4096;
-
-/// Mapa de memória da `BootInfo`, se o ponteiro e o tamanho forem plausíveis.
-fn memory_map(info: &BootInfo) -> Option<&'static [MemRegion]> {
-    let ptr = info.memory_map;
-    let len = usize::try_from(info.memory_map_len).ok()?;
-    if ptr.is_null() || !ptr.is_aligned() || info.memory_map_len > MAX_REGIONS {
-        return None;
-    }
-    // SAFETY: o optboot (T-103) grava `memory_map_len` faixas num vetor
-    // próprio, de tipo Kernel no mapa, apontado pelo mapa direto; nada mais
-    // escreve nessa memória.
-    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
-}
-
-/// Imprime o mapa de memória recebido (aceite do T-102).
-fn log_memory_map(map: &[MemRegion]) {
-    info!("okernel: mapa de memória com {} faixas", map.len());
-    for r in map {
-        info!(
-            "okernel:   {:#014x}-{:#014x} {:?} ({} KiB)",
-            r.base,
-            r.end(),
-            r.kind(),
-            r.len >> 10
-        );
-    }
-    let usable: u64 = map
-        .iter()
-        .filter(|r| r.kind() == MemKind::Usable)
-        .map(|r| r.len)
-        .sum();
-    info!("okernel: {} KiB usáveis", usable >> 10);
-}
 
 /// Primeira função em Rust, chamada por `kernel_entry` já na pilha do kernel.
 #[unsafe(no_mangle)]
@@ -82,13 +50,18 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         info.boot_time_ns
     );
     trace!("okernel: BootInfo em {:p}", info);
-    match memory_map(info) {
-        Some(map) => log_memory_map(map),
+    bootinfo::set(info);
+    match bootinfo::memory_map(info) {
+        Some(map) => bootinfo::log_memory_map(map),
         None => warn!("okernel: mapa de memória ausente ou inválido"),
     }
-    if option(cmdline, "test") == Some("fault") {
-        warn!("okernel: test=fault, provocando #UD");
-        arch::x86_64::trigger_invalid_opcode();
+    match option(cmdline, "test") {
+        Some("fault") => {
+            warn!("okernel: test=fault, provocando #UD");
+            arch::x86_64::trigger_invalid_opcode();
+        }
+        Some("kernel") => ktest::run(option(cmdline, "ktest")),
+        _ => {}
     }
     info!("okernel: desligando");
     qemu_exit(QemuExit::Success)
