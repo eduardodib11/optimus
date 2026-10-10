@@ -9,6 +9,11 @@
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use kabi::{SYSCALL_COUNT, Syscall};
+
+// Prova que a ABI compartilhada compila no kernel: a tabela de syscalls fecha.
+const _: () = assert!(SYSCALL_COUNT == Syscall::ThreadExit as usize + 1);
+
 /// Número de entradas no kernel; fica no BSS e serve para o `optboot` exercitar
 /// um segmento RW- com memória zerada além do arquivo.
 static ENTRIES: AtomicU64 = AtomicU64::new(0);

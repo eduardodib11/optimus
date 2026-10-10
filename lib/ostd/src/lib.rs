@@ -8,3 +8,6 @@
 
 /// Versão da biblioteca, exposta para diagnóstico.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// ABI do kernel (syscalls, erros, direitos, handles), a mesma usada pelo `okernel`.
+pub use kabi;
