@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::{env, fs, sync::mpsc, thread};
 
 /// Alvo do kernel no lugar de `x86_64-optimus-kernel`: alvos próprios em JSON
 /// exigem `-Zbuild-std`, que não existe no Rust estável (ADR 0025).
@@ -36,11 +36,22 @@ const BOOT_MARKERS: &[&str] = &[
     "optboot: KASLR",
     "saindo dos serviços de boot",
     "okernel: hello",
+    "okernel: GDT, TSS e IDT carregadas",
     "okernel: kaslr_slide",
     "okernel: mapa de memória",
 ];
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
 const KERNEL_EXIT_OK: i32 = 33;
+/// Textos que o cenário `test=fault` exige: o dump legível do #UD.
+const FAULT_MARKERS: &[&str] = &[
+    "okernel: hello",
+    "okernel: GDT, TSS e IDT carregadas",
+    "okernel: FALTA #UD (opcode inválido), vetor 6",
+    "  rip 0x",
+    "  rax 0x",
+    "  cr3 0x",
+    "okernel: CPU congelada",
+];
 /// Prefixo das linhas em que o `optboot` descreve cada segmento carregado.
 const SEGMENT_PREFIX: &str = "optboot: seg ";
 const SMOKE_TIMEOUT: Duration = Duration::from_mins(1);
@@ -320,52 +331,114 @@ fn run(opts: &Options) -> Result {
     }
 }
 
-/// Dá boot no QEMU sem interação e confere a serial com [`check_serial`].
+/// Um boot de teste: linha de comando, o que a serial precisa (e não pode)
+/// mostrar e como o QEMU deve terminar.
+struct Scenario {
+    name: &'static str,
+    cmdline: &'static str,
+    markers: &'static [&'static str],
+    forbidden: &'static [&'static str],
+    /// `Some(código)`: o kernel desliga o QEMU com esse código. `None`: a CPU
+    /// congela, e o xtask encerra o QEMU assim que todos os marcadores saem.
+    exit: Option<i32>,
+}
+
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "boot normal",
+        cmdline: "",
+        markers: BOOT_MARKERS,
+        forbidden: &["okernel: FALTA", "PÂNICO"],
+        exit: Some(KERNEL_EXIT_OK),
+    },
+    Scenario {
+        name: "falta proposital",
+        cmdline: "test=fault",
+        markers: FAULT_MARKERS,
+        forbidden: &["okernel: desligando"],
+        exit: None,
+    },
+];
+
+/// Dá boot em cada cenário e confere a serial com [`check_serial`].
 fn smoke(opts: &Options) -> Result {
     build(opts)?;
-    let esp = image(opts, &opts.cmdline)?;
+    for scenario in SCENARIOS {
+        boot_scenario(opts, scenario)?;
+    }
+    Ok(())
+}
+
+fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
+    let esp = image(opts, sc.cmdline)?;
     let mut child = qemu(opts, &esp)?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("falha ao iniciar o QEMU: {e}"))?;
     let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
     let reader = thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = stdout.read_to_end(&mut out);
-        String::from_utf8_lossy(&out).into_owned()
-    });
-    let start = Instant::now();
-    let exit = loop {
-        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
-            break st.code();
+        let mut chunk = [0u8; 4096];
+        while let Ok(n @ 1..) = stdout.read(&mut chunk) {
+            if tx.send(chunk[..n].to_vec()).is_err() {
+                break;
+            }
         }
-        if start.elapsed() > SMOKE_TIMEOUT {
+    });
+    let mut raw = Vec::new();
+    let start = Instant::now();
+    let seen_all = |raw: &[u8]| {
+        let text = String::from_utf8_lossy(raw);
+        sc.markers.iter().all(|m| text.contains(m))
+    };
+    // `Ok(código)`: o QEMU terminou sozinho; `Err(congelou)`: o xtask o matou,
+    // depois de ver todos os marcadores (`true`) ou por tempo (`false`).
+    let end: std::result::Result<Option<i32>, bool> = loop {
+        raw.extend(rx.try_iter().flatten());
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break Ok(st.code());
+        }
+        let frozen = sc.exit.is_none() && seen_all(&raw);
+        if frozen || start.elapsed() > SMOKE_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
-            break None;
+            break Err(frozen);
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let serial = reader.join().unwrap_or_default();
-    let result = check_serial(&serial).and_then(|()| match exit {
-        Some(KERNEL_EXIT_OK) => Ok(()),
-        Some(code) => Err(format!("QEMU saiu com {code}, esperado {KERNEL_EXIT_OK}")),
-        None => Err("o kernel não desligou o QEMU a tempo".into()),
+    let _ = reader.join();
+    raw.extend(rx.try_iter().flatten());
+    let serial = String::from_utf8_lossy(&raw);
+    let result = check_serial(&serial, sc.markers, sc.forbidden).and_then(|()| match end {
+        Ok(code) if code.is_some() && code == sc.exit => Ok(()),
+        Ok(code) => Err(format!(
+            "QEMU terminou com {code:?}, esperado {:?}",
+            sc.exit
+        )),
+        Err(true) => Ok(()),
+        Err(false) => Err("tempo esgotado".into()),
     });
     match result {
         Ok(()) => {
-            println!("xtask: smoke test de boot ok");
+            println!("xtask: smoke test de boot ok ({})", sc.name);
             Ok(())
         }
-        Err(e) => Err(format!("smoke test de boot falhou: {e}; serial:\n{serial}")),
+        Err(e) => Err(format!(
+            "smoke test de boot falhou ({}): {e}; serial:\n{serial}",
+            sc.name
+        )),
     }
 }
 
-/// Exige os `BOOT_MARKERS`, ao menos um segmento e nenhum segmento W+X.
-fn check_serial(serial: &str) -> Result {
-    if let Some(missing) = BOOT_MARKERS.iter().find(|m| !serial.contains(*m)) {
+/// Exige `markers`, recusa `forbidden` e exige ao menos um segmento do
+/// kernel e nenhum segmento W+X.
+fn check_serial(serial: &str, markers: &[&str], forbidden: &[&str]) -> Result {
+    if let Some(missing) = markers.iter().find(|m| !serial.contains(*m)) {
         return Err(format!("faltou \"{missing}\""));
+    }
+    if let Some(bad) = forbidden.iter().find(|m| serial.contains(*m)) {
+        return Err(format!("não devia aparecer \"{bad}\""));
     }
     let mut segments = 0;
     for line in serial.lines().filter(|l| l.contains(SEGMENT_PREFIX)) {
@@ -513,13 +586,16 @@ mod tests {
                   optboot: KASLR: deslocamento 0x200000\r\n\
                   optboot: tabelas de página prontas; saindo dos serviços de boot\r\n\
                   info  okernel: hello\r\n\
+                  info  okernel: GDT, TSS e IDT carregadas\r\n\
                   info  okernel: kaslr_slide 0x200000\r\n\
                   info  okernel: mapa de memória com 24 faixas\r\n";
-        assert_eq!(check_serial(ok), Ok(()));
-        assert!(check_serial("Optimus OS \u{2014} optboot\r\n").is_err());
-        assert!(check_serial(&ok.replace("okernel: hello", "okernel")).is_err());
-        assert!(check_serial(&ok.replace("R-X", "RWX")).is_err());
-        assert!(check_serial(&ok.replace("optboot: seg", "x")).is_err());
+        let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
+        assert_eq!(check(ok), Ok(()));
+        assert!(check("Optimus OS \u{2014} optboot\r\n").is_err());
+        assert!(check(&ok.replace("okernel: hello", "okernel")).is_err());
+        assert!(check(&ok.replace("R-X", "RWX")).is_err());
+        assert!(check(&ok.replace("optboot: seg", "x")).is_err());
+        assert!(check(&format!("{ok}okernel: FALTA #GP\r\n")).is_err());
     }
 
     #[test]
