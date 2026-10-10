@@ -21,6 +21,7 @@ const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const CRATES: &[(&str, &str, &str)] = &[
     ("optboot", "boot/optboot/src/main.rs", UEFI_TARGET),
     ("okernel", "kernel/okernel/src/main.rs", KERNEL_TARGET),
+    ("oelf", "lib/oelf/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
 ];
 
@@ -315,6 +316,16 @@ fn test(opts: &Options) -> Result {
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
     status(cargo().args(["clippy", "--package", "xtask", "--", "-D", "warnings"]))?;
+    // Bibliotecas testadas no host também passam pelo clippy com os testes.
+    status(cargo().args([
+        "clippy",
+        "--package",
+        "oelf",
+        "--tests",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     for (package, _, target) in CRATES {
         status(cargo().args([
             "clippy",
