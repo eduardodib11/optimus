@@ -1,9 +1,9 @@
-//! Instruções privilegiadas da CPU: CPUID, registradores de controle, MSRs e
-//! TLB.
+//! Instruções privilegiadas da CPU: CPUID, registradores de controle, MSRs,
+//! TLB, TSC e interrupções.
 
 use core::arch::asm;
 
-/// Resultado de CPUID: EAX, EBX e ECX.
+/// Resultado de CPUID.
 pub struct CpuidResult {
     /// EAX.
     pub eax: u32,
@@ -11,6 +11,8 @@ pub struct CpuidResult {
     pub ebx: u32,
     /// ECX.
     pub ecx: u32,
+    /// EDX.
+    pub edx: u32,
 }
 
 /// Executa CPUID na folha `leaf`, subfolha `sub`.
@@ -22,7 +24,21 @@ pub fn cpuid(leaf: u32, sub: u32) -> CpuidResult {
         eax: r.eax,
         ebx: r.ebx,
         ecx: r.ecx,
+        edx: r.edx,
     }
+}
+
+/// Assinatura do hipervisor (CPUID `0x4000_0000`), se houver um.
+pub fn hypervisor() -> Option<[u8; 12]> {
+    if cpuid(1, 0).ecx & (1 << 31) == 0 {
+        return None;
+    }
+    let r = cpuid(0x4000_0000, 0);
+    let mut sig = [0; 12];
+    for (chunk, word) in sig.chunks_mut(4).zip([r.ebx, r.ecx, r.edx]) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    Some(sig)
 }
 
 /// Maior folha básica (`basic`) ou estendida de CPUID que a CPU oferece.
@@ -92,6 +108,34 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
         asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, nostack));
     }
     (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Grava `value` no MSR `msr`.
+///
+/// # Safety
+///
+/// O MSR precisa existir e o valor não pode quebrar o kernel.
+pub unsafe fn wrmsr(msr: u32, value: u64) {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "WRMSR divide o valor em EDX:EAX"
+    )]
+    let (low, high) = (value as u32, (value >> 32) as u32);
+    // SAFETY: contrato do chamador.
+    unsafe { asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nostack)) };
+}
+
+/// Lê o contador de tempo (TSC).
+pub fn rdtsc() -> u64 {
+    // SAFETY: RDTSC só lê o contador; o kernel não liga CR4.TSD.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Liga as interrupções e espera a próxima; volta com elas desligadas.
+pub fn wait_for_interrupt() {
+    // SAFETY: STI só vale depois da instrução seguinte, então nenhuma
+    // interrupção escapa entre STI e HLT; os tratadores instalados voltam.
+    unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
 /// Invalida a entrada da TLB de `virt` nesta CPU.
