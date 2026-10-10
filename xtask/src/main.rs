@@ -57,6 +57,8 @@ struct Options {
     smp: u32,
     mem: String,
     suite: String,
+    /// Linha de comando do kernel, gravada em `\EFI\optimus\cmdline.txt`.
+    cmdline: String,
 }
 
 impl Default for Options {
@@ -69,6 +71,7 @@ impl Default for Options {
             smp: 1,
             mem: "512M".into(),
             suite: "all".into(),
+            cmdline: String::new(),
         }
     }
 }
@@ -93,6 +96,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     .map_err(|_| "--smp espera um número")?;
             }
             "--mem" => opts.mem = value("--mem")?,
+            "--cmdline" => opts.cmdline = value("--cmdline")?,
             "unit" | "boot" | "all" => opts.suite.clone_from(arg),
             other => return Err(format!("opção desconhecida: {other}")),
         }
@@ -121,7 +125,7 @@ fn main() -> ExitCode {
     };
     let result = parse(rest).and_then(|opts| match cmd.as_str() {
         "build" => build(&opts),
-        "image" => build(&opts).and_then(|()| image(&opts).map(drop)),
+        "image" => build(&opts).and_then(|()| image(&opts, &opts.cmdline).map(drop)),
         "run" => run(&opts),
         "test" => test(&opts),
         "check" => check(),
@@ -198,8 +202,9 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
     }
 }
 
-/// Monta a ESP em `target/esp`, que o QEMU expõe como disco FAT virtual.
-fn image(opts: &Options) -> Result<PathBuf> {
+/// Monta a ESP em `target/esp`, que o QEMU expõe como disco FAT virtual, com
+/// `cmdline` como linha de comando do kernel (vazia: sem arquivo).
+fn image(opts: &Options, cmdline: &str) -> Result<PathBuf> {
     let esp = root().join("target/esp");
     let boot = esp.join("EFI/BOOT");
     fs::create_dir_all(&boot).map_err(|e| format!("criando {}: {e}", boot.display()))?;
@@ -213,6 +218,13 @@ fn image(opts: &Options) -> Result<PathBuf> {
     let kernel = root().join(format!("target/{KERNEL_TARGET}/{}/okernel", mode(opts)));
     fs::copy(&kernel, optimus.join("okernel.elf"))
         .map_err(|e| format!("copiando {}: {e}", kernel.display()))?;
+    let cmdline_file = optimus.join("cmdline.txt");
+    if cmdline.is_empty() {
+        let _ = fs::remove_file(&cmdline_file);
+    } else {
+        fs::write(&cmdline_file, cmdline)
+            .map_err(|e| format!("gravando {}: {e}", cmdline_file.display()))?;
+    }
     println!("xtask: ESP pronta em {}", esp.display());
     Ok(esp)
 }
@@ -297,7 +309,7 @@ fn kvm_usable() -> bool {
 
 fn run(opts: &Options) -> Result {
     build(opts)?;
-    let esp = image(opts)?;
+    let esp = image(opts, &opts.cmdline)?;
     let mut cmd = qemu(opts, &esp)?;
     let st = cmd
         .status()
@@ -311,7 +323,7 @@ fn run(opts: &Options) -> Result {
 /// Dá boot no QEMU sem interação e confere a serial com [`check_serial`].
 fn smoke(opts: &Options) -> Result {
     build(opts)?;
-    let esp = image(opts)?;
+    let esp = image(opts, &opts.cmdline)?;
     let mut child = qemu(opts, &esp)?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -473,12 +485,15 @@ mod tests {
             "--gdb",
             "--profile",
             "jarvis",
+            "--cmdline",
+            "log=debug",
         ]))
         .unwrap();
         assert_eq!(
             (opts.smp, opts.mem.as_str(), opts.gdb, opts.profile.as_str()),
             (4, "1G", true, "jarvis")
         );
+        assert_eq!(opts.cmdline, "log=debug");
     }
 
     #[test]
