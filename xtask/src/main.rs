@@ -304,6 +304,8 @@ fn test(opts: &Options) -> Result {
             "--exclude",
             "ostd",
         ]))?;
+        // A lógica portável do kernel (biblioteca `okernel`) roda no host.
+        status(cargo().args(["test", "--package", "okernel", "--lib"]))?;
     }
     if matches!(opts.suite.as_str(), "boot" | "all") {
         smoke(opts)?;
@@ -315,6 +317,17 @@ fn test(opts: &Options) -> Result {
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
     status(cargo().args(["clippy", "--package", "xtask", "--", "-D", "warnings"]))?;
+    // Testes no host da biblioteca do kernel.
+    status(cargo().args([
+        "clippy",
+        "--package",
+        "okernel",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     for (package, _, target) in CRATES {
         status(cargo().args([
             "clippy",
