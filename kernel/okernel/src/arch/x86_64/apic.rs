@@ -25,6 +25,8 @@ const REG_ID: u32 = 0x20;
 const REG_VERSION: u32 = 0x30;
 const REG_EOI: u32 = 0xb0;
 const REG_SVR: u32 = 0xf0;
+const REG_ICR: u32 = 0x300;
+const REG_ICR_HIGH: u32 = 0x310;
 const REG_LVT_TIMER: u32 = 0x320;
 const REG_TIMER_INITIAL: u32 = 0x380;
 const REG_TIMER_CURRENT: u32 = 0x390;
@@ -51,6 +53,7 @@ static DEADLINE: AtomicBool = AtomicBool::new(false);
 static TIMER_FIRES: AtomicU64 = AtomicU64::new(0);
 static TIMER_LAST_TSC: AtomicU64 = AtomicU64::new(0);
 static UNEXPECTED: AtomicU64 = AtomicU64::new(0);
+static FROZEN: AtomicBool = AtomicBool::new(false);
 
 /// Modo atual.
 pub fn mode() -> Mode {
@@ -182,6 +185,34 @@ pub fn arm_timer(deadline_tsc: u64, ticks: u32) {
         write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
         write(REG_TIMER_INITIAL, ticks.max(1));
     }
+}
+
+/// Manda NMI a todas as outras CPUs (para congelá-las no pânico).
+fn nmi_others() {
+    // Entrega NMI (100b), nível de asserção, destino "todas menos esta".
+    let icr: u32 = (0b100 << 8) | (1 << 14) | (0b11 << 18);
+    match mode() {
+        // SAFETY: ICR do x2APIC; um NMI só para as outras CPUs.
+        Mode::X2Apic => unsafe { wrmsr(0x800 + (REG_ICR >> 4), u64::from(icr)) },
+        Mode::XApic => {
+            write(REG_ICR_HIGH, 0);
+            write(REG_ICR, icr);
+        }
+        Mode::Off => {}
+    }
+}
+
+/// Congela o resto da máquina para o pânico: mascara o timer desta CPU e
+/// manda NMI às outras, que param ao ver [`frozen`].
+pub fn freeze_others() {
+    FROZEN.store(true, Ordering::SeqCst);
+    write(REG_LVT_TIMER, LVT_MASKED | u32::from(TIMER_VECTOR));
+    nmi_others();
+}
+
+/// Um pânico pediu que as CPUs parem.
+pub fn frozen() -> bool {
+    FROZEN.load(Ordering::SeqCst)
 }
 
 /// Tratador das interrupções de vetor 32 a 255, chamado com IF desligado.

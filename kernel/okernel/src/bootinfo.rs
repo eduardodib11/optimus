@@ -38,6 +38,18 @@ pub fn memory_map(info: &BootInfo) -> Option<&'static [MemRegion]> {
     Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
+/// Fim da faixa física coberta pelo mapa direto, pela mesma regra do
+/// optboot: toda a RAM e ACPI e ao menos 4 GiB, arredondado para 1 GiB.
+pub fn direct_map_limit(map: &[MemRegion]) -> u64 {
+    let ram = map
+        .iter()
+        .filter(|r| matches!(r.kind(), MemKind::Usable | MemKind::Acpi | MemKind::Kernel))
+        .map(MemRegion::end)
+        .max()
+        .unwrap_or(0);
+    ram.max(4 << 30).next_multiple_of(1 << 30)
+}
+
 /// Imprime o mapa de memória recebido (aceite do T-102).
 pub fn log_memory_map(map: &[MemRegion]) {
     info!("okernel: mapa de memória com {} faixas", map.len());

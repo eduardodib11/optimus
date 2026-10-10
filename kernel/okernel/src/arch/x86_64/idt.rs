@@ -193,6 +193,10 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
         super::apic::dispatch(frame.vector);
         return;
     }
+    if frame.vector == 2 && super::apic::frozen() {
+        // NMI do pânico de outra CPU: para sem despejar nada.
+        halt();
+    }
     if super::probe::fixup(frame, control_registers()[1]) {
         return;
     }

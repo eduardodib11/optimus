@@ -6,6 +6,8 @@ use super::{inb, outb};
 const COM1: u16 = 0x3f8;
 /// Line Status Register: bit 5 = registrador de transmissão vazio.
 const LSR_THR_EMPTY: u8 = 1 << 5;
+/// Line Status Register: bit 0 = byte recebido.
+const LSR_DATA_READY: u8 = 1;
 
 /// Porta serial COM1. Só existe uma; o logger guarda o acesso exclusivo.
 pub struct Serial(());
@@ -35,6 +37,16 @@ impl Serial {
     /// emergência, quando nada mais roda).
     pub fn com1() -> Self {
         Self(())
+    }
+
+    /// Byte recebido, se houver (sem esperar).
+    #[allow(
+        clippy::unused_self,
+        reason = "`&mut self` é a prova de acesso exclusivo"
+    )]
+    pub fn try_read(&mut self) -> Option<u8> {
+        // SAFETY: ler LSR e RBR só consome o byte recebido.
+        unsafe { (inb(COM1 + 5) & LSR_DATA_READY != 0).then(|| inb(COM1)) }
     }
 
     #[allow(
