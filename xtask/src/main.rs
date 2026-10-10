@@ -348,6 +348,8 @@ fn test(opts: &Options) -> Result {
             "--exclude",
             "ostd",
         ]))?;
+        // A lógica portável do kernel (biblioteca `okernel`) roda no host.
+        status(cargo().args(["test", "--package", "okernel", "--lib"]))?;
     }
     if matches!(opts.suite.as_str(), "boot" | "all") {
         smoke(opts)?;
@@ -364,6 +366,16 @@ fn check() -> Result {
         "clippy",
         "--package",
         "oelf",
+        "--tests",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    status(cargo().args([
+        "clippy",
+        "--package",
+        "okernel",
+        "--lib",
         "--tests",
         "--",
         "-D",
