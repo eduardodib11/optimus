@@ -9,12 +9,15 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 #[macro_use]
 mod klog;
 #[macro_use]
 mod ktest;
 mod arch;
 mod bootinfo;
+mod kheap;
 mod kmem;
 
 use core::panic::PanicInfo;
@@ -56,6 +59,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         Some(map) => {
             bootinfo::log_memory_map(map);
             kmem::init(map);
+            kheap::init(cmdline);
         }
         None => warn!("okernel: mapa de memória ausente ou inválido"),
     }
@@ -67,6 +71,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         Some("kernel") => ktest::run(option(cmdline, "ktest")),
         _ => {}
     }
+    kheap::log_stats();
     info!("okernel: desligando");
     qemu_exit(QemuExit::Success)
 }

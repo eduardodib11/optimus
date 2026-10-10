@@ -39,6 +39,8 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: GDT, TSS e IDT carregadas",
     "okernel: kaslr_slide",
     "okernel: mapa de memória",
+    "okernel: identidade removida",
+    "okernel: heap: slab   16 B",
 ];
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
 const KERNEL_EXIT_OK: i32 = 33;
@@ -655,7 +657,9 @@ mod tests {
                   info  okernel: hello\r\n\
                   info  okernel: GDT, TSS e IDT carregadas\r\n\
                   info  okernel: kaslr_slide 0x200000\r\n\
-                  info  okernel: mapa de memória com 24 faixas\r\n";
+                  info  okernel: mapa de memória com 24 faixas\r\n\
+                  info  okernel: identidade removida; 40 páginas\r\n\
+                  info  okernel: heap: slab   16 B: 0 slabs\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
         assert!(check("Optimus OS \u{2014} optboot\r\n").is_err());
