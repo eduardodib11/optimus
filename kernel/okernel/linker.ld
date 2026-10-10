@@ -24,9 +24,11 @@ SECTIONS
 {
     . = KERNEL_BASE;
 
-    .text : ALIGN(4K) { *(.text .text.*) } :text
+    .text : ALIGN(4K) { __kernel_text_start = .; *(.text .text.*) } :text
+    __kernel_text_end = .;
 
     . = ALIGN(4K);
+    __kernel_rodata_start = .;
     .rodata : { *(.rodata .rodata.*) } :rodata
     .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) } :rodata
     .got : { *(.got .got.*) } :rodata
@@ -36,6 +38,7 @@ SECTIONS
     .dynstr : { *(.dynstr) } :rodata
     .rela.dyn : { *(.rela.dyn .rela.*) } :rodata
     .dynamic : { *(.dynamic) } :rodata :dynamic
+    __kernel_rodata_end = .;
 
     . = ALIGN(4K);
     .data : { *(.data .data.*) } :data

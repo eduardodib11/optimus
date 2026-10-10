@@ -183,6 +183,27 @@ fn pagina_de_2m_e_divisao() {
 }
 
 #[test]
+fn percorre_todas_as_folhas_em_ordem() {
+    let mut pt = Fake::new(16);
+    pt.map(0x40_0000, PhysAddr(0), PageSize::Size2M, Flags::READ)
+        .unwrap();
+    pt.map(K + 0x3000, PhysAddr(0x9000), PageSize::Size4K, Flags::RX)
+        .unwrap();
+    pt.map(K, PhysAddr(0x8000), PageSize::Size4K, Flags::RW)
+        .unwrap();
+    let mut seen = Vec::new();
+    pt.for_each_leaf(&mut |virt, m| seen.push((virt, m.phys, m.size, m.flags)));
+    assert_eq!(
+        seen,
+        [
+            (0x40_0000, PhysAddr(0), PageSize::Size2M, Flags::READ),
+            (K, PhysAddr(0x8000), PageSize::Size4K, Flags::RW),
+            (K + 0x3000, PhysAddr(0x9000), PageSize::Size4K, Flags::RX),
+        ]
+    );
+}
+
+#[test]
 fn falta_de_frame_vira_erro() {
     let mut pt = Fake::new(3);
     assert_eq!(

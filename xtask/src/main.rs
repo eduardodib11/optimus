@@ -301,6 +301,10 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     .arg(format!("format=raw,file=fat:rw:{}", esp.display()));
     if kvm_usable() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
+    } else {
+        // Sem KVM, o TCG emula tudo o que sabe (SMEP, SMAP, UMIP, x2APIC),
+        // para os testes de kernel exercitarem esses caminhos.
+        cmd.args(["-cpu", "max"]);
     }
     if opts.gdb {
         cmd.args(["-s", "-S"]);

@@ -311,6 +311,43 @@ impl<M: TableMemory> PageTables<M> {
         None
     }
 
+    /// Chama `f(virt, folha)` para cada folha de 4 KiB ou 2 MiB presente, em
+    /// ordem crescente de endereço (para auditar W^X, por exemplo).
+    pub fn for_each_leaf(&mut self, f: &mut dyn FnMut(u64, Mapping)) {
+        self.visit(self.root, 4, 0, f);
+    }
+
+    fn visit(&mut self, table: PhysAddr, level: u32, base: u64, f: &mut dyn FnMut(u64, Mapping)) {
+        for i in 0..ENTRIES {
+            let entry = self.mem.table(table)[i];
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            let mut virt = base | ((i as u64) << (12 + 9 * (level - 1)));
+            if level == 4 && i >= ENTRIES / 2 {
+                virt |= 0xffff_0000_0000_0000;
+            }
+            let size = match (level, entry & HUGE != 0) {
+                (1, _) => PageSize::Size4K,
+                (2, true) => PageSize::Size2M,
+                (3, true) => continue,
+                _ => {
+                    self.visit(PhysAddr(entry & ADDR_4K), level - 1, virt, f);
+                    continue;
+                }
+            };
+            let phys = PhysAddr(entry & size.addr_mask());
+            f(
+                virt,
+                Mapping {
+                    phys,
+                    size,
+                    flags: Flags::from_bits(entry),
+                },
+            );
+        }
+    }
+
     /// Tabela e índice da folha presente de tamanho `size` em `virt`,
     /// dividindo uma página de 2 MiB se `size` for 4 KiB.
     fn leaf(&mut self, virt: u64, size: PageSize) -> Result<(PhysAddr, usize), MapError> {
