@@ -162,14 +162,15 @@ fn build(opts: &Options) -> Result {
     );
     for (package, _, target) in CRATES {
         let mut cmd = cargo();
-        let flags = rustc_flags(package);
-        let sub = if flags.is_empty() { "build" } else { "rustc" };
-        cmd.args([sub, "--package", package, "--target", target]);
+        cmd.args(["build", "--package", package, "--target", target]);
         if opts.release {
             cmd.arg("--release");
         }
+        // Vale para a crate e suas dependências (lib e bin do kernel, `kabi`), e cada
+        // pacote é compilado numa invocação própria, então não vaza para o `ostd`.
+        let flags = rustc_flags(package);
         if !flags.is_empty() {
-            cmd.arg("--").args(flags);
+            cmd.env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f"));
         }
         status(&mut cmd)?;
     }
