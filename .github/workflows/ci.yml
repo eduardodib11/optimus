@@ -9,7 +9,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain fixada em rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - name: Formatação, clippy e allowlist de unsafe
@@ -18,7 +18,7 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: QEMU e OVMF
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
       - name: Toolchain fixada em rust-toolchain.toml

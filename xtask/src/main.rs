@@ -234,13 +234,23 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     .arg(format!("if=pflash,format=raw,file={}", vars_copy.display()))
     .arg("-drive")
     .arg(format!("format=raw,file=fat:rw:{}", esp.display()));
-    if Path::new("/dev/kvm").exists() {
+    if kvm_usable() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
     }
     if opts.gdb {
         cmd.args(["-s", "-S"]);
     }
     Ok(cmd)
+}
+
+/// KVM só acelera se `/dev/kvm` existir e o usuário puder abri-lo (nos runners
+/// do GitHub ele existe, mas sem permissão).
+fn kvm_usable() -> bool {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
 }
 
 fn run(opts: &Options) -> Result {
