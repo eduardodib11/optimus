@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["xtask", "boot/optboot", "kernel/okernel", "lib/ostd"]
+# Só o xtask roda no host; as demais crates são compiladas por `cargo xtask build`.
+default-members = ["xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/eduardodib11/optimus"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

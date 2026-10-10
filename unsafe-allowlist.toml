@@ -1,0 +1,6 @@
+# Crates autorizadas a usar `unsafe` (SDD v1.0, seção 17.1).
+# Todas as outras DEVEM declarar `#![forbid(unsafe_code)]`; `cargo xtask check` verifica.
+crates = [
+    "boot/optboot",
+    "kernel/okernel",
+]
