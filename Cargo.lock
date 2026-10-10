@@ -13,6 +13,9 @@ version = "0.1.0"
 [[package]]
 name = "optboot"
 version = "0.1.0"
+dependencies = [
+ "oelf",
+]
 
 [[package]]
 name = "ostd"
