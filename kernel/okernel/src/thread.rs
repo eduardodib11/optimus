@@ -282,6 +282,13 @@ impl Thread {
         (va != 0).then_some(va)
     }
 
+    /// `va` serve de buffer de IPC: zero ou uma página alinhada na metade
+    /// de usuário.
+    #[must_use]
+    pub fn valid_ipc_buffer(va: u64) -> bool {
+        va == 0 || (va.is_multiple_of(PAGE_SIZE) && (USER_START..USER_END).contains(&va))
+    }
+
     /// Fixa o buffer de IPC (parte de `thread_configure`): uma página
     /// alinhada na metade de usuário; zero tira o buffer.
     ///
@@ -290,8 +297,7 @@ impl Thread {
     /// [`Error::InvalidArgument`] para endereço desalinhado ou fora da
     /// metade de usuário.
     pub fn set_ipc_buffer(&self, va: u64) -> Result<(), Error> {
-        let ok = va == 0 || (va.is_multiple_of(PAGE_SIZE) && (USER_START..USER_END).contains(&va));
-        if !ok {
+        if !Self::valid_ipc_buffer(va) {
             return Err(Error::InvalidArgument);
         }
         self.ipc_buffer.store(va, Ordering::Release);

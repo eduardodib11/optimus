@@ -9,13 +9,16 @@
 //! um `SchedContext` sem limite de prioridade [`ROOT_PRIORITY`].
 //!
 //! A thread começa em `e_entry` com os handles iniciais em `rdi` (cota
-//! raiz), `rsi` (o próprio `AddressSpace`) e `rdx` (a própria thread).
+//! raiz), `rsi` (o próprio `AddressSpace`) e `rdx` (a própria thread nos
+//! 32 bits baixos e, nos altos, uma cópia do bootfs num `MemoryObject` só
+//! com `READ | MAP`, de onde o `root` carrega os outros serviços; ADR
+//! 0029).
 
 use alloc::sync::Arc;
 
 use kabi::boot::MemKind;
 use kabi::vm::{EXEC, PAGE_SIZE, WRITE};
-use kabi::{Handle, ObjectType};
+use kabi::{Handle, ObjectType, Rights, handle_pair};
 use okernel::cap::{Cap, SharedCapSpace};
 use okernel::sched::Params;
 use okernel::thread::{RunState, Thread};
@@ -36,8 +39,9 @@ pub const STACK_TOP: u64 = 0x0000_7fff_ffff_0000;
 pub const STACK_BYTES: u64 = 64 << 10;
 /// Prioridade do `root` (serviços de sistema, seção 6.6).
 pub const ROOT_PRIORITY: u64 = 150;
-/// Quanto o boot espera o `root` terminar antes de desistir.
-const RUN_LIMIT_NS: u64 = 10_000_000_000;
+/// Quanto o boot espera o `root` terminar antes de desistir (o cenário
+/// `cargo xtask test hello` faz 10⁶ idas e voltas de IPC sob o TCG).
+const RUN_LIMIT_NS: u64 = 1_200_000_000_000;
 
 /// O processo criado.
 pub struct Process {
@@ -45,8 +49,8 @@ pub struct Process {
     pub cspace: Arc<SharedCapSpace>,
     /// A thread inicial, já iniciada.
     pub thread: Arc<Thread>,
-    /// Handles da cota, do espaço e da thread no `cspace`.
-    pub handles: [Handle; 3],
+    /// Handles da cota, do espaço, da thread e do bootfs no `cspace`.
+    pub handles: [Handle; 4],
 }
 
 /// A imagem do bootfs, se a `BootInfo` a trouxer numa faixa `Bootfs`.
@@ -77,24 +81,22 @@ fn cap(space: &SharedCapSpace, h: Handle) -> Result<Cap, &'static str> {
     space.lock().get(h).cloned().map_err(|_| "handle")
 }
 
-/// Cria um `MemoryObject` de `len` bytes, copia `data` para ele a partir
-/// do deslocamento de `va` na página e o mapeia na página de `va` com
-/// `flags`; a capability do objeto some (a região guarda o objeto).
-fn map_copy(
+/// Cria um `MemoryObject` de `len` bytes e copia `data` para ele a partir
+/// do byte `pos`; devolve o handle e a capability.
+fn new_copy(
     p: &SharedCapSpace,
     quota: Handle,
-    aspace: &Cap,
-    (va, len, flags): (u64, u64, u64),
+    len: u64,
+    mut pos: u64,
     data: &[u8],
-) -> Result<(), &'static str> {
+) -> Result<(Handle, Cap), &'static str> {
     let h = p
         .lock()
         .obj_create(quota, ObjectType::MemoryObject, len)
         .map_err(|_| "obj_create(MemoryObject)")?;
     let object = cap(p, h)?;
     let mo = object.object.as_memory_object().map_err(|_| "tipo")?;
-    // Copia `data` para os bytes a partir de `va % 4 KiB`, página a página.
-    let mut pos = va & (PAGE_SIZE - 1);
+    // Copia página a página.
     let mut rest = data;
     while !rest.is_empty() {
         let off = pos % PAGE_SIZE;
@@ -114,17 +116,32 @@ fn map_copy(
         pos += n as u64;
         rest = &rest[n..];
     }
+    Ok((h, object))
+}
+
+/// Cria um `MemoryObject` de `len` bytes, copia `data` para ele a partir
+/// do deslocamento de `va` na página e o mapeia na página de `va` com
+/// `flags`; a capability do objeto some (a região guarda o objeto).
+fn map_copy(
+    p: &SharedCapSpace,
+    quota: Handle,
+    aspace: &Cap,
+    (va, len, flags): (u64, u64, u64),
+    data: &[u8],
+) -> Result<(), &'static str> {
+    let (h, object) = new_copy(p, quota, len, va & (PAGE_SIZE - 1), data)?;
     vm_map(aspace, &object, va & !(PAGE_SIZE - 1), 0, len, flags).map_err(|_| "vm_map")?;
     drop(p.lock().delete(h));
     Ok(())
 }
 
-/// Monta o processo do executável `elf` (já validado) e inicia a thread.
+/// Monta o processo do executável `elf` (já validado), com uma cópia de
+/// `image` (o bootfs) só para leitura, e inicia a thread.
 ///
 /// # Errors
 ///
 /// O passo que falhou.
-pub fn spawn(elf: &oelf::Elf<'_>) -> Result<Process, &'static str> {
+pub fn spawn(elf: &oelf::Elf<'_>, image: &[u8]) -> Result<Process, &'static str> {
     if elf.is_relocatable() {
         return Err("root relocável (PIE) ainda não é suportado");
     }
@@ -182,16 +199,27 @@ pub fn spawn(elf: &oelf::Elf<'_>) -> Result<Process, &'static str> {
     thread
         .configure(Arc::clone(&cspace), space)
         .map_err(|_| "thread_configure")?;
+    let len = (image.len() as u64).next_multiple_of(PAGE_SIZE);
+    let (full, _) = new_copy(&cspace, quota, len, 0, image)?;
+    let fs = cspace
+        .lock()
+        .mint(full, Rights::READ | Rights::MAP, None)
+        .map_err(|_| "cap_mint(bootfs)")?;
+    drop(cspace.lock().delete(full));
     let entry = UserEntry {
         rip: elf.entry(),
         rsp: STACK_TOP,
-        args: [quota, a, t].map(|h| u64::from(h.raw())),
+        args: [
+            u64::from(quota.raw()),
+            u64::from(a.raw()),
+            handle_pair(t, fs),
+        ],
     };
     kthread::start(&thread, &entry).map_err(|_| "thread_start")?;
     Ok(Process {
         cspace,
         thread,
-        handles: [quota, a, t],
+        handles: [quota, a, t, fs],
     })
 }
 
@@ -207,7 +235,7 @@ pub fn load(image: &[u8]) -> Result<Process, &'static str> {
         return Err("hash do root não confere");
     }
     let elf = oelf::Elf::parse_user(entry.data).map_err(|_| "ELF do root inválido")?;
-    spawn(&elf)
+    spawn(&elf, image)
 }
 
 /// Roda as prontas até `thread` terminar (ou o prazo vencer).

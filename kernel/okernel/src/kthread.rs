@@ -641,6 +641,7 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
         }
         Syscall::ThreadExit => exit_current(),
         Syscall::ClockGet => Ok([ktime::now_ns(), 0, 0]),
+        Syscall::ThreadStart => thread_start(a).map(|()| [0; 3]),
         _ => {
             let space = current()
                 .and_then(|t| t.cspace())
@@ -648,6 +649,26 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
             sys::invoke(&space, call, a, kcap::REVOKE_SLICE_BUDGET, &mut KernelEnv)
         }
     }
+}
+
+/// `thread_start(thread, rip, rsp, a0, a1, a2)` (ADR 0029): exige `START`
+/// na thread.
+fn thread_start(a: [u64; 6]) -> Result<(), Error> {
+    let space = current()
+        .and_then(|t| t.cspace())
+        .ok_or(Error::NotSupported)?;
+    let h = kabi::Handle::try_from(a[0]).map_err(|_| Error::InvalidHandle)?;
+    let cap = space.lock().get(h)?.clone();
+    let thread = cap.object.as_thread()?;
+    if !cap.rights.contains(kabi::Rights::START) {
+        return Err(Error::AccessDenied);
+    }
+    let entry = UserEntry {
+        rip: a[1],
+        rsp: a[2],
+        args: [a[3], a[4], a[5]],
+    };
+    start(thread, &entry)
 }
 
 /// `kabi::DEBUG_PRINT` (provisória): nos testes de kernel o texto vai ao
