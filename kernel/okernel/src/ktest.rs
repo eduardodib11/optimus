@@ -33,7 +33,11 @@ macro_rules! ensure {
 }
 
 /// Suítes registradas, na ordem de execução.
-const SUITES: &[&[Test]] = &[crate::bootinfo::TESTS, crate::arch::x86_64::TESTS];
+const SUITES: &[&[Test]] = &[
+    crate::bootinfo::TESTS,
+    crate::arch::x86_64::TESTS,
+    crate::kmem::TESTS,
+];
 
 /// Roda os testes selecionados e desliga o QEMU com o resultado.
 pub fn run(filter: Option<&str>) -> ! {

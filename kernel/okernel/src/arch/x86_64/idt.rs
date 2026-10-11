@@ -1,7 +1,9 @@
 //! IDT e tratadores das exceções 0 a 31 (T-105).
 //!
 //! Toda exceção despeja os registradores na serial e congela a CPU: o kernel
-//! nunca segue em estado inconsistente (SDD v1.0, seção 6.5). Faltas de
+//! nunca segue em estado inconsistente (SDD v1.0, seção 6.5). A única
+//! exceção são as faltas das sondas de memória ([`super::probe`]), que voltam
+//! a quem sondou com a falta registrada. Faltas de
 //! usuário viram mensagens ao endpoint de exceções em T-210; o registro
 //! persistente e a reinicialização do pânico vêm em T-110.
 
@@ -20,29 +22,30 @@ use super::serial::Serial;
 
 /// Quadro montado por `isr_common` (`vectors.S`), na ordem da memória.
 #[repr(C)]
+#[allow(missing_docs, reason = "registradores salvos, na ordem do quadro")]
 pub struct TrapFrame {
-    rax: u64,
-    rbx: u64,
-    rcx: u64,
-    rdx: u64,
-    rsi: u64,
-    rdi: u64,
-    rbp: u64,
-    r8: u64,
-    r9: u64,
-    r10: u64,
-    r11: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-    vector: u64,
-    error: u64,
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
+    pub(super) rax: u64,
+    pub(super) rbx: u64,
+    pub(super) rcx: u64,
+    pub(super) rdx: u64,
+    pub(super) rsi: u64,
+    pub(super) rdi: u64,
+    pub(super) rbp: u64,
+    pub(super) r8: u64,
+    pub(super) r9: u64,
+    pub(super) r10: u64,
+    pub(super) r11: u64,
+    pub(super) r12: u64,
+    pub(super) r13: u64,
+    pub(super) r14: u64,
+    pub(super) r15: u64,
+    pub(super) vector: u64,
+    pub(super) error: u64,
+    pub(super) rip: u64,
+    pub(super) cs: u64,
+    pub(super) rflags: u64,
+    pub(super) rsp: u64,
+    pub(super) ss: u64,
 }
 
 /// Entrada de 16 bytes da IDT.
@@ -175,10 +178,14 @@ fn control_registers() -> [u64; 4] {
     [cr0, cr2, cr3, cr4]
 }
 
-/// Chamado por `isr_common`: despeja o estado da CPU na serial e congela.
+/// Chamado por `isr_common`: retoma a falta de uma sonda ou despeja o estado
+/// da CPU na serial e congela.
 #[unsafe(no_mangle)]
-extern "sysv64" fn exception_handler(frame: &TrapFrame) -> ! {
-    let f = frame;
+extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
+    if super::probe::fixup(frame, control_registers()[1]) {
+        return;
+    }
+    let f = &*frame;
     let (name, what) = usize::try_from(f.vector)
         .ok()
         .and_then(|v| NAMES.get(v))

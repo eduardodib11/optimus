@@ -3,8 +3,10 @@
 
 use core::arch::{asm, global_asm};
 
+pub mod cpu;
 pub mod gdt;
 pub mod idt;
+pub mod probe;
 pub mod serial;
 mod tests;
 
@@ -12,6 +14,7 @@ pub use tests::TESTS;
 
 global_asm!(include_str!("entry.S"));
 global_asm!(include_str!("vectors.S"));
+global_asm!(include_str!("probe.S"));
 
 /// Carrega GDT, TSS e IDT.
 ///

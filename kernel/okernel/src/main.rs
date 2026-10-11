@@ -15,6 +15,7 @@ mod klog;
 mod ktest;
 mod arch;
 mod bootinfo;
+mod kmem;
 
 use core::panic::PanicInfo;
 
@@ -52,7 +53,10 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
     trace!("okernel: BootInfo em {:p}", info);
     bootinfo::set(info);
     match bootinfo::memory_map(info) {
-        Some(map) => bootinfo::log_memory_map(map),
+        Some(map) => {
+            bootinfo::log_memory_map(map);
+            kmem::init(map);
+        }
         None => warn!("okernel: mapa de memória ausente ou inválido"),
     }
     match option(cmdline, "test") {

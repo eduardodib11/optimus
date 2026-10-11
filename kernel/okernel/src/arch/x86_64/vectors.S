@@ -3,7 +3,9 @@
  * Cada porta empilha um código de erro falso (0) quando a CPU não empilha
  * um, e depois o número do vetor, para que `isr_common` sempre veja o mesmo
  * quadro. `isr_common` salva os 15 registradores gerais e chama
- * `exception_handler(&TrapFrame)`, que despeja o estado e congela a CPU.
+ * `exception_handler(&mut TrapFrame)`. O tratador despeja o estado e
+ * congela a CPU, ou, se a falta veio de uma sonda (`probe.S`), ajusta o
+ * quadro e volta; aí `isr_common` restaura os registradores e faz `iretq`.
  *
  * Pilha ao chamar o tratador (do topo para baixo): SS, RSP, RFLAGS, CS, RIP
  * (da CPU), erro, vetor, r15 ... rax. São 22 palavras = 176 bytes; como a CPU
@@ -77,11 +79,24 @@ isr_common:
     cld
     mov rdi, rsp
     call exception_handler
-    /* O tratador não volta; se voltar, para aqui. */
-2:
-    cli
-    hlt
-    jmp 2b
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    /* Vetor e código de erro. */
+    add rsp, 16
+    iretq
 
 /* Endereços das 32 portas, na ordem dos vetores. Cada `.quad` vira uma
    relocação R_X86_64_RELATIVE, ajustada pelo optboot ao KASLR. */
