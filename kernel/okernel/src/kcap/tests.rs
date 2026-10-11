@@ -1,10 +1,12 @@
 //! Testes de kernel de objetos e capabilities.
 
-use kabi::{Error, ObjectType};
-use okernel::cap::object::object_bytes;
-use okernel::cap::{MemoryQuota, obj_create};
+use alloc::vec::Vec;
 
-use super::root_quota;
+use kabi::{Error, ObjectType, Rights};
+use okernel::cap::object::object_bytes;
+use okernel::cap::{CapSpace, MemoryQuota, obj_create};
+
+use super::{root_cap_space, root_quota};
 use crate::kheap;
 use crate::ktest::{Outcome, Test};
 
@@ -18,12 +20,20 @@ pub const TESTS: &[Test] = &[
         name: "cap.alem_da_cota_retorna_quota_exceeded",
         run: alem_da_cota,
     },
+    Test {
+        name: "cap.handle_antigo_retorna_invalid_handle",
+        run: handle_antigo,
+    },
+    Test {
+        name: "cap.capspace_cresce_e_devolve_a_cota",
+        run: capspace_cresce,
+    },
 ];
 
 fn usa_o_heap() -> Outcome {
     let root = root_quota().ok_or("sem cota raiz")?;
     let (quota0, live0) = (root.used(), kheap::live_blocks());
-    let objects: alloc::vec::Vec<_> = (0..100)
+    let objects: Vec<_> = (0..100)
         .map(|_| obj_create(&root, ObjectType::MemoryQuota, 1000))
         .collect::<Result<_, _>>()
         .map_err(|_| "obj_create falhou")?;
@@ -51,5 +61,46 @@ fn alem_da_cota() -> Outcome {
     drop(full);
     ensure!(q.used() == 0);
     ensure!(root_quota().is_some_and(|r| r.used() >= overhead));
+    Ok(())
+}
+
+fn handle_antigo() -> Outcome {
+    let (space, q) = root_cap_space().map_err(|_| "root_cap_space")?;
+    let mut space = space.lock();
+    let a = space.mint(q, Rights::CREATE, None).map_err(|_| "mint")?;
+    ensure!(space.delete(a).is_ok());
+    let b = space.mint(q, Rights::ALL, None).map_err(|_| "mint")?;
+    ensure!(a.index() == b.index() && a.generation() != b.generation());
+    ensure!(space.info(a).err() == Some(Error::InvalidHandle));
+    ensure!(space.delete(a).err() == Some(Error::InvalidHandle));
+    ensure!(space.mint(a, Rights::ALL, None).err() == Some(Error::InvalidHandle));
+    let info = space.info(b).map_err(|_| "info")?;
+    ensure!(info.object_type == ObjectType::MemoryQuota);
+    ensure!(info.rights == Rights::CREATE | Rights::SPLIT);
+    Ok(())
+}
+
+fn capspace_cresce() -> Outcome {
+    let root = root_quota().ok_or("sem cota raiz")?;
+    let before = root.used();
+    let (space, q) = root_cap_space().map_err(|_| "root_cap_space")?;
+    let created = root.used();
+    let handles = {
+        let mut space = space.lock();
+        let handles: Vec<_> = (0..10_000)
+            .map(|_| space.mint(q, Rights::CREATE, None))
+            .collect::<Result<_, _>>()
+            .map_err(|_| "mint")?;
+        // 10 001 capabilities (índice 0 reservado) ocupam 3 folhas.
+        ensure!(root.used() == created + 2 * CapSpace::<4096>::LEAF_BYTES);
+        for &h in &handles {
+            ensure!(space.delete(h).is_ok());
+        }
+        ensure!(space.len() == 1);
+        handles
+    };
+    ensure!(handles.len() == 10_000);
+    drop(space);
+    ensure!(root.used() == before);
     Ok(())
 }
