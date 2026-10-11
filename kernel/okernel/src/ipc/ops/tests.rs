@@ -9,7 +9,10 @@ use kabi::ipc::{FLAG_NONBLOCK, IpcBuffer, MsgInfo, recv_target};
 use kabi::{Error, Handle, ObjectType, Rights, Syscall};
 
 use super::{Out, Regs, Step, begin, finish};
-use crate::cap::{Cap, CapSpace, MemoryQuota, Object, SharedCapSpace, default_rights, obj_create};
+use crate::cap::space::Revoke;
+use crate::cap::{
+    Cap, CapSpace, MemoryQuota, Object, SharedCapSpace, default_rights, obj_create, xcdt,
+};
 use crate::sync::SpinLock;
 use crate::sys::Env;
 use crate::thread::Thread;
@@ -385,8 +388,30 @@ fn transferencia_de_capability_exige_grant() {
         assert!(cap.object.same(&ntfy));
         assert_eq!((cap.rights, cap.badge), (Rights::SIGNAL, 0x55));
         assert_eq!(buf[IpcBuffer::WORDS_OFFSET..][..3], [7, 8, 9]);
-        // A original continua com o remetente.
+        drop(s);
+        // A original continua com o remetente, e a cópia é filha dela
+        // (ADR 0028): revogar a original apaga a cópia no servidor.
         assert!(w.client.space.lock().get(mine).is_ok());
+        let root = w.client.give(&ntfy, Rights::ALL, 0);
+        xcdt::delete(&w.client.space, mine).unwrap();
+        let mine = xcdt::mint(&w.client.space, root, Rights::SIGNAL, Some(0x55)).unwrap();
+        put_caps(&mut env, &w.client, &[mine]);
+        let recv = regs(w.s_target, 0, &[]);
+        assert!(blocked(&w.server.begin(&mut env, Syscall::IpcRecv, &recv)));
+        let sent = w
+            .client
+            .begin(&mut env, Syscall::IpcSend, &with_caps(w.c_ep, 1, 0));
+        assert!(sent.is_ok());
+        let buf = env.buffer(&w.server.thread).clone();
+        let copy = Handle::from_raw(u32::try_from(buf[0] & 0xffff_ffff).unwrap());
+        assert!(w.server.space.lock().get(copy).is_ok());
+        while xcdt::revoke(&w.client.space, root, 1).unwrap() == Revoke::Continue {}
+        assert!(w.client.space.lock().get(mine).is_err());
+        assert_eq!(
+            w.server.space.lock().get(copy).unwrap_err(),
+            Error::InvalidHandle
+        );
+        w.server.space.lock().check_invariants().unwrap();
     }
 }
 

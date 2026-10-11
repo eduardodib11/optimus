@@ -12,9 +12,9 @@ use crate::platform;
 use crate::sync::SpinLock;
 use crate::vm::tests::platform as fake_platform;
 
-fn setup() -> (Arc<MemoryQuota>, SharedCapSpace, u64) {
+fn setup() -> (Arc<MemoryQuota>, Arc<SharedCapSpace>, u64) {
     let root = MemoryQuota::root(64 << 20);
-    let space = SpinLock::new(crate::cap::CapSpace::new(&root).unwrap());
+    let space = Arc::new(SpinLock::new(crate::cap::CapSpace::new(&root).unwrap()));
     let q = space
         .lock()
         .insert(Cap {
@@ -63,7 +63,7 @@ impl Env for Fake {
     }
 }
 
-fn call(space: &SharedCapSpace, c: Syscall, a: [u64; 6]) -> Result<Values, Error> {
+fn call(space: &Arc<SharedCapSpace>, c: Syscall, a: [u64; 6]) -> Result<Values, Error> {
     invoke(space, c, a, 4, &mut Fake::default())
 }
 

@@ -17,8 +17,10 @@
 //! endpoint pela qual o servidor recebeu a chamada (definido aqui).
 //!
 //! A capability transferida é uma cópia com os mesmos direitos e badge,
-//! inserida como raiz da árvore de derivação do `CapSpace` do receptor (a
-//! árvore é por `CapSpace`; revogar a original não alcança a cópia).
+//! filha da original na árvore de derivação (ADR 0028,
+//! [`xcdt::transfer`]): revogar a original apaga a cópia. Os handles são
+//! conferidos no envio e copiados na entrega; o que sumiu do remetente
+//! entre um e outro não chega.
 //! Receptor sem buffer de IPC, ou sem espaço no `CapSpace`, recebe menos
 //! capabilities e palavras longas; `info` diz quantas chegaram.
 //!
@@ -38,13 +40,13 @@
 
 #![forbid(unsafe_code)]
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use kabi::ipc::{FLAG_NONBLOCK, IpcBuffer, MsgInfo, split_recv_target};
 use kabi::{Error, Handle, MSG_MAX_CAPS, MSG_REG_WORDS, Rights, Syscall};
 
 use super::{Blocked, Endpoint, Message, Outgoing, Reply};
-use crate::cap::{Cap, Object, SharedCapSpace};
+use crate::cap::{Cap, Object, SharedCapSpace, xcdt};
 use crate::sys::Env;
 use crate::thread::{RunState, Thread};
 
@@ -127,7 +129,7 @@ fn handle(raw: u64) -> Result<Handle, Error> {
 /// Monta a mensagem de saída da thread atual: só as palavras declaradas,
 /// e as capabilities do cabeçalho do buffer dela, se `grant` permitir.
 fn outgoing(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     me: &Thread,
     regs: &Regs,
     grant: bool,
@@ -160,9 +162,11 @@ fn outgoing(
         let s = space.lock();
         for (i, slot) in out.caps.iter_mut().take(usize::from(info.caps)).enumerate() {
             #[allow(clippy::cast_possible_truncation, reason = "metade de 32 bits")]
-            let raw = (header[i / 2] >> (32 * (i % 2))) as u32;
-            *slot = Some(s.get(Handle::from_raw(raw))?.clone());
+            let h = Handle::from_raw((header[i / 2] >> (32 * (i % 2))) as u32);
+            s.get(h)?;
+            *slot = Some(h);
         }
+        out.from = Some(Arc::downgrade(space));
     }
     Ok(out)
 }
@@ -183,22 +187,27 @@ fn copy_words(from: &Thread, to: &Thread, count: u16, env: &mut dyn Env) -> u16 
     done
 }
 
-/// Insere as capabilities no `CapSpace` de `to` e grava os handles no
-/// buffer dela; quantas chegaram (as que não couberem morrem com `caps`).
-fn transfer_caps(to: &Thread, caps: [Option<Cap>; MSG_MAX_CAPS], env: &mut dyn Env) -> u8 {
-    let Some(space) = to.cspace() else { return 0 };
+/// Copia as capabilities de `from` para o `CapSpace` de `to` e grava os
+/// handles no buffer dela; quantas chegaram (para na primeira que não
+/// couber ou que sumiu do remetente).
+fn transfer_caps(
+    to: &Thread,
+    from: Option<Weak<SharedCapSpace>>,
+    caps: [Option<Handle>; MSG_MAX_CAPS],
+    env: &mut dyn Env,
+) -> u8 {
+    let (Some(space), Some(from)) = (to.cspace(), from.and_then(|f| f.upgrade())) else {
+        return 0;
+    };
     let mut handles = [0u32; MSG_MAX_CAPS];
     let mut n = 0;
-    {
-        let mut s = space.lock();
-        for c in caps.into_iter().flatten() {
-            match s.insert(c) {
-                Ok(h) => {
-                    handles[n] = h.raw();
-                    n += 1;
-                }
-                Err(_) => break,
+    for h in caps.into_iter().flatten() {
+        match xcdt::transfer(&from, h, &space) {
+            Ok(h) => {
+                handles[n] = h.raw();
+                n += 1;
             }
+            Err(_) => break,
         }
     }
     let header = [
@@ -206,9 +215,8 @@ fn transfer_caps(to: &Thread, caps: [Option<Cap>; MSG_MAX_CAPS], env: &mut dyn E
         u64::from(handles[2]) | (u64::from(handles[3]) << 32),
     ];
     if n > 0 && !env.write_buffer(to, 0, &header) {
-        let mut s = space.lock();
         for &h in &handles[..n] {
-            drop(s.delete(Handle::from_raw(h)));
+            let _ = xcdt::delete(&space, Handle::from_raw(h));
         }
         return 0;
     }
@@ -228,7 +236,7 @@ fn deliver(from: &Thread, out: Outgoing, to: &Thread, env: &mut dyn Env) {
         0
     };
     msg.info.caps = if has_buffer {
-        transfer_caps(to, out.caps, env)
+        transfer_caps(to, out.from, out.caps, env)
     } else {
         0
     };
@@ -260,7 +268,7 @@ fn unblock(me: &Thread) {
 
 /// Envio ou chamada num endpoint.
 fn send(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     me: &Arc<Thread>,
     ep_cap: &Cap,
     regs: &Regs,
@@ -332,7 +340,7 @@ fn send_out(
 
 /// Resposta pelo `Reply` (sem receber); devolve quem foi acordado.
 fn reply_to(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     me: &Thread,
     reply: &Reply,
     regs: &Regs,
@@ -403,7 +411,7 @@ fn recv_caps(space: &SharedCapSpace, target: u64) -> Result<(Cap, Arc<Reply>), E
 ///
 /// Os da syscall (ver o módulo).
 pub fn begin(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     call: Syscall,
     regs: &Regs,
     env: &mut dyn Env,
@@ -495,7 +503,7 @@ pub fn finish(me: &Thread) -> Result<Out, Error> {
 ///
 /// Os da syscall (ver o módulo).
 pub fn invoke(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     call: Syscall,
     regs: &Regs,
     env: &mut dyn Env,
@@ -548,9 +556,9 @@ pub fn kernel_call(
     }
     let out = Outgoing {
         msg,
-        caps: Default::default(),
         badge: ep_cap.badge,
         call: true,
+        ..Outgoing::default()
     };
     let wait = Wait {
         deadline: 0,

@@ -28,10 +28,10 @@ use alloc::sync::{Arc, Weak};
 use core::fmt;
 
 use kabi::ipc::MsgInfo;
-use kabi::{Badge, Error, MSG_MAX_CAPS, MSG_REG_WORDS};
+use kabi::{Badge, Error, Handle, MSG_MAX_CAPS, MSG_REG_WORDS};
 
 use crate::cap::object::object_bytes;
-use crate::cap::{Cap, Charge, MemoryQuota};
+use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
 use crate::sync::SpinLock;
 use crate::thread::Thread;
 
@@ -48,14 +48,17 @@ pub struct Message {
     pub words: [u64; MSG_REG_WORDS],
 }
 
-/// O que um remetente leva: a mensagem, as capabilities já resolvidas no
-/// `CapSpace` dele e o badge da capability do endpoint.
+/// O que um remetente leva: a mensagem, os handles das capabilities a
+/// transferir (conferidos no envio e copiados na entrega, como filhas das
+/// originais) e o badge da capability do endpoint.
 #[derive(Debug, Default)]
 pub struct Outgoing {
     /// Registradores da mensagem.
     pub msg: Message,
-    /// Capabilities a transferir.
-    pub caps: [Option<Cap>; MSG_MAX_CAPS],
+    /// `CapSpace` do remetente, se a mensagem leva capabilities.
+    pub from: Option<Weak<SharedCapSpace>>,
+    /// Handles, em `from`, das capabilities a transferir.
+    pub caps: [Option<Handle>; MSG_MAX_CAPS],
     /// Badge entregue ao receptor.
     pub badge: Badge,
     /// `ipc_call`: espera a resposta.
@@ -317,8 +320,7 @@ fn close(t: Arc<Thread>, object: *const ()) {
         slot.result = Err(Error::PeerClosed);
         (core::mem::take(&mut slot.blocked), slot.out.take())
     };
-    // O `Reply` de quem esperava receber e as capabilities da mensagem
-    // morrem fora da trava.
+    // O `Reply` de quem esperava receber morre fora da trava.
     drop((blocked, out));
     t.platform().wake(t);
 }
@@ -371,7 +373,7 @@ pub fn cancel(t: &Arc<Thread>, why: Error) -> bool {
         }
         Blocked::None => {}
     }
-    // As capabilities da mensagem morrem fora das travas.
+    // O que a mensagem segura morre fora das travas.
     drop(out);
     true
 }
