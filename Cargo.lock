@@ -51,6 +51,7 @@ name = "ostd"
 version = "0.1.0"
 dependencies = [
  "kabi",
+ "oelf",
 ]
 
 [[package]]

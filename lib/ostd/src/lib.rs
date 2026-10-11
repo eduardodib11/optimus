@@ -5,7 +5,8 @@
 //! a entrada do processo ([`entry!`] e [`rt`]), as syscalls cruas
 //! ([`sys`]), invólucros seguros para depuração, tempo, capabilities
 //! ([`cap`]), memória ([`vm`]), threads ([`thread`]) e o IPC síncrono com
-//! o buffer de IPC ([`ipc`], T-208). Alocador, `Mutex`/`Condvar` sobre
+//! o buffer de IPC ([`ipc`], T-208), e o carregador de executáveis do
+//! bootfs ([`process`], ADR 0029). Alocador, `Mutex`/`Condvar` sobre
 //! futex e clientes OIDL ficam para depois.
 //!
 //! Só [`arch`] usa `unsafe` (a instrução `syscall`, o `_start` e o acesso
@@ -18,6 +19,7 @@
 pub mod arch;
 pub mod cap;
 pub mod ipc;
+pub mod process;
 pub mod rt;
 pub mod sys;
 pub mod thread;
