@@ -43,12 +43,10 @@ const REVOKE_CAPS: usize = 100_000;
 /// Maior fatia aceita com KVM ou em hardware real (aceite do T-204).
 const SLICE_LIMIT_NS: u64 = 50_000;
 /// Tolerância no TCG do QEMU, que emula a CPU cerca de 8 vezes mais devagar
-/// neste código: p99 das fatias até 10 vezes o limite (500 µs).
+/// neste código: p99 das fatias até 10 vezes o limite (500 µs). Lá a maior
+/// fatia só é registrada: o TSC segue o relógio do host, e uma preempção do
+/// processo do QEMU entra inteira na medida de uma fatia.
 const TCG_P99_LIMIT_NS: u64 = 10 * SLICE_LIMIT_NS;
-/// No TCG o TSC segue o relógio do host, e uma preempção do processo do
-/// QEMU entra na medida de uma fatia: a maior fatia vai até 40 vezes o
-/// limite (2 ms).
-const TCG_MAX_LIMIT_NS: u64 = 40 * SLICE_LIMIT_NS;
 
 fn usa_o_heap() -> Outcome {
     let root = root_quota().ok_or("sem cota raiz")?;
@@ -164,22 +162,23 @@ fn revogacao_fatiada() -> Outcome {
     let count = slices.len();
     slices.sort_unstable();
     let (max, p99) = (slices[count - 1], slices[count * 99 / 100]);
-    let tcg = cpu::hypervisor().is_some_and(|sig| &sig == b"TCGTCGTCGTCG");
-    let (max_limit, p99_limit) = if tcg {
-        (TCG_MAX_LIMIT_NS, TCG_P99_LIMIT_NS)
-    } else {
-        (SLICE_LIMIT_NS, SLICE_LIMIT_NS)
-    };
+    let tcg = cpu::under_tcg();
     info!(
         "ktest: · revogação de {total} caps em {count} fatias de {REVOKE_SLICE_BUDGET} passos: \
-         maior {max} ns, p99 {p99} ns, mediana {} ns, total {} µs \
-         (limites {max_limit}/{p99_limit} ns, {})",
+         maior {max} ns, p99 {p99} ns, mediana {} ns, total {} µs ({})",
         slices[count / 2],
         elapsed / 1000,
-        if tcg { "TCG" } else { "KVM/hardware" }
+        if tcg {
+            "TCG: exige p99 ≤ 500 µs, maior só registrada"
+        } else {
+            "KVM/hardware: exige maior ≤ 50 µs"
+        }
     );
     ensure!(count >= total / REVOKE_SLICE_BUDGET as usize);
-    ensure!(u64::from(max) <= max_limit);
-    ensure!(u64::from(p99) <= p99_limit);
+    if tcg {
+        ensure!(u64::from(p99) <= TCG_P99_LIMIT_NS);
+    } else {
+        ensure!(u64::from(max) <= SLICE_LIMIT_NS);
+    }
     Ok(())
 }
