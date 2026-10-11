@@ -46,6 +46,7 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: hello",
     "okernel: GDT, TSS e IDT carregadas",
     "okernel: kaslr_slide",
+    DIRECT_MAP_LINE,
     "okernel: mapa de memória",
     "okernel: identidade removida",
     "okernel: heap: slab   16 B",
@@ -55,6 +56,8 @@ const BOOT_MARKERS: &[&str] = &[
     "root: iniciado",
     "okernel: root terminou",
 ];
+/// Linha em que o kernel diz onde ficou o mapa direto (ADR 0026).
+const DIRECT_MAP_LINE: &str = "okernel: mapa direto em ";
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
 const KERNEL_EXIT_OK: i32 = 33;
 /// Status do QEMU quando o kernel sai com falha (0x11), como no pânico em teste.
@@ -449,16 +452,48 @@ const KTEST_START: &str = "ktest: início, ";
 /// Última linha do harness: `ktest: fim: N ok, M falharam`.
 const KTEST_END: &str = "ktest: fim: ";
 
-/// Dá boot em cada cenário e confere a serial com [`check_serial`].
+/// Dá boot em cada cenário e confere a serial com [`check_serial`]; com
+/// mais de um boot, confere também que o mapa direto mudou de lugar.
 fn smoke(opts: &Options, scenarios: &[Scenario]) -> Result {
     build(opts)?;
+    let mut bases = Vec::new();
     for scenario in scenarios {
-        boot_scenario(opts, scenario)?;
+        let serial = boot_scenario(opts, scenario)?;
+        bases.extend(direct_map_base(&serial));
+    }
+    check_direct_map_bases(&bases)
+}
+
+/// Base do mapa direto anunciada pelo kernel na serial.
+fn direct_map_base(serial: &str) -> Option<u64> {
+    let line = serial
+        .lines()
+        .find_map(|l| l.split_once(DIRECT_MAP_LINE))?
+        .1;
+    let hex = line.trim().strip_prefix("0x")?;
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// Com dois ou mais boots, a base do mapa direto não pode ter sido a mesma
+/// em todos (ADR 0026; a chance de coincidir por acaso é de 1 em 2^16 por
+/// par de boots).
+fn check_direct_map_bases(bases: &[u64]) -> Result {
+    if bases.len() >= 2 && bases.iter().all(|b| *b == bases[0]) {
+        return Err(format!(
+            "o mapa direto ficou em {:#x} em {} boots",
+            bases[0],
+            bases.len()
+        ));
+    }
+    if bases.len() >= 2 {
+        let list: Vec<String> = bases.iter().map(|b| format!("{b:#x}")).collect();
+        println!("xtask: mapa direto mudou entre boots: {}", list.join(", "));
     }
     Ok(())
 }
 
-fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
+/// Dá boot num cenário e devolve a serial, se ela conferir.
+fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let esp = image(opts, sc.cmdline)?;
     let monitor = root().join("target/qemu-monitor.sock");
     let mut cmd = qemu(opts, &esp)?;
@@ -550,7 +585,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
                 }
             }
             println!("xtask: smoke test de boot ok ({})", sc.name);
-            Ok(())
+            Ok(serial.into_owned())
         }
         Err(e) => Err(format!(
             "smoke test de boot falhou ({}): {e}; serial:\n{serial}",
@@ -847,6 +882,7 @@ mod tests {
                   info  okernel: hello\r\n\
                   info  okernel: GDT, TSS e IDT carregadas\r\n\
                   info  okernel: kaslr_slide 0x200000\r\n\
+                  info  okernel: mapa direto em 0xffff823c00000000\r\n\
                   info  okernel: mapa de memória com 24 faixas\r\n\
                   info  okernel: identidade removida; 40 páginas\r\n\
                   info  okernel: heap: slab   16 B: 0 slabs\r\n\
@@ -862,6 +898,16 @@ mod tests {
         assert!(check(&ok.replace("R-X", "RWX")).is_err());
         assert!(check(&ok.replace("optboot: seg", "x")).is_err());
         assert!(check(&format!("{ok}okernel: FALTA #GP\r\n")).is_err());
+    }
+
+    #[test]
+    fn mapa_direto_precisa_mudar_entre_boots() {
+        let serial = "info  okernel: mapa direto em 0xffff823c00000000\r\n";
+        assert_eq!(direct_map_base(serial), Some(0xffff_823c_0000_0000));
+        assert_eq!(direct_map_base("okernel: hello"), None);
+        assert!(check_direct_map_bases(&[1, 1, 1]).is_err());
+        assert!(check_direct_map_bases(&[1, 2, 1]).is_ok());
+        assert!(check_direct_map_bases(&[1]).is_ok());
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //!
 //! Ordem das travas: tabelas de página antes de frames.
 
-use kabi::boot::{DIRECT_MAP_BASE, MemRegion};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use kabi::boot::{DIRECT_MAP_START, MemRegion};
 use okernel::mm::buddy::{FrameAllocator, FrameMeta};
 use okernel::mm::paging::{Flags, MapError, Mapping, PageSize, PageTables, Table, TableMemory};
 use okernel::mm::{FRAME_SIZE, PhysAddr, frames};
@@ -20,6 +22,8 @@ use crate::arch::x86_64::cpu;
 mod tests;
 pub use tests::TESTS;
 
+/// Base do mapa direto, lida da `BootInfo` no boot (ADR 0026).
+static DIRECT_BASE: AtomicU64 = AtomicU64::new(DIRECT_MAP_START);
 static FRAMES: SpinLock<Option<FrameAllocator<'static>>> = SpinLock::new(None);
 static KERNEL_PT: SpinLock<Option<PageTables<DirectMap>>> = SpinLock::new(None);
 
@@ -46,9 +50,20 @@ pub fn kernel_rodata() -> (u64, u64) {
     )
 }
 
+/// Fixa a base do mapa direto (`BootInfo.direct_map_base`, já validada).
+/// Chamar uma vez, no boot, antes de qualquer acesso pelo mapa direto.
+pub fn set_direct_base(base: u64) {
+    DIRECT_BASE.store(base, Ordering::Relaxed);
+}
+
+/// Base do mapa direto: o endereço virtual do físico 0.
+pub fn direct_base() -> u64 {
+    DIRECT_BASE.load(Ordering::Relaxed)
+}
+
 /// Endereço virtual de `phys` no mapa direto.
-pub const fn direct(phys: PhysAddr) -> u64 {
-    DIRECT_MAP_BASE + phys.0
+pub fn direct(phys: PhysAddr) -> u64 {
+    direct_base() + phys.0
 }
 
 /// Tabelas acessadas pelo mapa direto, com frames do buddy.

@@ -3,7 +3,7 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use kabi::boot::{BootInfo, MemKind, MemRegion};
+use kabi::boot::{BootInfo, DIRECT_MAP_START, MemKind, MemRegion, direct_map_base_valid};
 
 use crate::ktest::{Outcome, Test};
 
@@ -76,10 +76,16 @@ pub fn log_memory_map(map: &[MemRegion]) {
 }
 
 /// Testes de kernel da `BootInfo`.
-pub const TESTS: &[Test] = &[Test {
-    name: "boot.mapa_de_memoria_ordenado_e_com_ram",
-    run: mapa_ordenado,
-}];
+pub const TESTS: &[Test] = &[
+    Test {
+        name: "boot.mapa_de_memoria_ordenado_e_com_ram",
+        run: mapa_ordenado,
+    },
+    Test {
+        name: "boot.mapa_direto_na_base_sorteada",
+        run: mapa_direto_sorteado,
+    },
+];
 
 fn mapa_ordenado() -> Outcome {
     let info = get().ok_or("BootInfo ausente")?;
@@ -88,5 +94,22 @@ fn mapa_ordenado() -> Outcome {
     ensure!(!map.is_empty());
     ensure!(map.windows(2).all(|w| w[0].end() <= w[1].base));
     ensure!(map.iter().any(|r| r.kind() == MemKind::Usable));
+    Ok(())
+}
+
+/// ADR 0026: o kernel usa a base da `BootInfo`, alinhada a 1 GiB e dentro
+/// da faixa, e o físico 0 está nela; o GiB anterior não é mapa direto.
+fn mapa_direto_sorteado() -> Outcome {
+    let info = get().ok_or("BootInfo ausente")?;
+    let map = memory_map(info).ok_or("mapa de memória inválido")?;
+    let (base, limit) = (info.direct_map_base, direct_map_limit(map));
+    info!("ktest: · mapa direto em {base:#x}, {} GiB", limit >> 30);
+    ensure!(crate::kmem::direct_base() == base);
+    ensure!(direct_map_base_valid(base, limit));
+    let first = crate::kmem::translate(base).ok_or("físico 0 fora do mapa")?;
+    ensure!(first.phys.0 == 0);
+    let last = crate::kmem::translate(base + limit - 4096).ok_or("fim fora do mapa")?;
+    ensure!(last.phys.0 == limit - 4096);
+    ensure!(base == DIRECT_MAP_START || crate::kmem::translate(base - 4096).is_none());
     Ok(())
 }

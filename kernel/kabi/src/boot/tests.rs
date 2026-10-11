@@ -12,7 +12,12 @@ fn layout_estavel() {
     assert_eq!(offset_of!(BootInfo, acpi_rsdp), 64);
     assert_eq!(offset_of!(BootInfo, cmdline), 88);
     assert_eq!(offset_of!(BootInfo, rng_seed), 88 + 1024 + 8);
-    assert_eq!(size_of::<BootInfo>(), 88 + 1024 + 8 + 64 + 8 + 16 + 8);
+    assert_eq!(offset_of!(BootInfo, kaslr_slide), 88 + 1024 + 8 + 64);
+    assert_eq!(
+        offset_of!(BootInfo, direct_map_base),
+        88 + 1024 + 8 + 64 + 8
+    );
+    assert_eq!(size_of::<BootInfo>(), 88 + 1024 + 8 + 64 + 8 + 8 + 16 + 8);
     assert_eq!(BOOT_MAGIC.to_be_bytes(), *b"OPTIMUS!");
 }
 
@@ -75,4 +80,39 @@ fn tipo_desconhecido_conta_como_reservado() {
     r.kind = 99;
     assert_eq!(r.kind(), MemKind::Reserved);
     assert_eq!(MemRegion::new(u64::MAX, 2, MemKind::Usable).end(), u64::MAX);
+}
+
+#[test]
+fn mapa_direto_sorteado_em_passos_de_1_gib() {
+    const GIB: u64 = 1 << 30;
+    let span = DIRECT_MAP_END - DIRECT_MAP_START;
+    assert_eq!(direct_map_slots(4 * GIB), span / GIB - 3);
+    assert_eq!(direct_map_slots(4 * GIB - 1), direct_map_slots(4 * GIB));
+    assert_eq!(direct_map_slots(span), 1);
+    assert_eq!(direct_map_slots(span + 1), 0);
+    assert_eq!(direct_map_slots(u64::MAX), 0);
+    assert_eq!(choose_direct_map_base(0, 4 * GIB), Some(DIRECT_MAP_START));
+    assert_eq!(choose_direct_map_base(7, span + 1), None);
+    let last = DIRECT_MAP_END - 4 * GIB;
+    assert_eq!(
+        choose_direct_map_base(u64::MAX, 4 * GIB).map(|b| b <= last),
+        Some(true)
+    );
+    assert_eq!(
+        choose_direct_map_base(direct_map_slots(4 * GIB) - 1, 4 * GIB),
+        Some(last)
+    );
+    let mut seen = std::collections::HashSet::new();
+    for r in [1u64, 2, 3, 0xdead_beef, 1 << 40, u64::MAX / 3] {
+        let base = choose_direct_map_base(r, 512 << 20).unwrap();
+        assert!(direct_map_base_valid(base, 512 << 20));
+        assert!(base + GIB <= DIRECT_MAP_END);
+        seen.insert(base);
+    }
+    assert!(seen.len() > 1);
+    assert!(direct_map_base_valid(last, 4 * GIB));
+    assert!(!direct_map_base_valid(last + GIB, 4 * GIB));
+    assert!(!direct_map_base_valid(DIRECT_MAP_START + 4096, GIB));
+    assert!(!direct_map_base_valid(DIRECT_MAP_START - GIB, GIB));
+    assert_eq!(BootInfo::empty().direct_map_base, DIRECT_MAP_START);
 }

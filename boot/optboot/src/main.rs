@@ -27,7 +27,7 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr::{self, null_mut};
 
-use kabi::boot::{BootInfo, CMDLINE_MAX, DIRECT_MAP_BASE, MemKind, MemRegion, PhysRange};
+use kabi::boot::{BootInfo, CMDLINE_MAX, MemKind, MemRegion, PhysRange, choose_direct_map_base};
 
 use arch::x86_64::{disable_interrupts, enter_kernel, rdtsc};
 use firmware::{BOOTFS_MEMORY, Entropy, KERNEL_MEMORY, RawMap};
@@ -466,9 +466,18 @@ fn exit_boot_services(bs: &BootServices, image: Handle, buf: &mut [u8]) -> Resul
     Err(Error::Efi("ExitBootServices", status))
 }
 
-/// Endereço no mapa direto de algo que está na memória física com identidade.
-fn direct<T: ?Sized>(object: &T) -> u64 {
-    DIRECT_MAP_BASE + ptr::from_ref(object).addr() as u64
+/// Endereço no mapa direto em `base` de algo que está na memória física com
+/// identidade.
+fn direct<T: ?Sized>(base: u64, object: &T) -> u64 {
+    base + ptr::from_ref(object).addr() as u64
+}
+
+/// Sorteia a base do mapa direto para `limit` bytes de memória física (ADR
+/// 0026), com 8 bytes próprios, separados da semente do kernel.
+fn choose_direct_base(bs: &BootServices, limit: u64) -> Result<u64, Error> {
+    let mut rand = [0u8; 8];
+    firmware::entropy(bs, &mut rand);
+    choose_direct_map_base(u64::from_le_bytes(rand), limit).ok_or(Error::Paging)
 }
 
 /// Carrega o kernel, monta `BootInfo` e tabelas de página, encerra os serviços
@@ -518,8 +527,10 @@ fn boot(
             alloc_zeroed::<Table>(bs, KERNEL_MEMORY, needed)?,
         )
     };
+    let base = choose_direct_base(bs, limit)?;
+    info.direct_map_base = base;
     let mut tables = PageTables::new(pool);
-    tables.map_physical(limit)?;
+    tables.map_physical(limit, base)?;
     for (virt, phys, len, flags) in kernel.mappings() {
         tables.map_range(virt, phys, len, flags.writable(), flags.executable())?;
     }
@@ -527,13 +538,14 @@ fn boot(
     tables.map_range(STACK_BASE + 4096, stack_phys, STACK_SIZE, true, false)?;
     let _ = write!(
         out,
-        "optboot: tabelas de página prontas, mapa direto até {limit:#x}; saindo dos serviços de boot\r\n"
+        "optboot: tabelas de página prontas, mapa direto de {limit:#x} bytes em {base:#x}; saindo dos serviços de boot\r\n"
     );
     let raw = exit_boot_services(bs, image, raw_buf)?;
     // Daqui em diante não há console nem serviços de boot: nada pode falhar.
     disable_interrupts();
     let n = firmware::normalize(raw_buf, &raw, regions);
-    info.memory_map = ptr::with_exposed_provenance(usize::try_from(direct(regions)).unwrap_or(0));
+    info.memory_map =
+        ptr::with_exposed_provenance(usize::try_from(direct(base, regions)).unwrap_or(0));
     info.memory_map_len = n as u64;
     let ns = u128::from(rdtsc()) * 1_000_000_000 / u128::from(hz);
     info.boot_time_ns = u64::try_from(ns).unwrap_or(u64::MAX);
@@ -541,7 +553,7 @@ fn boot(
     // SAFETY: as tabelas mapeiam em identidade toda a RAM (onde estão o código
     // e a pilha do optboot), a imagem do kernel com `entry` executável e a pilha
     // gravável; os serviços de boot acabaram e as interrupções estão desligadas.
-    unsafe { enter_kernel(tables.root(), stack_top, entry, direct(info)) }
+    unsafe { enter_kernel(tables.root(), stack_top, entry, direct(base, info)) }
 }
 
 /// Ponto de entrada chamado pelo firmware UEFI.

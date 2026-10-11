@@ -5,7 +5,7 @@
 //! - identidade da memória física baixa, RWX, só para a transição (o código do
 //!   optboot continua executando no endereço físico depois do `mov cr3`); o
 //!   kernel a remove em T-107;
-//! - mapa direto da mesma faixa em [`DIRECT_MAP_BASE`], RW e NX;
+//! - mapa direto da mesma faixa numa base sorteada (ADR 0026), RW e NX;
 //! - a imagem do kernel no endereço deslocado, com a permissão de cada
 //!   segmento (W^X: texto R-X, só leitura R--, dados RW- e NX);
 //! - a pilha inicial do kernel em [`STACK_BASE`], RW e NX, com uma página de
@@ -14,7 +14,7 @@
 //! A memória física até [`identity_limit`] vai em páginas de 2 MiB; o resto em
 //! páginas de 4 KiB. Todas as tabelas vêm de um bloco reservado de antemão.
 
-use kabi::boot::{DIRECT_MAP_BASE, MemKind, MemRegion};
+use kabi::boot::{MemKind, MemRegion};
 
 use crate::Error;
 
@@ -61,7 +61,9 @@ pub fn identity_limit(map: &[MemRegion]) -> u64 {
 pub fn tables_needed(limit: u64, kernel_size: u64) -> usize {
     let gib = usize::try_from(limit >> 30).unwrap_or(usize::MAX);
     let kernel = usize::try_from(kernel_size / HUGE_SIZE).unwrap_or(usize::MAX);
-    1 + 2 * (1 + gib) + (2 + kernel + 2) + 3 + 4
+    // O mapa direto numa base sorteada pode cruzar uma fronteira de 512 GiB
+    // e precisar de um PDPT a mais.
+    1 + 2 * (1 + gib) + 1 + (2 + kernel + 2) + 3 + 4
 }
 
 /// Construtor de tabelas sobre um bloco de páginas físicas zeradas.
@@ -117,12 +119,13 @@ impl PageTables {
         Ok(())
     }
 
-    /// Mapeia `[0, limit)` em identidade (RWX) e em [`DIRECT_MAP_BASE`] (RW, NX).
-    pub fn map_physical(&mut self, limit: u64) -> Result<(), Error> {
+    /// Mapeia `[0, limit)` em identidade (RWX) e no mapa direto em `base`
+    /// (RW, NX).
+    pub fn map_physical(&mut self, limit: u64, base: u64) -> Result<(), Error> {
         for phys in (0..limit / HUGE_SIZE).map(|i| i * HUGE_SIZE) {
             let entry = phys | PRESENT | WRITABLE | HUGE;
             self.map(phys, entry, 2)?;
-            self.map(DIRECT_MAP_BASE + phys, entry | NO_EXECUTE, 2)?;
+            self.map(base + phys, entry | NO_EXECUTE, 2)?;
         }
         Ok(())
     }

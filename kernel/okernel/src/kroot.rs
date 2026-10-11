@@ -13,7 +13,7 @@
 
 use alloc::sync::Arc;
 
-use kabi::boot::{DIRECT_MAP_BASE, MemKind};
+use kabi::boot::MemKind;
 use kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use kabi::{Handle, ObjectType};
 use okernel::cap::{Cap, SharedCapSpace};
@@ -65,7 +65,12 @@ pub fn bootfs() -> Option<&'static [u8]> {
     // SAFETY: a faixa é `Bootfs` no mapa do optboot: nunca vai ao buddy,
     // ninguém a grava depois da entrega e o mapa direto a cobre
     // (`direct_map_limit` conta as faixas `Bootfs`).
-    Some(unsafe { core::slice::from_raw_parts((DIRECT_MAP_BASE + r.base) as *const u8, len) })
+    Some(unsafe {
+        core::slice::from_raw_parts(
+            kmem::direct(okernel::mm::PhysAddr(r.base)) as *const u8,
+            len,
+        )
+    })
 }
 
 fn cap(space: &SharedCapSpace, h: Handle) -> Result<Cap, &'static str> {
