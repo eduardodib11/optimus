@@ -32,6 +32,7 @@ use kabi::{Badge, Error, Handle, MSG_MAX_CAPS, MSG_REG_WORDS};
 
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
+use crate::sched::SchedContext;
 use crate::sync::SpinLock;
 use crate::thread::Thread;
 
@@ -229,6 +230,10 @@ type Caller = (Arc<Thread>, bool);
 pub struct Reply {
     _charge: Charge,
     caller: SpinLock<Option<Caller>>,
+    /// Quem atende a chamada e o `SchedContext` que recebeu de quem
+    /// chamou (seção 6.6), devolvido quando a espera acaba. Trava tomada
+    /// depois de `caller`, nunca junto.
+    donation: SpinLock<Option<(Weak<Thread>, Arc<SchedContext>)>>,
 }
 
 impl fmt::Debug for Reply {
@@ -247,6 +252,7 @@ impl Reply {
         Ok(Self {
             _charge: quota.charge(object_bytes::<Self>())?,
             caller: SpinLock::new(None),
+            donation: SpinLock::new(None),
         })
     }
 
@@ -287,7 +293,35 @@ impl Reply {
 
     /// Consome a resposta: devolve quem espera (uma vez só).
     pub fn take(&self) -> Option<Caller> {
-        self.caller.lock().take()
+        let caller = self.caller.lock().take();
+        self.end_donation();
+        caller
+    }
+
+    /// Doação (seção 6.6): `server` atende a chamada pendente com o
+    /// `SchedContext` de quem chamou, até a resposta (ou até a espera
+    /// acabar de outro jeito).
+    pub fn donate(&self, server: &Arc<Thread>) {
+        let Some(sc) = self
+            .caller
+            .lock()
+            .as_ref()
+            .and_then(|c| c.0.sched_context())
+        else {
+            return;
+        };
+        server.donate(Arc::clone(&sc));
+        *self.donation.lock() = Some((Arc::downgrade(server), sc));
+    }
+
+    /// Devolve a doação, se houver.
+    fn end_donation(&self) {
+        let donation = self.donation.lock().take();
+        if let Some((server, sc)) = donation
+            && let Some(server) = server.upgrade()
+        {
+            server.undonate(&sc);
+        }
     }
 
     /// Esquece `t`, se for quem espera (prazo vencido).
@@ -298,6 +332,10 @@ impl Reply {
             .is_some_and(|c| core::ptr::eq(Arc::as_ptr(&c.0), t));
         if ours {
             *c = None;
+        }
+        drop(c);
+        if ours {
+            self.end_donation();
         }
         ours
     }
@@ -341,6 +379,7 @@ impl Drop for Reply {
     /// A resposta nunca virá: quem espera acorda com `PeerClosed`.
     fn drop(&mut self) {
         let caller = self.caller.lock().take();
+        self.end_donation();
         if let Some((t, _)) = caller {
             close(t, core::ptr::from_ref(self).cast());
         }

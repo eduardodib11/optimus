@@ -13,6 +13,7 @@ use crate::cap::space::Revoke;
 use crate::cap::{
     Cap, CapSpace, MemoryQuota, Object, SharedCapSpace, default_rights, obj_create, xcdt,
 };
+use crate::sched::{Params, SchedContext};
 use crate::sync::SpinLock;
 use crate::sys::Env;
 use crate::thread::Thread;
@@ -564,4 +565,57 @@ fn reply_destruido_acorda_quem_chamou_com_peer_closed() {
     delete(&w.server, w.s_target >> 32);
     assert_eq!(finish(&w.client.thread), Err(Error::PeerClosed));
     assert!(!w.client.thread.ipc().lock().awaiting_reply());
+}
+
+/// Liga a `t` um `SchedContext` novo com prioridade `priority`.
+fn bind_sc(quota: &Arc<MemoryQuota>, t: &Thread, priority: u64) -> Arc<SchedContext> {
+    let sc = obj_create(quota, ObjectType::SchedContext, 0).unwrap();
+    let sc = Arc::clone(sc.as_sched_context().unwrap());
+    sc.configure(Params::new(1_000_000, 1_000_000, priority).unwrap());
+    t.bind_sched(Arc::clone(&sc)).unwrap();
+    sc
+}
+
+fn runs_on(t: &Thread, sc: &Arc<SchedContext>) -> bool {
+    t.sched_context().is_some_and(|s| Arc::ptr_eq(&s, sc))
+}
+
+#[test]
+fn servidor_roda_com_o_schedcontext_de_quem_chama_ate_responder() {
+    let w = world(Rights::SEND);
+    let mut env = Fake::default();
+    let c_sc = bind_sc(&w.quota, &w.client.thread, 200);
+    let s_sc = bind_sc(&w.quota, &w.server.thread, 10);
+    // Servidor esperando: a chamada doa ao entregar.
+    let recv = regs(w.s_target, 0, &[]);
+    assert!(blocked(&w.server.begin(&mut env, Syscall::IpcRecv, &recv)));
+    let call = regs(w.c_ep, 1, &[]);
+    assert!(blocked(&w.client.begin(&mut env, Syscall::IpcCall, &call)));
+    assert!(runs_on(&w.server.thread, &c_sc));
+    // A resposta devolve a doação.
+    let answer = regs(w.s_target, 2, &[]);
+    let replied = w.server.begin(&mut env, Syscall::IpcReplyRecv, &answer);
+    assert!(blocked(&replied));
+    assert!(runs_on(&w.server.thread, &s_sc));
+    // Chamada já na fila: a doação vem ao receber, com um ponto de
+    // preempção para o escalonador cobrar o SchedContext certo.
+    w.server.thread.ipc().lock().blocked = crate::ipc::Blocked::None;
+    w.ep.as_endpoint().unwrap().remove(&w.server.thread);
+    assert!(blocked(&w.client.begin(&mut env, Syscall::IpcCall, &call)));
+    let preempts = env.preempts;
+    let got = w.server.begin(&mut env, Syscall::IpcRecv, &recv);
+    assert!(matches!(got, Ok(Step::Done(_))));
+    assert!(runs_on(&w.server.thread, &c_sc));
+    assert_eq!(env.preempts, preempts + 1);
+    // Prazo vencido de quem chamou também devolve a doação.
+    assert!(crate::ipc::cancel(&w.client.thread, Error::TimedOut));
+    assert!(runs_on(&w.server.thread, &s_sc));
+    // E o Reply destruído.
+    assert!(blocked(&w.client.begin(&mut env, Syscall::IpcCall, &call)));
+    let got = w.server.begin(&mut env, Syscall::IpcRecv, &recv);
+    assert!(matches!(got, Ok(Step::Done(_))));
+    assert!(runs_on(&w.server.thread, &c_sc));
+    delete(&w.server, w.s_target >> 32);
+    assert!(runs_on(&w.server.thread, &s_sc));
+    assert_eq!(finish(&w.client.thread), Err(Error::PeerClosed));
 }

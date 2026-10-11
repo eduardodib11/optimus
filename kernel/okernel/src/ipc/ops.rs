@@ -29,6 +29,11 @@
 //! pronto; [`FLAG_NONBLOCK`] faz o mesmo com `WouldBlock`. O prazo de
 //! `ipc_call` vale também para a espera da resposta.
 //!
+//! Doação de `SchedContext` (seção 6.6): quem recebe uma chamada roda com
+//! o `SchedContext` de quem chamou (o tempo e a prioridade dele) até
+//! responder pelo `Reply`, ou até a espera acabar de outro jeito (prazo,
+//! `Reply` destruído); a doação passa adiante em chamadas aninhadas.
+//!
 //! Caminho rápido (seção 6.7): `ipc_call` que encontra o servidor esperando
 //! e `ipc_reply_recv` que não encontra outro remetente, ambos só com
 //! registradores, pedem a [`Env::handoff`] a troca direta para a outra
@@ -325,6 +330,7 @@ fn send_out(
     };
     // O receptor só entra na fila com o `Reply` vazio.
     let _ = reply.bind(Arc::clone(me), grant);
+    reply.donate(&r);
     block(me, Blocked::Reply(Arc::downgrade(&reply)), None);
     let handoff = if fast {
         Some(r)
@@ -380,13 +386,21 @@ fn receive(
     Ok(Some(s))
 }
 
-/// Entrega a mensagem do remetente `s`, já fora da fila, a `me`.
-fn take_from(me: &Thread, s: Arc<Thread>, reply: &Arc<Reply>, grant: bool, env: &mut dyn Env) {
+/// Entrega a mensagem do remetente `s`, já fora da fila, a `me`; devolve
+/// se era uma chamada (e `me` passou a rodar com o tempo de `s`).
+fn take_from(
+    me: &Arc<Thread>,
+    s: Arc<Thread>,
+    reply: &Arc<Reply>,
+    grant: bool,
+    env: &mut dyn Env,
+) -> bool {
     let out = s.ipc().lock().out.take().unwrap_or_default();
     let call = out.call;
     deliver(&s, out, me, env);
     if call {
         let _ = reply.bind(Arc::clone(&s), grant);
+        reply.donate(me);
         s.ipc().lock().blocked = Blocked::Reply(Arc::downgrade(reply));
     } else {
         let mut slot = s.ipc().lock();
@@ -395,6 +409,7 @@ fn take_from(me: &Thread, s: Arc<Thread>, reply: &Arc<Reply>, grant: bool, env: 
         drop(slot);
         env.wake(s, 0);
     }
+    call
 }
 
 fn recv_caps(space: &SharedCapSpace, target: u64) -> Result<(Cap, Arc<Reply>), Error> {
@@ -448,9 +463,13 @@ pub fn begin(
             };
             match receive(&me, ep, &reply, grant, wait) {
                 Ok(Some(s)) => {
-                    take_from(&me, s, &reply, grant, env);
-                    if let Some((caller, _)) = replied {
-                        env.wake(caller, 0);
+                    let donated = take_from(&me, s, &reply, grant, env);
+                    if let Some((caller, _)) = &replied {
+                        env.wake(Arc::clone(caller), 0);
+                    }
+                    // Acordou alguém ou mudou o `SchedContext` em que roda:
+                    // o escalonador reavalia (e passa a cobrar o certo).
+                    if donated || replied.is_some() {
                         env.preempt();
                     }
                     Ok(Step::Done(finish(&me)?))

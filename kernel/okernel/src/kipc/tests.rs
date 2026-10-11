@@ -1,7 +1,7 @@
 //! Testes de kernel do IPC (T-208): ping-pong entre duas threads de
 //! usuário em processos diferentes, transferência de capability com e sem
 //! `GRANT` (e a revogação que alcança a cópia, ADR 0028), prazo vencido e
-//! `PeerClosed` quando o objeto morre.
+//! `PeerClosed` quando o objeto morre e a doação de `SchedContext`.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -23,6 +23,8 @@ use crate::kthread::{KernelEnv, UserEntry, fast_switches, start, yield_now};
 use crate::ktime;
 use crate::kvm::activate;
 
+mod doacao;
+
 /// Testes de kernel do IPC.
 pub const TESTS: &[Test] = &[
     Test {
@@ -41,6 +43,10 @@ pub const TESTS: &[Test] = &[
         name: "ipc.objeto_destruido_acorda_com_peer_closed",
         run: peer_closed,
     },
+    Test {
+        name: "ipc.doacao_de_schedcontext_evita_inversao_de_prioridade",
+        run: doacao::sem_inversao_de_prioridade,
+    },
 ];
 
 unsafe extern "C" {
@@ -51,7 +57,7 @@ unsafe extern "C" {
 }
 
 const VOLTAS: u64 = 10_000;
-const BADGE: u64 = 0x77;
+pub(crate) const BADGE: u64 = 0x77;
 
 /// Lê ou grava `N` palavras do usuário em `va`, no espaço de `p`.
 pub(crate) fn user_words<const N: usize>(
