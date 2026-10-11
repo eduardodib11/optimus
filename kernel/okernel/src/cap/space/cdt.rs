@@ -18,7 +18,7 @@
 
 use kabi::{Error, Handle};
 
-use super::{CapSpace, NIL};
+use super::{CapObject, CapSpace, NIL};
 
 /// Maior profundidade de uma capability na árvore (raiz = 0).
 pub const MAX_DERIVATION_DEPTH: u32 = 64;
@@ -33,7 +33,7 @@ pub enum Revoke {
     Continue,
 }
 
-impl<const N: usize> CapSpace<N> {
+impl<const N: usize, O: CapObject> CapSpace<N, O> {
     /// `Busy` se `src` estiver numa subárvore em revogação;
     /// `InvalidArgument` se um filho passaria de [`MAX_DERIVATION_DEPTH`].
     pub(super) fn check_mint_parent(&self, src: u32) -> Result<(), Error> {

@@ -151,7 +151,7 @@ fn parse(args: &[String]) -> Result<Options> {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some((cmd, rest)) = args.split_first() else {
-        eprintln!("uso: cargo xtask <build|image|run|test|check> [opções]");
+        eprintln!("uso: cargo xtask <build|image|run|test|check|kani> [opções]");
         return ExitCode::FAILURE;
     };
     let result = parse(rest).and_then(|opts| match cmd.as_str() {
@@ -160,6 +160,7 @@ fn main() -> ExitCode {
         "run" => run(&opts),
         "test" => test(&opts),
         "check" => check(),
+        "kani" => kani(),
         other => Err(format!("subcomando desconhecido: {other}")),
     });
     match result {
@@ -695,6 +696,38 @@ fn check() -> Result {
     }
     check_unsafe()
 }
+
+/// Provas Kani da lógica portável do kernel (T-204); `KANI_ALL=1` roda
+/// todas. O Kani é ferramenta de host, fora do toolchain fixado: `cargo
+/// install --locked kani-verifier && cargo kani setup`.
+fn kani() -> Result {
+    let installed = Command::new("cargo-kani")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|st| st.success());
+    if !installed {
+        return Err(
+            "Kani não instalado; rode `cargo install --locked kani-verifier && cargo kani setup`"
+                .into(),
+        );
+    }
+    let mut cmd = cargo();
+    cmd.args(["kani", "--package", "okernel", "--lib"]);
+    // As demais provas esgotam a memória do CBMC (ver `cap/space/proofs.rs`).
+    if env::var_os("KANI_ALL").is_none() {
+        for harness in KANI_HARNESSES {
+            cmd.args(["--harness", harness]);
+        }
+    }
+    status(&mut cmd)
+}
+
+/// Provas Kani que cabem na memória de uma máquina comum.
+const KANI_HARNESSES: &[&str] = &[
+    "cap::space::proofs::derive_nunca_aumenta",
+    "cap::space::proofs::mint_nunca_aumenta",
+];
 
 fn check_unsafe() -> Result {
     let allowlist =
