@@ -44,5 +44,21 @@ user_alternate:
     syscall
     ud2
 
+/* user_spin(rdi = prazo em ns do relógio)
+ *
+ * Gira lendo o relógio (clock_get, que não cede a CPU) até o prazo e
+ * termina: só a preempção pelo timer tira a thread da CPU. */
+.global user_spin
+user_spin:
+    mov r12, rdi
+1:
+    mov eax, 27
+    syscall
+    cmp rdx, r12
+    jb 1b
+    mov eax, 33
+    syscall
+    ud2
+
 .global user_test_end
 user_test_end:

@@ -22,6 +22,7 @@ use kabi::Error;
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
 use crate::platform::{KERNEL_STACK_BYTES, KernelStack, Platform};
+use crate::sched::SchedContext;
 use crate::sync::SpinLock;
 use crate::vm::SharedAddressSpace;
 
@@ -87,6 +88,9 @@ pub struct Thread {
     fpu: Vec<Block>,
     fpu_addr: usize,
     binding: SpinLock<Binding>,
+    /// `SchedContext` em que a thread roda; trava folha (nada é tomado
+    /// com ela na mão), lida pelo escalonador.
+    sched: SpinLock<Option<Arc<SchedContext>>>,
 }
 
 impl fmt::Debug for Thread {
@@ -126,6 +130,7 @@ impl Thread {
             fpu,
             fpu_addr,
             binding: SpinLock::new(Binding::default()),
+            sched: SpinLock::new(None),
         })
     }
 
@@ -198,6 +203,28 @@ impl Thread {
             aspace: Some(aspace),
         };
         Ok(())
+    }
+
+    /// `sched_bind`: a thread passa a rodar sobre `sc`. Só antes de
+    /// `thread_start`, uma vez por thread e por `SchedContext`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] se a thread já iniciou ou já tem um `SchedContext`,
+    /// ou se `sc` já está ligado a outra.
+    pub fn bind_sched(&self, sc: Arc<SchedContext>) -> Result<(), Error> {
+        let mut slot = self.sched.lock();
+        if self.state() != RunState::Inactive || slot.is_some() || !sc.try_bind() {
+            return Err(Error::Busy);
+        }
+        *slot = Some(sc);
+        Ok(())
+    }
+
+    /// O `SchedContext` da thread, se ligado.
+    #[must_use]
+    pub fn sched_context(&self) -> Option<Arc<SchedContext>> {
+        self.sched.lock().clone()
     }
 
     /// O `CapSpace` da thread, se configurada.

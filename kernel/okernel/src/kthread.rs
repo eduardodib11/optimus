@@ -11,14 +11,23 @@
 //! O kernel não é preemptível (ADR 0009) e roda com interrupções desligadas;
 //! elas só chegam no anel 3 ou no ocioso. Por isso a fila tem uma trava
 //! simples, nunca segura durante a troca.
+//!
+//! Escalonamento (T-207, seção 6.6): prioridade fixa de 256 níveis com
+//! round-robin de [`DEFAULT_SLICE_NS`] dentro do nível; cada thread roda
+//! sobre o orçamento do seu `SchedContext` e, sem orçamento, espera o fim
+//! da janela fora da fila. Sem tick: a cada decisão o timer do APIC é
+//! armado para o próximo evento (fim da fatia, fim do orçamento da atual ou
+//! reabastecimento de uma thread em espera). O consumo é medido pelo
+//! relógio nas decisões (syscalls de troca e interrupções do timer).
 
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Syscall};
+use okernel::sched::{DEFAULT_SLICE_NS, Params, RunQueue, SchedContext};
 use okernel::sync::SpinLock;
 use okernel::sys::{self, Values};
 use okernel::thread::{RunState, Thread};
@@ -50,19 +59,57 @@ pub struct UserEntry {
     pub args: [u64; 3],
 }
 
+/// Um evento do registro do escalonador (para os testes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A thread (pelo endereço do objeto) rodou em `[start, end)`.
+    Ran {
+        /// Endereço do objeto `Thread`.
+        thread: usize,
+        /// Início, no relógio.
+        start: u64,
+        /// Fim.
+        end: u64,
+    },
+    /// A thread ficou sem orçamento em `at` e espera até `until`.
+    Throttled {
+        /// Endereço do objeto `Thread`.
+        thread: usize,
+        /// Quando.
+        at: u64,
+        /// Reabastecimento.
+        until: u64,
+    },
+}
+
 struct Sched {
     /// Thread na CPU; `None` é o ocioso (o contexto de boot).
     current: Option<Arc<Thread>>,
-    ready: VecDeque<Arc<Thread>>,
+    /// Quando a atual foi cobrada pela última vez.
+    charged_at: u64,
+    /// Quando a atual começou a rodar e quando acaba a fatia dela.
+    started_at: u64,
+    slice_end: u64,
+    ready: RunQueue<Arc<Thread>>,
+    /// Sem orçamento, esperando o reabastecimento.
+    throttled: Vec<Arc<Thread>>,
     /// Thread que terminou e cuja pilha ainda estava em uso na troca; a
     /// próxima a rodar a solta.
     dead: Option<Arc<Thread>>,
+    /// Registro de eventos dos testes (capacidade reservada antes; nunca
+    /// aloca aqui).
+    trace: Vec<Event>,
 }
 
 static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     current: None,
-    ready: VecDeque::new(),
+    charged_at: 0,
+    started_at: 0,
+    slice_end: 0,
+    ready: RunQueue::new(),
+    throttled: Vec::new(),
     dead: None,
+    trace: Vec::new(),
 });
 /// rsp salvo do ocioso.
 static IDLE_RSP: AtomicU64 = AtomicU64::new(0);
@@ -89,7 +136,10 @@ pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
     if thread.state() != RunState::Inactive {
         return Err(Error::Busy);
     }
-    if thread.root().is_none() || !user_addr(entry.rip) || !user_addr(entry.rsp) {
+    let configured = thread
+        .sched_context()
+        .is_some_and(|sc| sc.params().is_some());
+    if thread.root().is_none() || !configured || !user_addr(entry.rip) || !user_addr(entry.rsp) {
         return Err(Error::InvalidArgument);
     }
     let [rdi, rsi, rdx] = entry.args;
@@ -109,8 +159,10 @@ pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
     // `switch_context` para o trampolim.
     let switch_at = frame_at - 7 * 8;
     let mut sched = SCHED.lock();
+    // Toda thread iniciada tem lugar reservado na espera: o escalonador
+    // nunca aloca.
     sched
-        .ready
+        .throttled
         .try_reserve(1)
         .map_err(|_| Error::QuotaExceeded)?;
     // SAFETY: a pilha de kernel da thread está mapeada (RW) e é só dela;
@@ -126,34 +178,136 @@ pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
             .write((thread_trampoline as *const ()).addr() as u64);
     }
     thread.saved_rsp().store(switch_at, Ordering::Release);
-    thread.set_state(RunState::Ready);
-    sched.ready.push_back(Arc::clone(thread));
+    enqueue(&mut sched, Arc::clone(thread), ktime::now_ns());
     Ok(())
 }
 
-/// Por que a thread atual deixa a CPU.
+/// `SchedContext` e parâmetros de uma thread iniciada (`start` exige).
+fn sc_of(t: &Thread) -> Option<(Arc<SchedContext>, Params)> {
+    let sc = t.sched_context()?;
+    let params = sc.params()?;
+    Some((sc, params))
+}
+
+/// Põe `t` na fila do nível dela ou, sem orçamento, na espera.
+fn enqueue(s: &mut Sched, t: Arc<Thread>, now: u64) {
+    let Some((sc, p)) = sc_of(&t) else { return };
+    let mut b = sc.budget();
+    b.refill(&p, now);
+    sc.set_budget(b);
+    if b.exhausted(&p) {
+        if s.trace.len() < s.trace.capacity() {
+            let thread = Arc::as_ptr(&t).addr();
+            let until = b.replenish_at;
+            s.trace.push(Event::Throttled {
+                thread,
+                at: now,
+                until,
+            });
+        }
+        t.set_state(RunState::Throttled);
+        if s.throttled.try_reserve(1).is_ok() {
+            s.throttled.push(t);
+        }
+    } else {
+        t.set_state(RunState::Ready);
+        let _ = s.ready.push(p.priority, t);
+    }
+}
+
+/// Desconta da atual o tempo desde a última cobrança.
+fn charge_current(s: &mut Sched, now: u64) {
+    if let Some((sc, p)) = s.current.as_deref().and_then(sc_of) {
+        let mut b = sc.budget();
+        b.consume(&p, now.saturating_sub(s.charged_at));
+        sc.set_budget(b);
+    }
+    s.charged_at = now;
+}
+
+/// Devolve à fila as threads em espera cuja janela acabou.
+fn release_throttled(s: &mut Sched, now: u64) {
+    let mut i = 0;
+    while i < s.throttled.len() {
+        let due = sc_of(&s.throttled[i]).is_some_and(|(sc, _)| now >= sc.budget().replenish_at);
+        if due {
+            let t = s.throttled.swap_remove(i);
+            enqueue(s, t, now);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Arma o timer para o próximo evento: fim da fatia ou do orçamento da
+/// atual, ou o primeiro reabastecimento.
+fn program_timer(s: &Sched, now: u64) {
+    let mut at = u64::MAX;
+    if let Some((sc, p)) = s.current.as_deref().and_then(sc_of) {
+        at = at.min(s.slice_end);
+        if let Some(d) = sc.budget().deadline(&p, now) {
+            at = at.min(d);
+        }
+    }
+    for t in &s.throttled {
+        if let Some((sc, _)) = sc_of(t) {
+            at = at.min(sc.budget().replenish_at);
+        }
+    }
+    if at != u64::MAX {
+        ktime::set_timer_at(at);
+    }
+}
+
+/// Por que o escalonador foi chamado.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Why {
-    /// Cede a vez e volta para o fim da fila.
+    /// A atual cede a vez e volta para o fim do nível.
     Yield,
-    /// Terminou.
+    /// A atual terminou.
     Exit,
+    /// Timer ou ponto de preempção: a atual segue, a menos que o orçamento
+    /// ou a fatia tenha acabado ou haja alguém mais prioritário.
+    Preempt,
+}
+
+/// A atual pode seguir na CPU (só para [`Why::Preempt`]).
+fn keeps_running(s: &Sched, t: &Thread, now: u64) -> bool {
+    let Some((sc, p)) = sc_of(t) else {
+        return false;
+    };
+    let mut b = sc.budget();
+    b.refill(&p, now);
+    sc.set_budget(b);
+    let top = s.ready.highest();
+    let higher = top.is_some_and(|h| h > p.priority);
+    let turn_over = now >= s.slice_end && top == Some(p.priority);
+    !b.exhausted(&p) && !higher && !turn_over
 }
 
 /// Escolhe a próxima thread e troca para ela. Volta quando a que chamou
 /// for escolhida de novo (nunca, se ela saiu).
 fn schedule(why: Why) {
+    let now = ktime::now_ns();
     let mut s = SCHED.lock();
+    charge_current(&mut s, now);
+    release_throttled(&mut s, now);
+    if why == Why::Preempt
+        && let Some(cur) = s.current.clone()
+        && keeps_running(&s, &cur, now)
+    {
+        program_timer(&s, now);
+        return;
+    }
     let prev = s.current.take();
     if let Some(p) = &prev {
         if why == Why::Exit {
             p.set_state(RunState::Exited);
-        } else if s.ready.try_reserve(1).is_ok() {
-            p.set_state(RunState::Ready);
-            s.ready.push_back(Arc::clone(p));
+        } else {
+            enqueue(&mut s, Arc::clone(p), now);
         }
     }
-    let next = s.ready.pop_front();
+    let next = s.ready.pop().map(|(_, t)| t);
     let same = match (&prev, &next) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
@@ -161,8 +315,31 @@ fn schedule(why: Why) {
     };
     if let Some(n) = &next {
         n.set_state(RunState::Running);
+        if let Some((sc, p)) = sc_of(n) {
+            let mut b = sc.budget();
+            b.activate(&p, now);
+            sc.set_budget(b);
+        }
+    }
+    if !same {
+        if let Some(p) = &prev
+            && s.trace.len() < s.trace.capacity()
+        {
+            let thread = Arc::as_ptr(p).addr();
+            let start = s.started_at;
+            s.trace.push(Event::Ran {
+                thread,
+                start,
+                end: now,
+            });
+        }
+        s.started_at = now;
+    }
+    if !same || why == Why::Yield {
+        s.slice_end = now.saturating_add(DEFAULT_SLICE_NS);
     }
     s.current.clone_from(&next);
+    program_timer(&s, now);
     if same {
         return;
     }
@@ -232,6 +409,25 @@ pub fn yield_now() {
     schedule(Why::Yield);
 }
 
+/// Disparo do timer do APIC (com o EOI já feito), vindo do anel 3 ou do
+/// ocioso: reavalia quem roda.
+pub fn on_timer() {
+    schedule(Why::Preempt);
+}
+
+/// Liga o registro de eventos do escalonador com espaço para `capacity`
+/// eventos (testes); `false` sem memória.
+pub fn trace_start(capacity: usize) -> bool {
+    let mut s = SCHED.lock();
+    s.trace = Vec::new();
+    s.trace.try_reserve_exact(capacity).is_ok()
+}
+
+/// Desliga o registro e devolve os eventos.
+pub fn trace_take() -> Vec<Event> {
+    core::mem::take(&mut SCHED.lock().trace)
+}
+
 /// `thread_exit`: a thread atual termina.
 fn exit_current() -> ! {
     schedule(Why::Exit);
@@ -274,7 +470,9 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
             let space = current()
                 .and_then(|t| t.cspace())
                 .ok_or(Error::NotSupported)?;
-            sys::invoke(&space, call, a, kcap::REVOKE_SLICE_BUDGET, &mut || {})
+            // Entre fatias de `cap_revoke`, o ponto de preempção (ADR 0009).
+            let mut preempt = || schedule(Why::Preempt);
+            sys::invoke(&space, call, a, kcap::REVOKE_SLICE_BUDGET, &mut preempt)
         }
     }
 }

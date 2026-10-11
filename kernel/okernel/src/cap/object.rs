@@ -7,7 +7,7 @@
 //!
 //! `AddressSpace`, `MemoryObject` (T-205) e `Thread` (T-206) usam a [`Platform`](crate::platform::Platform)
 //! instalada pelo kernel. Os tipos que dependem de tarefas futuras (IPC,
-//! escalonador) respondem [`Error::NotSupported`] por enquanto.
+//! interrupções, DMA) respondem [`Error::NotSupported`] por enquanto.
 
 use alloc::sync::Arc;
 use core::fmt;
@@ -18,6 +18,7 @@ use kabi::{Error, ObjectType, Rights};
 use super::quota::MemoryQuota;
 use super::space::CapSpace;
 use crate::platform;
+use crate::sched::SchedContext;
 use crate::sync::SpinLock;
 use crate::thread::Thread;
 use crate::vm::{AddressSpace, MemoryObject, SharedAddressSpace};
@@ -39,6 +40,8 @@ pub enum Object {
     MemoryObject(Arc<MemoryObject>),
     /// Contexto de execução.
     Thread(Arc<Thread>),
+    /// Orçamento de CPU e prioridade.
+    SchedContext(Arc<SchedContext>),
 }
 
 impl fmt::Debug for Object {
@@ -49,6 +52,7 @@ impl fmt::Debug for Object {
             Self::AddressSpace(a) => Arc::as_ptr(a).addr(),
             Self::MemoryObject(m) => Arc::as_ptr(m).addr(),
             Self::Thread(t) => Arc::as_ptr(t).addr(),
+            Self::SchedContext(s) => Arc::as_ptr(s).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -64,6 +68,7 @@ impl Object {
             Self::AddressSpace(_) => ObjectType::AddressSpace,
             Self::MemoryObject(_) => ObjectType::MemoryObject,
             Self::Thread(_) => ObjectType::Thread,
+            Self::SchedContext(_) => ObjectType::SchedContext,
         }
     }
 
@@ -76,6 +81,7 @@ impl Object {
             (Self::AddressSpace(a), Self::AddressSpace(b)) => Arc::ptr_eq(a, b),
             (Self::MemoryObject(a), Self::MemoryObject(b)) => Arc::ptr_eq(a, b),
             (Self::Thread(a), Self::Thread(b)) => Arc::ptr_eq(a, b),
+            (Self::SchedContext(a), Self::SchedContext(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -139,6 +145,18 @@ impl Object {
             _ => Err(Error::WrongType),
         }
     }
+
+    /// O `SchedContext`, se o objeto for um.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_sched_context(&self) -> Result<&Arc<SchedContext>, Error> {
+        match self {
+            Self::SchedContext(s) => Ok(s),
+            _ => Err(Error::WrongType),
+        }
+    }
 }
 
 /// Bytes que um `Arc<T>` ocupa no heap: dois contadores mais o valor.
@@ -186,7 +204,8 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 /// sai de `quota` junto com o tamanho do objeto); `CapSpace`, zero (as
 /// folhas da tabela são cobradas da mesma cota à medida que ela cresce);
 /// `AddressSpace`, zero (tabelas e regiões são cobradas ao mapear);
-/// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB; `Thread`, zero.
+/// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB; `Thread` e
+/// `SchedContext`, zero (este nasce sem configuração).
 /// Os direitos sobre `quota`
 /// (`CREATE`, e `SPLIT` para cotas) são conferidos por quem chama, que tem a
 /// capability.
@@ -224,6 +243,10 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
         ObjectType::Thread => {
             let platform = platform::get().ok_or(Error::NotSupported)?;
             Ok(Object::Thread(Arc::new(Thread::new(quota, platform)?)))
+        }
+        ObjectType::SchedContext => {
+            let charge = quota.charge(object_bytes::<SchedContext>())?;
+            Ok(Object::SchedContext(Arc::new(SchedContext::new(charge))))
         }
         _ => Err(Error::NotSupported),
     }

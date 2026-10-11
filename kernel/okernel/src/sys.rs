@@ -6,7 +6,7 @@
 //! `TryFrom<u64>` da `kabi`. Os valores de retorno vão na mesma ordem a
 //! partir do segundo registrador de retorno: `rdx`, `r10`, `r8` (definido
 //! aqui; a seção 14.1 só diz "rdx e seguintes"). Syscalls que o kernel trata
-//! fora daqui (threads, tempo, escalonador) e as ainda não implementadas
+//! fora daqui (yield, saída e partida de threads, tempo) e as ainda não implementadas
 //! devolvem [`Error::NotSupported`].
 //!
 //! Ordem de travas (seção 6.9): o `CapSpace` é solto antes de tocar no
@@ -14,10 +14,13 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::sync::Arc;
+
 use kabi::{Error, Handle, ObjectType, Rights, Syscall};
 
 use crate::cap::SharedCapSpace;
 use crate::cap::space::Revoke;
+use crate::sched::Params;
 use crate::vm::{vm_map, vm_protect, vm_unmap};
 
 /// Valores devolvidos em `rdx`, `r10` e `r8`.
@@ -92,6 +95,27 @@ pub fn invoke(
         Syscall::VmProtect => {
             let aspace = space.lock().get(handle(a[0])?)?.clone();
             vm_protect(&aspace, a[1], a[2], a[3]).map(|()| [0; 3])
+        }
+        Syscall::SchedConfigure => {
+            let cap = space.lock().get(handle(a[0])?)?.clone();
+            let sc = cap.object.as_sched_context()?;
+            if !cap.rights.contains(Rights::CONFIGURE) {
+                return Err(Error::AccessDenied);
+            }
+            sc.configure(Params::new(a[1], a[2], a[3])?);
+            Ok([0; 3])
+        }
+        Syscall::SchedBind => {
+            let (sc, thread) = {
+                let s = space.lock();
+                (s.get(handle(a[0])?)?.clone(), s.get(handle(a[1])?)?.clone())
+            };
+            let (sc_obj, t) = (sc.object.as_sched_context()?, thread.object.as_thread()?);
+            if !sc.rights.contains(Rights::BIND) || !thread.rights.contains(Rights::WRITE_STATE) {
+                return Err(Error::AccessDenied);
+            }
+            t.bind_sched(Arc::clone(sc_obj))?;
+            Ok([0; 3])
         }
         _ => Err(Error::NotSupported),
     }

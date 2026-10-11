@@ -14,6 +14,7 @@ pub mod console;
 pub mod log;
 pub mod mm;
 pub mod platform;
+pub mod sched;
 pub mod sync;
 pub mod sys;
 pub mod thread;
