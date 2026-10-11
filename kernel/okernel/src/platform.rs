@@ -28,6 +28,26 @@ pub trait Platform: Sync {
     /// Invalida a tradução de `virt` no espaço com PML4 `root`, onde ela
     /// estiver em cache.
     fn flush(&self, root: PhysAddr, virt: u64);
+    /// Pilha de kernel de uma thread nova ([`KERNEL_STACK_BYTES`]), com
+    /// página de guarda.
+    fn alloc_kernel_stack(&self) -> Option<KernelStack>;
+    /// Devolve uma pilha de [`alloc_kernel_stack`](Self::alloc_kernel_stack),
+    /// que ninguém mais usa.
+    fn free_kernel_stack(&self, stack: KernelStack);
+    /// Bytes da área de estado de FPU/SIMD de uma thread (XSAVE ou FXSAVE).
+    fn fpu_area_bytes(&self) -> usize;
+}
+
+/// Bytes da pilha de kernel de cada thread (seção 6.3).
+pub const KERNEL_STACK_BYTES: u64 = 16 << 10;
+
+/// Pilha de kernel de uma thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelStack {
+    /// Topo (exclusivo), alinhado a 16 bytes.
+    pub top: u64,
+    /// Identificador da pilha para quem a alocou.
+    pub slot: u32,
 }
 
 static PLATFORM: SpinLock<Option<&'static dyn Platform>> = SpinLock::new(None);

@@ -72,6 +72,17 @@ pub unsafe fn write_cr3(value: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack)) };
 }
 
+/// Grava o CR0.
+///
+/// # Safety
+///
+/// O valor não pode desligar proteções nem a paginação de que o kernel
+/// depende.
+pub unsafe fn write_cr0(value: u64) {
+    // SAFETY: contrato do chamador.
+    unsafe { asm!("mov cr0, {}", in(reg) value, options(nostack)) };
+}
+
 /// Grava o CR4.
 ///
 /// # Safety

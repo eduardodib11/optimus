@@ -1,0 +1,219 @@
+//! Objeto `Thread` (T-206; SDD v1.0, seções 6.1 e 6.3).
+//!
+//! Uma thread tem pilha de kernel própria (16 KiB com página de guarda),
+//! área de estado de FPU/SIMD do tamanho que a CPU pede (XSAVE ou FXSAVE),
+//! o `CapSpace` e o `AddressSpace` em que roda. Tudo é cobrado da cota na
+//! criação. Os registradores de usuário ficam num quadro no topo da pilha de
+//! kernel, montado e lido pelo código de arquitetura.
+//!
+//! O que o escalonador lê a cada troca (estado, rsp salvo, CR3, área de FPU)
+//! fica em atômicas e endereços fixos, para ele não tomar a trava da thread
+//! com a da fila na mão (ordem da seção 6.9: objeto antes da fila).
+
+#![forbid(unsafe_code)]
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::fmt;
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+use kabi::Error;
+
+use crate::cap::object::object_bytes;
+use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
+use crate::platform::{KERNEL_STACK_BYTES, KernelStack, Platform};
+use crate::sync::SpinLock;
+use crate::vm::SharedAddressSpace;
+
+/// Estado de execução.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RunState {
+    /// Criada, ainda sem `thread_start`.
+    Inactive = 0,
+    /// Na fila, pronta para rodar.
+    Ready = 1,
+    /// Na CPU.
+    Running = 2,
+    /// Esperando o próximo período do `SchedContext` (T-207).
+    Throttled = 3,
+    /// Terminou com `thread_exit`; não roda mais.
+    Exited = 4,
+}
+
+impl RunState {
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Ready,
+            2 => Self::Running,
+            3 => Self::Throttled,
+            4 => Self::Exited,
+            _ => Self::Inactive,
+        }
+    }
+}
+
+/// Bloco de 64 bytes alinhado como XSAVE exige.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Block([u8; 64]);
+
+/// Palavra de controle x87 inicial (FNINIT).
+const FCW_INIT: u16 = 0x037f;
+/// MXCSR inicial: todas as exceções SIMD mascaradas.
+const MXCSR_INIT: u32 = 0x1f80;
+
+/// Onde a thread roda: tabelas de capabilities e de páginas.
+#[derive(Default)]
+pub struct Binding {
+    /// `CapSpace` usado nas syscalls da thread.
+    pub cspace: Option<Arc<SharedCapSpace>>,
+    /// `AddressSpace` da thread.
+    pub aspace: Option<Arc<SharedAddressSpace>>,
+}
+
+/// Contexto de execução.
+pub struct Thread {
+    charge: Charge,
+    platform: &'static dyn Platform,
+    stack: KernelStack,
+    /// rsp do kernel salvo na última troca de contexto (escrito pelo asm).
+    saved_rsp: AtomicU64,
+    /// PML4 do espaço da thread (zero sem espaço).
+    root: AtomicU64,
+    state: AtomicU8,
+    /// Área de FPU; só o código de troca de contexto a acessa, pelo
+    /// endereço exposto em `fpu_addr`.
+    fpu: Vec<Block>,
+    fpu_addr: usize,
+    binding: SpinLock<Binding>,
+}
+
+impl fmt::Debug for Thread {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Thread(pilha {:#x}, {:?})", self.stack.top, self.state())
+    }
+}
+
+impl Thread {
+    /// Thread inativa, com pilha e área de FPU, cobrada de `quota`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QuotaExceeded`] sem cota ou sem memória para a pilha.
+    pub fn new(quota: &Arc<MemoryQuota>, platform: &'static dyn Platform) -> Result<Self, Error> {
+        let fpu_bytes = platform.fpu_area_bytes();
+        let blocks = fpu_bytes.div_ceil(size_of::<Block>());
+        let cost = object_bytes::<Self>() + KERNEL_STACK_BYTES + (blocks * 64) as u64;
+        let charge = quota.charge(cost)?;
+        let mut fpu = Vec::new();
+        fpu.try_reserve_exact(blocks)
+            .map_err(|_| Error::QuotaExceeded)?;
+        fpu.resize(blocks, Block([0; 64]));
+        if let Some(first) = fpu.first_mut() {
+            first.0[..2].copy_from_slice(&FCW_INIT.to_le_bytes());
+            first.0[24..28].copy_from_slice(&MXCSR_INIT.to_le_bytes());
+        }
+        let fpu_addr = fpu.as_mut_ptr().expose_provenance();
+        let stack = platform.alloc_kernel_stack().ok_or(Error::QuotaExceeded)?;
+        Ok(Self {
+            charge,
+            platform,
+            stack,
+            saved_rsp: AtomicU64::new(0),
+            root: AtomicU64::new(0),
+            state: AtomicU8::new(RunState::Inactive as u8),
+            fpu,
+            fpu_addr,
+            binding: SpinLock::new(Binding::default()),
+        })
+    }
+
+    /// Pilha de kernel.
+    #[must_use]
+    pub const fn stack(&self) -> KernelStack {
+        self.stack
+    }
+
+    /// Endereço (com proveniência exposta) da área de FPU, alinhado a 64.
+    #[must_use]
+    pub const fn fpu_area(&self) -> usize {
+        self.fpu_addr
+    }
+
+    /// Bytes da área de FPU.
+    #[must_use]
+    pub fn fpu_bytes(&self) -> usize {
+        self.fpu.len() * size_of::<Block>()
+    }
+
+    /// Onde o asm de troca guarda o rsp do kernel.
+    #[must_use]
+    pub const fn saved_rsp(&self) -> &AtomicU64 {
+        &self.saved_rsp
+    }
+
+    /// PML4 do espaço (para o CR3), se configurada.
+    #[must_use]
+    pub fn root(&self) -> Option<u64> {
+        let root = self.root.load(Ordering::Acquire);
+        (root != 0).then_some(root)
+    }
+
+    /// Estado de execução.
+    #[must_use]
+    pub fn state(&self) -> RunState {
+        RunState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    /// Muda o estado (pelo escalonador).
+    pub fn set_state(&self, state: RunState) {
+        self.state.store(state as u8, Ordering::Release);
+    }
+
+    /// Bytes cobrados da cota.
+    #[must_use]
+    pub const fn charged(&self) -> u64 {
+        self.charge.bytes()
+    }
+
+    /// `thread_configure`: liga a thread a um `CapSpace` e a um
+    /// `AddressSpace`. Só antes de `thread_start`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] se a thread já foi iniciada.
+    pub fn configure(
+        &self,
+        cspace: Arc<SharedCapSpace>,
+        aspace: Arc<SharedAddressSpace>,
+    ) -> Result<(), Error> {
+        let mut binding = self.binding.lock();
+        if self.state() != RunState::Inactive {
+            return Err(Error::Busy);
+        }
+        self.root.store(aspace.lock().root().0, Ordering::Release);
+        *binding = Binding {
+            cspace: Some(cspace),
+            aspace: Some(aspace),
+        };
+        Ok(())
+    }
+
+    /// O `CapSpace` da thread, se configurada.
+    #[must_use]
+    pub fn cspace(&self) -> Option<Arc<SharedCapSpace>> {
+        self.binding.lock().cspace.clone()
+    }
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        // Quem solta a última referência nunca é a própria thread: o
+        // escalonador só a solta depois de trocar para outra.
+        self.platform.free_kernel_stack(self.stack);
+    }
+}
+
+#[cfg(test)]
+mod tests;

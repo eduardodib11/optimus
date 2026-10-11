@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use super::*;
 use crate::mm::FRAME_SIZE;
 use crate::mm::paging::{ENTRIES, Table, TableMemory};
+use crate::platform::KernelStack;
 
 /// PML4 do kernel na plataforma falsa.
 pub(crate) const KERNEL_ROOT: PhysAddr = PhysAddr(0x7f00_0000);
@@ -19,6 +20,7 @@ pub(crate) struct Fake {
     pub(crate) next: AtomicU64,
     pub(crate) frames_live: AtomicI64,
     pub(crate) tables_live: AtomicI64,
+    pub(crate) stacks_live: AtomicI64,
     pub(crate) frame_limit: i64,
     pub(crate) flushes: Mutex<Vec<u64>>,
 }
@@ -59,6 +61,7 @@ impl Fake {
             next: AtomicU64::new(0x10_0000),
             frames_live: AtomicI64::new(0),
             tables_live: AtomicI64::new(0),
+            stacks_live: AtomicI64::new(0),
             frame_limit,
             flushes: Mutex::new(Vec::new()),
         }))
@@ -98,6 +101,19 @@ impl Platform for Leaked {
     }
     fn flush(&self, _: PhysAddr, virt: u64) {
         self.0.flushes.lock().unwrap().push(virt);
+    }
+    fn alloc_kernel_stack(&self) -> Option<KernelStack> {
+        let slot = self.0.stacks_live.fetch_add(1, Ordering::Relaxed);
+        Some(KernelStack {
+            top: 0xffff_e000_0000_4000,
+            slot: u32::try_from(slot).ok()?,
+        })
+    }
+    fn free_kernel_stack(&self, _: KernelStack) {
+        self.0.stacks_live.fetch_sub(1, Ordering::Relaxed);
+    }
+    fn fpu_area_bytes(&self) -> usize {
+        832
     }
 }
 
