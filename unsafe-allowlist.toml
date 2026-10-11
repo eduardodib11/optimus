@@ -3,4 +3,6 @@
 crates = [
     "boot/optboot",
     "kernel/okernel",
+    # "ostd baixo nível" (seção 17.1): só `lib/ostd/src/arch/` (syscall e _start).
+    "lib/ostd",
 ]

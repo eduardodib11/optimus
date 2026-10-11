@@ -1,0 +1,17 @@
+[package]
+name = "root"
+description = "Primeiro processo do Optimus: recebe as capabilities iniciais e inicia o svcmgr."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "root"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+
+[lints]
+workspace = true

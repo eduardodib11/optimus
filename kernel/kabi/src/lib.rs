@@ -108,6 +108,13 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
 /// Quantidade de syscalls da ABI v1 ("34 syscalls estáveis").
 pub const SYSCALL_COUNT: usize = Syscall::ALL.len();
 
+/// Syscall de depuração provisória, fora da ABI v1: `debug_print(ptr, len)`
+/// manda até [`DEBUG_PRINT_MAX`] bytes UTF-8 ao registro do kernel. Sai
+/// quando `debug_write` ganhar a capability de depuração (seção 14.2).
+pub const DEBUG_PRINT: u64 = 0x8000_0000;
+/// Bytes aceitos por chamada de [`DEBUG_PRINT`].
+pub const DEBUG_PRINT_MAX: usize = 64;
+
 /// Status de sucesso devolvido em `rax` (seção 14.1).
 pub const STATUS_OK: u64 = 0;
 

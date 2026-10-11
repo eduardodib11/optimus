@@ -5,7 +5,7 @@
  * RX no anel 3. Todo salto é relativo, então o código roda em qualquer
  * endereço. Usa só registradores e a página RW cujo endereço recebe.
  *
- * Syscalls: 0x80000000 = depuração dos testes (kthread::DEBUG_PRINT),
+ * Syscalls: 0x80000000 = depuração dos testes (kabi::DEBUG_PRINT),
  * 23 = ntfy_wait, 25 = obj_bind_notify, 26 = irq_ack, 27 = clock_get,
  * 28 = yield, 29 = futex_wait, 30 = futex_wake, 33 = thread_exit.
  */

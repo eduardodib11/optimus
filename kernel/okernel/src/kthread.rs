@@ -41,13 +41,6 @@ use crate::{kcap, kmem, ktest, ktime};
 mod tests;
 pub use tests::TESTS;
 
-/// Syscall de depuração dos testes de kernel, fora da ABI v1 da `kabi`:
-/// `debug_print(ptr, len)` copia até 64 bytes do usuário para um registro
-/// que os testes leem. Só existe em build de depuração com `test=kernel`;
-/// fora disso devolve `NotSupported`. Temporária: sai quando `debug_write`
-/// ganhar a capability de depuração.
-pub const DEBUG_PRINT: u64 = 0x8000_0000;
-
 /// Registradores iniciais de uma thread de usuário.
 #[derive(Clone, Copy, Debug)]
 pub struct UserEntry {
@@ -500,7 +493,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
 }
 
 fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
-    if nr == DEBUG_PRINT {
+    if nr == kabi::DEBUG_PRINT {
         return debug_print(a[0], a[1]);
     }
     let call = Syscall::try_from(nr).map_err(|_| Error::NotSupported)?;
@@ -520,17 +513,23 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
     }
 }
 
+/// `kabi::DEBUG_PRINT` (provisória): nos testes de kernel o texto vai ao
+/// registro que eles leem; fora deles, ao registro do kernel, uma linha por
+/// chamada. Qualquer thread pode chamá-la até `debug_write` ganhar a
+/// capability de depuração.
 fn debug_print(ptr: u64, len: u64) -> Result<Values, Error> {
-    if !cfg!(debug_assertions) || !ktest::active() {
-        return Err(Error::NotSupported);
-    }
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; kabi::DEBUG_PRINT_MAX];
     let len = usize::try_from(len)
         .ok()
         .filter(|&n| n <= buf.len())
         .ok_or(Error::InvalidArgument)?;
     if !probe::copy_from_user(&mut buf[..len], ptr) {
         return Err(Error::InvalidArgument);
+    }
+    if !ktest::active() {
+        let text = core::str::from_utf8(&buf[..len]).map_err(|_| Error::InvalidArgument)?;
+        info!("{}", text.trim_end());
+        return Ok([len as u64, 0, 0]);
     }
     let mut log = DEBUG_LOG.lock();
     let (bytes, used) = &mut *log;

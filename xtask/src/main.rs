@@ -27,6 +27,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
     ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
+    ("root", "services/root/src/main.rs", USER_TARGET),
 ];
 
 /// Bibliotecas portáveis cujos testes rodam no host.
@@ -235,6 +236,9 @@ fn build(opts: &Options) -> Result {
 fn rustc_flags(package: &str) -> &'static [&'static str] {
     match package {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
+        // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
+        // (o kernel ainda não reloca processos; ASLR de usuário depois).
+        "root" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -650,6 +654,8 @@ fn test(opts: &Options) -> Result {
             "optboot",
             "--exclude",
             "ostd",
+            "--exclude",
+            "root",
         ]))?;
         // A lógica portável do kernel (biblioteca `okernel`) roda no host.
         status(cargo().args(["test", "--package", "okernel", "--lib"]))?;
