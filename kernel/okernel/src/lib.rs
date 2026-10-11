@@ -6,7 +6,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 pub mod acpi;
+pub mod cap;
 pub mod console;
 pub mod log;
 pub mod mm;
