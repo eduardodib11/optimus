@@ -81,6 +81,21 @@ pub fn halt() -> ! {
     }
 }
 
+/// Reinicia a máquina: reset pela porta 0xcf9 (chipsets Intel e q35), pelo
+/// controlador de teclado e, se nada disso funcionar, por falta tripla.
+pub fn reset() -> ! {
+    // SAFETY: 0xcf9 e 0x64 só pedem reset; a falta tripla com IDT vazia
+    // também só reinicia. Nada depois disso precisa continuar.
+    unsafe {
+        outb(0xcf9, 0x02);
+        outb(0xcf9, 0x06);
+        outb(0x64, 0xfe);
+        let empty = gdt::Pointer { limit: 0, base: 0 };
+        asm!("lidt [{}]", "int3", in(reg) &raw const empty, options(nostack));
+    }
+    halt()
+}
+
 /// Desliga o QEMU pelo `isa-debug-exit`; fora do QEMU, para a CPU.
 pub fn qemu_exit(code: QemuExit) -> ! {
     // SAFETY: escrever em 0xf4 só tem efeito com o `isa-debug-exit` do QEMU;

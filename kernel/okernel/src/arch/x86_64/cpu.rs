@@ -131,6 +131,12 @@ pub fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
+/// Desliga as interrupções.
+pub fn disable_interrupts() {
+    // SAFETY: CLI só adia interrupções desta CPU.
+    unsafe { asm!("cli", options(nomem, nostack)) };
+}
+
 /// Liga as interrupções e espera a próxima; volta com elas desligadas.
 pub fn wait_for_interrupt() {
     // SAFETY: STI só vale depois da instrução seguinte, então nenhuma

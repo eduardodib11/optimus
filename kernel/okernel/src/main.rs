@@ -19,9 +19,8 @@ mod arch;
 mod bootinfo;
 mod kheap;
 mod kmem;
+mod kpanic;
 mod ktime;
-
-use core::panic::PanicInfo;
 
 use kabi::boot::BootInfo;
 use kabi::{SYSCALL_COUNT, Syscall};
@@ -71,6 +70,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
             arch::x86_64::trigger_invalid_opcode();
         }
         Some("kernel") => ktest::run(option(cmdline, "ktest")),
+        Some("panic") => panic!("pânico de teste proposital (test=panic)"),
         _ => {}
     }
     kheap::log_stats();
@@ -79,7 +79,6 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
 }
 
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    klog::emergency(format_args!("okernel: PÂNICO: {info}"));
-    qemu_exit(QemuExit::Failure)
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    kpanic::handle(info)
 }

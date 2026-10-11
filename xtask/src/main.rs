@@ -4,7 +4,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -45,6 +46,21 @@ const BOOT_MARKERS: &[&str] = &[
 ];
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
 const KERNEL_EXIT_OK: i32 = 33;
+/// Status do QEMU quando o kernel sai com falha (0x11), como no pânico em teste.
+const KERNEL_EXIT_FAILURE: i32 = 35;
+/// Linha em que o pânico de `test=panic` espera o xtask capturar a tela.
+const PANIC_WAIT: &str = "okernel: pânico registrado; aguardando confirmação na serial";
+/// Textos que o cenário `test=panic` exige na serial (T-110).
+const PANIC_MARKERS: &[&str] = &[
+    "okernel: hello",
+    "okernel: PÂNICO em kernel/okernel/src/main.rs:",
+    ": pânico de teste proposital (test=panic)",
+    "okernel: tela de pânico desenhada",
+    PANIC_WAIT,
+    "okernel: confirmação recebida",
+];
+/// Cor de fundo da tela de pânico (`okernel::console::PANIC_BACKGROUND`).
+const PANIC_RGB: [u8; 3] = [0x80, 0x00, 0x00];
 /// Textos que o cenário `test=fault` exige: o dump legível do #UD.
 const FAULT_MARKERS: &[&str] = &[
     "okernel: hello",
@@ -351,6 +367,9 @@ struct Scenario {
     exit: Option<i32>,
     /// Confere e mostra o relatório do harness de testes de kernel (T-111).
     ktest: bool,
+    /// Captura a tela pelo monitor do QEMU quando o pânico pedir e confere
+    /// a tela de pânico (T-110).
+    screen: bool,
 }
 
 const SCENARIOS: &[Scenario] = &[
@@ -361,6 +380,7 @@ const SCENARIOS: &[Scenario] = &[
         forbidden: &["okernel: FALTA", "PÂNICO"],
         exit: Some(KERNEL_EXIT_OK),
         ktest: false,
+        screen: false,
     },
     Scenario {
         name: "falta proposital",
@@ -369,6 +389,16 @@ const SCENARIOS: &[Scenario] = &[
         forbidden: &["okernel: desligando"],
         exit: None,
         ktest: false,
+        screen: false,
+    },
+    Scenario {
+        name: "pânico proposital",
+        cmdline: "test=panic",
+        markers: PANIC_MARKERS,
+        forbidden: &["okernel: desligando", "okernel: FALTA"],
+        exit: Some(KERNEL_EXIT_FAILURE),
+        ktest: false,
+        screen: true,
     },
 ];
 
@@ -381,6 +411,7 @@ const KERNEL_SCENARIO: Scenario = Scenario {
     forbidden: &["ktest: FALHOU", "okernel: FALTA", "PÂNICO"],
     exit: Some(KERNEL_EXIT_OK),
     ktest: true,
+    screen: false,
 };
 /// Primeira linha do harness: `ktest: início, N testes`.
 const KTEST_START: &str = "ktest: início, ";
@@ -398,11 +429,24 @@ fn smoke(opts: &Options, scenarios: &[Scenario]) -> Result {
 
 fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
     let esp = image(opts, sc.cmdline)?;
-    let mut child = qemu(opts, &esp)?
-        .stdin(Stdio::null())
+    let monitor = root().join("target/qemu-monitor.sock");
+    let mut cmd = qemu(opts, &esp)?;
+    if sc.screen {
+        let _ = fs::remove_file(&monitor);
+        cmd.arg("-monitor")
+            .arg(format!("unix:{},server=on,wait=off", monitor.display()));
+    }
+    let stdin = if sc.screen {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    let mut child = cmd
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("falha ao iniciar o QEMU: {e}"))?;
+    let mut screen: Option<Result> = None;
     let mut stdout = child.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     let reader = thread::spawn(move || {
@@ -426,6 +470,14 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
         if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
             break Ok(st.code());
         }
+        if sc.screen && screen.is_none() && String::from_utf8_lossy(&raw).contains(PANIC_WAIT) {
+            let shot = check_panic_screen(&monitor);
+            // Qualquer byte na serial libera o kernel para sair.
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(b"\n").and_then(|()| stdin.flush());
+            }
+            screen = Some(shot);
+        }
         let frozen = sc.exit.is_none() && seen_all(&raw);
         if frozen || start.elapsed() > SMOKE_TIMEOUT {
             let _ = child.kill();
@@ -444,6 +496,11 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
             } else {
                 Ok(())
             }
+        })
+        .and_then(|()| match (sc.screen, screen) {
+            (false, _) => Ok(()),
+            (true, Some(shot)) => shot,
+            (true, None) => Err("a tela de pânico não foi capturada".into()),
         })
         .and_then(|()| match end {
             Ok(code) if code.is_some() && code == sc.exit => Ok(()),
@@ -469,6 +526,59 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result {
             sc.name
         )),
     }
+}
+
+/// Pede ao monitor do QEMU uma captura da tela e confere a tela de pânico:
+/// a maior parte no vermelho do fundo e algum texto branco.
+fn check_panic_screen(monitor: &Path) -> Result {
+    let shot = root().join("target/panic-screen.ppm");
+    let _ = fs::remove_file(&shot);
+    let mut sock = UnixStream::connect(monitor).map_err(|e| format!("monitor do QEMU: {e}"))?;
+    writeln!(sock, "screendump {}", shot.display()).map_err(|e| e.to_string())?;
+    let start = Instant::now();
+    loop {
+        if let Ok(bytes) = fs::read(&shot)
+            && let Some((width, height, pixels)) = parse_ppm(&bytes)
+        {
+            let count = |rgb: [u8; 3]| pixels.chunks(3).filter(|p| *p == rgb).count();
+            let (red, white) = (count(PANIC_RGB), count([0xff; 3]));
+            println!(
+                "xtask: tela de pânico {width}x{height}: {red} pixels de fundo, {white} de texto"
+            );
+            return if red * 2 > width * height && white > 500 {
+                Ok(())
+            } else {
+                Err("a captura não mostra a tela de pânico".into())
+            };
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            return Err("o QEMU não gravou a captura da tela".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Imagem PPM binária (P6, 8 bits) completa: largura, altura e pixels RGB.
+fn parse_ppm(bytes: &[u8]) -> Option<(usize, usize, &[u8])> {
+    let mut fields = Vec::new();
+    let mut at = 0;
+    while fields.len() < 4 {
+        while bytes.get(at)?.is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while !bytes.get(at)?.is_ascii_whitespace() {
+            at += 1;
+        }
+        fields.push(std::str::from_utf8(&bytes[start..at]).ok()?);
+    }
+    let [magic, width, height, max] = fields[..] else {
+        return None;
+    };
+    let (width, height): (usize, usize) = (width.parse().ok()?, height.parse().ok()?);
+    let pixels = bytes.get(at + 1..)?;
+    (magic == "P6" && max == "255" && pixels.len() == width * height * 3)
+        .then_some((width, height, pixels))
 }
 
 /// Confere o relatório do harness: ao menos um teste, todos anunciados
@@ -670,6 +780,16 @@ mod tests {
         assert!(check(&ok.replace("R-X", "RWX")).is_err());
         assert!(check(&ok.replace("optboot: seg", "x")).is_err());
         assert!(check(&format!("{ok}okernel: FALTA #GP\r\n")).is_err());
+    }
+
+    #[test]
+    fn le_ppm_completo() {
+        let mut ppm = b"P6\n2 1\n255\n".to_vec();
+        ppm.extend_from_slice(&[0x80, 0, 0, 0xff, 0xff, 0xff]);
+        let (w, h, px) = parse_ppm(&ppm).unwrap();
+        assert_eq!((w, h, px.len()), (2, 1, 6));
+        assert!(parse_ppm(&ppm[..ppm.len() - 1]).is_none());
+        assert!(parse_ppm(b"P3\n1 1\n255\nabc").is_none());
     }
 
     #[test]
