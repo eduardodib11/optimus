@@ -1,22 +1,27 @@
 //! `ostd`: biblioteca base dos processos de usuário do Optimus (SDD v1.0,
 //! seção 7.1).
 //!
-//! Por ora (T-211), o mínimo para um serviço rodar: a entrada do processo
-//! ([`entry!`] e [`rt`]), as syscalls cruas ([`sys`]) e invólucros seguros
-//! para depuração, threads e tempo, e o IPC síncrono ([`ipc`], T-208).
-//! Alocador, `Mutex`/`Condvar` sobre futex e clientes OIDL chegam com o
-//! T-212.
+//! Por ora (T-211, T-212), o mínimo para um serviço rodar e criar outro:
+//! a entrada do processo ([`entry!`] e [`rt`]), as syscalls cruas
+//! ([`sys`]), invólucros seguros para depuração, tempo, capabilities
+//! ([`cap`]), memória ([`vm`]), threads ([`thread`]) e o IPC síncrono com
+//! o buffer de IPC ([`ipc`], T-208). Alocador, `Mutex`/`Condvar` sobre
+//! futex e clientes OIDL ficam para depois.
 //!
-//! Só [`arch`] usa `unsafe` (a instrução `syscall` e o `_start`), como a
-//! seção 17.1 permite ao "ostd baixo nível"; o resto da crate o proíbe.
+//! Só [`arch`] usa `unsafe` (a instrução `syscall`, o `_start` e o acesso
+//! à memória que o processo mapeou), como a seção 17.1 permite ao "ostd
+//! baixo nível"; o resto da crate o proíbe.
 
 #![no_std]
 #![deny(unsafe_code)]
 
 pub mod arch;
+pub mod cap;
 pub mod ipc;
 pub mod rt;
 pub mod sys;
+pub mod thread;
+pub mod vm;
 
 /// Versão da biblioteca, exposta para diagnóstico.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -45,24 +50,40 @@ pub mod debug {
             rest = tail;
         }
     }
-}
 
-/// Threads.
-pub mod thread {
-    use kabi::Syscall;
+    /// Linha formatada sem alocar, até `kabi::DEBUG_PRINT_MAX` bytes (o
+    /// que passar é cortado).
+    struct Line {
+        buf: [u8; kabi::DEBUG_PRINT_MAX],
+        len: usize,
+    }
 
-    /// Termina a thread atual (`thread_exit`).
-    pub fn exit() -> ! {
-        let _ = crate::sys::syscall(Syscall::ThreadExit, [0; 6]);
-        // O kernel nunca volta de `thread_exit`.
-        loop {
-            core::hint::spin_loop();
+    impl core::fmt::Write for Line {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for c in s.chars() {
+                let mut tmp = [0; 4];
+                let bytes = c.encode_utf8(&mut tmp).as_bytes();
+                let Some(dst) = self.buf.get_mut(self.len..self.len + bytes.len()) else {
+                    return Err(core::fmt::Error);
+                };
+                dst.copy_from_slice(bytes);
+                self.len += bytes.len();
+            }
+            Ok(())
         }
     }
 
-    /// Cede a CPU (`yield`).
-    pub fn yield_now() {
-        let _ = crate::sys::syscall(Syscall::Yield, [0; 6]);
+    /// Como [`print`], com formatação (`format_args!`), numa linha só.
+    pub fn print_fmt(args: core::fmt::Arguments<'_>) {
+        let mut line = Line {
+            buf: [0; kabi::DEBUG_PRINT_MAX],
+            len: 0,
+        };
+        let _ = core::fmt::write(&mut line, args);
+        // `write_str` só copia caracteres inteiros.
+        if let Ok(text) = core::str::from_utf8(&line.buf[..line.len]) {
+            print(text);
+        }
     }
 }
 

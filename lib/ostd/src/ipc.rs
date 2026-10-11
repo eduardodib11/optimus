@@ -138,3 +138,46 @@ pub fn reply_recv(
 ) -> Result<Received, Error> {
     ipc(Syscall::IpcReplyRecv, recv_target(ep, reply), msg, deadline)
 }
+
+/// Endereço sugerido para o buffer de IPC da thread inicial de um processo
+/// (longe do executável em 2 MiB e da pilha no topo da metade de usuário).
+pub const DEFAULT_BUFFER_VA: u64 = 0x1000_0000;
+
+/// Buffer de IPC da thread: uma página do processo, mapeada no próprio
+/// espaço e registrada com `thread_configure` (seção 6.7). No `Drop`, o
+/// registro sai antes da página.
+#[derive(Debug)]
+pub struct Buffer {
+    map: crate::vm::Mapping,
+    thread: Handle,
+}
+
+impl Buffer {
+    /// Cria a página na cota `quota`, mapeia em `va` no espaço `aspace` e
+    /// a registra como buffer de IPC de `thread`.
+    ///
+    /// # Errors
+    ///
+    /// Os de `obj_create`, `vm_map` e `thread_configure`.
+    pub fn new(quota: Handle, aspace: Handle, thread: Handle, va: u64) -> Result<Self, Error> {
+        use kabi::vm::{PAGE_SIZE, WRITE};
+        let page = crate::cap::create(quota, kabi::ObjectType::MemoryObject, PAGE_SIZE)?;
+        let map = crate::vm::Mapping::new(aspace, page, va, PAGE_SIZE, WRITE);
+        // A região guarda o objeto; a capability não faz mais falta.
+        let _ = crate::cap::delete(page);
+        let map = map?;
+        crate::thread::set_ipc_buffer(thread, Some(va))?;
+        Ok(Self { map, thread })
+    }
+
+    /// O conteúdo: handles de capabilities e palavras longas.
+    pub fn get(&mut self) -> &mut kabi::ipc::IpcBuffer {
+        crate::arch::mem::ipc_buffer(&mut self.map)
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        let _ = crate::thread::set_ipc_buffer(self.thread, None);
+    }
+}
