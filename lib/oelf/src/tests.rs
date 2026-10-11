@@ -257,3 +257,29 @@ fn pie_recusa_dinamico_invalido() {
     two[at..at + 56].copy_from_slice(&copy);
     assert_eq!(Elf::parse(&two).unwrap_err(), Error::BadDynamic);
 }
+
+#[test]
+fn usuario_so_na_metade_baixa() {
+    let user = |vaddr: u64, memsz: u64| {
+        let p = load(R | X, 0x1000, vaddr, 0x10, memsz);
+        Elf::parse_user(&build(vaddr, &[p], 0x2000)).map(drop)
+    };
+    assert_eq!(user(0x20_0000, 0x10), Ok(()));
+    assert_eq!(user(BASE, 0x10), Err(Error::NotUserHalf));
+    assert_eq!(user(0x1000, 0x10), Err(Error::NotUserHalf));
+    assert_eq!(user(USER_END - 0x1000, 0x2000), Err(Error::NotUserHalf));
+    // O kernel continua recusando a metade baixa, e o usuário, o kernel.
+    assert_eq!(
+        Elf::parse(&build(
+            0x20_0000,
+            &[load(R | X, 0x1000, 0x20_0000, 0x10, 0x10)],
+            0x2000
+        ))
+        .map(drop),
+        Err(Error::NotHigherHalf)
+    );
+    assert_eq!(
+        Elf::parse_user(&kernel()).map(drop),
+        Err(Error::NotUserHalf)
+    );
+}

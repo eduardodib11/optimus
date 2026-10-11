@@ -6,6 +6,8 @@
 //!
 //! Aceita `ET_EXEC` e, para KASLR, `ET_DYN` (PIE estático) cujas únicas
 //! relocações são `R_X86_64_RELATIVE` em `.rela.dyn` ([`Elf::relocations`]).
+//! [`Elf::parse`] exige segmentos na metade alta (o kernel);
+//! [`Elf::parse_user`], na faixa de usuário (processos, T-211).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -16,6 +18,10 @@ use core::fmt;
 pub const PAGE_SIZE: u64 = 4096;
 /// Primeiro endereço canônico da metade alta (x86-64, 48 bits).
 pub const HIGHER_HALF: u64 = 0xffff_8000_0000_0000;
+/// Primeiro endereço de usuário mapeável (`kabi::vm::USER_START`).
+pub const USER_START: u64 = 0x0001_0000;
+/// Fim (exclusivo) da metade baixa canônica (`kabi::vm::USER_END`).
+pub const USER_END: u64 = 0x0000_8000_0000_0000;
 /// Limite de program headers aceitos; barra arquivos que pedem trabalho demais.
 pub const MAX_PHDRS: usize = 64;
 
@@ -66,6 +72,8 @@ pub enum Error {
     BadAlignment,
     /// Segmento fora da metade alta canônica.
     NotHigherHalf,
+    /// Segmento fora da faixa de usuário (`USER_START..USER_END`).
+    NotUserHalf,
     /// Aritmética de endereço transbordaria.
     Overflow,
     /// Segmentos fora de ordem ou dividindo uma página.
@@ -149,6 +157,8 @@ pub struct Elf<'a> {
     phoff: usize,
     phnum: usize,
     pie: bool,
+    /// Segmentos na faixa de usuário em vez da metade alta.
+    user: bool,
     /// Offset no arquivo e quantidade das relocações de `.rela.dyn`.
     rela: (usize, usize),
 }
@@ -200,7 +210,7 @@ fn pages(p: &Phdr) -> Result<(u64, u64), Error> {
     Ok((p.vaddr & !(PAGE_SIZE - 1), end))
 }
 
-fn check_segment<'a>(d: &'a [u8], p: &Phdr) -> Result<&'a [u8], Error> {
+fn check_segment<'a>(d: &'a [u8], p: &Phdr, user: bool) -> Result<&'a [u8], Error> {
     let flags = Flags(p.flags);
     if flags.writable() && flags.executable() {
         return Err(Error::WriteExecute);
@@ -216,10 +226,13 @@ fn check_segment<'a>(d: &'a [u8], p: &Phdr) -> Result<&'a [u8], Error> {
     {
         return Err(Error::BadAlignment);
     }
-    if p.vaddr < HIGHER_HALF {
+    let (_, end) = pages(p)?;
+    if user && (p.vaddr < USER_START || end > USER_END) {
+        return Err(Error::NotUserHalf);
+    }
+    if !user && p.vaddr < HIGHER_HALF {
         return Err(Error::NotHigherHalf);
     }
-    pages(p)?;
     Ok(bytes)
 }
 
@@ -230,6 +243,20 @@ impl<'a> Elf<'a> {
     ///
     /// Devolve o primeiro problema encontrado; veja [`Error`].
     pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_in(data, false)
+    }
+
+    /// Como [`Elf::parse`], para um executável de usuário: todo segmento
+    /// fica em `USER_START..USER_END`.
+    ///
+    /// # Errors
+    ///
+    /// Devolve o primeiro problema encontrado; veja [`Error`].
+    pub fn parse_user(data: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_in(data, true)
+    }
+
+    fn parse_in(data: &'a [u8], user: bool) -> Result<Self, Error> {
         let ident = data.get(..EHDR_SIZE).ok_or(Error::Truncated)?;
         if ident[..4] != *b"\x7fELF" {
             return Err(Error::BadMagic);
@@ -271,6 +298,7 @@ impl<'a> Elf<'a> {
             phoff,
             phnum,
             pie,
+            user,
             rela: (0, 0),
         };
         elf.validate()?;
@@ -366,7 +394,7 @@ impl<'a> Elf<'a> {
         let mut entry_ok = false;
         let mut any = false;
         for p in self.loads() {
-            check_segment(self.data, &p)?;
+            check_segment(self.data, &p, self.user)?;
             let (start, end) = pages(&p)?;
             if start < prev_end {
                 return Err(Error::Overlap);
@@ -410,7 +438,7 @@ impl<'a> Elf<'a> {
                 vaddr: p.vaddr,
                 memsz: p.memsz,
                 flags: Flags(p.flags),
-                data: check_segment(self.data, &p).ok()?,
+                data: check_segment(self.data, &p, self.user).ok()?,
             })
         })
     }
