@@ -10,5 +10,8 @@ name = "optboot"
 test = false
 bench = false
 
+[dependencies]
+oelf = { path = "../../lib/oelf" }
+
 [lints]
 workspace = true
