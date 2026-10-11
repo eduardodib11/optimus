@@ -4,6 +4,8 @@
 //! ELF64 com `oelf` e copia cada segmento para páginas físicas próprias.
 //! T-102: monta a `BootInfo` v1 (`kabi::boot`) com mapa de memória, GOP, RSDP
 //! e semente aleatória ([`firmware`]).
+//! T-211: lê o bootfs (`\EFI\optimus\bootfs.obfs`), valida a imagem OBFS,
+//! confere o BLAKE3 de cada entrada e o entrega em `BootInfo.bootfs`.
 //! T-103: aplica KASLR ao kernel PIE ([`kernel`]), monta as tabelas de página
 //! iniciais ([`paging`]), chama `ExitBootServices` e salta para
 //! `kernel_entry(&BootInfo)` com interrupções desligadas.
@@ -25,10 +27,10 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr::{self, null_mut};
 
-use kabi::boot::{BootInfo, CMDLINE_MAX, DIRECT_MAP_BASE, MemKind, MemRegion};
+use kabi::boot::{BootInfo, CMDLINE_MAX, DIRECT_MAP_BASE, MemKind, MemRegion, PhysRange};
 
 use arch::x86_64::{disable_interrupts, enter_kernel, rdtsc};
-use firmware::{Entropy, KERNEL_MEMORY, RawMap};
+use firmware::{BOOTFS_MEMORY, Entropy, KERNEL_MEMORY, RawMap};
 use paging::{PageTables, STACK_BASE, STACK_BYTES, STACK_SIZE, Table};
 
 type Status = usize;
@@ -179,6 +181,12 @@ const FILE_MODE_READ: u64 = 1;
 const KERNEL_PATH: &str = "\\EFI\\optimus\\okernel.elf";
 /// Teto do arquivo do kernel, contra ESPs com arquivos absurdos.
 const MAX_KERNEL_SIZE: u64 = 64 << 20;
+// TODO(boot A/B): assinatura híbrida do bootfs (SDD 5.1, passo 3).
+const BOOTFS_PATH: &str = "\\EFI\\optimus\\bootfs.obfs";
+/// Teto do bootfs.
+const MAX_BOOTFS_SIZE: u64 = 256 << 20;
+/// `EFI_NOT_FOUND`.
+const NOT_FOUND: Status = (1 << (usize::BITS - 1)) | 0xe;
 /// Linha de comando do kernel (opcional), texto UTF-8 de até 1 KiB.
 const CMDLINE_PATH: &str = "\\EFI\\optimus\\cmdline.txt";
 
@@ -192,6 +200,10 @@ enum Error {
     Elf(oelf::Error),
     /// Faltou tabela de página reservada ou houve mapeamento duplicado.
     Paging,
+    /// O bootfs foi recusado.
+    Bootfs(obfs::Error),
+    /// O BLAKE3 de uma entrada do bootfs não confere.
+    BootfsHash(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -201,6 +213,8 @@ impl fmt::Display for Error {
             Self::BadSize(size) => write!(f, "tamanho inválido {size:#x}"),
             Self::Elf(e) => write!(f, "ELF inválido: {e:?}"),
             Self::Paging => f.write_str("erro ao montar as tabelas de página"),
+            Self::Bootfs(e) => write!(f, "bootfs inválido: {e:?}"),
+            Self::BootfsHash(name) => write!(f, "bootfs: hash de \"{name}\" não confere"),
         }
     }
 }
@@ -244,12 +258,14 @@ impl Console<'_> {
 }
 
 /// Lê um arquivo inteiro e não vazio de até `max` bytes da ESP para um
-/// buffer de pool que nunca é liberado.
+/// buffer que nunca é liberado: de pool ou, com `pages`, em páginas
+/// alinhadas a 4 KiB desse tipo de memória.
 fn read_file(
     bs: &BootServices,
     image: Handle,
     name: &str,
     max: u64,
+    pages: Option<u32>,
 ) -> Result<&'static [u8], Error> {
     let mut path = [0u16; 32];
     for (dst, unit) in path.iter_mut().zip(name.encode_utf16()) {
@@ -287,11 +303,17 @@ fn read_file(
         .ok()
         .filter(|&n| n > 0 && size <= max)
         .ok_or(Error::BadSize(size))?;
-    let mut buf = null_mut();
-    // SAFETY: AllocatePool só escreve o ponteiro devolvido em `buf`.
-    efi("AllocatePool", unsafe {
-        (bs.allocate_pool)(LOADER_DATA, len, &raw mut buf)
-    })?;
+    let buf: *mut u8 = if let Some(kind) = pages {
+        // SAFETY: zero é um byte válido.
+        unsafe { alloc_zeroed::<u8>(bs, kind, len) }?.as_mut_ptr()
+    } else {
+        let mut buf = null_mut();
+        // SAFETY: AllocatePool só escreve o ponteiro devolvido em `buf`.
+        efi("AllocatePool", unsafe {
+            (bs.allocate_pool)(LOADER_DATA, len, &raw mut buf)
+        })?;
+        buf
+    };
     let mut done = 0;
     while done < len {
         let mut chunk = len - done;
@@ -375,6 +397,39 @@ fn gather(
     Ok(info)
 }
 
+/// Lê o bootfs para páginas próprias (tipo [`BOOTFS_MEMORY`]), valida a
+/// imagem e confere o BLAKE3 de cada entrada. Sem arquivo, segue com o
+/// bootfs vazio; imagem inválida ou adulterada impede o boot.
+fn load_bootfs(out: &mut Console, bs: &BootServices, image: Handle) -> Result<PhysRange, Error> {
+    let bytes = match read_file(bs, image, BOOTFS_PATH, MAX_BOOTFS_SIZE, Some(BOOTFS_MEMORY)) {
+        Err(Error::Efi("Open", NOT_FOUND)) => {
+            let _ = out.write_str("optboot: AVISO: sem bootfs\r\n");
+            return Ok(PhysRange::default());
+        }
+        other => other?,
+    };
+    let fs = obfs::Image::parse(bytes).map_err(Error::Bootfs)?;
+    fs.verify().map_err(|(_, name)| Error::BootfsHash(name))?;
+    for e in fs.entries() {
+        let _ = write!(
+            out,
+            "optboot: bootfs: {} ({} bytes)\r\n",
+            e.name,
+            e.data.len()
+        );
+    }
+    let base = bytes.as_ptr().addr() as u64;
+    let _ = write!(
+        out,
+        "optboot: bootfs com {} entradas verificadas (BLAKE3) em {base:#x}\r\n",
+        fs.len()
+    );
+    Ok(PhysRange {
+        base,
+        len: bytes.len() as u64,
+    })
+}
+
 /// Imprime o resumo do mapa de memória normalizado.
 fn summarize(out: &mut Console, map: &[MemRegion]) {
     let total = |kind| -> u64 { map.iter().filter(|r| r.kind() == kind).map(|r| r.len).sum() };
@@ -425,14 +480,15 @@ fn boot(
     st: &SystemTable,
     image: Handle,
 ) -> Result<Infallible, Error> {
-    let file = read_file(bs, image, KERNEL_PATH, MAX_KERNEL_SIZE)?;
+    let file = read_file(bs, image, KERNEL_PATH, MAX_KERNEL_SIZE, None)?;
     let kernel = kernel::load(out, bs, file)?;
     let entry = kernel.entry();
     let _ = write!(out, "optboot: kernel carregado, entrada {entry:#x}\r\n");
     let info = gather(out, bs, st)?;
     info.kaslr_slide = kernel.slide;
     // Arquivo ausente, vazio ou inválido vale como linha de comando vazia.
-    let cmdline = read_file(bs, image, CMDLINE_PATH, CMDLINE_MAX as u64)
+    info.bootfs = load_bootfs(out, bs, image)?;
+    let cmdline = read_file(bs, image, CMDLINE_PATH, CMDLINE_MAX as u64, None)
         .ok()
         .and_then(|bytes| core::str::from_utf8(bytes).ok())
         .unwrap_or("");

@@ -41,6 +41,7 @@ const BOOT_MARKERS: &[&str] = &[
     "optboot: kernel carregado",
     "optboot: mapa de memória",
     "optboot: KASLR",
+    "entradas verificadas (BLAKE3)",
     "saindo dos serviços de boot",
     "okernel: hello",
     "okernel: GDT, TSS e IDT carregadas",
@@ -838,6 +839,7 @@ mod tests {
                   optboot: kernel carregado, entrada 0xffffffff80000000\r\n\
                   optboot: mapa de memória: 24 regiões, 517896 KiB usáveis\r\n\
                   optboot: KASLR: deslocamento 0x200000\r\n\
+                  optboot: bootfs com 1 entradas verificadas (BLAKE3) em 0x1000\r\n\
                   optboot: tabelas de página prontas; saindo dos serviços de boot\r\n\
                   info  okernel: hello\r\n\
                   info  okernel: GDT, TSS e IDT carregadas\r\n\

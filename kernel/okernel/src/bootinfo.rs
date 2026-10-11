@@ -39,11 +39,16 @@ pub fn memory_map(info: &BootInfo) -> Option<&'static [MemRegion]> {
 }
 
 /// Fim da faixa física coberta pelo mapa direto, pela mesma regra do
-/// optboot: toda a RAM e ACPI e ao menos 4 GiB, arredondado para 1 GiB.
+/// optboot: toda a RAM, ACPI e bootfs e ao menos 4 GiB, arredondado para 1 GiB.
 pub fn direct_map_limit(map: &[MemRegion]) -> u64 {
     let ram = map
         .iter()
-        .filter(|r| matches!(r.kind(), MemKind::Usable | MemKind::Acpi | MemKind::Kernel))
+        .filter(|r| {
+            matches!(
+                r.kind(),
+                MemKind::Usable | MemKind::Acpi | MemKind::Kernel | MemKind::Bootfs
+            )
+        })
         .map(MemRegion::end)
         .max()
         .unwrap_or(0);

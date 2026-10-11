@@ -38,13 +38,18 @@ pub const STACK_SIZE: u64 = STACK_BYTES as u64;
 #[repr(C, align(4096))]
 pub struct Table([u64; ENTRIES]);
 
-/// Fim da faixa física mapeada em identidade e no mapa direto: toda a RAM e
-/// ACPI do mapa, e ao menos os 4 GiB baixos (onde ficam o framebuffer, o
+/// Fim da faixa física mapeada em identidade e no mapa direto: toda a RAM, ACPI e
+/// bootfs do mapa, e ao menos os 4 GiB baixos (onde ficam o framebuffer, o
 /// APIC e o IOAPIC), arredondado para 1 GiB.
 pub fn identity_limit(map: &[MemRegion]) -> u64 {
     let ram = map
         .iter()
-        .filter(|r| matches!(r.kind(), MemKind::Usable | MemKind::Acpi | MemKind::Kernel))
+        .filter(|r| {
+            matches!(
+                r.kind(),
+                MemKind::Usable | MemKind::Acpi | MemKind::Kernel | MemKind::Bootfs
+            )
+        })
         .map(MemRegion::end)
         .max()
         .unwrap_or(0);
