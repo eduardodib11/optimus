@@ -1,6 +1,6 @@
 # ADR 0028: Árvore de derivação entre CapSpaces
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-11)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.2 e 6.9
 - Relaciona-se com: ADR 0001, ADR 0007, T-204, T-208
@@ -79,6 +79,6 @@ toca duas tabelas.
 - Marcadores de capabilities apagadas ocupam slots até os descendentes
   remotos sumirem; um descendente num `CapSpace` que morreu sem ser apagado
   deixa o marcador até o dono revogar o ancestral ou morrer.
-- A spec `CapRevoke.tla` precisa ganhar a transferência entre tabelas e os
-  marcadores (pendente).
+- A spec `CapRevoke.tla` modela a transferência entre tabelas, os marcadores
+  e a revogação através dos CapSpaces.
 - A seção 6.9 do SDD ganha a trava `CDT` na próxima revisão.
