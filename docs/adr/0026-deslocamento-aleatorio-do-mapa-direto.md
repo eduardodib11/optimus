@@ -1,6 +1,6 @@
 # ADR 0026: Deslocamento aleatório do mapa direto na BootInfo
 
-- Status: proposta
+- Status: aceita (aprovada por Eduardo em 2026-10-11)
 - Data: 2026-10-10
 - Origem: SDD v1.0, seções 5.2, 6.4 e 6.5
 - Relaciona-se com: ADR 0005 (optboot), T-103, T-107

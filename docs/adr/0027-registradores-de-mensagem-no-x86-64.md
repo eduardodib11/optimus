@@ -1,6 +1,6 @@
 # ADR 0027: Registradores das syscalls de IPC no x86-64
 
-- Status: proposta
+- Status: aceita (aprovada por Eduardo em 2026-10-11)
 - Data: 2026-10-10
 - Origem: SDD v1.0, seções 6.7 e 14.1
 - Relaciona-se com: ADR 0007 (IPC), T-201, T-208
