@@ -13,6 +13,7 @@ pub mod cap;
 pub mod console;
 pub mod log;
 pub mod mm;
+pub mod notify;
 pub mod platform;
 pub mod sched;
 pub mod sync;

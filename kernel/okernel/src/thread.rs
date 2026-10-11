@@ -40,6 +40,8 @@ pub enum RunState {
     Throttled = 3,
     /// Terminou com `thread_exit`; não roda mais.
     Exited = 4,
+    /// Esperando numa `Notification` ou num futex (T-209), fora da fila.
+    Blocked = 5,
 }
 
 impl RunState {
@@ -49,6 +51,7 @@ impl RunState {
             2 => Self::Running,
             3 => Self::Throttled,
             4 => Self::Exited,
+            5 => Self::Blocked,
             _ => Self::Inactive,
         }
     }
@@ -83,6 +86,9 @@ pub struct Thread {
     /// PML4 do espaço da thread (zero sem espaço).
     root: AtomicU64,
     state: AtomicU8,
+    /// Valor entregue a quem acorda a thread bloqueada (os bits da
+    /// notificação, T-209).
+    wake_value: AtomicU64,
     /// Área de FPU; só o código de troca de contexto a acessa, pelo
     /// endereço exposto em `fpu_addr`.
     fpu: Vec<Block>,
@@ -127,6 +133,7 @@ impl Thread {
             saved_rsp: AtomicU64::new(0),
             root: AtomicU64::new(0),
             state: AtomicU8::new(RunState::Inactive as u8),
+            wake_value: AtomicU64::new(0),
             fpu,
             fpu_addr,
             binding: SpinLock::new(Binding::default()),
@@ -182,6 +189,17 @@ impl Thread {
         self.charge.bytes()
     }
 
+    /// Guarda o valor que a thread recebe ao acordar.
+    pub fn set_wake_value(&self, value: u64) {
+        self.wake_value.store(value, Ordering::Release);
+    }
+
+    /// O valor entregue no último despertar.
+    #[must_use]
+    pub fn wake_value(&self) -> u64 {
+        self.wake_value.load(Ordering::Acquire)
+    }
+
     /// `thread_configure`: liga a thread a um `CapSpace` e a um
     /// `AddressSpace`. Só antes de `thread_start`.
     ///
@@ -225,6 +243,12 @@ impl Thread {
     #[must_use]
     pub fn sched_context(&self) -> Option<Arc<SchedContext>> {
         self.sched.lock().clone()
+    }
+
+    /// O `AddressSpace` da thread, se configurada.
+    #[must_use]
+    pub fn aspace(&self) -> Option<Arc<SharedAddressSpace>> {
+        self.binding.lock().aspace.clone()
     }
 
     /// O `CapSpace` da thread, se configurada.
