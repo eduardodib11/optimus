@@ -1,0 +1,12 @@
+[package]
+name = "kabi"
+description = "ABI do okernel: syscalls, erros, direitos, handles e layout de mensagem."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+bench = false
+
+[lints]
+workspace = true

@@ -20,6 +20,7 @@ const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 /// Crates do sistema e o alvo de cada uma.
 const CRATES: &[(&str, &str, &str)] = &[
     ("optboot", "boot/optboot/src/main.rs", UEFI_TARGET),
+    ("kabi", "kernel/kabi/src/lib.rs", KERNEL_TARGET),
     ("okernel", "kernel/okernel/src/main.rs", KERNEL_TARGET),
     ("oelf", "lib/oelf/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
@@ -27,8 +28,10 @@ const CRATES: &[(&str, &str, &str)] = &[
 
 const PROFILES: &[&str] = &["lite", "basic", "jarvis", "premium", "server"];
 
-/// Texto que o smoke test procura na serial.
-const BOOT_MARKER: &str = "optboot";
+/// Textos que o smoke test exige na serial.
+const BOOT_MARKERS: &[&str] = &["optboot", "optboot: kernel carregado"];
+/// Prefixo das linhas em que o `optboot` descreve cada segmento carregado.
+const SEGMENT_PREFIX: &str = "optboot: seg ";
 const SMOKE_TIMEOUT: Duration = Duration::from_mins(1);
 
 type Result<T = ()> = std::result::Result<T, String>;
@@ -163,9 +166,24 @@ fn build(opts: &Options) -> Result {
         if opts.release {
             cmd.arg("--release");
         }
+        // Vale para a crate e suas dependências (lib e bin do kernel, `kabi`), e cada
+        // pacote é compilado numa invocação própria, então não vaza para o `ostd`.
+        let flags = rustc_flags(package);
+        if !flags.is_empty() {
+            cmd.env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f"));
+        }
         status(&mut cmd)?;
     }
     Ok(())
+}
+
+/// Flags de `rustc` só para a crate final, no lugar do que o alvo próprio
+/// definiria (ADR 0025): o kernel vive nos 2 GiB do topo e é `ET_EXEC`.
+fn rustc_flags(package: &str) -> &'static [&'static str] {
+    match package {
+        "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=static"],
+        _ => &[],
+    }
 }
 
 /// Monta a ESP em `target/esp`, que o QEMU expõe como disco FAT virtual.
@@ -176,6 +194,13 @@ fn image(opts: &Options) -> Result<PathBuf> {
     let efi = root().join(format!("target/{UEFI_TARGET}/{}/optboot.efi", mode(opts)));
     fs::copy(&efi, boot.join("BOOTX64.EFI"))
         .map_err(|e| format!("copiando {}: {e}", efi.display()))?;
+    // TODO(boot A/B): slots em \EFI\optimus\slot-{a,b}\ e assinaturas híbridas
+    // do kernel (SDD 5.1, passos 2 e 3), em tarefa posterior ao backlog M0-M2.
+    let optimus = esp.join("EFI/optimus");
+    fs::create_dir_all(&optimus).map_err(|e| format!("criando {}: {e}", optimus.display()))?;
+    let kernel = root().join(format!("target/{KERNEL_TARGET}/{}/okernel", mode(opts)));
+    fs::copy(&kernel, optimus.join("okernel.elf"))
+        .map_err(|e| format!("copiando {}: {e}", kernel.display()))?;
     println!("xtask: ESP pronta em {}", esp.display());
     Ok(esp)
 }
@@ -260,7 +285,7 @@ fn run(opts: &Options) -> Result {
     status(&mut qemu(opts, &esp)?)
 }
 
-/// Dá boot no QEMU sem interação e exige ver `BOOT_MARKER` na serial.
+/// Dá boot no QEMU sem interação e confere a serial com [`check_serial`].
 fn smoke(opts: &Options) -> Result {
     build(opts)?;
     let esp = image(opts)?;
@@ -285,12 +310,32 @@ fn smoke(opts: &Options) -> Result {
         thread::sleep(Duration::from_millis(100));
     }
     let serial = reader.join().unwrap_or_default();
-    if serial.contains(BOOT_MARKER) {
-        println!("xtask: smoke test de boot ok");
-        Ok(())
-    } else {
-        Err(format!("smoke test de boot falhou; serial:\n{serial}"))
+    match check_serial(&serial) {
+        Ok(()) => {
+            println!("xtask: smoke test de boot ok");
+            Ok(())
+        }
+        Err(e) => Err(format!("smoke test de boot falhou: {e}; serial:\n{serial}")),
     }
+}
+
+/// Exige os `BOOT_MARKERS`, ao menos um segmento e nenhum segmento W+X.
+fn check_serial(serial: &str) -> Result {
+    if let Some(missing) = BOOT_MARKERS.iter().find(|m| !serial.contains(*m)) {
+        return Err(format!("faltou \"{missing}\""));
+    }
+    let mut segments = 0;
+    for line in serial.lines().filter(|l| l.contains(SEGMENT_PREFIX)) {
+        let perms = line.split_whitespace().last().unwrap_or_default();
+        if perms.contains('W') && perms.contains('X') {
+            return Err(format!("segmento W+X: {}", line.trim()));
+        }
+        segments += 1;
+    }
+    if segments == 0 {
+        return Err("nenhum segmento do kernel carregado".into());
+    }
+    Ok(())
 }
 
 fn test(opts: &Options) -> Result {
@@ -410,6 +455,18 @@ mod tests {
         assert!(parse(&args(&["--profile", "turbo"])).is_err());
         assert!(parse(&args(&["--arch", "aarch64"])).is_err());
         assert!(parse(&args(&["--smp"])).is_err());
+    }
+
+    #[test]
+    fn serial_exige_kernel_carregado_e_w_xor_x() {
+        let ok = "Optimus OS \u{2014} optboot\r\n\
+                  optboot: seg 0xffffffff80000000 -> 0x1000 0xcc R-X\r\n\
+                  optboot: seg 0xffffffff80002000 -> 0x2000 0x8 RW-\r\n\
+                  optboot: kernel carregado, entrada 0xffffffff80000000\r\n";
+        assert_eq!(check_serial(ok), Ok(()));
+        assert!(check_serial("Optimus OS \u{2014} optboot\r\n").is_err());
+        assert!(check_serial(&ok.replace("R-X", "RWX")).is_err());
+        assert!(check_serial(&ok.replace("optboot: seg", "x")).is_err());
     }
 
     #[test]
