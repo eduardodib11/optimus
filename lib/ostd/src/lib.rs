@@ -3,8 +3,9 @@
 //!
 //! Por ora (T-211), o mínimo para um serviço rodar: a entrada do processo
 //! ([`entry!`] e [`rt`]), as syscalls cruas ([`sys`]) e invólucros seguros
-//! para depuração, threads e tempo. Alocador, `Mutex`/`Condvar` sobre
-//! futex, IPC e clientes OIDL chegam com o T-212.
+//! para depuração, threads e tempo, e o IPC síncrono ([`ipc`], T-208).
+//! Alocador, `Mutex`/`Condvar` sobre futex e clientes OIDL chegam com o
+//! T-212.
 //!
 //! Só [`arch`] usa `unsafe` (a instrução `syscall` e o `_start`), como a
 //! seção 17.1 permite ao "ostd baixo nível"; o resto da crate o proíbe.
@@ -13,6 +14,7 @@
 #![deny(unsafe_code)]
 
 pub mod arch;
+pub mod ipc;
 pub mod rt;
 pub mod sys;
 

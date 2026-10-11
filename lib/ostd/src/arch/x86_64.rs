@@ -1,4 +1,4 @@
-//! x86-64: `syscall` e `_start`.
+//! x86-64: `syscall`, a syscall de IPC e `_start`.
 
 use core::arch::{asm, global_asm};
 
@@ -57,4 +57,38 @@ pub fn syscall(nr: u64, args: [u64; 6]) -> (u64, [u64; 3]) {
         );
     }
     (status, [v0, v1, v2])
+}
+
+/// Syscall de IPC `nr` com os registradores da ADR 0027: `regs` vai para
+/// `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`, `r12`–`r15`; devolve o status
+/// (`rax`) e `rdi`, `rsi`, `rdx`, `r8`, `r9`, `r12`–`r15`.
+#[must_use]
+pub fn ipc(nr: u64, regs: [u64; 10]) -> (u64, [u64; 9]) {
+    let [rdi, rsi, rdx, r10, r8, r9, r12, r13, r14, r15] = regs;
+    let mut out = [0u64; 9];
+    let status;
+    // SAFETY: `syscall` entra no kernel, que pode ler e gravar o buffer de
+    // IPC da thread (por isso sem `nomem`) e volta com `rcx` e `r11`
+    // destruídos, `r10` indefinido e o resultado nos demais registradores
+    // declarados; os outros são preservados.
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") nr => status,
+            inlateout("rdi") rdi => out[0],
+            inlateout("rsi") rsi => out[1],
+            inlateout("rdx") rdx => out[2],
+            inlateout("r10") r10 => _,
+            inlateout("r8") r8 => out[3],
+            inlateout("r9") r9 => out[4],
+            inlateout("r12") r12 => out[5],
+            inlateout("r13") r13 => out[6],
+            inlateout("r14") r14 => out[7],
+            inlateout("r15") r15 => out[8],
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    (status, out)
 }

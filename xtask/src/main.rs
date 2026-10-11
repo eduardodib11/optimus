@@ -54,6 +54,7 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: relógio: TSC de",
     "okernel: root carregado do bootfs",
     "root: iniciado",
+    "root: IPC sem par: TimedOut e WouldBlock",
     "okernel: root terminou",
 ];
 /// Linha em que o kernel diz onde ficou o mapa direto (ADR 0026).
@@ -898,6 +899,7 @@ mod tests {
                   info  okernel: relógio: TSC de 2100000 kHz\r\n\
                   info  okernel: root carregado do bootfs (856 KiB), iniciando no anel 3\r\n\
                   info  root: iniciado\r\n\
+                  info  root: IPC sem par: TimedOut e WouldBlock\r\n\
                   info  okernel: root terminou\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
