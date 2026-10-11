@@ -17,7 +17,10 @@
 //! Os slots livres formam uma lista encadeada por índice: alocar e liberar
 //! custam O(1), sem varrer a folha.
 //!
-//! A árvore de derivação e a revogação fatiada (T-204) ficam em [`cdt`].
+//! A árvore de derivação e a revogação fatiada (T-204) ficam em [`cdt`];
+//! os elos com slots de outros `CapSpace`s (cópias transferidas por IPC,
+//! ADR 0028), em [`xlink`], e as operações que os atravessam, em
+//! [`crate::cap::xcdt`].
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -32,7 +35,9 @@ use super::quota::{Charge, MemoryQuota};
 use crate::sync::SpinLock;
 
 pub mod cdt;
-pub use cdt::{MAX_DERIVATION_DEPTH, Revoke};
+pub mod xlink;
+pub use cdt::{MAX_DERIVATION_DEPTH, Revoke, Walk};
+pub use xlink::XRef;
 
 /// Fim de lista.
 const NIL: u32 = u32::MAX;
@@ -93,6 +98,9 @@ struct Slot<O> {
     /// Próximo irmão; num slot livre, o próximo da lista livre.
     next: u32,
     prev: u32,
+    /// Marcador (ADR 0028): capability apagada que ainda tem descendentes
+    /// remotos; sem `cap`, mas ocupa o slot e segue na árvore.
+    tomb: bool,
 }
 
 impl<O> Slot<O> {
@@ -104,6 +112,7 @@ impl<O> Slot<O> {
             first_child: NIL,
             next: NIL,
             prev: NIL,
+            tomb: false,
         }
     }
 }
@@ -121,6 +130,8 @@ pub struct CapSpace<const N: usize = CAPSPACE_SLOTS_PER_LEVEL, O: CapObject = Ob
     live: u32,
     /// Slot cuja revogação está em andamento.
     revoking: Option<u32>,
+    /// Elos remotos, por índice de slot crescente (ADR 0028).
+    xlinks: Vec<xlink::XLinks<N, O>>,
 }
 
 impl<const N: usize, O: CapObject> CapSpace<N, O> {
@@ -149,6 +160,7 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
             free: NIL,
             live: 0,
             revoking: None,
+            xlinks: Vec::new(),
         })
     }
 
@@ -238,11 +250,16 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
     }
 
     /// Esvazia o slot (já fora da árvore), avança a geração e o devolve à
-    /// lista livre (ou o aposenta). Devolve a capability que estava nele.
+    /// lista livre (ou o aposenta). Devolve a capability que estava nele
+    /// (nenhuma num marcador).
     fn release(&mut self, index: u32) -> Option<Cap<O>> {
         let free = self.free;
         let slot = self.slot_mut(index);
-        let cap = slot.cap.take()?;
+        let tomb = core::mem::take(&mut slot.tomb);
+        let cap = slot.cap.take();
+        if cap.is_none() && !tomb {
+            return None;
+        }
         let generation = slot.generation + 1;
         let retired = generation == RETIRED_GENERATION;
         *slot = Slot {
@@ -253,8 +270,10 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
         if !retired {
             self.free = index;
         }
-        self.live -= 1;
-        Some(cap)
+        if cap.is_some() {
+            self.live -= 1;
+        }
+        cap
     }
 
     /// Guarda uma capability sem pai (a de `obj_create` ou uma inicial).
@@ -338,13 +357,17 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
     /// filhos sobem para o avô (ou viram raízes); os direitos deles seguem
     /// contidos nos do novo pai, por transitividade.
     ///
+    /// Só para capabilities sem elos remotos; as outras passam por
+    /// [`crate::cap::xcdt::delete`].
+    ///
     /// # Errors
     ///
     /// [`Error::InvalidHandle`] como em [`get`](Self::get); [`Error::Busy`]
-    /// se `h` for o alvo de uma revogação em andamento.
+    /// se `h` for o alvo de uma revogação em andamento ou tiver elos
+    /// remotos.
     pub fn delete(&mut self, h: Handle) -> Result<Cap<O>, Error> {
         let index = self.index_of(h)?;
-        if self.revoking == Some(index) {
+        if self.revoking == Some(index) || self.has_xlinks(index) {
             return Err(Error::Busy);
         }
         self.unlink_lifting_children(index);

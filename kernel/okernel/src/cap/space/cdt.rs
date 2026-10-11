@@ -18,10 +18,25 @@
 
 use kabi::{Error, Handle};
 
-use super::{CapObject, CapSpace, NIL};
+use super::{CapObject, CapSpace, NIL, XRef};
 
 /// Maior profundidade de uma capability na árvore (raiz = 0).
 pub const MAX_DERIVATION_DEPTH: u32 = 64;
+
+/// Onde parou a parte local de uma fatia de revogação entre tabelas
+/// ([`CapSpace::revoke_walk`]).
+#[derive(Debug)]
+pub enum Walk<const N: usize, O: CapObject> {
+    /// Chegou ao alvo sem descendentes: a revogação acabou.
+    Done,
+    /// O orçamento acabou.
+    Continue,
+    /// O nó tem um filho remoto: descer para ele.
+    Down(XRef<N, O>),
+    /// O nó é uma raiz local sem filhos, a liberar, com este pai remoto e
+    /// esta geração.
+    Up(Option<XRef<N, O>>, u8),
+}
 
 /// Resultado de uma fatia de `cap_revoke`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,11 +143,7 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
     /// [`Error::InvalidHandle`] para `h` inválido; [`Error::Busy`] se outra
     /// revogação estiver em andamento neste `CapSpace`.
     pub fn revoke(&mut self, h: Handle, budget: u32) -> Result<Revoke, Error> {
-        let target = self.index_of(h)?;
-        match self.revoking {
-            Some(r) if r != target => return Err(Error::Busy),
-            _ => self.revoking = Some(target),
-        }
+        let target = self.start_revoke(h)?;
         let (mut work, mut freed) = (0, 0);
         let mut node = target;
         loop {
@@ -159,6 +170,79 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
             freed += 1;
             node = parent;
         }
+    }
+
+    /// Parte local de uma fatia de `cap_revoke` entre tabelas
+    /// (`crate::cap::xcdt::revoke`): a partir de `node`, desce aos filhos
+    /// locais e libera as folhas, subindo pelos pais locais, até chegar a
+    /// `target` (o alvo, se for nesta tabela), acabar o orçamento ou
+    /// precisar de outra tabela. `work` e `freed` contam a fatia toda.
+    pub fn revoke_walk(
+        &mut self,
+        node: &mut u32,
+        target: Option<u32>,
+        work: &mut u32,
+        freed: &mut u32,
+        budget: u32,
+    ) -> Walk<N, O> {
+        loop {
+            loop {
+                let first = self.slot(*node).first_child;
+                if first == NIL {
+                    break;
+                }
+                *node = first;
+                *work += 1;
+            }
+            let remote = !self.xlinks.is_empty();
+            if remote && let Some(x) = self.first_xchild(*node) {
+                return Walk::Down(x);
+            }
+            if target == Some(*node) {
+                self.revoking = None;
+                return Walk::Done;
+            }
+            if *freed > 0 && *work >= budget {
+                return Walk::Continue;
+            }
+            *work += 1;
+            *freed += 1;
+            let parent = self.slot(*node).parent;
+            if parent == NIL {
+                let generation = self.slot(*node).generation;
+                return Walk::Up(self.xparent(*node), generation);
+            }
+            if remote || self.revoking == Some(*node) {
+                drop(self.free_leaf(*node));
+            } else {
+                self.unlink_lifting_children(*node);
+                drop(self.release(*node));
+            }
+            *node = parent;
+        }
+    }
+
+    /// Marca `h` como alvo da revogação em andamento (ou confirma que já
+    /// é) e devolve o índice dele.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHandle`] para `h` inválido; [`Error::Busy`] se outra
+    /// revogação estiver em andamento.
+    pub fn start_revoke(&mut self, h: Handle) -> Result<u32, Error> {
+        let target = self.index_of(h)?;
+        match self.revoking {
+            Some(r) if r != target => Err(Error::Busy),
+            _ => {
+                self.revoking = Some(target);
+                Ok(target)
+            }
+        }
+    }
+
+    /// Encerra a revogação em andamento.
+    pub fn end_revoke(&mut self) {
+        self.revoking = None;
     }
 
     /// Handle do alvo da revogação em andamento, se houver.
@@ -202,18 +286,23 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
         let mut live = 0;
         for index in 1..self.fresh {
             let slot = self.slot(index);
-            let Some(cap) = &slot.cap else {
+            if slot.tomb && !self.has_children(index) {
+                return Err("marcador sem descendentes");
+            }
+            if slot.cap.is_none() && !slot.tomb {
                 if slot.parent != NIL || slot.first_child != NIL {
                     return Err("ParentValid: slot livre com elos");
                 }
                 continue;
-            };
-            live += 1;
+            }
+            if slot.cap.is_some() {
+                live += 1;
+            }
             let mut children = 0;
             let (mut child, mut prev) = (slot.first_child, NIL);
             while child != NIL {
                 let c = self.slot(child);
-                if c.parent != index || c.prev != prev || c.cap.is_none() {
+                if c.parent != index || c.prev != prev || (c.cap.is_none() && !c.tomb) {
                     return Err("elos de filhos inconsistentes");
                 }
                 (prev, child) = (child, c.next);
@@ -228,14 +317,18 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
                 }
                 continue;
             }
-            let Some(parent) = &self.slot(slot.parent).cap else {
+            let parent = self.slot(slot.parent);
+            if parent.cap.is_none() && !parent.tomb {
                 return Err("ParentValid: pai livre");
-            };
-            if !parent.rights.contains(cap.rights) {
-                return Err("MintMonotonic: filho com direito que o pai não tem");
             }
-            if !parent.object.same(&cap.object) {
-                return Err("filho aponta para outro objeto");
+            // Marcadores não têm direitos nem objeto a comparar.
+            if let (Some(parent), Some(cap)) = (&parent.cap, &slot.cap) {
+                if !parent.rights.contains(cap.rights) {
+                    return Err("MintMonotonic: filho com direito que o pai não tem");
+                }
+                if !parent.object.same(&cap.object) {
+                    return Err("filho aponta para outro objeto");
+                }
             }
             let (mut node, mut depth) = (slot.parent, 1);
             while node != NIL {
@@ -255,6 +348,6 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
         if self.revoking.is_some_and(|r| self.slot(r).cap.is_none()) {
             return Err("alvo da revogação livre");
         }
-        Ok(())
+        self.check_xlinks()
     }
 }

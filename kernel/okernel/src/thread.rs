@@ -99,6 +99,9 @@ pub struct Thread {
     /// `SchedContext` em que a thread roda; trava folha (nada é tomado
     /// com ela na mão), lida pelo escalonador.
     sched: SpinLock<Option<Arc<SchedContext>>>,
+    /// `SchedContext` doado por quem chamou, enquanto a thread atende a
+    /// chamada (seção 6.6); vale no lugar de `sched`. Trava folha.
+    donated: SpinLock<Option<Arc<SchedContext>>>,
     /// Estado de IPC (T-208); trava folha, depois da fila do objeto.
     ipc: SpinLock<IpcSlot>,
     /// Endereço de usuário do buffer de IPC (zero: sem buffer).
@@ -147,6 +150,7 @@ impl Thread {
             fpu_addr,
             binding: SpinLock::new(Binding::default()),
             sched: SpinLock::new(None),
+            donated: SpinLock::new(None),
             ipc: SpinLock::new(IpcSlot::default()),
             ipc_buffer: AtomicU64::new(0),
             exception: AtomicU32::new(0),
@@ -257,10 +261,26 @@ impl Thread {
         Ok(())
     }
 
-    /// O `SchedContext` da thread, se ligado.
+    /// O `SchedContext` em que a thread roda: o doado, se ela atende uma
+    /// chamada, ou o dela, se ligado.
     #[must_use]
     pub fn sched_context(&self) -> Option<Arc<SchedContext>> {
-        self.sched.lock().clone()
+        let donated = self.donated.lock().clone();
+        donated.or_else(|| self.sched.lock().clone())
+    }
+
+    /// Doação em `ipc_call` (seção 6.6): a thread passa a rodar com `sc`,
+    /// o tempo e a prioridade de quem chamou, até [`undonate`](Self::undonate).
+    pub fn donate(&self, sc: Arc<SchedContext>) {
+        *self.donated.lock() = Some(sc);
+    }
+
+    /// Devolve a doação `sc`, se for a que a thread usa agora.
+    pub fn undonate(&self, sc: &Arc<SchedContext>) {
+        let mut donated = self.donated.lock();
+        if donated.as_ref().is_some_and(|d| Arc::ptr_eq(d, sc)) {
+            *donated = None;
+        }
     }
 
     /// O `AddressSpace` da thread, se configurada.

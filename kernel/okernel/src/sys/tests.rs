@@ -12,9 +12,9 @@ use crate::platform;
 use crate::sync::SpinLock;
 use crate::vm::tests::platform as fake_platform;
 
-fn setup() -> (Arc<MemoryQuota>, SharedCapSpace, u64) {
+fn setup() -> (Arc<MemoryQuota>, Arc<SharedCapSpace>, u64) {
     let root = MemoryQuota::root(64 << 20);
-    let space = SpinLock::new(crate::cap::CapSpace::new(&root).unwrap());
+    let space = Arc::new(SpinLock::new(crate::cap::CapSpace::new(&root).unwrap()));
     let q = space
         .lock()
         .insert(Cap {
@@ -63,7 +63,7 @@ impl Env for Fake {
     }
 }
 
-fn call(space: &SharedCapSpace, c: Syscall, a: [u64; 6]) -> Result<Values, Error> {
+fn call(space: &Arc<SharedCapSpace>, c: Syscall, a: [u64; 6]) -> Result<Values, Error> {
     invoke(space, c, a, 4, &mut Fake::default())
 }
 
@@ -293,7 +293,7 @@ fn notificacao_por_handles() {
 }
 
 /// Cria um objeto de `ty` e devolve o handle cru.
-fn create(space: &SharedCapSpace, q: u64, ty: ObjectType) -> u64 {
+fn create(space: &Arc<SharedCapSpace>, q: u64, ty: ObjectType) -> u64 {
     call(space, Syscall::ObjCreate, [q, ty.to_raw(), 0, 0, 0, 0]).unwrap()[0]
 }
 
@@ -334,6 +334,43 @@ fn mint_para_outro_cap_space() {
         Err(Error::AccessDenied)
     );
     assert_eq!((space.lock().len(), target.lock().len()), before);
+}
+
+/// A cópia que `cap_mint` faz em outro `CapSpace` é filha remota da origem
+/// (ADR 0029 sobre a árvore da ADR 0028): revogar a origem a apaga no
+/// destino, com o que tiver sido derivado dela lá; apagar a origem sem
+/// revogar não a apaga.
+#[test]
+fn revogar_a_origem_apaga_a_copia_de_cap_mint_no_destino() {
+    let (_root, space, q) = setup();
+    let other = create(&space, q, ObjectType::CapSpace);
+    let target = Arc::clone(get(&space, other).object.as_cap_space().unwrap());
+    let n = create(&space, q, ObjectType::Notification);
+    let signal = u64::from(Rights::SIGNAL.bits());
+    let info = |s: &Arc<SharedCapSpace>, h: u64| call(s, Syscall::CapInfo, [h, 0, 0, 0, 0, 0]);
+    let [copy, ..] = call(&space, Syscall::CapMint, [n, signal, 5, other, 0, 0]).unwrap();
+    let [grand, ..] = call(&target, Syscall::CapMint, [copy, signal, 0, 0, 0, 0]).unwrap();
+    assert_eq!(
+        info(&target, copy),
+        Ok([ObjectType::Notification.to_raw(), signal, 5])
+    );
+    let before = target.lock().len();
+    call(&space, Syscall::CapRevoke, [n, 0, 0, 0, 0, 0]).unwrap();
+    assert_eq!(info(&target, copy), Err(Error::InvalidHandle));
+    assert_eq!(info(&target, grand), Err(Error::InvalidHandle));
+    assert_eq!(target.lock().len(), before - 2);
+    // A origem segue valendo e pode copiar de novo.
+    assert!(info(&space, n).is_ok());
+    let [again, ..] = call(&space, Syscall::CapMint, [n, signal, 0, other, 0, 0]).unwrap();
+    // Apagar a origem não leva a cópia (fica um marcador), mas revogar o
+    // ancestral local da origem ainda a alcança.
+    let [mid, ..] = call(&space, Syscall::CapMint, [n, signal, 0, 0, 0, 0]).unwrap();
+    let [deep, ..] = call(&space, Syscall::CapMint, [mid, signal, 0, other, 0, 0]).unwrap();
+    call(&space, Syscall::CapDelete, [mid, 0, 0, 0, 0, 0]).unwrap();
+    assert!(info(&target, deep).is_ok());
+    call(&space, Syscall::CapRevoke, [n, 0, 0, 0, 0, 0]).unwrap();
+    assert_eq!(info(&target, again), Err(Error::InvalidHandle));
+    assert_eq!(info(&target, deep), Err(Error::InvalidHandle));
 }
 
 #[test]

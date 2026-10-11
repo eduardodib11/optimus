@@ -31,6 +31,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
     ("root", "services/root/src/main.rs", USER_TARGET),
     ("hello", "services/hello/src/main.rs", USER_TARGET),
+    ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
 
 /// Bibliotecas portáveis cujos testes rodam no host.
@@ -126,6 +127,10 @@ struct Options {
     /// Idas e voltas do `hello` com o `root` (entrada `hello.rounds` do
     /// bootfs); `None` deixa o padrão do `root`.
     rounds: Option<u64>,
+    /// Duração da rodada de `fuzz`, em segundos.
+    seconds: u64,
+    /// Semente de `fuzz` (`None`: sorteada do relógio).
+    seed: Option<u64>,
 }
 
 impl Default for Options {
@@ -140,6 +145,8 @@ impl Default for Options {
             suite: "all".into(),
             cmdline: String::new(),
             rounds: None,
+            seconds: 60,
+            seed: None,
         }
     }
 }
@@ -165,6 +172,19 @@ fn parse(args: &[String]) -> Result<Options> {
             }
             "--mem" => opts.mem = value("--mem")?,
             "--cmdline" => opts.cmdline = value("--cmdline")?,
+            "--seconds" => {
+                opts.seconds = value("--seconds")?
+                    .parse()
+                    .map_err(|_| "--seconds espera um número")?;
+            }
+            "--seed" => {
+                let v = value("--seed")?;
+                let seed = v
+                    .strip_prefix("0x")
+                    .map_or_else(|| v.parse(), |hex| u64::from_str_radix(hex, 16))
+                    .map_err(|_| "--seed espera um número (decimal ou 0x…)")?;
+                opts.seed = Some(seed);
+            }
             "--rounds" => {
                 opts.rounds = Some(
                     value("--rounds")?
@@ -172,7 +192,7 @@ fn parse(args: &[String]) -> Result<Options> {
                         .map_err(|_| "--rounds espera um número")?,
                 );
             }
-            "unit" | "boot" | "kernel" | "hello" | "all" => opts.suite.clone_from(arg),
+            "unit" | "boot" | "kernel" | "hello" | "fuzz" | "all" => opts.suite.clone_from(arg),
             other => return Err(format!("opção desconhecida: {other}")),
         }
     }
@@ -195,7 +215,7 @@ fn parse(args: &[String]) -> Result<Options> {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some((cmd, rest)) = args.split_first() else {
-        eprintln!("uso: cargo xtask <build|image|run|test|check|kani|bench> [opções]");
+        eprintln!("uso: cargo xtask <build|image|run|test|fuzz|check|kani|bench> [opções]");
         return ExitCode::FAILURE;
     };
     let result = parse(rest).and_then(|opts| match cmd.as_str() {
@@ -203,6 +223,7 @@ fn main() -> ExitCode {
         "image" => build(&opts).and_then(|()| image(&opts, &opts.cmdline, opts.rounds).map(drop)),
         "run" => run(&opts),
         "test" => test(&opts),
+        "fuzz" => fuzz(&opts),
         "check" => check(),
         "kani" => kani(),
         "bench" => bench::bench(&opts),
@@ -277,7 +298,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" => &["-C", "relocation-model=static"],
+        "root" | "hello" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -312,7 +333,7 @@ fn image(opts: &Options, cmdline: &str, rounds: Option<u64>) -> Result<PathBuf> 
 }
 
 /// Serviços do bootfs: (nome na imagem, binário de usuário).
-const BOOTFS: &[(&str, &str)] = &[("root", "root"), ("hello", "hello")];
+const BOOTFS: &[(&str, &str)] = &[("root", "root"), ("hello", "hello"), ("okfuzz", "okfuzz")];
 
 /// Monta o bootfs com `tools/mkobfs` a partir dos binários de usuário e,
 /// com `rounds`, a entrada `hello.rounds` que o `root` lê.
@@ -801,6 +822,8 @@ fn test(opts: &Options) -> Result {
             "ostd",
             "--exclude",
             "root",
+            "--exclude",
+            "okfuzz",
         ]))?;
         // A lógica portável do kernel (biblioteca `okernel`) roda no host.
         status(cargo().args(["test", "--package", "okernel", "--lib"]))?;
@@ -819,6 +842,118 @@ fn test(opts: &Options) -> Result {
         };
         smoke(&release, &[HELLO_SCENARIO])?;
     }
+    if matches!(opts.suite.as_str(), "fuzz" | "all") {
+        // Rodada curta com semente fixa: breve o bastante para o CI, mas
+        // já exercita todas as syscalls (`cargo xtask fuzz` roda o longo).
+        run_fuzz(opts, FUZZ_SHORT_SECONDS, FUZZ_SHORT_SEED)?;
+    }
+    Ok(())
+}
+
+/// Marcador de sucesso do `okfuzz`: a cota raiz voltou ao fim da rodada.
+const FUZZ_OK: &str = "okernel: okfuzz terminou; cota raiz devolvida";
+/// Texto que denuncia um kernel quebrado numa rodada de fuzz.
+const FUZZ_BAD: &[&str] = &[
+    "PÂNICO",
+    "okernel: FALTA",
+    "okernel: okfuzz não terminou no prazo",
+    "não voltou",
+];
+/// Duração da rodada curta de fuzz dentro do `test all` (segundos).
+const FUZZ_SHORT_SECONDS: u64 = 60;
+/// Semente fixa da rodada curta, para o `test all` ser reprodutível.
+const FUZZ_SHORT_SEED: u64 = 0x0c_f022;
+
+/// `cargo xtask fuzz [--seconds N] [--seed S]`: sobe o QEMU com
+/// `test=fuzz`, roda o `okfuzz` por `N` segundos e falha se o kernel entrar
+/// em pânico, tomar uma falta ou travar. A semente é impressa para
+/// reproduzir com `--seed`.
+fn fuzz(opts: &Options) -> Result {
+    build(opts)?;
+    let seed = opts.seed.unwrap_or_else(seed_from_clock) & ((1 << 48) - 1);
+    run_fuzz(opts, opts.seconds, seed)
+}
+
+/// Semente dos 48 bits baixos do relógio do host.
+fn seed_from_clock() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| {
+            u64::try_from(d.as_nanos() & u128::from(u64::MAX)).unwrap_or(1)
+        })
+}
+
+/// Sobe o QEMU com `test=fuzz`, semente `seed` e duração `seconds`, e
+/// confere a serial.
+fn run_fuzz(opts: &Options, seconds: u64, seed: u64) -> Result {
+    let cmdline = format!("test=fuzz fuzz.seed=0x{seed:x} fuzz.secs={seconds}");
+    println!("xtask: fuzz semente 0x{seed:x}, {seconds} s (repita com --seed 0x{seed:x})");
+    let esp = image(opts, &cmdline, None)?;
+    let mut child = qemu(opts, &esp)?
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("falha ao iniciar o QEMU: {e}"))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n @ 1..) = stdout.read(&mut chunk) {
+            if tx.send(chunk[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    // Folga sobre a duração pedida: o kernel se dá `seconds + 600 s` antes
+    // de desistir, e o host precisa viver mais para capturar a mensagem.
+    let limit = Duration::from_secs(seconds + 800);
+    let mut raw = Vec::new();
+    let start = Instant::now();
+    // `Ok(código)`: o QEMU saiu sozinho; `Err(())`: o host o matou por
+    // tempo esgotado (travou).
+    let end: std::result::Result<Option<i32>, ()> = loop {
+        raw.extend(rx.try_iter().flatten());
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break Ok(st.code());
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let _ = reader.join();
+    raw.extend(rx.try_iter().flatten());
+    let serial = String::from_utf8_lossy(&raw);
+    check_fuzz(&serial, end, seed)
+}
+
+/// Decide a rodada de fuzz: nenhum texto de kernel quebrado, o marcador de
+/// sucesso e saída do QEMU com o código de sucesso.
+fn check_fuzz(serial: &str, exit: std::result::Result<Option<i32>, ()>, seed: u64) -> Result {
+    let fail = |why: String| {
+        Err(format!(
+            "fuzz falhou (semente 0x{seed:x}): {why};\n{serial}"
+        ))
+    };
+    if let Some(bad) = FUZZ_BAD.iter().find(|m| serial.contains(*m)) {
+        return fail(format!("a serial mostrou \"{bad}\""));
+    }
+    match exit {
+        Err(()) => return fail("o QEMU travou (tempo esgotado sem o kernel sair)".into()),
+        Ok(Some(KERNEL_EXIT_OK)) => {}
+        Ok(code) => return fail(format!("o QEMU terminou com {code:?}")),
+    }
+    if !serial.contains(FUZZ_OK) {
+        return fail("sem o marcador de sucesso do okfuzz".into());
+    }
+    for line in serial.lines().filter(|l| l.contains("okfuzz:")) {
+        if let Some((_, rest)) = line.split_once("okfuzz:") {
+            println!("  okfuzz:{}", rest.trim_end());
+        }
+    }
+    println!("xtask: fuzz ok (semente 0x{seed:x})");
     Ok(())
 }
 

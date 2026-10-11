@@ -1,14 +1,16 @@
 //! Testes de kernel do IPC (T-208): ping-pong entre duas threads de
 //! usuário em processos diferentes, transferência de capability com e sem
-//! `GRANT` e prazo vencido.
+//! `GRANT` (e a revogação que alcança a cópia, ADR 0028), prazo vencido e
+//! `PeerClosed` quando o objeto morre e a doação de `SchedContext`.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use kabi::ipc::{MsgInfo, recv_target};
 use kabi::vm::PAGE_SIZE;
-use kabi::{Error, Handle, ObjectType, Rights, STATUS_OK};
+use kabi::{Error, Handle, ObjectType, Rights, STATUS_OK, Syscall};
 use okernel::cap::{Cap, Object};
+use okernel::sys;
 use okernel::thread::{RunState, Thread};
 
 use crate::arch::x86_64::{cpu, probe};
@@ -17,9 +19,11 @@ use crate::ktest::{Outcome, Test};
 use crate::kthread::tests::{
     DATA_VA, Process, delete, process, run_until_exit, thread, user_symbol,
 };
-use crate::kthread::{UserEntry, fast_switches, start, yield_now};
+use crate::kthread::{KernelEnv, UserEntry, fast_switches, start, yield_now};
 use crate::ktime;
 use crate::kvm::activate;
+
+mod doacao;
 
 /// Testes de kernel do IPC.
 pub const TESTS: &[Test] = &[
@@ -39,6 +43,10 @@ pub const TESTS: &[Test] = &[
         name: "ipc.objeto_destruido_acorda_com_peer_closed",
         run: peer_closed,
     },
+    Test {
+        name: "ipc.doacao_de_schedcontext_evita_inversao_de_prioridade",
+        run: doacao::sem_inversao_de_prioridade,
+    },
 ];
 
 unsafe extern "C" {
@@ -49,7 +57,7 @@ unsafe extern "C" {
 }
 
 const VOLTAS: u64 = 10_000;
-const BADGE: u64 = 0x77;
+pub(crate) const BADGE: u64 = 0x77;
 
 /// Lê ou grava `N` palavras do usuário em `va`, no espaço de `p`.
 pub(crate) fn user_words<const N: usize>(
@@ -241,6 +249,16 @@ fn transferencia() -> Outcome {
             let cap = s.get(h).map_err(|_| "capability recebida")?;
             ensure!(cap.object.same(&ntfy) && cap.rights == Rights::SIGNAL);
             ensure!(s.len() == before + 1);
+            drop(s);
+            // A cópia é filha da original (ADR 0028): `cap_revoke` no
+            // cliente a apaga no servidor.
+            let revoke = [u64::from(ntfy_h.raw()), 0, 0, 0, 0, 0];
+            let space = &client.cspace;
+            let revoked = sys::invoke(space, Syscall::CapRevoke, revoke, 4, &mut KernelEnv);
+            info!("ktest: · cap_revoke no cliente: {revoked:?}");
+            ensure!(revoked.is_ok());
+            ensure!(server.cspace.lock().get(h).err() == Some(Error::InvalidHandle));
+            ensure!(server.cspace.lock().len() == before);
         } else {
             ensure!(first == Error::AccessDenied.to_raw() && second == STATUS_OK);
             ensure!(label == 0x12 && info.caps == 0);

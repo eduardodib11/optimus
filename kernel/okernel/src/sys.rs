@@ -10,8 +10,10 @@
 //! fora daqui (yield, saída e partida de threads, tempo) e as ainda não implementadas
 //! devolvem [`Error::NotSupported`].
 //!
-//! Ordem de travas (seção 6.9): o `CapSpace` é solto antes de tocar no
-//! objeto; capabilities apagadas morrem já sem a trava.
+//! Ordem de travas (seção 6.9, com a `CDT` da ADR 0028 à frente): o
+//! `CapSpace` é solto antes de tocar no objeto; capabilities apagadas
+//! morrem já sem a trava. `cap_mint`, `cap_delete` e `cap_revoke` passam
+//! pela árvore entre tabelas ([`xcdt`]).
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +23,7 @@ use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Handle, ObjectType, Rights, Syscall};
 
 use crate::cap::space::Revoke;
-use crate::cap::{Cap, SharedCapSpace};
+use crate::cap::{Cap, SharedCapSpace, xcdt};
 use crate::futex::FUTEXES;
 use crate::notify::Wait;
 use crate::sched::Params;
@@ -100,7 +102,7 @@ fn futex_key(thread: &Thread, addr: u64) -> Result<u64, Error> {
 ///
 /// Os da syscall; [`Error::NotSupported`] para as tratadas fora daqui.
 pub fn invoke(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     call: Syscall,
     a: [u64; 6],
     revoke_budget: u32,
@@ -109,14 +111,18 @@ pub fn invoke(
     match call {
         Syscall::CapMint => mint(space, a),
         Syscall::CapDelete => {
-            let cap = space.lock().delete(handle(a[0])?)?;
-            drop(cap);
+            xcdt::delete(space, handle(a[0])?)?;
             Ok([0; 3])
         }
         Syscall::CapRevoke => {
             let h = handle(a[0])?;
-            while space.lock().revoke(h, revoke_budget)? == Revoke::Continue {
+            while xcdt::revoke(space, h, revoke_budget)? == Revoke::Continue {
                 env.preempt();
+                // Entre as fatias, uma revogação de fora pode ter apagado
+                // o alvo (ADR 0028).
+                if space.lock().get(h).is_err() {
+                    return Err(Error::Revoked);
+                }
             }
             Ok([0; 3])
         }
@@ -175,29 +181,22 @@ pub fn invoke(
 }
 
 /// `cap_mint(origem, máscara, badge, destino)`: com `destino` (um
-/// `CapSpace` com `MANAGE`) diferente da própria tabela, a cópia é feita
-/// aqui, com as regras de `mint`, e transferida para lá como numa mensagem
-/// de IPC (raiz da árvore do destino; ADR 0029).
-fn mint(space: &SharedCapSpace, a: [u64; 6]) -> Result<Values, Error> {
+/// `CapSpace` com `MANAGE`) diferente da própria tabela, a cópia, com as
+/// regras de `mint`, nasce lá como filha remota da origem (ADR 0029 sobre
+/// a árvore da ADR 0028): revogar a origem apaga a cópia.
+fn mint(space: &Arc<SharedCapSpace>, a: [u64; 6]) -> Result<Values, Error> {
     let badge = (a[2] != 0).then_some(a[2]);
-    let dest = match a[3] {
-        0 => None,
+    let (src, mask) = (handle(a[0])?, rights(a[1])?);
+    let h = match a[3] {
+        0 => xcdt::mint(space, src, mask, badge)?,
         raw => {
             let cap = cap_with(space, raw, Rights::MANAGE)?;
             let dest = Arc::clone(cap.object.as_cap_space()?);
-            (!core::ptr::eq(Arc::as_ptr(&dest), space)).then_some(dest)
+            drop(cap);
+            xcdt::mint_into(space, src, mask, badge, &dest)?
         }
     };
-    let h = space.lock().mint(handle(a[0])?, rights(a[1])?, badge)?;
-    let Some(dest) = dest else {
-        return Ok([u64::from(h.raw()), 0, 0]);
-    };
-    // Uma trava de `CapSpace` por vez (seção 6.9): a cópia sai daqui
-    // antes de entrar no destino; se não couber lá, morre sem trava.
-    let cap = space.lock().delete(h)?;
-    let moved = dest.lock().insert(cap.clone());
-    drop(cap);
-    moved.map(|h| [u64::from(h.raw()), 0, 0])
+    Ok([u64::from(h.raw()), 0, 0])
 }
 
 /// `thread_configure(thread, cspace, aspace, buffer, exceção, flags)`

@@ -135,13 +135,26 @@ fn map_copy(
     Ok(())
 }
 
-/// Monta o processo do executável `elf` (já validado), com uma cópia de
-/// `image` (o bootfs) só para leitura, e inicia a thread.
+/// Processo ainda sem threads: o `CapSpace` com a cota raiz e o
+/// `AddressSpace` com os segmentos do executável e a pilha inicial.
+pub(crate) struct Image {
+    /// Tabela de capabilities.
+    pub cspace: Arc<SharedCapSpace>,
+    /// Handle da cota raiz.
+    pub quota: Handle,
+    /// Handle do `AddressSpace`.
+    pub aspace: Handle,
+    /// Capability do `AddressSpace`.
+    pub aspace_cap: Cap,
+}
+
+/// Monta o `CapSpace` e o `AddressSpace` de `elf` (já validado), com a
+/// pilha da thread inicial abaixo de [`STACK_TOP`].
 ///
 /// # Errors
 ///
 /// O passo que falhou.
-pub fn spawn(elf: &oelf::Elf<'_>, image: &[u8]) -> Result<Process, &'static str> {
+pub(crate) fn image(elf: &oelf::Elf<'_>) -> Result<Image, &'static str> {
     if elf.is_relocatable() {
         return Err("root relocável (PIE) ainda não é suportado");
     }
@@ -169,43 +182,80 @@ pub fn spawn(elf: &oelf::Elf<'_>, image: &[u8]) -> Result<Process, &'static str>
             seg.data,
         )?;
     }
-    map_copy(
-        &cspace,
+    let image = Image {
+        cspace,
         quota,
-        &aspace,
-        (STACK_TOP - STACK_BYTES, STACK_BYTES, WRITE),
-        &[],
-    )?;
+        aspace: a,
+        aspace_cap: aspace,
+    };
+    map_stack(&image, STACK_TOP)?;
+    Ok(image)
+}
+
+/// Mapeia em `p` uma pilha de [`STACK_BYTES`] abaixo de `top`.
+///
+/// # Errors
+///
+/// O passo que falhou.
+pub(crate) fn map_stack(p: &Image, top: u64) -> Result<(), &'static str> {
+    map_zeros(p, top - STACK_BYTES, STACK_BYTES, WRITE)
+}
+
+/// Mapeia em `p` `len` bytes zerados em `va` com `flags` (um objeto novo,
+/// cuja capability some; a região o guarda).
+///
+/// # Errors
+///
+/// O passo que falhou.
+pub(crate) fn map_zeros(p: &Image, va: u64, len: u64, flags: u64) -> Result<(), &'static str> {
+    map_copy(&p.cspace, p.quota, &p.aspace_cap, (va, len, flags), &[])
+}
+
+/// Cria uma thread configurada no processo `p`, com um `SchedContext`
+/// próprio sem limite e prioridade `priority`, ainda sem iniciar.
+///
+/// # Errors
+///
+/// O passo que falhou.
+pub(crate) fn new_thread(p: &Image, priority: u64) -> Result<(Handle, Arc<Thread>), &'static str> {
+    let cspace = &p.cspace;
     let t = cspace
         .lock()
-        .obj_create(quota, ObjectType::Thread, 0)
+        .obj_create(p.quota, ObjectType::Thread, 0)
         .map_err(|_| "obj_create(Thread)")?;
     let sc = cspace
         .lock()
-        .obj_create(quota, ObjectType::SchedContext, 0)
+        .obj_create(p.quota, ObjectType::SchedContext, 0)
         .map_err(|_| "obj_create(SchedContext)")?;
-    let thread = Arc::clone(cap(&cspace, t)?.object.as_thread().map_err(|_| "tipo")?);
+    let thread = Arc::clone(cap(cspace, t)?.object.as_thread().map_err(|_| "tipo")?);
     let sched = Arc::clone(
-        cap(&cspace, sc)?
+        cap(cspace, sc)?
             .object
             .as_sched_context()
             .map_err(|_| "tipo")?,
     );
     drop(cspace.lock().delete(sc));
     let period = 1_000_000;
-    sched.configure(Params::new(period, period, ROOT_PRIORITY).map_err(|_| "params")?);
+    sched.configure(Params::new(period, period, priority).map_err(|_| "params")?);
     thread.bind_sched(sched).map_err(|_| "sched_bind")?;
-    let space = Arc::clone(aspace.object.as_address_space().map_err(|_| "tipo")?);
+    let space = Arc::clone(p.aspace_cap.object.as_address_space().map_err(|_| "tipo")?);
     thread
-        .configure(Arc::clone(&cspace), space)
+        .configure(Arc::clone(cspace), space)
         .map_err(|_| "thread_configure")?;
-    let len = (image.len() as u64).next_multiple_of(PAGE_SIZE);
-    let (full, _) = new_copy(&cspace, quota, len, 0, image)?;
-    let fs = cspace
-        .lock()
-        .mint(full, Rights::READ | Rights::MAP, None)
-        .map_err(|_| "cap_mint(bootfs)")?;
-    drop(cspace.lock().delete(full));
+    Ok((t, thread))
+}
+
+/// Monta o processo do executável `elf` (já validado), com uma cópia de
+/// `fs` (o bootfs) só para leitura, e inicia a thread.
+///
+/// # Errors
+///
+/// O passo que falhou.
+pub fn spawn(elf: &oelf::Elf<'_>, fs: &[u8]) -> Result<Process, &'static str> {
+    let p = image(elf)?;
+    let (quota, a) = (p.quota, p.aspace);
+    let (t, thread) = new_thread(&p, ROOT_PRIORITY)?;
+    let fs = read_only_copy(&p, fs)?;
     let entry = UserEntry {
         rip: elf.entry(),
         rsp: STACK_TOP,
@@ -217,10 +267,28 @@ pub fn spawn(elf: &oelf::Elf<'_>, image: &[u8]) -> Result<Process, &'static str>
     };
     kthread::start(&thread, &entry).map_err(|_| "thread_start")?;
     Ok(Process {
-        cspace,
+        cspace: p.cspace,
         thread,
         handles: [quota, a, t, fs],
     })
+}
+
+/// Copia `data` para um `MemoryObject` novo em `p` e devolve um handle só
+/// com `READ | MAP` para ele (a capability completa some).
+///
+/// # Errors
+///
+/// O passo que falhou.
+fn read_only_copy(p: &Image, data: &[u8]) -> Result<Handle, &'static str> {
+    let len = (data.len() as u64).next_multiple_of(PAGE_SIZE);
+    let (full, _) = new_copy(&p.cspace, p.quota, len, 0, data)?;
+    let fs = p
+        .cspace
+        .lock()
+        .mint(full, Rights::READ | Rights::MAP, None)
+        .map_err(|_| "cap_mint(bootfs)")?;
+    drop(p.cspace.lock().delete(full));
+    Ok(fs)
 }
 
 /// Acha, confere e inicia o `root` do bootfs `image`.

@@ -3,7 +3,7 @@
 - Status: proposta (aguarda aprovação de Eduardo)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.1, 6.2, 7.2, 14.2 e T-212
-- Relaciona-se com: ADR 0007 (IPC), ADR 0027, ADR 0028 (proposta), T-210, T-211
+- Relaciona-se com: ADR 0007 (IPC), ADR 0027, ADR 0028 (aceita), T-210, T-211
 
 ## Contexto
 
@@ -45,10 +45,11 @@ inteiro a partir do anel 3, e faltam peças que o SDD só nomeia:
    `CapSpace` de destino (com `MANAGE`), ou 0 para a própria tabela, como
    hoje. Num destino diferente, a cópia é feita como um `cap_mint` local
    (mesmas regras de direitos, badge, profundidade e revogação em
-   andamento) e depois transferida ao destino como numa mensagem de IPC:
-   entra como raiz da árvore do destino. Enquanto a ADR 0028 não for
-   aceita, revogar a origem não alcança essa cópia, igual à transferência
-   por IPC; com ela, a cópia vira filha remota da origem, sem mudar a ABI.
+   andamento, conferidas também nos ancestrais remotos) e nasce no
+   destino como filha remota da origem, pela árvore de derivação entre
+   `CapSpace`s da ADR 0028 (`xcdt`), como na transferência por IPC:
+   revogar a origem, ou um ancestral dela, apaga a cópia e o que dela
+   derivar no destino; apagar a origem não a apaga (fica um marcador).
 4. **O bootfs para o `root`**: o kernel copia a imagem do bootfs (já
    verificada pelo optboot) para um `MemoryObject` e dá ao `root` uma
    capability só com `READ | MAP`. O handle vai nos 32 bits altos de `rdx`
