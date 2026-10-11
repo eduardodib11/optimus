@@ -30,6 +30,9 @@ use crate::mm::PhysAddr;
 use crate::mm::paging::Flags;
 use crate::platform::Platform;
 
+mod aspace;
+pub use aspace::{AddressSpace, SharedAddressSpace, vm_map, vm_protect, vm_unmap};
+
 /// Permissões de uma página de usuário além da leitura.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Perms {
