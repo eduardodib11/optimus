@@ -5,18 +5,30 @@ Modelos iniciais de capabilities e IPC do Optimus OS, conforme o SDD v1.0
 
 ## CapRevoke.tla
 
-Modela um CapSpace com `N` slots, handles `<<slot, geração>>` e a árvore de
-derivação: `obj_create` (cap raiz com todos os direitos), `cap_mint` (filho
-com direitos ⊆ do pai), `cap_delete` (filhos sobem para o avô) e
-`cap_revoke` fatiado e preemptível (`RevokeStart`, `RevokeStep` apaga uma
-folha por vez intercalado com outras ações, `RevokeEnd`). Durante a
-revogação, mint dentro da subárvore e delete do alvo são recusados (`Busy`).
+Modela dois CapSpaces (slots 1..N/2 e N/2+1..N numa só numeração, `space[s]`
+diz o dono) e a árvore de derivação entre eles (ADR 0028): `obj_create` (cap
+raiz com todos os direitos), `cap_mint` (filho local com direitos ⊆ do pai),
+`Transfer` (cópia por IPC, exige GRANT, vira **filha remota** da original),
+`cap_delete` e `cap_revoke` fatiado e preemptível (`RevokeStart`, `RevokeStep`
+apaga uma folha descendente, local ou remota, por vez, `RevokeEnd`).
 
-Invariantes: `TypeOK`, `MintMonotonic` (filho ⊆ pai), `ParentValid` (sem
-pai pendurado), `Acyclic`, `RevokeComplete` (após revoke de c não sobra
-descendente) e `NoStaleHandle` (handle antigo não resolve após reuso do slot).
-Vivacidade: `RevokeTerminates`. `CHECK_DEADLOCK FALSE`: slots com geração
-esgotada são aposentados e o CapSpace finito acaba; isso é fim legítimo.
+`cap_delete` normal sobe os filhos para o avô. Se o slot tem filho remoto (ou
+é cópia remota com filhos), vira **marcador**: `marker[s]`, sem direitos nem
+handle utilizável, mas preso na árvore até os descendentes sumirem
+(`ReapMarker` o libera então; `cap_revoke` também apaga marcadores folha).
+Há várias revogações simultâneas (`revoking` é conjunto): apagar a cópia que
+está em revogação encerra aquela revogação. Mint, transferência e nova
+revogação dentro de qualquer subárvore em revogação (através dos CapSpaces)
+são recusados (`Busy`), assim como delete do alvo. A trava global `CDT` faz
+cada operação atômica, então o modelo as executa como passos únicos.
+
+Invariantes: `TypeOK`, `MintMonotonic` (filho ⊆ pai, salvo pai marcador),
+`ParentValid` (sem pai pendurado), `Acyclic`, `MarkerValid`, `RevokingLive`,
+`RevokeComplete` (após revoke de c não sobra descendente, remoto incluído) e
+`NoStaleHandle` (handle antigo ou de marcador não resolve). Vivacidade:
+`RevokeTerminates` (toda revogação iniciada termina). `CHECK_DEADLOCK FALSE`:
+slots com geração esgotada são aposentados e o modelo finito acaba; isso é
+fim legítimo. Configuração: N = 4, Rights = {R, G}, MaxGen = 1.
 
 ## Ipc.tla
 
@@ -45,8 +57,8 @@ de SchedContext, caminho rápido, notificações e anéis SPSC, SMP.
     java -XX:+UseParallelGC -cp /caminho/tla2tools.jar tlc2.TLC -workers auto -config CapRevoke.cfg CapRevoke.tla
     java -XX:+UseParallelGC -cp /caminho/tla2tools.jar tlc2.TLC -workers auto -config Ipc.cfg Ipc.tla
 
-Resultado esperado: "No error has been found" (≈10 s e ≈2 s). Testes de
+Resultado esperado: "No error has been found" (≈1 min, 147510 estados distintos para CapRevoke; ≈2 s para Ipc). Testes de
 mutação (mint que amplia direitos, delete sem avançar geração, revoke que
-termina cedo, Reply não consumido, transferência sem GRANT, remoção da
+termina cedo, revoke que ignora elos remotos (`RevokeComplete`), Reply não consumido, transferência sem GRANT, remoção da
 justiça) fazem o TLC acusar a invariante ou propriedade correspondente.
 Apague `states/` e `*_TTrace_*` gerados antes de versionar.
