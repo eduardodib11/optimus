@@ -48,7 +48,7 @@ const VOLTAS: u64 = 10_000;
 const BADGE: u64 = 0x77;
 
 /// Lê ou grava `N` palavras do usuário em `va`, no espaço de `p`.
-fn user_words<const N: usize>(
+pub(crate) fn user_words<const N: usize>(
     p: &Process,
     va: u64,
     write: Option<[u64; N]>,
@@ -84,7 +84,12 @@ fn user_words<const N: usize>(
 }
 
 /// Guarda em `p` uma capability de `object`.
-fn give(p: &Process, object: &Object, rights: Rights, badge: u64) -> Result<Handle, &'static str> {
+pub(crate) fn give(
+    p: &Process,
+    object: &Object,
+    rights: Rights,
+    badge: u64,
+) -> Result<Handle, &'static str> {
     p.cspace
         .lock()
         .insert(Cap {
@@ -96,7 +101,7 @@ fn give(p: &Process, object: &Object, rights: Rights, badge: u64) -> Result<Hand
 }
 
 /// Objeto novo de `ty` na cota de `p`, com a capability de `obj_create`.
-fn create(p: &Process, ty: ObjectType) -> Result<(Handle, Object), &'static str> {
+pub(crate) fn create(p: &Process, ty: ObjectType) -> Result<(Handle, Object), &'static str> {
     let h = p
         .cspace
         .lock()
@@ -108,7 +113,7 @@ fn create(p: &Process, ty: ObjectType) -> Result<(Handle, Object), &'static str>
 
 /// Inicia em `p` uma thread em `sym` com a pilha no topo da página
 /// `stack_page` de dados e o buffer de IPC na página 0.
-fn spawn(
+pub(crate) fn spawn(
     p: &Process,
     sym: *const u8,
     args: [u64; 3],

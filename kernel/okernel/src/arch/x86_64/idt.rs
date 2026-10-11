@@ -4,9 +4,10 @@
 //! Toda exceção despeja os registradores na serial e congela a CPU: o kernel
 //! nunca segue em estado inconsistente (SDD v1.0, seção 6.5). A única
 //! exceção são as faltas das sondas de memória ([`super::probe`]), que voltam
-//! a quem sondou com a falta registrada. Faltas de
-//! usuário viram mensagens ao endpoint de exceções em T-210; o registro
-//! persistente e a reinicialização do pânico vêm em T-110.
+//! a quem sondou com a falta registrada, e as exceções vindas do anel 3,
+//! que viram mensagens ao endpoint de exceções da thread (T-210,
+//! [`crate::kfault`]). O registro persistente e a reinicialização do
+//! pânico vêm em T-110.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -135,6 +136,15 @@ const NAMES: [(&str, &str); 32] = [
     ("---", "reservada"),
 ];
 
+/// Mnemônico e descrição da exceção `vector`.
+pub fn exception_name(vector: u64) -> (&'static str, &'static str) {
+    usize::try_from(vector)
+        .ok()
+        .and_then(|v| NAMES.get(v))
+        .copied()
+        .unwrap_or(("???", "vetor desconhecido"))
+}
+
 /// Preenche as portas 0 a 255 e carrega a IDT.
 ///
 /// # Safety
@@ -205,15 +215,15 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
         // NMI do pânico de outra CPU: para sem despejar nada.
         halt();
     }
+    if frame.cs & 3 == 3 && kabi::fault::user_vector(frame.vector) {
+        crate::kfault::user_exception(frame, control_registers()[1]);
+        return;
+    }
     if super::probe::fixup(frame, control_registers()[1]) {
         return;
     }
     let f = &*frame;
-    let (name, what) = usize::try_from(f.vector)
-        .ok()
-        .and_then(|v| NAMES.get(v))
-        .copied()
-        .unwrap_or(("???", "vetor desconhecido"));
+    let (name, what) = exception_name(f.vector);
     let [cr0, cr2, cr3, cr4] = control_registers();
     let regs = [
         ("rax", f.rax),
