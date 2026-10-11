@@ -19,6 +19,7 @@ mod arch;
 mod bootinfo;
 mod kcap;
 mod kheap;
+mod kipc;
 mod kirq;
 mod kmem;
 mod kpanic;
