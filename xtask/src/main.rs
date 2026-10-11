@@ -33,7 +33,11 @@ const BOOT_MARKERS: &[&str] = &[
     "optboot",
     "optboot: kernel carregado",
     "optboot: mapa de memória",
+    "optboot: KASLR",
+    "saindo dos serviços de boot",
 ];
+/// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
+const KERNEL_EXIT_OK: i32 = 33;
 /// Prefixo das linhas em que o `optboot` descreve cada segmento carregado.
 const SEGMENT_PREFIX: &str = "optboot: seg ";
 const SMOKE_TIMEOUT: Duration = Duration::from_mins(1);
@@ -182,10 +186,11 @@ fn build(opts: &Options) -> Result {
 }
 
 /// Flags de `rustc` só para a crate final, no lugar do que o alvo próprio
-/// definiria (ADR 0025): o kernel vive nos 2 GiB do topo e é `ET_EXEC`.
+/// definiria (ADR 0025): o kernel vive nos 2 GiB do topo e é PIE, para o
+/// `optboot` aplicar o deslocamento de KASLR pelas relocações relativas.
 fn rustc_flags(package: &str) -> &'static [&'static str] {
     match package {
-        "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=static"],
+        "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         _ => &[],
     }
 }
@@ -257,6 +262,8 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     .args(["-display", "none", "-serial", "stdio", "-no-reboot"])
     // Fonte do EFI_RNG_PROTOCOL do OVMF; a semente do optboot vem dele.
     .args(["-device", "virtio-rng-pci"])
+    // Porta 0xf4: o kernel desliga o QEMU com um código de saída.
+    .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
     .arg("-drive")
     .arg(format!(
         "if=pflash,format=raw,readonly=on,file={}",
@@ -288,7 +295,14 @@ fn kvm_usable() -> bool {
 fn run(opts: &Options) -> Result {
     build(opts)?;
     let esp = image(opts)?;
-    status(&mut qemu(opts, &esp)?)
+    let mut cmd = qemu(opts, &esp)?;
+    let st = cmd
+        .status()
+        .map_err(|e| format!("falha ao executar o QEMU: {e}"))?;
+    match st.code() {
+        Some(0 | KERNEL_EXIT_OK) => Ok(()),
+        _ => Err(format!("QEMU terminou com {st}")),
+    }
 }
 
 /// Dá boot no QEMU sem interação e confere a serial com [`check_serial`].
@@ -307,16 +321,24 @@ fn smoke(opts: &Options) -> Result {
         String::from_utf8_lossy(&out).into_owned()
     });
     let start = Instant::now();
-    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
+    let exit = loop {
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break st.code();
+        }
         if start.elapsed() > SMOKE_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
-            break;
+            break None;
         }
         thread::sleep(Duration::from_millis(100));
-    }
+    };
     let serial = reader.join().unwrap_or_default();
-    match check_serial(&serial) {
+    let result = check_serial(&serial).and_then(|()| match exit {
+        Some(KERNEL_EXIT_OK) => Ok(()),
+        Some(code) => Err(format!("QEMU saiu com {code}, esperado {KERNEL_EXIT_OK}")),
+        None => Err("o kernel não desligou o QEMU a tempo".into()),
+    });
+    match result {
         Ok(()) => {
             println!("xtask: smoke test de boot ok");
             Ok(())
@@ -469,7 +491,9 @@ mod tests {
                   optboot: seg 0xffffffff80000000 -> 0x1000 0xcc R-X\r\n\
                   optboot: seg 0xffffffff80002000 -> 0x2000 0x8 RW-\r\n\
                   optboot: kernel carregado, entrada 0xffffffff80000000\r\n\
-                  optboot: mapa de memória: 24 regiões, 517896 KiB usáveis\r\n";
+                  optboot: mapa de memória: 24 regiões, 517896 KiB usáveis\r\n\
+                  optboot: KASLR: deslocamento 0x200000\r\n\
+                  optboot: tabelas de página prontas; saindo dos serviços de boot\r\n";
         assert_eq!(check_serial(ok), Ok(()));
         assert!(check_serial("Optimus OS \u{2014} optboot\r\n").is_err());
         assert!(check_serial(&ok.replace("R-X", "RWX")).is_err());

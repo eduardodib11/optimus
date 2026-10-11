@@ -81,3 +81,47 @@ pub fn rdtsc() -> u64 {
     // optboot roda no anel 0, onde CR4.TSD não bloqueia a instrução.
     unsafe { core::arch::x86_64::_rdtsc() }
 }
+
+/// Desliga interrupções mascaráveis.
+pub fn disable_interrupts() {
+    // SAFETY: CLI só limpa RFLAGS.IF; o optboot não depende de interrupções
+    // depois de ExitBootServices.
+    unsafe { asm!("cli", options(nomem, nostack)) };
+}
+
+/// Liga EFER.NXE e CR0.WP, carrega `pml4` no CR3, troca a pilha para
+/// `stack_top` e salta para `entry` com `arg` em `rdi` (System V). Não volta.
+///
+/// # Safety
+///
+/// `pml4` precisa mapear em identidade o código e a pilha atuais do optboot
+/// (que continuam em uso até o salto), mapear `entry` como executável e
+/// `stack_top` como gravável; interrupções precisam estar desligadas e os
+/// serviços de boot encerrados.
+pub unsafe fn enter_kernel(pml4: u64, stack_top: u64, entry: u64, arg: u64) -> ! {
+    // SAFETY: contrato acima. NXE vem antes do CR3 porque as tabelas novas
+    // usam o bit NX, que sem NXE é reservado e causaria falta de página.
+    // O `push 0` deixa a pilha como depois de um `call` (rsp ≡ 8 mod 16) e
+    // termina o encadeamento de quadros para depuradores.
+    unsafe {
+        asm!(
+            "mov ecx, 0xc0000080",
+            "rdmsr",
+            "or eax, 1 << 11",
+            "wrmsr",
+            "mov rax, cr0",
+            "or rax, 1 << 16",
+            "mov cr0, rax",
+            "mov cr3, r8",
+            "mov rsp, r9",
+            "xor ebp, ebp",
+            "push 0",
+            "jmp r10",
+            in("r8") pml4,
+            in("r9") stack_top,
+            in("r10") entry,
+            in("rdi") arg,
+            options(noreturn),
+        )
+    }
+}

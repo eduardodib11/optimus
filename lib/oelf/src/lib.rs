@@ -3,6 +3,9 @@
 //! Sem alocação e sem `unsafe`. [`Elf::parse`] valida o arquivo inteiro de uma
 //! vez; depois disso, [`Elf::segments`] só entrega segmentos `PT_LOAD` que já
 //! passaram por todas as checagens. Entrada maliciosa vira [`Error`], nunca pânico.
+//!
+//! Aceita `ET_EXEC` e, para KASLR, `ET_DYN` (PIE estático) cujas únicas
+//! relocações são `R_X86_64_RELATIVE` em `.rela.dyn` ([`Elf::relocations`]).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -19,8 +22,20 @@ pub const MAX_PHDRS: usize = 64;
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const DYN_SIZE: usize = 16;
+const RELA_SIZE: usize = 24;
+const R_X86_64_RELATIVE: u64 = 8;
+/// `DT_*` usados: fim, relocações com addend e o tamanho de cada uma.
+const DT_NULL: u64 = 0;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+/// `DT_*` recusados: bibliotecas, `DT_REL`, relocação de texto, PLT e RELR.
+const DT_REJECTED: [u64; 5] = [1, 17, 22, 23, 36];
 
 /// Motivo pelo qual um arquivo foi recusado.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +50,7 @@ pub enum Error {
     NotLittleEndian,
     /// Versão do ELF diferente de 1.
     BadVersion,
-    /// Não é `ET_EXEC`.
+    /// Não é `ET_EXEC` nem `ET_DYN`.
     NotExecutable,
     /// Não é `EM_X86_64`.
     BadMachine,
@@ -61,6 +76,10 @@ pub enum Error {
     NoSegments,
     /// Ponto de entrada fora de um segmento executável.
     BadEntry,
+    /// `PT_DYNAMIC` malformado ou com algo além de `R_X86_64_RELATIVE`.
+    BadDynamic,
+    /// Relocação de outro tipo ou com alvo fora dos segmentos.
+    BadRelocation,
 }
 
 /// Permissões de um segmento (`p_flags`).
@@ -112,6 +131,16 @@ pub struct Segment<'a> {
     pub data: &'a [u8],
 }
 
+/// Relocação `R_X86_64_RELATIVE`: o loader grava `addend + deslocamento`
+/// (64 bits) em `vaddr + deslocamento`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relocation {
+    /// Endereço virtual de ligação do alvo; os 8 bytes cabem num segmento.
+    pub vaddr: u64,
+    /// Valor no endereço de ligação.
+    pub addend: u64,
+}
+
 /// Executável ELF64 x86-64 validado.
 #[derive(Debug, Clone, Copy)]
 pub struct Elf<'a> {
@@ -119,6 +148,9 @@ pub struct Elf<'a> {
     entry: u64,
     phoff: usize,
     phnum: usize,
+    pie: bool,
+    /// Offset no arquivo e quantidade das relocações de `.rela.dyn`.
+    rela: (usize, usize),
 }
 
 struct Phdr {
@@ -212,9 +244,11 @@ impl<'a> Elf<'a> {
         if ident[6] != 1 || u32_at(data, 20) != Some(1) {
             return Err(Error::BadVersion);
         }
-        if field16(16)? != ET_EXEC {
-            return Err(Error::NotExecutable);
-        }
+        let pie = match field16(16)? {
+            ET_EXEC => false,
+            ET_DYN => true,
+            _ => return Err(Error::NotExecutable),
+        };
         if field16(18)? != EM_X86_64 {
             return Err(Error::BadMachine);
         }
@@ -236,15 +270,95 @@ impl<'a> Elf<'a> {
             entry: u64_at(data, 24).ok_or(Error::Truncated)?,
             phoff,
             phnum,
+            pie,
+            rela: (0, 0),
         };
         elf.validate()?;
+        let elf = Self {
+            rela: if pie { elf.dynamic()? } else { (0, 0) },
+            ..elf
+        };
+        elf.relocations_raw()
+            .try_for_each(|r| elf.check_relocation(r?))?;
         Ok(elf)
     }
 
+    fn phdrs(&self) -> impl Iterator<Item = Phdr> + '_ {
+        (0..self.phnum).filter_map(|i| phdr(self.data, self.phoff + i * PHDR_SIZE))
+    }
+
     fn loads(&self) -> impl Iterator<Item = Phdr> + '_ {
-        (0..self.phnum)
-            .filter_map(|i| phdr(self.data, self.phoff + i * PHDR_SIZE))
-            .filter(|p| p.kind == PT_LOAD && p.memsz > 0)
+        self.phdrs().filter(|p| p.kind == PT_LOAD && p.memsz > 0)
+    }
+
+    /// Lê o único `PT_DYNAMIC` e devolve onde fica `.rela.dyn` no arquivo.
+    fn dynamic(&self) -> Result<(usize, usize), Error> {
+        let mut dynamics = self.phdrs().filter(|p| p.kind == PT_DYNAMIC);
+        let Some(p) = dynamics.next() else {
+            return Ok((0, 0));
+        };
+        if dynamics.next().is_some() {
+            return Err(Error::BadDynamic);
+        }
+        let start = usize::try_from(p.offset).map_err(|_| Error::BadDynamic)?;
+        let len = usize::try_from(p.filesz).map_err(|_| Error::BadDynamic)?;
+        let table = start
+            .checked_add(len)
+            .and_then(|end| self.data.get(start..end))
+            .ok_or(Error::BadDynamic)?;
+        let (mut rela, mut size, mut ent) = (None, 0, RELA_SIZE as u64);
+        for entry in table.chunks_exact(DYN_SIZE) {
+            let tag = u64_at(entry, 0).ok_or(Error::BadDynamic)?;
+            let value = u64_at(entry, 8).ok_or(Error::BadDynamic)?;
+            match tag {
+                DT_NULL => break,
+                DT_RELA => rela = Some(value),
+                DT_RELASZ => size = value,
+                DT_RELAENT => ent = value,
+                t if DT_REJECTED.contains(&t) => return Err(Error::BadDynamic),
+                _ => {}
+            }
+        }
+        let Some(rela) = rela.filter(|_| size > 0) else {
+            return Ok((0, 0));
+        };
+        if ent != RELA_SIZE as u64 || size % ent != 0 {
+            return Err(Error::BadDynamic);
+        }
+        // `.rela.dyn` precisa estar inteira na parte de arquivo de um PT_LOAD.
+        let seg = self
+            .loads()
+            .find(|p| rela >= p.vaddr && size <= p.filesz && rela - p.vaddr <= p.filesz - size)
+            .ok_or(Error::BadDynamic)?;
+        let offset =
+            usize::try_from(seg.offset + (rela - seg.vaddr)).map_err(|_| Error::BadDynamic)?;
+        let count = usize::try_from(size / ent).map_err(|_| Error::BadDynamic)?;
+        Ok((offset, count))
+    }
+
+    fn relocations_raw(&self) -> impl Iterator<Item = Result<Relocation, Error>> + 'a {
+        let (data, (offset, count)) = (self.data, self.rela);
+        (0..count).map(move |i| {
+            let at = offset + i * RELA_SIZE;
+            let field = |n| u64_at(data, at + n).ok_or(Error::BadDynamic);
+            if field(8)? != R_X86_64_RELATIVE {
+                return Err(Error::BadRelocation);
+            }
+            Ok(Relocation {
+                vaddr: field(0)?,
+                addend: field(16)?,
+            })
+        })
+    }
+
+    fn check_relocation(&self, r: Relocation) -> Result<(), Error> {
+        let inside =
+            |p: &Phdr| r.vaddr >= p.vaddr && p.memsz >= 8 && r.vaddr - p.vaddr <= p.memsz - 8;
+        if self.loads().any(|p| inside(&p)) {
+            Ok(())
+        } else {
+            Err(Error::BadRelocation)
+        }
     }
 
     fn validate(&self) -> Result<(), Error> {
@@ -275,6 +389,18 @@ impl<'a> Elf<'a> {
     #[must_use]
     pub fn entry(&self) -> u64 {
         self.entry
+    }
+
+    /// É `ET_DYN` e pode ser carregado em outro endereço aplicando
+    /// [`Elf::relocations`].
+    #[must_use]
+    pub fn is_relocatable(&self) -> bool {
+        self.pie
+    }
+
+    /// Relocações `R_X86_64_RELATIVE` já validadas; vazio em `ET_EXEC`.
+    pub fn relocations(&self) -> impl Iterator<Item = Relocation> + 'a {
+        self.relocations_raw().filter_map(Result::ok)
     }
 
     /// Segmentos `PT_LOAD` com memória, em ordem crescente de endereço.
