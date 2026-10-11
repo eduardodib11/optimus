@@ -191,7 +191,9 @@ fn control_registers() -> [u64; 4] {
 #[unsafe(no_mangle)]
 extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
     if frame.vector >= 32 {
-        super::apic::dispatch(frame.vector);
+        if super::apic::dispatch(frame.vector) {
+            crate::kthread::on_timer();
+        }
         return;
     }
     if frame.vector == 2 && super::apic::frozen() {

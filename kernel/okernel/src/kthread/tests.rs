@@ -1,4 +1,5 @@
-//! Testes de kernel de threads de usuário e syscalls (T-206).
+//! Testes de kernel de threads de usuário e syscalls (T-206) e do
+//! escalonador (T-207, em `sched`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -6,6 +7,7 @@ use alloc::vec::Vec;
 use kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use kabi::{Error, Handle, ObjectType};
 use okernel::cap::{Cap, SharedCapSpace};
+use okernel::sched::Params;
 use okernel::thread::{RunState, Thread};
 use okernel::vm::vm_map;
 
@@ -15,6 +17,8 @@ use crate::kcap::{root_cap_space, root_quota};
 use crate::kmem;
 use crate::ktest::{Outcome, Test};
 use crate::kvm::activate;
+
+mod sched;
 
 /// Testes de kernel de threads de usuário.
 pub const TESTS: &[Test] = &[
@@ -29,6 +33,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "thread.copias_de_usuario_so_na_metade_baixa",
         run: copias,
+    },
+    Test {
+        name: "sched.sem_orcamento_espera_o_proximo_periodo",
+        run: sched::sem_orcamento_espera,
     },
 ];
 
@@ -104,9 +112,35 @@ pub fn process(data_pages: u64) -> Result<Process, &'static str> {
     })
 }
 
-/// Cria uma thread no processo, configurada, ainda sem iniciar; devolve
-/// o handle dela também, para o teste apagá-la no fim.
+/// Cria uma thread no processo, configurada e ligada a um `SchedContext`
+/// sem limite de prioridade 100, ainda sem iniciar; devolve o handle dela
+/// também, para o teste apagá-la no fim.
 pub fn thread(p: &Process) -> Result<(Handle, Arc<Thread>), &'static str> {
+    let params = Params::new(1_000_000, 1_000_000, 100).map_err(|_| "params")?;
+    thread_with(p, params)
+}
+
+/// Como [`thread`], com o `SchedContext` configurado com `params`.
+pub fn thread_with(p: &Process, params: Params) -> Result<(Handle, Arc<Thread>), &'static str> {
+    let (h, t) = bare_thread(p)?;
+    let sc = p
+        .cspace
+        .lock()
+        .obj_create(p.quota, ObjectType::SchedContext, 0)
+        .map_err(|_| "obj_create(SchedContext)")?;
+    let sc = Arc::clone(
+        cap(&p.cspace, sc)?
+            .object
+            .as_sched_context()
+            .map_err(|_| "tipo")?,
+    );
+    sc.configure(params);
+    t.bind_sched(sc).map_err(|_| "bind")?;
+    Ok((h, t))
+}
+
+/// Thread configurada, sem `SchedContext`.
+fn bare_thread(p: &Process) -> Result<(Handle, Arc<Thread>), &'static str> {
     let h = p
         .cspace
         .lock()
@@ -210,7 +244,10 @@ fn start_recusa() -> Outcome {
         args: [0; 3],
     };
     ensure!(start(&lone_t, &e) == Err(Error::InvalidArgument));
-    delete(&p, &[h, lone])?;
+    // Sem `SchedContext`, também não.
+    let (bare, bare_t) = bare_thread(&p)?;
+    ensure!(start(&bare_t, &e) == Err(Error::InvalidArgument));
+    delete(&p, &[h, lone, bare])?;
     Ok(())
 }
 

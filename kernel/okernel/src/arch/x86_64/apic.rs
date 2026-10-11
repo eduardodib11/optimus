@@ -3,8 +3,10 @@
 //! seção 6.8).
 //!
 //! O 8259 legado fica todo mascarado. Interrupções de vetor 32 a 255 chegam a
-//! [`dispatch`]: o timer só registra o disparo (o tratador não toma travas
-//! nem aloca), o vetor espúrio é ignorado e os demais contam como inesperados.
+//! [`dispatch`]: o timer registra o disparo e, depois do EOI, chama o
+//! escalonador (T-207; as interrupções só chegam no anel 3 ou no ocioso,
+//! nunca com trava do kernel na mão), o vetor espúrio é ignorado e os
+//! demais contam como inesperados.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -216,16 +218,21 @@ pub fn frozen() -> bool {
 }
 
 /// Tratador das interrupções de vetor 32 a 255, chamado com IF desligado.
-pub fn dispatch(vector: u64) {
-    match u8::try_from(vector) {
-        Ok(SPURIOUS_VECTOR) => return,
+/// Devolve se foi o timer, já com o EOI feito (o escalonador pode trocar de
+/// thread em seguida).
+pub fn dispatch(vector: u64) -> bool {
+    let timer = match u8::try_from(vector) {
+        Ok(SPURIOUS_VECTOR) => return false,
         Ok(TIMER_VECTOR) => {
             TIMER_LAST_TSC.store(cpu::rdtsc(), Ordering::Relaxed);
             TIMER_FIRES.fetch_add(1, Ordering::Release);
+            true
         }
         _ => {
             UNEXPECTED.fetch_add(1, Ordering::Relaxed);
+            false
         }
-    }
+    };
     write(REG_EOI, 0);
+    timer
 }
