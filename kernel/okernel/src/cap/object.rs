@@ -9,17 +9,36 @@
 //! respondem [`Error::NotSupported`] por enquanto.
 
 use alloc::sync::Arc;
+use core::fmt;
 use core::mem::size_of;
 
 use kabi::{Error, ObjectType, Rights};
 
 use super::quota::MemoryQuota;
+use super::space::CapSpace;
+use crate::sync::SpinLock;
+
+/// `CapSpace` compartilhado, com a trava que a seção 6.9 põe à frente de
+/// todas as outras.
+pub type SharedCapSpace = SpinLock<CapSpace>;
 
 /// Referência contada a um objeto do kernel, como guardada num slot.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Object {
     /// Orçamento de bytes.
     MemoryQuota(Arc<MemoryQuota>),
+    /// Tabela de capabilities.
+    CapSpace(Arc<SharedCapSpace>),
+}
+
+impl fmt::Debug for Object {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ptr = match self {
+            Self::MemoryQuota(q) => Arc::as_ptr(q).addr(),
+            Self::CapSpace(c) => Arc::as_ptr(c).addr(),
+        };
+        write!(f, "{:?}@{ptr:#x}", self.object_type())
+    }
 }
 
 impl Object {
@@ -28,6 +47,7 @@ impl Object {
     pub const fn object_type(&self) -> ObjectType {
         match self {
             Self::MemoryQuota(_) => ObjectType::MemoryQuota,
+            Self::CapSpace(_) => ObjectType::CapSpace,
         }
     }
 
@@ -36,6 +56,8 @@ impl Object {
     pub fn same(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::MemoryQuota(a), Self::MemoryQuota(b)) => Arc::ptr_eq(a, b),
+            (Self::CapSpace(a), Self::CapSpace(b)) => Arc::ptr_eq(a, b),
+            _ => false,
         }
     }
 
@@ -47,6 +69,19 @@ impl Object {
     pub fn as_quota(&self) -> Result<&Arc<MemoryQuota>, Error> {
         match self {
             Self::MemoryQuota(q) => Ok(q),
+            Self::CapSpace(_) => Err(Error::WrongType),
+        }
+    }
+
+    /// O `CapSpace`, se o objeto for um.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_cap_space(&self) -> Result<&Arc<SharedCapSpace>, Error> {
+        match self {
+            Self::CapSpace(c) => Ok(c),
+            Self::MemoryQuota(_) => Err(Error::WrongType),
         }
     }
 }
@@ -93,7 +128,9 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 /// `quota`.
 ///
 /// `args` por tipo: `MemoryQuota`, o orçamento da cota filha em bytes (que
-/// sai de `quota` junto com o tamanho do objeto). Os direitos sobre `quota`
+/// sai de `quota` junto com o tamanho do objeto); `CapSpace`, zero (as
+/// folhas da tabela são cobradas da mesma cota à medida que ela cresce).
+/// Os direitos sobre `quota`
 /// (`CREATE`, e `SPLIT` para cotas) são conferidos por quem chama, que tem a
 /// capability.
 ///
@@ -113,6 +150,10 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
                 args, charge,
             ))))
         }
+        ObjectType::CapSpace if args != 0 => Err(Error::InvalidArgument),
+        ObjectType::CapSpace => Ok(Object::CapSpace(Arc::new(SpinLock::new(CapSpace::new(
+            quota,
+        )?)))),
         _ => Err(Error::NotSupported),
     }
 }
