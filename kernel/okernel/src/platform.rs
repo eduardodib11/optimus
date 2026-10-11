@@ -9,10 +9,12 @@
 #![forbid(unsafe_code)]
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use crate::mm::PhysAddr;
 use crate::mm::paging::TableMemory;
 use crate::sync::SpinLock;
+use crate::thread::Thread;
 
 /// Serviços da máquina para os objetos do kernel.
 pub trait Platform: Sync {
@@ -36,6 +38,10 @@ pub trait Platform: Sync {
     fn free_kernel_stack(&self, stack: KernelStack);
     /// Bytes da área de estado de FPU/SIMD de uma thread (XSAVE ou FXSAVE).
     fn fpu_area_bytes(&self) -> usize;
+    /// Põe de volta na fila `thread`, bloqueada num objeto de IPC que foi
+    /// destruído (o resultado da espera já está gravado nela); não troca de
+    /// thread. Pode ser chamada com a trava de um `CapSpace` na mão.
+    fn wake(&self, thread: Arc<Thread>);
 }
 
 /// Bytes da pilha de kernel de cada thread (seção 6.3).

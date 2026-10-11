@@ -276,6 +276,18 @@ fn send(
     let mut out = outgoing(space, me, regs, ep_cap.rights.contains(Rights::GRANT), env)?;
     out.badge = ep_cap.badge;
     out.call = call;
+    send_out(me, ep, out, wait, env)
+}
+
+/// Entrega `out` ao primeiro receptor de `ep` ou põe `me` na fila de envio.
+fn send_out(
+    me: &Arc<Thread>,
+    ep: &Arc<Endpoint>,
+    out: Outgoing,
+    wait: Wait,
+    env: &mut dyn Env,
+) -> Result<Step, Error> {
+    let call = out.call;
     let fast = out.msg.info.registers_only();
     let Some(r) = ep.pop_receiver() else {
         if let Some(e) = wait.refuse {
@@ -488,20 +500,65 @@ pub fn invoke(
     regs: &Regs,
     env: &mut dyn Env,
 ) -> Result<Out, Error> {
-    match begin(space, call, regs, env)? {
+    let step = begin(space, call, regs, env)?;
+    let me = env.current().ok_or(Error::NotSupported)?;
+    let out = wait_for(&me, step, env)?;
+    Ok(if call == Syscall::IpcSend {
+        Out::default()
+    } else {
+        out
+    })
+}
+
+/// Espera o fim de `step` (bloqueando `me`, se for o caso) e devolve o que
+/// chegou.
+fn wait_for(me: &Thread, step: Step, env: &mut dyn Env) -> Result<Out, Error> {
+    match step {
         Step::Done(out) => Ok(out),
         Step::Block { deadline, handoff } => {
-            let me = env.current().ok_or(Error::NotSupported)?;
             match handoff {
                 Some(to) => env.handoff(to, deadline),
                 None => env.block_until(deadline),
             }
-            match call {
-                Syscall::IpcSend => finish(&me).map(|_| Out::default()),
-                _ => finish(&me),
-            }
+            finish(me)
         }
     }
+}
+
+/// `ipc_call` feito pelo kernel em nome de `me`, a thread atual, pela
+/// capability `ep_cap` (falta de usuário, T-210): `msg` só em
+/// registradores, sem capabilities e sem prazo. Devolve a resposta.
+///
+/// `ep_cap` é solta antes de esperar: a espera não mantém o endpoint vivo.
+///
+/// # Errors
+///
+/// [`Error::WrongType`] se `ep_cap` não for de endpoint;
+/// [`Error::AccessDenied`] sem `SEND`; o erro da espera (`PeerClosed` se o
+/// endpoint ou o `Reply` morrer antes da resposta).
+pub fn kernel_call(
+    me: &Arc<Thread>,
+    ep_cap: Cap,
+    msg: Message,
+    env: &mut dyn Env,
+) -> Result<Out, Error> {
+    let ep = ep_cap.object.as_endpoint()?;
+    if !ep_cap.rights.contains(Rights::SEND) {
+        return Err(Error::AccessDenied);
+    }
+    let out = Outgoing {
+        msg,
+        caps: Default::default(),
+        badge: ep_cap.badge,
+        call: true,
+    };
+    let wait = Wait {
+        deadline: 0,
+        refuse: None,
+    };
+    let step = send_out(me, ep, out, wait, env)?;
+    drop(ep_cap);
+    wait_for(me, step, env)
 }
 
 #[cfg(test)]

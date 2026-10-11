@@ -15,10 +15,10 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use kabi::Error;
 use kabi::vm::{PAGE_SIZE, USER_END, USER_START};
+use kabi::{Error, Handle};
 
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
@@ -103,6 +103,9 @@ pub struct Thread {
     ipc: SpinLock<IpcSlot>,
     /// Endereço de usuário do buffer de IPC (zero: sem buffer).
     ipc_buffer: AtomicU64,
+    /// Handle cru, no `CapSpace` da thread, do endpoint de exceções (T-210;
+    /// zero: sem endpoint).
+    exception: AtomicU32,
 }
 
 impl fmt::Debug for Thread {
@@ -146,7 +149,14 @@ impl Thread {
             sched: SpinLock::new(None),
             ipc: SpinLock::new(IpcSlot::default()),
             ipc_buffer: AtomicU64::new(0),
+            exception: AtomicU32::new(0),
         })
+    }
+
+    /// A plataforma da thread (quem a põe de volta na fila).
+    #[must_use]
+    pub fn platform(&self) -> &'static dyn Platform {
+        self.platform
     }
 
     /// Pilha de kernel.
@@ -286,6 +296,21 @@ impl Thread {
         }
         self.ipc_buffer.store(va, Ordering::Release);
         Ok(())
+    }
+
+    /// Fixa o endpoint de exceções (parte de `thread_configure`, T-210): o
+    /// handle, no `CapSpace` da thread, procurado a cada falta; o handle
+    /// nulo tira o endpoint. Como só o handle fica guardado, apagar ou
+    /// revogar a capability também o tira.
+    pub fn set_exception_handler(&self, h: Handle) {
+        self.exception.store(h.raw(), Ordering::Release);
+    }
+
+    /// O handle do endpoint de exceções, se houver.
+    #[must_use]
+    pub fn exception_handler(&self) -> Option<Handle> {
+        let raw = self.exception.load(Ordering::Acquire);
+        (raw != 0).then(|| Handle::from_raw(raw))
     }
 
     /// O `CapSpace` da thread, se configurada.

@@ -594,8 +594,9 @@ pub fn trace_take() -> Vec<Event> {
     core::mem::take(&mut SCHED.lock().trace)
 }
 
-/// `thread_exit`: a thread atual termina.
-fn exit_current() -> ! {
+/// `thread_exit`: a thread atual termina. Quem chama solta antes as
+/// referências que tiver na pilha: esta função nunca volta.
+pub fn exit_current() -> ! {
     schedule(Why::Exit);
     unreachable!("thread terminada voltou a rodar");
 }

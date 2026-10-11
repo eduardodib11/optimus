@@ -469,3 +469,74 @@ fn resposta_com_capability_exige_grant_do_servidor() {
         }
     }
 }
+
+/// Apaga a capability de handle cru `h` (32 bits baixos) de `p`.
+fn delete(p: &Proc, h: u64) {
+    let h = Handle::from_raw(u32::try_from(h & 0xffff_ffff).unwrap());
+    drop(p.space.lock().delete(h).unwrap());
+}
+
+#[test]
+fn endpoint_destruido_acorda_quem_espera_com_peer_closed() {
+    // Receptor na fila; some a última capability do endpoint.
+    let w = world(Rights::SEND);
+    let mut env = Fake::default();
+    let recv = regs(w.s_target, 0, &[]);
+    assert!(blocked(&w.server.begin(&mut env, Syscall::IpcRecv, &recv)));
+    let World {
+        ep,
+        client,
+        server,
+        c_ep,
+        s_target,
+        ..
+    } = w;
+    drop(ep);
+    delete(&client, c_ep);
+    assert!(
+        server.thread.ipc().lock().receiving(),
+        "ainda há capability"
+    );
+    delete(&server, s_target);
+    assert_eq!(finish(&server.thread), Err(Error::PeerClosed));
+    assert!(!server.thread.ipc().lock().receiving());
+    // Remetente na fila (chamada sem servidor) levando uma capability: ela
+    // é solta com a mensagem.
+    let w = world(Rights::SEND | Rights::GRANT);
+    let ntfy = obj_create(&w.quota, ObjectType::Notification, 0).unwrap();
+    let h = w.client.give(&ntfy, Rights::SIGNAL, 0);
+    put_caps(&mut env, &w.client, &[h]);
+    let call = with_caps(w.c_ep, 1, 0);
+    assert!(blocked(&w.client.begin(&mut env, Syscall::IpcCall, &call)));
+    let World {
+        ep,
+        client,
+        server,
+        c_ep,
+        s_target,
+        ..
+    } = w;
+    drop(ep);
+    delete(&client, c_ep);
+    delete(&server, s_target);
+    assert_eq!(finish(&client.thread), Err(Error::PeerClosed));
+    assert!(client.thread.ipc().lock().out.is_none());
+    delete(&client, u64::from(h.raw()));
+    assert_eq!(Arc::strong_count(ntfy.as_notification().unwrap()), 1);
+}
+
+#[test]
+fn reply_destruido_acorda_quem_chamou_com_peer_closed() {
+    let w = world(Rights::SEND);
+    let mut env = Fake::default();
+    let call = regs(w.c_ep, 1, &[42]);
+    assert!(blocked(&w.client.begin(&mut env, Syscall::IpcCall, &call)));
+    let recv = regs(w.s_target, 0, &[]);
+    let got = w.server.begin(&mut env, Syscall::IpcRecv, &recv);
+    assert!(matches!(got, Ok(Step::Done(_))));
+    assert!(w.client.thread.ipc().lock().awaiting_reply());
+    // O servidor apaga o Reply sem responder.
+    delete(&w.server, w.s_target >> 32);
+    assert_eq!(finish(&w.client.thread), Err(Error::PeerClosed));
+    assert!(!w.client.thread.ipc().lock().awaiting_reply());
+}

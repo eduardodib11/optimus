@@ -5,7 +5,7 @@
  * RX no anel 3. Todo salto é relativo, então o código roda em qualquer
  * endereço. Usa só registradores e a página RW cujo endereço recebe.
  *
- * Syscalls: 0x80000000 = depuração dos testes (kabi::DEBUG_PRINT),
+ * Syscalls: 6 = vm_map, 0x80000000 = depuração dos testes (kabi::DEBUG_PRINT),
  * 18 = ipc_send, 19 = ipc_recv, 20 = ipc_call, 21 = ipc_reply_recv,
  * 23 = ntfy_wait, 25 = obj_bind_notify, 26 = irq_ack, 27 = clock_get,
  * 28 = yield, 29 = futex_wait, 30 = futex_wake, 33 = thread_exit.
@@ -349,6 +349,103 @@ user_ipc_recv:
     mov [rbp + 40], rdx
     mov eax, dword ptr [rbp]
     mov [rbp + 48], rax
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_fault(rdi = vetor, rsi = página RW)
+ *
+ * Faltas de usuário (T-210): grava 1 em [página] e causa a exceção
+ * `vetor` (0 = divisão por zero, 6 = ud2, 13 = hlt no anel 3, 14 = leitura
+ * do endereço 0). Se for retomada, grava 2 em [página] e termina. */
+.global user_fault
+user_fault:
+    mov qword ptr [rsi], 1
+    cmp rdi, 14
+    je 14f
+    cmp rdi, 13
+    je 13f
+    cmp rdi, 6
+    je 6f
+    xor edx, edx
+    xor eax, eax
+    xor ecx, ecx
+    div rcx
+    jmp 1f
+6:
+    ud2
+13:
+    hlt
+    jmp 1f
+14:
+    mov rax, qword ptr [0]
+1:
+    mov qword ptr [rsi], 2
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_fault_read(rdi = endereço, rsi = página RW)
+ *
+ * Grava 1 em [página], lê a palavra em `endereço` (que falta até o
+ * tratador mapeá-la), grava-a em [página + 8], grava 2 em [página] e
+ * termina. */
+.global user_fault_read
+user_fault_read:
+    mov qword ptr [rsi], 1
+    mov rax, qword ptr [rdi]
+    mov qword ptr [rsi + 8], rax
+    mov qword ptr [rsi], 2
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_fault_handler(rdi = endpoint | reply << 32, rsi = página RW,
+ * rdx = AddressSpace | MemoryObject << 32)
+ *
+ * Tratador de faltas: recebe uma falta e grava em [página + 16] o status,
+ * [+ 24] o badge, [+ 32] o rótulo, [+ 40] o código de erro, [+ 48] o
+ * endereço e [+ 56] o rip. Mapeia o MemoryObject (gravável) na página do
+ * endereço (vm_map, status em [+ 64]) e responde com rótulo 0 pelo Reply
+ * (ipc_send, status em [+ 72]), o que retoma a thread. */
+.global user_fault_handler
+user_fault_handler:
+    mov rbx, rdi
+    mov rbp, rsi
+    push rdx
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 19
+    syscall
+    mov [rbp + 16], rax
+    mov [rbp + 24], rdi
+    mov [rbp + 32], rsi
+    mov [rbp + 40], r8
+    mov [rbp + 48], r9
+    mov [rbp + 56], r12
+    test rax, rax
+    jnz 1f
+    pop rcx
+    mov edi, ecx
+    mov rsi, rcx
+    shr rsi, 32
+    mov rdx, r9
+    and rdx, -4096
+    xor r10d, r10d
+    mov r8d, 4096
+    mov r9d, 1
+    mov eax, 6
+    syscall
+    mov [rbp + 64], rax
+    mov rdi, rbx
+    shr rdi, 32
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 18
+    syscall
+    mov [rbp + 72], rax
+1:
     mov eax, 33
     syscall
     ud2
