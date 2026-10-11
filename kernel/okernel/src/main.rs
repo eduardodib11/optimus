@@ -19,6 +19,7 @@ mod arch;
 mod bootinfo;
 mod kcap;
 mod kfault;
+mod kfuzz;
 mod kheap;
 mod kipc;
 mod kirq;
@@ -90,6 +91,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         }
         Some("kernel") => ktest::run(option(cmdline, "ktest")),
         Some("panic") => panic!("pânico de teste proposital (test=panic)"),
+        Some("fuzz") => kfuzz::run(cmdline),
         _ => kroot::run(),
     }
     kheap::log_stats();

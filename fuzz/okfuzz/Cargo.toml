@@ -1,0 +1,17 @@
+[package]
+name = "okfuzz"
+description = "okfuzz: fuzzer de syscalls do Optimus (T-214), iniciado pelo kernel com test=fuzz."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "okfuzz"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+
+[lints]
+workspace = true

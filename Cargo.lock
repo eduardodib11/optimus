@@ -34,6 +34,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "okfuzz"
+version = "0.1.0"
+dependencies = [
+ "ostd",
+]
+
+[[package]]
 name = "optboot"
 version = "0.1.0"
 dependencies = [
