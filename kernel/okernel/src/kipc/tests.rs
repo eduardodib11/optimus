@@ -9,7 +9,7 @@ use kabi::ipc::{MsgInfo, recv_target};
 use kabi::vm::PAGE_SIZE;
 use kabi::{Error, Handle, ObjectType, Rights, STATUS_OK};
 use okernel::cap::{Cap, Object};
-use okernel::thread::Thread;
+use okernel::thread::{RunState, Thread};
 
 use crate::arch::x86_64::{cpu, probe};
 use crate::kcap::root_quota;
@@ -17,7 +17,7 @@ use crate::ktest::{Outcome, Test};
 use crate::kthread::tests::{
     DATA_VA, Process, delete, process, run_until_exit, thread, user_symbol,
 };
-use crate::kthread::{UserEntry, fast_switches, start};
+use crate::kthread::{UserEntry, fast_switches, start, yield_now};
 use crate::ktime;
 use crate::kvm::activate;
 
@@ -34,6 +34,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "ipc.prazo_vencido_devolve_timed_out",
         run: prazo,
+    },
+    Test {
+        name: "ipc.objeto_destruido_acorda_com_peer_closed",
+        run: peer_closed,
     },
 ];
 
@@ -269,5 +273,66 @@ fn prazo() -> Outcome {
     ensure!(ns >= 2_000_000);
     drop(t);
     delete(&server, &[h])?;
+    Ok(())
+}
+
+/// Roda as prontas até `t` bloquear.
+pub(crate) fn run_until_blocked(t: &Thread) -> Outcome {
+    for _ in 0..1000 {
+        if t.state() == RunState::Blocked {
+            return Ok(());
+        }
+        yield_now();
+    }
+    Err("a thread não bloqueou")
+}
+
+/// Quem espera num endpoint ou num `Reply` cuja última capability some
+/// acorda com `PeerClosed`, em vez de esperar para sempre.
+fn peer_closed() -> Outcome {
+    let quota = root_quota().ok_or("sem cota raiz")?;
+    let used0 = quota.used();
+    {
+        // Receptor esperando; o endpoint é apagado.
+        let server = process(1)?;
+        let (ep_h, ep) = create(&server, ObjectType::Endpoint)?;
+        let (reply, _) = create(&server, ObjectType::Reply)?;
+        drop(ep);
+        let args = [recv_target(ep_h, reply), 0, DATA_VA];
+        let (h, t) = spawn(&server, &raw const user_ipc_recv, args, 0)?;
+        run_until_blocked(&t)?;
+        delete(&server, &[ep_h])?;
+        run_until_exit(&[Arc::clone(&t)])?;
+        let [recv_status] = user_words::<1>(&server, DATA_VA + 16, None)?;
+        drop(t);
+        delete(&server, &[h])?;
+        // Quem chamou espera a resposta; o servidor recebe, termina sem
+        // responder e o Reply é apagado.
+        let (client, server) = (process(1)?, process(1)?);
+        let (ep_h, ep) = create(&server, ObjectType::Endpoint)?;
+        let (reply, _) = create(&server, ObjectType::Reply)?;
+        let c_ep = give(&client, &ep, Rights::SEND, BADGE)?;
+        drop(ep);
+        let args = [recv_target(ep_h, reply), 0, DATA_VA];
+        let (hs, ts) = spawn(&server, &raw const user_ipc_recv, args, 0)?;
+        let args = [u64::from(c_ep.raw()), 1, DATA_VA];
+        let (hc, tc) = spawn(&client, &raw const user_ipc_client, args, 0)?;
+        run_until_exit(&[Arc::clone(&ts)])?;
+        run_until_blocked(&tc)?;
+        delete(&server, &[reply])?;
+        run_until_exit(&[Arc::clone(&tc)])?;
+        let [call_status] = user_words::<1>(&client, DATA_VA, None)?;
+        info!(
+            "ktest: · ipc_recv: {:?}; ipc_call: {:?}",
+            Error::try_from(recv_status).ok(),
+            Error::try_from(call_status).ok()
+        );
+        ensure!(recv_status == Error::PeerClosed.to_raw());
+        ensure!(call_status == Error::PeerClosed.to_raw());
+        drop((ts, tc));
+        delete(&server, &[hs])?;
+        delete(&client, &[hc])?;
+    }
+    ensure!(quota.used() == used0);
     Ok(())
 }

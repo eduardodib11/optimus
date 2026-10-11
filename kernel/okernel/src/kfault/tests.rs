@@ -8,13 +8,13 @@ use alloc::sync::Arc;
 use kabi::fault::{DIVIDE_ERROR, GENERAL_PROTECTION, INVALID_OPCODE, PAGE_FAULT};
 use kabi::ipc::recv_target;
 use kabi::vm::PAGE_SIZE;
-use kabi::{ObjectType, Rights, STATUS_OK};
+use kabi::{Error, ObjectType, Rights, STATUS_OK};
 use okernel::fault::Kill;
 use okernel::thread::RunState;
 
 use super::{killed, last};
 use crate::kcap::root_quota;
-use crate::kipc::tests::{create, give, spawn, user_words};
+use crate::kipc::tests::{create, give, run_until_blocked, spawn, user_words};
 use crate::kmem;
 use crate::ktest::{Outcome, Test};
 use crate::kthread::tests::{DATA_VA, delete, process, run_until_exit};
@@ -28,6 +28,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "falta.tratador_recebe_a_falta_e_mapeia_a_pagina",
         run: tratador,
+    },
+    Test {
+        name: "falta.endpoint_destruido_encerra_quem_espera",
+        run: ninguem_atende,
     },
 ];
 
@@ -132,5 +136,33 @@ fn tratador() -> Outcome {
     drop((tm, tf));
     delete(&memd, &[hm])?;
     delete(&faulty, &[hf])?;
+    Ok(())
+}
+
+/// Ninguém atende: a thread espera na fila do endpoint de exceções até
+/// a última capability dele sumir; aí é encerrada (`PeerClosed`).
+fn ninguem_atende() -> Outcome {
+    let p = process(1)?;
+    let (ep_h, ep) = create(&p, ObjectType::Endpoint)?;
+    drop(ep);
+    let before = killed();
+    let (h, t) = crate::kthread::tests::thread(&p)?;
+    t.set_exception_handler(ep_h);
+    let e = crate::kthread::UserEntry {
+        rip: crate::kthread::tests::user_symbol(&raw const user_fault),
+        rsp: DATA_VA + PAGE_SIZE,
+        args: [PAGE_FAULT, DATA_VA, 0],
+    };
+    ensure!(crate::kthread::start(&t, &e).is_ok());
+    run_until_blocked(&t)?;
+    ensure!(killed() == before);
+    delete(&p, &[ep_h])?;
+    run_until_exit(&[Arc::clone(&t)])?;
+    let report = last().ok_or("sem relatório")?;
+    info!("ktest: · {}", report.kill);
+    ensure!(killed() == before + 1);
+    ensure!(report.kill == Kill::Unanswered(Error::PeerClosed));
+    drop(t);
+    delete(&p, &[h])?;
     Ok(())
 }

@@ -11,6 +11,11 @@
 //! acordou, onde está bloqueada e o resultado da espera. As syscalls ficam
 //! em [`ops`].
 //!
+//! Quando a última capability de um `Endpoint` ou `Reply` some, o objeto
+//! morre e quem esperava nele acorda com `PeerClosed` (pela
+//! [`Platform`](crate::platform::Platform) da thread), em vez de esperar
+//! para sempre.
+//!
 //! Travas (seção 6.9): a fila do objeto (`Endpoint` ou `Reply`) antes do
 //! `IpcSlot` de uma thread; nada aqui segura duas delas ao mesmo tempo.
 //! As filas crescem no heap sem cobrança de cota, como as de notificação:
@@ -292,6 +297,51 @@ impl Reply {
             *c = None;
         }
         ours
+    }
+}
+
+/// Acorda com `PeerClosed` a thread `t`, que esperava em `object` (um
+/// `Endpoint` ou `Reply` sendo destruído); nada se ela já não esperava
+/// ali.
+fn close(t: Arc<Thread>, object: *const ()) {
+    let (blocked, out) = {
+        let mut slot = t.ipc().lock();
+        let here = match &slot.blocked {
+            Blocked::Send(ep) | Blocked::Recv(ep, ..) => ep.as_ptr().cast::<()>() == object,
+            Blocked::Reply(reply) => reply.as_ptr().cast::<()>() == object,
+            Blocked::None => false,
+        };
+        if !here {
+            return;
+        }
+        slot.result = Err(Error::PeerClosed);
+        (core::mem::take(&mut slot.blocked), slot.out.take())
+    };
+    // O `Reply` de quem esperava receber e as capabilities da mensagem
+    // morrem fora da trava.
+    drop((blocked, out));
+    t.platform().wake(t);
+}
+
+impl Drop for Endpoint {
+    /// Ninguém mais pode enviar nem receber: quem espera nas filas acorda
+    /// com `PeerClosed`.
+    fn drop(&mut self) {
+        let Queues { senders, receivers } = core::mem::take(&mut *self.queues.lock());
+        let me = core::ptr::from_ref(self).cast();
+        for t in senders.into_iter().chain(receivers) {
+            close(t, me);
+        }
+    }
+}
+
+impl Drop for Reply {
+    /// A resposta nunca virá: quem espera acorda com `PeerClosed`.
+    fn drop(&mut self) {
+        let caller = self.caller.lock().take();
+        if let Some((t, _)) = caller {
+            close(t, core::ptr::from_ref(self).cast());
+        }
     }
 }
 

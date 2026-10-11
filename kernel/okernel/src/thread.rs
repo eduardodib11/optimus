@@ -153,6 +153,12 @@ impl Thread {
         })
     }
 
+    /// A plataforma da thread (quem a põe de volta na fila).
+    #[must_use]
+    pub fn platform(&self) -> &'static dyn Platform {
+        self.platform
+    }
+
     /// Pilha de kernel.
     #[must_use]
     pub const fn stack(&self) -> KernelStack {
