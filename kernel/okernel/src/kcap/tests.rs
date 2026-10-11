@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use kabi::{Error, ObjectType, Rights};
 use okernel::cap::object::object_bytes;
-use okernel::cap::{CapSpace, MemoryQuota, obj_create};
+use okernel::cap::{CapSpace, MemoryQuota, obj_create, xcdt};
 
 use okernel::cap::space::Revoke;
 
@@ -124,8 +124,8 @@ fn capspace_cresce() -> Outcome {
 }
 
 fn revogacao_fatiada() -> Outcome {
-    let (space, q) = root_cap_space().map_err(|_| "root_cap_space")?;
-    let mut space = space.lock();
+    let (shared, q) = root_cap_space().map_err(|_| "root_cap_space")?;
+    let mut space = shared.lock();
     let target = space.mint(q, Rights::ALL, None).map_err(|_| "mint")?;
     // Árvore aleatória (xorshift), limitada pela profundidade máxima.
     let mut handles = Vec::with_capacity(REVOKE_CAPS + 1);
@@ -144,10 +144,12 @@ fn revogacao_fatiada() -> Outcome {
     }
     let total = handles.len() - 1;
     let mut slices: Vec<u32> = Vec::new();
+    // Pelo caminho da syscall: a árvore entre tabelas (ADR 0028).
+    drop(space);
     let start = now_ns();
     loop {
         let t0 = now_ns();
-        let status = space.revoke(target, REVOKE_SLICE_BUDGET);
+        let status = xcdt::revoke(&shared, target, REVOKE_SLICE_BUDGET);
         slices.push(u32::try_from(now_ns() - t0).unwrap_or(u32::MAX));
         match status {
             Ok(Revoke::Continue) => {}
@@ -156,6 +158,7 @@ fn revogacao_fatiada() -> Outcome {
         }
     }
     let elapsed = now_ns() - start;
+    let space = shared.lock();
     ensure!(space.len() == 2);
     ensure!(handles[1..].iter().all(|&h| space.get(h).is_err()));
     ensure!(space.check_invariants().is_ok());

@@ -28,10 +28,11 @@ use alloc::sync::{Arc, Weak};
 use core::fmt;
 
 use kabi::ipc::MsgInfo;
-use kabi::{Badge, Error, MSG_MAX_CAPS, MSG_REG_WORDS};
+use kabi::{Badge, Error, Handle, MSG_MAX_CAPS, MSG_REG_WORDS};
 
 use crate::cap::object::object_bytes;
-use crate::cap::{Cap, Charge, MemoryQuota};
+use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
+use crate::sched::SchedContext;
 use crate::sync::SpinLock;
 use crate::thread::Thread;
 
@@ -48,14 +49,17 @@ pub struct Message {
     pub words: [u64; MSG_REG_WORDS],
 }
 
-/// O que um remetente leva: a mensagem, as capabilities já resolvidas no
-/// `CapSpace` dele e o badge da capability do endpoint.
+/// O que um remetente leva: a mensagem, os handles das capabilities a
+/// transferir (conferidos no envio e copiados na entrega, como filhas das
+/// originais) e o badge da capability do endpoint.
 #[derive(Debug, Default)]
 pub struct Outgoing {
     /// Registradores da mensagem.
     pub msg: Message,
-    /// Capabilities a transferir.
-    pub caps: [Option<Cap>; MSG_MAX_CAPS],
+    /// `CapSpace` do remetente, se a mensagem leva capabilities.
+    pub from: Option<Weak<SharedCapSpace>>,
+    /// Handles, em `from`, das capabilities a transferir.
+    pub caps: [Option<Handle>; MSG_MAX_CAPS],
     /// Badge entregue ao receptor.
     pub badge: Badge,
     /// `ipc_call`: espera a resposta.
@@ -226,6 +230,10 @@ type Caller = (Arc<Thread>, bool);
 pub struct Reply {
     _charge: Charge,
     caller: SpinLock<Option<Caller>>,
+    /// Quem atende a chamada e o `SchedContext` que recebeu de quem
+    /// chamou (seção 6.6), devolvido quando a espera acaba. Trava tomada
+    /// depois de `caller`, nunca junto.
+    donation: SpinLock<Option<(Weak<Thread>, Arc<SchedContext>)>>,
 }
 
 impl fmt::Debug for Reply {
@@ -244,6 +252,7 @@ impl Reply {
         Ok(Self {
             _charge: quota.charge(object_bytes::<Self>())?,
             caller: SpinLock::new(None),
+            donation: SpinLock::new(None),
         })
     }
 
@@ -284,7 +293,35 @@ impl Reply {
 
     /// Consome a resposta: devolve quem espera (uma vez só).
     pub fn take(&self) -> Option<Caller> {
-        self.caller.lock().take()
+        let caller = self.caller.lock().take();
+        self.end_donation();
+        caller
+    }
+
+    /// Doação (seção 6.6): `server` atende a chamada pendente com o
+    /// `SchedContext` de quem chamou, até a resposta (ou até a espera
+    /// acabar de outro jeito).
+    pub fn donate(&self, server: &Arc<Thread>) {
+        let Some(sc) = self
+            .caller
+            .lock()
+            .as_ref()
+            .and_then(|c| c.0.sched_context())
+        else {
+            return;
+        };
+        server.donate(Arc::clone(&sc));
+        *self.donation.lock() = Some((Arc::downgrade(server), sc));
+    }
+
+    /// Devolve a doação, se houver.
+    fn end_donation(&self) {
+        let donation = self.donation.lock().take();
+        if let Some((server, sc)) = donation
+            && let Some(server) = server.upgrade()
+        {
+            server.undonate(&sc);
+        }
     }
 
     /// Esquece `t`, se for quem espera (prazo vencido).
@@ -295,6 +332,10 @@ impl Reply {
             .is_some_and(|c| core::ptr::eq(Arc::as_ptr(&c.0), t));
         if ours {
             *c = None;
+        }
+        drop(c);
+        if ours {
+            self.end_donation();
         }
         ours
     }
@@ -317,8 +358,7 @@ fn close(t: Arc<Thread>, object: *const ()) {
         slot.result = Err(Error::PeerClosed);
         (core::mem::take(&mut slot.blocked), slot.out.take())
     };
-    // O `Reply` de quem esperava receber e as capabilities da mensagem
-    // morrem fora da trava.
+    // O `Reply` de quem esperava receber morre fora da trava.
     drop((blocked, out));
     t.platform().wake(t);
 }
@@ -339,6 +379,7 @@ impl Drop for Reply {
     /// A resposta nunca virá: quem espera acorda com `PeerClosed`.
     fn drop(&mut self) {
         let caller = self.caller.lock().take();
+        self.end_donation();
         if let Some((t, _)) = caller {
             close(t, core::ptr::from_ref(self).cast());
         }
@@ -371,7 +412,7 @@ pub fn cancel(t: &Arc<Thread>, why: Error) -> bool {
         }
         Blocked::None => {}
     }
-    // As capabilities da mensagem morrem fora das travas.
+    // O que a mensagem segura morre fora das travas.
     drop(out);
     true
 }
