@@ -51,6 +51,9 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: heap: slab   16 B",
     "okernel: cota raiz de ",
     "okernel: relógio: TSC de",
+    "okernel: root carregado do bootfs",
+    "root: iniciado",
+    "okernel: root terminou",
 ];
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
 const KERNEL_EXIT_OK: i32 = 33;
@@ -848,7 +851,10 @@ mod tests {
                   info  okernel: identidade removida; 40 páginas\r\n\
                   info  okernel: heap: slab   16 B: 0 slabs\r\n\
                   info  okernel: cota raiz de 28000 KiB\r\n\
-                  info  okernel: relógio: TSC de 2100000 kHz\r\n";
+                  info  okernel: relógio: TSC de 2100000 kHz\r\n\
+                  info  okernel: root carregado do bootfs (856 KiB), iniciando no anel 3\r\n\
+                  info  root: iniciado\r\n\
+                  info  okernel: root terminou\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
         assert!(check("Optimus OS \u{2014} optboot\r\n").is_err());
