@@ -365,3 +365,5 @@ impl<const N: usize> CapSpace<N> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_cdt;
