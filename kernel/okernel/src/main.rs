@@ -22,6 +22,7 @@ mod kheap;
 mod kmem;
 mod kpanic;
 mod ktime;
+mod kvm;
 
 use kabi::boot::BootInfo;
 use kabi::{SYSCALL_COUNT, Syscall};
@@ -60,6 +61,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         Some(map) => {
             bootinfo::log_memory_map(map);
             kmem::init(map);
+            kvm::init();
             kheap::init(cmdline);
             kcap::init();
             ktime::init(info);

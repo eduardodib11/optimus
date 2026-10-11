@@ -5,8 +5,9 @@
 //! objeto aloca por conta própria. Quando a última referência some, o
 //! `Charge` é destruído com o objeto e os bytes voltam à cota.
 //!
-//! Os tipos que dependem de tarefas futuras (threads, IPC, memória virtual)
-//! respondem [`Error::NotSupported`] por enquanto.
+//! `AddressSpace` e `MemoryObject` (T-205) usam a [`Platform`](crate::platform::Platform)
+//! instalada pelo kernel. Os tipos que dependem de tarefas futuras (threads,
+//! IPC) respondem [`Error::NotSupported`] por enquanto.
 
 use alloc::sync::Arc;
 use core::fmt;
@@ -16,7 +17,9 @@ use kabi::{Error, ObjectType, Rights};
 
 use super::quota::MemoryQuota;
 use super::space::CapSpace;
+use crate::platform;
 use crate::sync::SpinLock;
+use crate::vm::{AddressSpace, MemoryObject, SharedAddressSpace};
 
 /// `CapSpace` compartilhado, com a trava que a seção 6.9 põe à frente de
 /// todas as outras.
@@ -29,6 +32,10 @@ pub enum Object {
     MemoryQuota(Arc<MemoryQuota>),
     /// Tabela de capabilities.
     CapSpace(Arc<SharedCapSpace>),
+    /// Espaço de endereçamento.
+    AddressSpace(Arc<SharedAddressSpace>),
+    /// Páginas físicas.
+    MemoryObject(Arc<MemoryObject>),
 }
 
 impl fmt::Debug for Object {
@@ -36,6 +43,8 @@ impl fmt::Debug for Object {
         let ptr = match self {
             Self::MemoryQuota(q) => Arc::as_ptr(q).addr(),
             Self::CapSpace(c) => Arc::as_ptr(c).addr(),
+            Self::AddressSpace(a) => Arc::as_ptr(a).addr(),
+            Self::MemoryObject(m) => Arc::as_ptr(m).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -48,6 +57,8 @@ impl Object {
         match self {
             Self::MemoryQuota(_) => ObjectType::MemoryQuota,
             Self::CapSpace(_) => ObjectType::CapSpace,
+            Self::AddressSpace(_) => ObjectType::AddressSpace,
+            Self::MemoryObject(_) => ObjectType::MemoryObject,
         }
     }
 
@@ -57,6 +68,8 @@ impl Object {
         match (self, other) {
             (Self::MemoryQuota(a), Self::MemoryQuota(b)) => Arc::ptr_eq(a, b),
             (Self::CapSpace(a), Self::CapSpace(b)) => Arc::ptr_eq(a, b),
+            (Self::AddressSpace(a), Self::AddressSpace(b)) => Arc::ptr_eq(a, b),
+            (Self::MemoryObject(a), Self::MemoryObject(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -69,7 +82,7 @@ impl Object {
     pub fn as_quota(&self) -> Result<&Arc<MemoryQuota>, Error> {
         match self {
             Self::MemoryQuota(q) => Ok(q),
-            Self::CapSpace(_) => Err(Error::WrongType),
+            _ => Err(Error::WrongType),
         }
     }
 
@@ -81,7 +94,31 @@ impl Object {
     pub fn as_cap_space(&self) -> Result<&Arc<SharedCapSpace>, Error> {
         match self {
             Self::CapSpace(c) => Ok(c),
-            Self::MemoryQuota(_) => Err(Error::WrongType),
+            _ => Err(Error::WrongType),
+        }
+    }
+
+    /// O espaço de endereçamento, se o objeto for um.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_address_space(&self) -> Result<&Arc<SharedAddressSpace>, Error> {
+        match self {
+            Self::AddressSpace(a) => Ok(a),
+            _ => Err(Error::WrongType),
+        }
+    }
+
+    /// O `MemoryObject`, se o objeto for um.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_memory_object(&self) -> Result<&Arc<MemoryObject>, Error> {
+        match self {
+            Self::MemoryObject(m) => Ok(m),
+            _ => Err(Error::WrongType),
         }
     }
 }
@@ -129,7 +166,9 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 ///
 /// `args` por tipo: `MemoryQuota`, o orçamento da cota filha em bytes (que
 /// sai de `quota` junto com o tamanho do objeto); `CapSpace`, zero (as
-/// folhas da tabela são cobradas da mesma cota à medida que ela cresce).
+/// folhas da tabela são cobradas da mesma cota à medida que ela cresce);
+/// `AddressSpace`, zero (tabelas e regiões são cobradas ao mapear);
+/// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB.
 /// Os direitos sobre `quota`
 /// (`CREATE`, e `SPLIT` para cotas) são conferidos por quem chama, que tem a
 /// capability.
@@ -150,10 +189,20 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
                 args, charge,
             ))))
         }
-        ObjectType::CapSpace if args != 0 => Err(Error::InvalidArgument),
+        ObjectType::CapSpace | ObjectType::AddressSpace if args != 0 => Err(Error::InvalidArgument),
         ObjectType::CapSpace => Ok(Object::CapSpace(Arc::new(SpinLock::new(CapSpace::new(
             quota,
         )?)))),
+        ObjectType::AddressSpace => {
+            let platform = platform::get().ok_or(Error::NotSupported)?;
+            let space = AddressSpace::new(quota, platform)?;
+            Ok(Object::AddressSpace(Arc::new(SpinLock::new(space))))
+        }
+        ObjectType::MemoryObject => {
+            let platform = platform::get().ok_or(Error::NotSupported)?;
+            let memory = MemoryObject::new(quota, args, platform)?;
+            Ok(Object::MemoryObject(Arc::new(memory)))
+        }
         _ => Err(Error::NotSupported),
     }
 }

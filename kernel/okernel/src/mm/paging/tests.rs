@@ -6,6 +6,7 @@ use super::*;
 struct Fake {
     tables: Vec<Box<Table>>,
     limit: usize,
+    freed: Vec<PhysAddr>,
 }
 
 impl Fake {
@@ -13,6 +14,7 @@ impl Fake {
         let mut mem = Self {
             tables: Vec::new(),
             limit,
+            freed: Vec::new(),
         };
         let root = mem.alloc_table().unwrap();
         PageTables::new(root, mem)
@@ -31,6 +33,10 @@ impl TableMemory for Fake {
         }
         self.tables.push(Box::new([0; ENTRIES]));
         Some(PhysAddr(self.tables.len() as u64 * FRAME_SIZE))
+    }
+
+    fn free_table(&mut self, phys: PhysAddr) {
+        self.freed.push(phys);
     }
 }
 
@@ -217,4 +223,28 @@ fn falta_de_frame_vira_erro() {
     );
     // A página grande continua inteira.
     assert_eq!(pt.translate(K + 0x5000).unwrap().size, PageSize::Size2M);
+}
+
+#[test]
+fn conta_tabelas_e_devolve_a_metade_baixa() {
+    let mut pt = Fake::new(64);
+    let u = 0x40_0000u64;
+    // PDPT + PD + PT para a primeira página; 2 MiB adiante, só mais um PT.
+    assert_eq!(pt.tables_needed(u, u + 0x1000), 3);
+    assert_eq!(pt.tables_needed(u, u + MIB2 + 0x1000), 4);
+    let user = Flags {
+        user: true,
+        ..Flags::RW
+    };
+    pt.map(u, PhysAddr(0x9000), PageSize::Size4K, user).unwrap();
+    assert_eq!(pt.memory().tables.len(), 4);
+    assert_eq!(pt.tables_needed(u, u + 0x2000), 0);
+    assert_eq!(pt.tables_needed(u, u + MIB2 + 0x1000), 1);
+    // Uma página do kernel não entra na conta nem é devolvida.
+    pt.map(K, PhysAddr(0xa000), PageSize::Size4K, Flags::RW)
+        .unwrap();
+    pt.free_user_half();
+    assert_eq!(pt.memory().freed.len(), 3);
+    assert_eq!(pt.translate(u), None);
+    assert!(pt.translate(K).is_some());
 }

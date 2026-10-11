@@ -9,8 +9,9 @@
 //! Os níveis intermediários liberam tudo (gravável, executável) e quem
 //! restringe é a folha. Quem chama invalida a TLB (`invlpg`) depois de
 //! [`PageTables::unmap`] e [`PageTables::protect`]. Tabelas intermediárias
-//! que ficam vazias não são devolvidas (custo de no máximo 4 KiB por 2 MiB
-//! já mapeados; a coleta entra com o `AddressSpace` do T-205).
+//! que ficam vazias não são devolvidas no `unmap` (custo de no máximo 4 KiB
+//! por 2 MiB já mapeados); o `AddressSpace` (T-205) as devolve todas ao
+//! morrer, por [`PageTables::free_user_half`].
 
 #![forbid(unsafe_code)]
 
@@ -175,6 +176,22 @@ pub trait TableMemory {
     fn table(&mut self, phys: PhysAddr) -> &mut Table;
     /// Um frame zerado para uma tabela nova.
     fn alloc_table(&mut self) -> Option<PhysAddr>;
+    /// Devolve uma tabela obtida com [`alloc_table`](Self::alloc_table).
+    fn free_table(&mut self, phys: PhysAddr);
+}
+
+impl<M: TableMemory + ?Sized> TableMemory for alloc::boxed::Box<M> {
+    fn table(&mut self, phys: PhysAddr) -> &mut Table {
+        (**self).table(phys)
+    }
+
+    fn alloc_table(&mut self) -> Option<PhysAddr> {
+        (**self).alloc_table()
+    }
+
+    fn free_table(&mut self, phys: PhysAddr) {
+        (**self).free_table(phys);
+    }
 }
 
 /// Uma folha encontrada por [`PageTables::translate`].
@@ -309,6 +326,67 @@ impl<M: TableMemory> PageTables<M> {
             });
         }
         None
+    }
+
+    /// Tabelas que faltam para mapear páginas de 4 KiB em `[start, end)`:
+    /// o que [`map`](Self::map) alocaria nessa faixa.
+    pub fn tables_needed(&mut self, start: u64, end: u64) -> u64 {
+        let mut needed = 0;
+        // Níveis 4 a 2: cada entrada ausente no caminho custa uma tabela
+        // para cada bloco do tamanho que ela cobre.
+        for level in (2..=4).rev() {
+            let span = 1u64 << (12 + 9 * (level - 1));
+            let mut block = start & !(span - 1);
+            while block < end {
+                if !self.has_table_below(block, level) {
+                    needed += 1;
+                }
+                block = match block.checked_add(span) {
+                    Some(b) => b,
+                    None => break,
+                };
+            }
+        }
+        needed
+    }
+
+    /// Verdadeiro se a entrada do nível `level` que cobre `virt` aponta
+    /// para uma tabela.
+    fn has_table_below(&mut self, virt: u64, level: u32) -> bool {
+        let mut table = self.root;
+        for l in (level..=4).rev() {
+            let entry = self.mem.table(table)[slot(virt, l)];
+            if entry & PRESENT == 0 || entry & HUGE != 0 {
+                return false;
+            }
+            table = PhysAddr(entry & ADDR_4K);
+        }
+        true
+    }
+
+    /// Devolve todas as tabelas da metade baixa (entradas 0 a 255 do PML4)
+    /// e zera essas entradas. As folhas apontam para frames de outros donos
+    /// (os `MemoryObject`), que não são tocados. Quem chama invalida a TLB.
+    pub fn free_user_half(&mut self) {
+        for i in 0..ENTRIES / 2 {
+            let entry = self.mem.table(self.root)[i];
+            if entry & PRESENT != 0 {
+                self.free_tree(PhysAddr(entry & ADDR_4K), 3);
+                self.mem.table(self.root)[i] = 0;
+            }
+        }
+    }
+
+    fn free_tree(&mut self, table: PhysAddr, level: u32) {
+        if level > 1 {
+            for i in 0..ENTRIES {
+                let entry = self.mem.table(table)[i];
+                if entry & PRESENT != 0 && entry & HUGE == 0 {
+                    self.free_tree(PhysAddr(entry & ADDR_4K), level - 1);
+                }
+            }
+        }
+        self.mem.free_table(table);
     }
 
     /// Chama `f(virt, folha)` para cada folha de 4 KiB ou 2 MiB presente, em

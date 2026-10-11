@@ -13,5 +13,7 @@ pub mod cap;
 pub mod console;
 pub mod log;
 pub mod mm;
+pub mod platform;
 pub mod sync;
 pub mod time;
+pub mod vm;

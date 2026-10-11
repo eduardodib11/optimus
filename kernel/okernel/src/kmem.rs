@@ -67,6 +67,10 @@ impl TableMemory for DirectMap {
         self.table(frame).fill(0);
         Some(frame)
     }
+
+    fn free_table(&mut self, phys: PhysAddr) {
+        free_frames(phys, 0);
+    }
 }
 
 /// Aloca `2^order` frames contíguos.
@@ -81,6 +85,11 @@ pub fn free_frames(addr: PhysAddr, order: usize) {
     {
         error!("okernel: free_frames({:#x}, {order}): {e:?}", addr.0);
     }
+}
+
+/// PML4 do kernel.
+pub fn kernel_root() -> Option<PhysAddr> {
+    Some(KERNEL_PT.lock().as_ref()?.root())
 }
 
 /// Frames livres e gerenciados.
@@ -150,6 +159,17 @@ pub fn init(map: &[MemRegion]) {
     // (código, pilha, BootInfo e tabelas estão na metade alta).
     let pml4 = unsafe { &mut *(direct(root) as *mut Table) };
     pml4[..256].fill(0);
+    // Toda entrada da metade alta ganha tabela já no boot: os espaços de
+    // usuário (T-205) copiam essas entradas, e um mapeamento posterior do
+    // kernel aparece em todos eles.
+    let mut tables = DirectMap;
+    let missing = pml4[256..].iter().filter(|e| **e & 1 == 0).count();
+    for entry in pml4[256..].iter_mut().filter(|e| **e & 1 == 0) {
+        match tables.alloc_table() {
+            Some(t) => *entry = t.0 | 0b11,
+            None => error!("okernel: sem frame para a metade alta do PML4"),
+        }
+    }
     let mut pt = PageTables::new(root, DirectMap);
     let mut protected = 0;
     for (start, end) in [kernel_text(), kernel_rodata()] {
@@ -167,7 +187,7 @@ pub fn init(map: &[MemRegion]) {
     *KERNEL_PT.lock() = Some(pt);
     cpu::flush_tlb();
     info!(
-        "okernel: identidade removida; {protected} páginas do kernel só de leitura no mapa direto"
+        "okernel: identidade removida; {protected} páginas do kernel só de leitura no mapa direto; {missing} entradas da metade alta criadas"
     );
     harden_cpu();
 }
