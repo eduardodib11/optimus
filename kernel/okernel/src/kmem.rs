@@ -67,6 +67,10 @@ impl TableMemory for DirectMap {
         self.table(frame).fill(0);
         Some(frame)
     }
+
+    fn free_table(&mut self, phys: PhysAddr) {
+        free_frames(phys, 0);
+    }
 }
 
 /// Aloca `2^order` frames contíguos.

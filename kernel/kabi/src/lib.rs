@@ -159,6 +159,25 @@ pub type Badge = u64;
 /// Slots por nível da tabela radix do `CapSpace` (seção 6.2).
 pub const CAPSPACE_SLOTS_PER_LEVEL: usize = 4096;
 
+/// Memória virtual do usuário: faixa e permissões de `vm_map` e `vm_protect`
+/// (seção 6.4).
+pub mod vm {
+    /// Primeiro endereço de usuário mapeável: os primeiros 64 KiB nunca são
+    /// mapeados.
+    pub const USER_START: u64 = 0x0001_0000;
+    /// Fim (exclusivo) da metade baixa canônica de 48 bits.
+    pub const USER_END: u64 = 0x0000_8000_0000_0000;
+    /// Tamanho da página de `vm_map`.
+    pub const PAGE_SIZE: u64 = 4096;
+    /// Flag de `vm_map`/`vm_protect`: gravável (leitura é sempre permitida).
+    pub const WRITE: u64 = 1;
+    /// Flag de `vm_map`/`vm_protect`: executável. Nunca junto com
+    /// [`WRITE`] (W^X).
+    pub const EXEC: u64 = 1 << 1;
+    /// Flags definidas; as demais são recusadas com `InvalidArgument`.
+    pub const ALL_FLAGS: u64 = WRITE | EXEC;
+}
+
 /// Rótulo de 64 bits de uma mensagem de IPC (seção 6.7).
 ///
 /// O significado do rótulo é do protocolo (OIDL); o kernel só o transporta.
