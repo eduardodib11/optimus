@@ -2,7 +2,8 @@
 //!
 //! Esqueleto do M1: PIE ligado na metade alta por `linker.ld` e carregado pelo
 //! `optboot` com KASLR (T-103). A entrada em assembly (`arch/x86_64/entry.S`)
-//! troca de pilha e chama [`kernel_main`] (T-104).
+//! troca de pilha e chama [`kernel_main`] (T-104), que carrega GDT, TSS e IDT
+//! (T-105). Com `test=fault` na linha de comando, provoca um #UD de propósito.
 
 #![no_std]
 #![no_main]
@@ -15,7 +16,7 @@ use core::panic::PanicInfo;
 
 use kabi::boot::{BootInfo, MemKind, MemRegion};
 use kabi::{SYSCALL_COUNT, Syscall};
-use okernel::log::{Level, level_from_cmdline};
+use okernel::log::{Level, level_from_cmdline, option};
 
 use arch::x86_64::{QemuExit, qemu_exit};
 
@@ -64,6 +65,10 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
     let cmdline = info.cmdline().unwrap_or("");
     klog::init(level_from_cmdline(cmdline, Level::Info));
     info!("okernel: hello");
+    // SAFETY: primeira e única chamada, no boot, com interrupções desligadas
+    // (o optboot entrega assim e nada as ligou).
+    unsafe { arch::x86_64::init() };
+    info!("okernel: GDT, TSS e IDT carregadas");
     if !info.is_valid() {
         error!("okernel: BootInfo inválida (magic {:#x})", info.magic);
         qemu_exit(QemuExit::Failure);
@@ -80,6 +85,10 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
     match memory_map(info) {
         Some(map) => log_memory_map(map),
         None => warn!("okernel: mapa de memória ausente ou inválido"),
+    }
+    if option(cmdline, "test") == Some("fault") {
+        warn!("okernel: test=fault, provocando #UD");
+        arch::x86_64::trigger_invalid_opcode();
     }
     info!("okernel: desligando");
     qemu_exit(QemuExit::Success)
