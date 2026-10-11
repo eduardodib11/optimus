@@ -11,6 +11,8 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, sync::mpsc, thread};
 
+mod bench;
+
 /// Alvo do kernel no lugar de `x86_64-optimus-kernel`: alvos próprios em JSON
 /// exigem `-Zbuild-std`, que não existe no Rust estável (ADR 0025).
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
@@ -193,7 +195,7 @@ fn parse(args: &[String]) -> Result<Options> {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some((cmd, rest)) = args.split_first() else {
-        eprintln!("uso: cargo xtask <build|image|run|test|check|kani> [opções]");
+        eprintln!("uso: cargo xtask <build|image|run|test|check|kani|bench> [opções]");
         return ExitCode::FAILURE;
     };
     let result = parse(rest).and_then(|opts| match cmd.as_str() {
@@ -203,6 +205,7 @@ fn main() -> ExitCode {
         "test" => test(&opts),
         "check" => check(),
         "kani" => kani(),
+        "bench" => bench::bench(&opts),
         other => Err(format!("subcomando desconhecido: {other}")),
     });
     match result {
