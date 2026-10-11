@@ -94,6 +94,18 @@ pub fn usage() -> (u64, u64) {
     (heap.limit(), heap.used())
 }
 
+/// Blocos vivos no heap: objetos nos slabs mais alocações grandes.
+pub fn live_blocks() -> u64 {
+    let heap = HEAP.lock();
+    let large = heap.large_stats();
+    heap.cache_stats()
+        .iter()
+        .map(|s| s.in_use as u64)
+        .sum::<u64>()
+        + large.allocs
+        - large.frees
+}
+
 /// Liga o heap com o limite de `kheap=` (MiB) ou o padrão.
 pub fn init(cmdline: &str) {
     let mib = okernel::log::option(cmdline, "kheap")

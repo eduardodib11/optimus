@@ -17,6 +17,7 @@ mod klog;
 mod ktest;
 mod arch;
 mod bootinfo;
+mod kcap;
 mod kheap;
 mod kmem;
 mod kpanic;
@@ -60,6 +61,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
             bootinfo::log_memory_map(map);
             kmem::init(map);
             kheap::init(cmdline);
+            kcap::init();
             ktime::init(info);
         }
         None => warn!("okernel: mapa de memória ausente ou inválido"),

@@ -39,6 +39,7 @@ const SUITES: &[&[Test]] = &[
     crate::kmem::TESTS,
     crate::kheap::TESTS,
     crate::ktime::TESTS,
+    crate::kcap::TESTS,
 ];
 
 /// Roda os testes selecionados e desliga o QEMU com o resultado.

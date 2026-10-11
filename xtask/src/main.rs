@@ -42,6 +42,7 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: mapa de memória",
     "okernel: identidade removida",
     "okernel: heap: slab   16 B",
+    "okernel: cota raiz de ",
     "okernel: relógio: TSC de",
 ];
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
@@ -772,6 +773,7 @@ mod tests {
                   info  okernel: mapa de memória com 24 faixas\r\n\
                   info  okernel: identidade removida; 40 páginas\r\n\
                   info  okernel: heap: slab   16 B: 0 slabs\r\n\
+                  info  okernel: cota raiz de 28000 KiB\r\n\
                   info  okernel: relógio: TSC de 2100000 kHz\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
