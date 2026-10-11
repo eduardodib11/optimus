@@ -5,6 +5,7 @@
 pub mod buddy;
 pub mod frames;
 pub mod paging;
+pub mod slab;
 
 /// Tamanho de um frame de memória física: 4 KiB.
 pub const FRAME_SIZE: u64 = 4096;

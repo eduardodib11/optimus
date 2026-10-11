@@ -37,6 +37,7 @@ const SUITES: &[&[Test]] = &[
     crate::bootinfo::TESTS,
     crate::arch::x86_64::TESTS,
     crate::kmem::TESTS,
+    crate::kheap::TESTS,
 ];
 
 /// Roda os testes selecionados e desliga o QEMU com o resultado.
@@ -61,6 +62,7 @@ pub fn run(filter: Option<&str>) -> ! {
             }
         }
     }
+    crate::kheap::log_stats();
     info!("ktest: fim: {passed} ok, {failed} falharam");
     qemu_exit(if failed == 0 && passed > 0 {
         QemuExit::Success
