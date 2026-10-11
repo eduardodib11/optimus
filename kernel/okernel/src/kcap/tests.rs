@@ -6,9 +6,13 @@ use kabi::{Error, ObjectType, Rights};
 use okernel::cap::object::object_bytes;
 use okernel::cap::{CapSpace, MemoryQuota, obj_create};
 
-use super::{root_cap_space, root_quota};
+use okernel::cap::space::Revoke;
+
+use super::{REVOKE_SLICE_BUDGET, root_cap_space, root_quota};
+use crate::arch::x86_64::cpu;
 use crate::kheap;
 use crate::ktest::{Outcome, Test};
+use crate::ktime::now_ns;
 
 /// Testes de kernel de objetos e capabilities.
 pub const TESTS: &[Test] = &[
@@ -28,7 +32,23 @@ pub const TESTS: &[Test] = &[
         name: "cap.capspace_cresce_e_devolve_a_cota",
         run: capspace_cresce,
     },
+    Test {
+        name: "cap.revogacao_de_100000_caps_fatiada",
+        run: revogacao_fatiada,
+    },
 ];
+
+/// Capabilities derivadas no teste de revogação (aceite do T-204).
+const REVOKE_CAPS: usize = 100_000;
+/// Maior fatia aceita com KVM ou em hardware real (aceite do T-204).
+const SLICE_LIMIT_NS: u64 = 50_000;
+/// Tolerância no TCG do QEMU, que emula a CPU cerca de 8 vezes mais devagar
+/// neste código: p99 das fatias até 10 vezes o limite (500 µs).
+const TCG_P99_LIMIT_NS: u64 = 10 * SLICE_LIMIT_NS;
+/// No TCG o TSC segue o relógio do host, e uma preempção do processo do
+/// QEMU entra na medida de uma fatia: a maior fatia vai até 40 vezes o
+/// limite (2 ms).
+const TCG_MAX_LIMIT_NS: u64 = 40 * SLICE_LIMIT_NS;
 
 fn usa_o_heap() -> Outcome {
     let root = root_quota().ok_or("sem cota raiz")?;
@@ -102,5 +122,64 @@ fn capspace_cresce() -> Outcome {
     ensure!(handles.len() == 10_000);
     drop(space);
     ensure!(root.used() == before);
+    Ok(())
+}
+
+fn revogacao_fatiada() -> Outcome {
+    let (space, q) = root_cap_space().map_err(|_| "root_cap_space")?;
+    let mut space = space.lock();
+    let target = space.mint(q, Rights::ALL, None).map_err(|_| "mint")?;
+    // Árvore aleatória (xorshift), limitada pela profundidade máxima.
+    let mut handles = Vec::with_capacity(REVOKE_CAPS + 1);
+    handles.push(target);
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    while handles.len() <= REVOKE_CAPS {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let src = handles[usize::try_from(rng % handles.len() as u64).unwrap_or(0)];
+        match space.mint(src, Rights::CREATE, None) {
+            Ok(h) => handles.push(h),
+            Err(Error::InvalidArgument) => {}
+            Err(_) => return Err("mint falhou"),
+        }
+    }
+    let total = handles.len() - 1;
+    let mut slices: Vec<u32> = Vec::new();
+    let start = now_ns();
+    loop {
+        let t0 = now_ns();
+        let status = space.revoke(target, REVOKE_SLICE_BUDGET);
+        slices.push(u32::try_from(now_ns() - t0).unwrap_or(u32::MAX));
+        match status {
+            Ok(Revoke::Continue) => {}
+            Ok(Revoke::Done) => break,
+            Err(_) => return Err("revoke falhou"),
+        }
+    }
+    let elapsed = now_ns() - start;
+    ensure!(space.len() == 2);
+    ensure!(handles[1..].iter().all(|&h| space.get(h).is_err()));
+    ensure!(space.check_invariants().is_ok());
+    let count = slices.len();
+    slices.sort_unstable();
+    let (max, p99) = (slices[count - 1], slices[count * 99 / 100]);
+    let tcg = cpu::hypervisor().is_some_and(|sig| &sig == b"TCGTCGTCGTCG");
+    let (max_limit, p99_limit) = if tcg {
+        (TCG_MAX_LIMIT_NS, TCG_P99_LIMIT_NS)
+    } else {
+        (SLICE_LIMIT_NS, SLICE_LIMIT_NS)
+    };
+    info!(
+        "ktest: · revogação de {total} caps em {count} fatias de {REVOKE_SLICE_BUDGET} passos: \
+         maior {max} ns, p99 {p99} ns, mediana {} ns, total {} µs \
+         (limites {max_limit}/{p99_limit} ns, {})",
+        slices[count / 2],
+        elapsed / 1000,
+        if tcg { "TCG" } else { "KVM/hardware" }
+    );
+    ensure!(count >= total / REVOKE_SLICE_BUDGET as usize);
+    ensure!(u64::from(max) <= max_limit);
+    ensure!(u64::from(p99) <= p99_limit);
     Ok(())
 }
