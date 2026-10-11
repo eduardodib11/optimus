@@ -25,7 +25,7 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr::{self, null_mut};
 
-use kabi::boot::{BootInfo, DIRECT_MAP_BASE, MemKind, MemRegion};
+use kabi::boot::{BootInfo, CMDLINE_MAX, DIRECT_MAP_BASE, MemKind, MemRegion};
 
 use arch::x86_64::{disable_interrupts, enter_kernel, rdtsc};
 use firmware::{Entropy, KERNEL_MEMORY, RawMap};
@@ -179,6 +179,8 @@ const FILE_MODE_READ: u64 = 1;
 const KERNEL_PATH: &str = "\\EFI\\optimus\\okernel.elf";
 /// Teto do arquivo do kernel, contra ESPs com arquivos absurdos.
 const MAX_KERNEL_SIZE: u64 = 64 << 20;
+/// Linha de comando do kernel (opcional), texto UTF-8 de até 1 KiB.
+const CMDLINE_PATH: &str = "\\EFI\\optimus\\cmdline.txt";
 
 /// Falha ao carregar o kernel.
 enum Error {
@@ -241,10 +243,16 @@ impl Console<'_> {
     }
 }
 
-/// Lê o kernel inteiro para um buffer de pool que nunca é liberado.
-fn read_kernel(bs: &BootServices, image: Handle) -> Result<&'static [u8], Error> {
+/// Lê um arquivo inteiro e não vazio de até `max` bytes da ESP para um
+/// buffer de pool que nunca é liberado.
+fn read_file(
+    bs: &BootServices,
+    image: Handle,
+    name: &str,
+    max: u64,
+) -> Result<&'static [u8], Error> {
     let mut path = [0u16; 32];
-    for (dst, unit) in path.iter_mut().zip(KERNEL_PATH.encode_utf16()) {
+    for (dst, unit) in path.iter_mut().zip(name.encode_utf16()) {
         *dst = unit;
     }
     let (mut loaded, mut sfs, mut root, mut file) =
@@ -277,7 +285,7 @@ fn read_kernel(bs: &BootServices, image: Handle) -> Result<&'static [u8], Error>
     }
     let len = usize::try_from(size)
         .ok()
-        .filter(|&n| n > 0 && size <= MAX_KERNEL_SIZE)
+        .filter(|&n| n > 0 && size <= max)
         .ok_or(Error::BadSize(size))?;
     let mut buf = null_mut();
     // SAFETY: AllocatePool só escreve o ponteiro devolvido em `buf`.
@@ -417,11 +425,19 @@ fn boot(
     st: &SystemTable,
     image: Handle,
 ) -> Result<Infallible, Error> {
-    let kernel = kernel::load(out, bs, read_kernel(bs, image)?)?;
+    let file = read_file(bs, image, KERNEL_PATH, MAX_KERNEL_SIZE)?;
+    let kernel = kernel::load(out, bs, file)?;
     let entry = kernel.entry();
     let _ = write!(out, "optboot: kernel carregado, entrada {entry:#x}\r\n");
     let info = gather(out, bs, st)?;
     info.kaslr_slide = kernel.slide;
+    // Arquivo ausente, vazio ou inválido vale como linha de comando vazia.
+    let cmdline = read_file(bs, image, CMDLINE_PATH, CMDLINE_MAX as u64)
+        .ok()
+        .and_then(|bytes| core::str::from_utf8(bytes).ok())
+        .unwrap_or("");
+    info.set_cmdline(cmdline.trim());
+    let _ = write!(out, "optboot: cmdline \"{}\"\r\n", cmdline.trim());
     let hz = tsc_hz(bs);
     // Tudo o que precisa de memória é reservado agora: depois do último
     // GetMemoryMap não se pode mais alocar.
