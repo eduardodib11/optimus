@@ -13,6 +13,8 @@ repository = "https://github.com/eduardodib11/optimus"
 
 [workspace.lints.rust]
 missing_docs = "deny"
+# `cfg(kani)`: provas do Kani (`cargo xtask kani`).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -16,10 +16,13 @@
 //!
 //! Os slots livres formam uma lista encadeada por índice: alocar e liberar
 //! custam O(1), sem varrer a folha.
+//!
+//! A árvore de derivação e a revogação fatiada (T-204) ficam em [`cdt`].
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt::Debug;
 use core::mem::size_of;
 
 use kabi::{Badge, CAPSPACE_SLOTS_PER_LEVEL, Error, Handle, ObjectType, Rights};
@@ -28,16 +31,39 @@ use super::object::{Object, default_rights, obj_create, object_bytes};
 use super::quota::{Charge, MemoryQuota};
 use crate::sync::SpinLock;
 
+pub mod cdt;
+pub use cdt::{MAX_DERIVATION_DEPTH, Revoke};
+
 /// Fim de lista.
 const NIL: u32 = u32::MAX;
 /// Geração em que o slot é aposentado.
 pub const RETIRED_GENERATION: u8 = u8::MAX;
 
+/// O que um slot referencia. No kernel é sempre [`Object`]; a tabela é
+/// genérica só para as provas do Kani usarem um objeto sem destruição em
+/// cadeia (a lógica de slots e da árvore não depende do objeto).
+pub trait CapObject: Clone + Debug {
+    /// Tipo do objeto.
+    fn object_type(&self) -> ObjectType;
+    /// Verdadeiro se as duas referências apontam para o mesmo objeto.
+    fn same(&self, other: &Self) -> bool;
+}
+
+impl CapObject for Object {
+    fn object_type(&self) -> ObjectType {
+        Object::object_type(self)
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Object::same(self, other)
+    }
+}
+
 /// Uma capability: objeto, direitos e badge.
 #[derive(Clone, Debug)]
-pub struct Cap {
+pub struct Cap<O = Object> {
     /// Objeto referenciado (conta uma referência).
-    pub object: Object,
+    pub object: O,
     /// Direitos sobre o objeto.
     pub rights: Rights,
     /// Badge entregue ao servidor junto com as mensagens (seção 6.2).
@@ -55,39 +81,49 @@ pub struct CapInfo {
     pub badge: Badge,
 }
 
-/// Um slot da tabela.
+/// Um slot da tabela: a capability, a geração e os elos da árvore de
+/// derivação, todos por índice (`NIL` = nenhum).
 #[derive(Debug)]
-struct Slot {
-    cap: Option<Cap>,
+struct Slot<O> {
+    cap: Option<Cap<O>>,
     generation: u8,
-    /// Próximo slot livre, quando este está livre.
-    next_free: u32,
+    /// Pai na árvore de derivação (`NIL`: raiz, de `obj_create`/`insert`).
+    parent: u32,
+    first_child: u32,
+    /// Próximo irmão; num slot livre, o próximo da lista livre.
+    next: u32,
+    prev: u32,
 }
 
-impl Slot {
+impl<O> Slot<O> {
     const fn empty() -> Self {
         Self {
             cap: None,
             generation: 0,
-            next_free: NIL,
+            parent: NIL,
+            first_child: NIL,
+            next: NIL,
+            prev: NIL,
         }
     }
 }
 
 /// Tabela de capabilities com `N` slots por nível.
 #[derive(Debug)]
-pub struct CapSpace<const N: usize = CAPSPACE_SLOTS_PER_LEVEL> {
+pub struct CapSpace<const N: usize = CAPSPACE_SLOTS_PER_LEVEL, O: CapObject = Object> {
     /// Cobrança do objeto mais as folhas.
     charge: Charge,
-    leaves: Vec<Box<[Slot]>>,
+    leaves: Vec<Box<[Slot<O>]>>,
     /// Primeiro índice nunca usado.
     fresh: u32,
     /// Topo da lista de slots livres.
     free: u32,
     live: u32,
+    /// Slot cuja revogação está em andamento.
+    revoking: Option<u32>,
 }
 
-impl<const N: usize> CapSpace<N> {
+impl<const N: usize, O: CapObject> CapSpace<N, O> {
     /// Slots ao todo: `N` folhas de `N` slots, cabendo nos 24 bits do handle.
     #[allow(
         clippy::cast_possible_truncation,
@@ -98,7 +134,7 @@ impl<const N: usize> CapSpace<N> {
         (N * N) as u32
     };
     /// Bytes cobrados por folha: os slots mais a entrada na raiz.
-    pub const LEAF_BYTES: u64 = (N * size_of::<Slot>() + size_of::<Box<[Slot]>>()) as u64;
+    pub const LEAF_BYTES: u64 = (N * size_of::<Slot<O>>() + size_of::<Box<[Slot<O>]>>()) as u64;
 
     /// Tabela vazia, cobrando de `quota` o tamanho do objeto.
     ///
@@ -112,6 +148,7 @@ impl<const N: usize> CapSpace<N> {
             fresh: 1,
             free: NIL,
             live: 0,
+            revoking: None,
         })
     }
 
@@ -133,11 +170,11 @@ impl<const N: usize> CapSpace<N> {
         self.charge.bytes()
     }
 
-    fn slot(&self, index: u32) -> &Slot {
+    fn slot(&self, index: u32) -> &Slot<O> {
         &self.leaves[index as usize / N][index as usize % N]
     }
 
-    fn slot_mut(&mut self, index: u32) -> &mut Slot {
+    fn slot_mut(&mut self, index: u32) -> &mut Slot<O> {
         &mut self.leaves[index as usize / N][index as usize % N]
     }
 
@@ -175,7 +212,7 @@ impl<const N: usize> CapSpace<N> {
     fn alloc_slot(&mut self) -> Result<u32, Error> {
         if self.free != NIL {
             let index = self.free;
-            self.free = self.slot(index).next_free;
+            self.free = self.slot(index).next;
             return Ok(index);
         }
         if self.fresh >= Self::CAPACITY {
@@ -188,23 +225,32 @@ impl<const N: usize> CapSpace<N> {
         Ok(self.fresh - 1)
     }
 
-    /// Ocupa um slot com `cap` e devolve o handle.
-    fn occupy(&mut self, index: u32, cap: Cap) -> Handle {
-        self.slot_mut(index).cap = Some(cap);
+    /// Ocupa um slot com `cap`, sem pai e sem filhos, e devolve o handle.
+    fn occupy(&mut self, index: u32, cap: Cap<O>) -> Handle {
+        let slot = self.slot_mut(index);
+        *slot = Slot {
+            cap: Some(cap),
+            generation: slot.generation,
+            ..Slot::empty()
+        };
         self.live += 1;
         self.handle(index)
     }
 
-    /// Esvazia o slot, avança a geração e o devolve à lista livre (ou o
-    /// aposenta). Devolve a capability que estava nele.
-    fn release(&mut self, index: u32) -> Option<Cap> {
+    /// Esvazia o slot (já fora da árvore), avança a geração e o devolve à
+    /// lista livre (ou o aposenta). Devolve a capability que estava nele.
+    fn release(&mut self, index: u32) -> Option<Cap<O>> {
         let free = self.free;
         let slot = self.slot_mut(index);
         let cap = slot.cap.take()?;
-        slot.generation += 1;
-        let retired = slot.generation == RETIRED_GENERATION;
+        let generation = slot.generation + 1;
+        let retired = generation == RETIRED_GENERATION;
+        *slot = Slot {
+            generation,
+            next: if retired { NIL } else { free },
+            ..Slot::empty()
+        };
         if !retired {
-            slot.next_free = free;
             self.free = index;
         }
         self.live -= 1;
@@ -217,7 +263,7 @@ impl<const N: usize> CapSpace<N> {
     ///
     /// [`Error::QuotaExceeded`] se a tabela estiver cheia ou a cota não
     /// cobrir uma folha nova.
-    pub fn insert(&mut self, cap: Cap) -> Result<Handle, Error> {
+    pub fn insert(&mut self, cap: Cap<O>) -> Result<Handle, Error> {
         let index = self.alloc_slot()?;
         Ok(self.occupy(index, cap))
     }
@@ -228,7 +274,7 @@ impl<const N: usize> CapSpace<N> {
     ///
     /// [`Error::InvalidHandle`] se `h` não aponta para um slot ocupado na
     /// mesma geração.
-    pub fn get(&self, h: Handle) -> Result<&Cap, Error> {
+    pub fn get(&self, h: Handle) -> Result<&Cap<O>, Error> {
         let index = self.index_of(h)?;
         self.slot(index).cap.as_ref().ok_or(Error::InvalidHandle)
     }
@@ -247,8 +293,8 @@ impl<const N: usize> CapSpace<N> {
         })
     }
 
-    /// `cap_mint`: cópia de `src` com os direitos de `src` reduzidos por
-    /// `mask` e, opcionalmente, um badge.
+    /// `cap_mint`: cópia de `src`, filha dela na árvore de derivação, com os
+    /// direitos de `src` reduzidos por `mask` e, opcionalmente, um badge.
     ///
     /// Os direitos da cópia são `src.rights.derive(mask)`, sempre contidos
     /// nos de `src`. Só uma capability sem badge (badge 0) recebe badge:
@@ -256,40 +302,57 @@ impl<const N: usize> CapSpace<N> {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHandle`] para `src` inválido; [`Error::AccessDenied`]
-    /// para badge sobre capability que já tem um; [`Error::QuotaExceeded`]
-    /// sem slot.
+    /// [`Error::InvalidHandle`] para `src` inválido; [`Error::Busy`] se `src`
+    /// estiver numa subárvore em revogação; [`Error::InvalidArgument`] além
+    /// de [`MAX_DERIVATION_DEPTH`]; [`Error::AccessDenied`] para badge sobre
+    /// capability que já tem um; [`Error::QuotaExceeded`] sem slot.
     pub fn mint(
         &mut self,
         src: Handle,
         mask: Rights,
         badge: Option<Badge>,
     ) -> Result<Handle, Error> {
-        let parent = self.get(src)?;
+        let src = self.index_of(src)?;
+        self.check_mint_parent(src)?;
+        let parent = self.slot(src).cap.as_ref().ok_or(Error::InvalidHandle)?;
         let badge = match badge {
             Some(_) if parent.badge != 0 => return Err(Error::AccessDenied),
             Some(b) => b,
             None => parent.badge,
         };
+        // O slot vem antes da cópia: falhar não cria nem destrói referência.
+        let index = self.alloc_slot()?;
+        let parent = self.slot(src).cap.as_ref().ok_or(Error::InvalidHandle)?;
         let cap = Cap {
             object: parent.object.clone(),
             rights: parent.rights.derive(mask),
             badge,
         };
-        self.insert(cap)
+        let h = self.occupy(index, cap);
+        self.link_child(src, index);
+        Ok(h)
     }
 
     /// `cap_delete`: libera o slot de `h` e devolve a capability, para quem
-    /// chama destruí-la (e talvez o objeto) depois de soltar a trava.
+    /// chama destruí-la (e talvez o objeto) depois de soltar a trava. Os
+    /// filhos sobem para o avô (ou viram raízes); os direitos deles seguem
+    /// contidos nos do novo pai, por transitividade.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHandle`] como em [`get`](Self::get).
-    pub fn delete(&mut self, h: Handle) -> Result<Cap, Error> {
+    /// [`Error::InvalidHandle`] como em [`get`](Self::get); [`Error::Busy`]
+    /// se `h` for o alvo de uma revogação em andamento.
+    pub fn delete(&mut self, h: Handle) -> Result<Cap<O>, Error> {
         let index = self.index_of(h)?;
+        if self.revoking == Some(index) {
+            return Err(Error::Busy);
+        }
+        self.unlink_lifting_children(index);
         self.release(index).ok_or(Error::InvalidHandle)
     }
+}
 
+impl<const N: usize> CapSpace<N, Object> {
     /// `obj_create` pela capability `quota` desta tabela: cria o objeto e
     /// guarda a capability dele, com os direitos de [`default_rights`].
     ///
@@ -325,5 +388,9 @@ impl<const N: usize> CapSpace<N> {
     }
 }
 
+#[cfg(kani)]
+mod proofs;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_cdt;

@@ -15,6 +15,14 @@ use crate::kheap;
 mod tests;
 pub use tests::TESTS;
 
+/// Orçamento de cada fatia de `cap_revoke` (passos: descer um nível da
+/// árvore ou apagar uma capability); entre fatias, a syscall (T-205 em
+/// diante) passa por um ponto de preempção. Medido no host com o build de
+/// depuração, numa árvore aleatória de 10^5 capabilities: mediana de 5 µs
+/// e p99 de 11 µs por fatia, abaixo dos 50 µs do aceite do T-204 (com 256
+/// passos o p99 já beirava os 50 µs).
+pub const REVOKE_SLICE_BUDGET: u32 = 64;
+
 /// Fração do heap reservada ao próprio kernel, fora da cota raiz (1/8).
 const KERNEL_RESERVE_SHIFT: u32 = 3;
 
