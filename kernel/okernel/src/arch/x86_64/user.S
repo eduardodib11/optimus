@@ -450,5 +450,120 @@ user_fault_handler:
     syscall
     ud2
 
+/* Benchmarks (T-213, `test=bench`). Cada amostra é a diferença do TSC
+ * (LFENCE; RDTSC) em volta de uma syscall, gravada em 8 bytes a partir de
+ * rdx/rsi; uma falha grava u64::MAX e termina. */
+
+/* user_bench_ipc_client(rdi = endpoint, rsi = voltas, rdx = amostras)
+ *
+ * ipc_call só com o rótulo (0 palavras), o caminho rápido. */
+.global user_bench_ipc_client
+user_bench_ipc_client:
+    mov rbx, rdi
+    mov rbp, rsi
+    sub rsp, 16
+    mov [rsp], rdx
+1:
+    lfence
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov [rsp + 8], rax
+    mov rdi, rbx
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 20
+    syscall
+    test rax, rax
+    jnz 8f
+    lfence
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    sub rax, [rsp + 8]
+    mov rcx, [rsp]
+    mov [rcx], rax
+    add qword ptr [rsp], 8
+    dec rbp
+    jnz 1b
+    jmp 9f
+8:
+    mov rcx, [rsp]
+    mov qword ptr [rcx], -1
+9:
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_bench_ipc_server(rdi = endpoint | reply << 32, rsi = voltas)
+ *
+ * Recebe, responde as voltas - 1 primeiras com ipc_reply_recv (0
+ * palavras) e a última com ipc_send no Reply. */
+.global user_bench_ipc_server
+user_bench_ipc_server:
+    mov rbx, rdi
+    mov rbp, rsi
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 19
+    syscall
+1:
+    test rax, rax
+    jnz 9f
+    dec rbp
+    jz 2f
+    mov rdi, rbx
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 21
+    syscall
+    jmp 1b
+2:
+    mov rdi, rbx
+    shr rdi, 32
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 18
+    syscall
+9:
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_bench_yield(rdi = voltas, rsi = amostras ou 0)
+ *
+ * Cede a CPU as voltas pedidas; com rsi, grava o tempo de cada yield (que
+ * volta depois de a outra thread rodar e ceder também). */
+.global user_bench_yield
+user_bench_yield:
+    mov rbx, rdi
+    mov rbp, rsi
+1:
+    lfence
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov r12, rax
+    mov eax, 28
+    syscall
+    lfence
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    sub rax, r12
+    test rbp, rbp
+    jz 2f
+    mov [rbp], rax
+    add rbp, 8
+2:
+    dec rbx
+    jnz 1b
+    mov eax, 33
+    syscall
+    ud2
+
 .global user_test_end
 user_test_end:
