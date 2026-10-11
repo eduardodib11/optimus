@@ -1,0 +1,12 @@
+[package]
+name = "mkobfs"
+description = "Ferramenta de host que monta e lista imagens OBFS (bootfs)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+obfs = { path = "../../lib/obfs", features = ["alloc"] }
+
+[lints]
+workspace = true

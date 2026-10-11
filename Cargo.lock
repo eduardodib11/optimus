@@ -7,6 +7,13 @@ name = "kabi"
 version = "0.1.0"
 
 [[package]]
+name = "mkobfs"
+version = "0.1.0"
+dependencies = [
+ "obfs",
+]
+
+[[package]]
 name = "obfs"
 version = "0.1.0"
 dependencies = [

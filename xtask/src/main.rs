@@ -259,6 +259,7 @@ fn image(opts: &Options, cmdline: &str) -> Result<PathBuf> {
     let kernel = root().join(format!("target/{KERNEL_TARGET}/{}/okernel", mode(opts)));
     fs::copy(&kernel, optimus.join("okernel.elf"))
         .map_err(|e| format!("copiando {}: {e}", kernel.display()))?;
+    bootfs(opts, &optimus.join("bootfs.obfs"))?;
     let cmdline_file = optimus.join("cmdline.txt");
     if cmdline.is_empty() {
         let _ = fs::remove_file(&cmdline_file);
@@ -268,6 +269,21 @@ fn image(opts: &Options, cmdline: &str) -> Result<PathBuf> {
     }
     println!("xtask: ESP pronta em {}", esp.display());
     Ok(esp)
+}
+
+/// Serviços do bootfs: (nome na imagem, binário de usuário).
+const BOOTFS: &[(&str, &str)] = &[("root", "root")];
+
+/// Monta o bootfs com `tools/mkobfs` a partir dos binários de usuário.
+fn bootfs(opts: &Options, output: &Path) -> Result {
+    let bin = root().join(format!("target/{USER_TARGET}/{}", mode(opts)));
+    let mut cmd = cargo();
+    cmd.args(["run", "--quiet", "--package", "mkobfs", "--", "-o"])
+        .arg(output);
+    for (name, file) in BOOTFS {
+        cmd.arg(format!("{name}={}", bin.join(file).display()));
+    }
+    status(&mut cmd)
 }
 
 /// Procura o firmware OVMF: variáveis `OVMF_CODE`/`OVMF_VARS` ou caminhos comuns.
@@ -672,7 +688,17 @@ fn test(opts: &Options) -> Result {
 /// Formatação, clippy em cada alvo e a regra de `unsafe` da seção 17.1.
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
-    status(cargo().args(["clippy", "--package", "xtask", "--", "-D", "warnings"]))?;
+    for tool in ["xtask", "mkobfs"] {
+        status(cargo().args([
+            "clippy",
+            "--package",
+            tool,
+            "--tests",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+    }
     // Bibliotecas testadas no host também passam pelo clippy com os testes.
     for package in HOST_TESTED {
         status(cargo().args([
@@ -748,7 +774,7 @@ fn check_unsafe() -> Result {
     let crates = CRATES
         .iter()
         .map(|(_, file, _)| *file)
-        .chain(["xtask/src/main.rs"]);
+        .chain(["xtask/src/main.rs", "tools/mkobfs/src/main.rs"]);
     for file in crates {
         let dir = file.split("/src/").next().unwrap_or(file);
         let allowed = allowlist.contains(&format!("\"{dir}\""));
