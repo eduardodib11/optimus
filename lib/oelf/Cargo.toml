@@ -1,0 +1,13 @@
+[package]
+name = "oelf"
+description = "Parser ELF64 sem alocação para o optboot e o kernel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true
