@@ -253,26 +253,58 @@ pub fn revoke(space: &Arc<SharedCapSpace>, h: Handle, budget: u32) -> Result<Rev
 ///
 /// # Errors
 ///
-/// [`Error::InvalidHandle`] se `src` não vale mais; [`Error::Busy`] e
-/// [`Error::InvalidArgument`] como em [`mint`];
-/// [`Error::QuotaExceeded`] sem slot em `to` ou cota para os elos.
+/// Os de [`mint_into`].
 pub fn transfer(
     from: &Arc<SharedCapSpace>,
     src: Handle,
+    to: &Arc<SharedCapSpace>,
+) -> Result<Handle, Error> {
+    mint_into(from, src, Rights::ALL, None, to)
+}
+
+/// `cap_mint` para outro `CapSpace` (ADR 0029): cópia de `src` (no
+/// `CapSpace` `from`) com os direitos reduzidos por `mask` e, se a
+/// original não tiver badge, `badge`, em `to`, como filha remota dela
+/// (ADR 0028): revogar a original apaga a cópia. Na mesma tabela, é
+/// [`mint`].
+///
+/// # Errors
+///
+/// [`Error::InvalidHandle`] se `src` não vale mais; [`Error::Busy`] e
+/// [`Error::InvalidArgument`] como em [`mint`]; [`Error::AccessDenied`]
+/// para badge sobre capability que já tem um; [`Error::QuotaExceeded`]
+/// sem slot em `to` ou cota para os elos.
+pub fn mint_into(
+    from: &Arc<SharedCapSpace>,
+    src: Handle,
+    mask: Rights,
+    badge: Option<Badge>,
     to: &Arc<SharedCapSpace>,
 ) -> Result<Handle, Error> {
     let _cdt = CDT.lock();
     let (index, generation, cap) = {
         let s = from.lock();
         let index = s.index(src)?;
-        (index, s.generation_of(index), s.get(src)?.clone())
+        let parent = s.get(src)?;
+        let badge = match badge {
+            Some(_) if parent.badge != 0 => return Err(Error::AccessDenied),
+            Some(b) => b,
+            None => parent.badge,
+        };
+        let cap = Cap {
+            object: parent.object.clone(),
+            rights: parent.rights.derive(mask),
+            badge,
+        };
+        (index, s.generation_of(index), cap)
     };
     check_parent(&Node {
         space: Arc::clone(from),
         index,
     })?;
     if Arc::ptr_eq(from, to) {
-        return from.lock().mint(src, Rights::ALL, None);
+        drop(cap);
+        return from.lock().mint(src, mask, badge);
     }
     let (h, child) = {
         let mut t = to.lock();

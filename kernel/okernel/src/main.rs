@@ -4,7 +4,8 @@
 //! `optboot` com KASLR (T-103). A entrada em assembly (`arch/x86_64/entry.S`)
 //! troca de pilha e chama [`kernel_main`] (T-104), que carrega GDT, TSS e IDT
 //! (T-105). Com `test=fault` na linha de comando, provoca um #UD de propósito;
-//! com `test=kernel`, roda os testes de kernel ([`ktest`], T-111).
+//! com `test=kernel`, roda os testes de kernel ([`ktest`], T-111); com
+//! `test=bench`, os benchmarks ([`kbench`], T-213).
 
 #![no_std]
 #![no_main]
@@ -17,6 +18,7 @@ mod klog;
 mod ktest;
 mod arch;
 mod bootinfo;
+mod kbench;
 mod kcap;
 mod kfault;
 mod kfuzz;
@@ -90,6 +92,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
             arch::x86_64::trigger_invalid_opcode();
         }
         Some("kernel") => ktest::run(option(cmdline, "ktest")),
+        Some("bench") => kbench::run(),
         Some("panic") => panic!("pânico de teste proposital (test=panic)"),
         Some("fuzz") => kfuzz::run(cmdline),
         _ => kroot::run(),

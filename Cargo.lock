@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "hello"
+version = "0.1.0"
+dependencies = [
+ "ostd",
+]
+
+[[package]]
 name = "kabi"
 version = "0.1.0"
 
@@ -58,12 +65,14 @@ name = "ostd"
 version = "0.1.0"
 dependencies = [
  "kabi",
+ "oelf",
 ]
 
 [[package]]
 name = "root"
 version = "0.1.0"
 dependencies = [
+ "obfs",
  "ostd",
 ]
 

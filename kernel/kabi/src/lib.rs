@@ -13,7 +13,7 @@
 mod handle;
 mod rights;
 
-pub use handle::Handle;
+pub use handle::{Handle, handle_pair, split_handle_pair};
 pub use rights::Rights;
 
 /// Versão da ABI de syscalls (seção 14.2, "ABI v1").
@@ -73,7 +73,7 @@ abi_enum! {
 /// Números das syscalls da ABI v1 (seção 14.2), passados em `rax`.
 pub enum Syscall: u32, raw(n) => u64::from(n);
     DebugWrite = 0 => "`debug_write`: só com capability de debug.",
-    CapMint = 1 => "`cap_mint`: cópia com direitos iguais ou menores e badge opcional.",
+    CapMint = 1 => "`cap_mint`: cópia com direitos iguais ou menores e badge opcional, na própria tabela ou noutro `CapSpace` (ADR 0029).",
     CapDelete = 2 => "`cap_delete`.",
     CapRevoke = 3 => "`cap_revoke`: apaga todos os descendentes.",
     CapInfo = 4 => "`cap_info`.",
@@ -82,8 +82,8 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     VmUnmap = 7 => "`vm_unmap`.",
     VmProtect = 8 => "`vm_protect`.",
     MemOp = 9 => "`mem_op`: commit, zero, cache.",
-    ThreadConfigure = 10 => "`thread_configure`.",
-    ThreadStart = 11 => "`thread_start`.",
+    ThreadConfigure = 10 => "`thread_configure`: `CapSpace`, `AddressSpace`, buffer de IPC e endpoint de exceções (ADR 0029).",
+    ThreadStart = 11 => "`thread_start`: `rip`, `rsp` e três valores iniciais (ADR 0029).",
     ThreadSuspend = 12 => "`thread_suspend`.",
     ThreadResume = 13 => "`thread_resume`.",
     ThreadReadState = 14 => "`thread_read_state`.",
@@ -186,6 +186,18 @@ pub mod vm {
     pub const EXEC: u64 = 1 << 1;
     /// Flags definidas; as demais são recusadas com `InvalidArgument`.
     pub const ALL_FLAGS: u64 = WRITE | EXEC;
+}
+
+/// Flags de `thread_configure` (ADR 0029): o que muda além do `CapSpace` e
+/// do `AddressSpace`.
+pub mod thread {
+    /// Registra o buffer de IPC (`r10`; 0 tira o buffer).
+    pub const CONFIGURE_IPC_BUFFER: u64 = 1;
+    /// Registra o endpoint de exceções (`r8`, handle no `CapSpace` da
+    /// thread; 0 tira o endpoint).
+    pub const CONFIGURE_EXCEPTION: u64 = 1 << 1;
+    /// Flags definidas; as demais são recusadas com `InvalidArgument`.
+    pub const CONFIGURE_ALL: u64 = CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION;
 }
 
 /// Rótulo de 64 bits de uma mensagem de IPC (seção 6.7).

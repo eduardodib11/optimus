@@ -1,0 +1,17 @@
+[package]
+name = "hello"
+description = "Primeiro serviço carregado pelo root do bootfs: conversa por IPC com ele (T-212)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hello"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+
+[lints]
+workspace = true

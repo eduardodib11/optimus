@@ -11,6 +11,7 @@ test = false
 bench = false
 
 [dependencies]
+obfs = { path = "../../lib/obfs" }
 ostd = { path = "../../lib/ostd" }
 
 [lints]

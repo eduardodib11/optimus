@@ -52,6 +52,21 @@ impl Handle {
     }
 }
 
+/// Dois handles num registrador: `low` nos 32 bits baixos e `high` nos
+/// altos (a entrada do `root`, ADR 0029; o alvo de `ipc_recv` usa o mesmo
+/// arranjo).
+#[must_use]
+pub const fn handle_pair(low: Handle, high: Handle) -> u64 {
+    low.0 as u64 | ((high.0 as u64) << 32)
+}
+
+/// Desfaz [`handle_pair`]: `(low, high)`.
+#[must_use]
+pub const fn split_handle_pair(raw: u64) -> (Handle, Handle) {
+    #[allow(clippy::cast_possible_truncation, reason = "metades de 32 bits")]
+    (Handle(raw as u32), Handle((raw >> 32) as u32))
+}
+
 impl TryFrom<u64> for Handle {
     type Error = UnknownValue;
 
@@ -84,5 +99,12 @@ mod tests {
         );
         assert_eq!(Handle::try_from(1 << 32), Err(UnknownValue(1 << 32)));
         assert!(Handle::try_from(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn par_de_handles() {
+        let (a, b) = (Handle::new(5, 1).unwrap(), Handle::new(9, 2).unwrap());
+        assert_eq!(handle_pair(a, b), 0x0200_0009_0100_0005);
+        assert_eq!(split_handle_pair(handle_pair(a, b)), (a, b));
     }
 }

@@ -3,7 +3,7 @@
 use super::{ROOT_NAME, bootfs, load, run_until_exit};
 use crate::kcap::root_quota;
 use crate::ktest::{Outcome, Test};
-use crate::kthread::take_debug_log;
+use crate::kthread::{take_debug_log, yield_now};
 
 /// Testes de kernel do bootfs.
 pub const TESTS: &[Test] = &[
@@ -33,7 +33,8 @@ fn entregue() -> Outcome {
     Ok(())
 }
 
-/// Aceite do T-211: o `root` do bootfs roda no anel 3 e se anuncia.
+/// Aceite do T-211: o `root` do bootfs roda no anel 3 e se anuncia; e o
+/// do T-212 em pequena escala: ele inicia o `hello` e conversa com ele.
 fn root_inicia() -> Outcome {
     let quota = root_quota().ok_or("sem cota raiz")?;
     let used0 = quota.used();
@@ -45,9 +46,17 @@ fn root_inicia() -> Outcome {
         let (log, len) = take_debug_log();
         let text = core::str::from_utf8(&log[..len]).unwrap_or("?");
         info!("ktest: · o root imprimiu \"{text}\"");
-        ensure!(text == "root: iniciadoroot: IPC sem par: TimedOut e WouldBlock");
+        ensure!(text.starts_with(
+            "root: iniciadoroot: IPC sem par: TimedOut e WouldBlockhello: iniciado pelo root"
+        ));
+        // T-212: o root carregou o hello do bootfs e conversou com ele.
+        ensure!(text.contains("idas e voltas sem erro"));
+        // O hello termina depois da última resposta do root.
+        for _ in 0..100 {
+            yield_now();
+        }
         // Quebra o ciclo thread ↔ CapSpace e devolve tudo à cota.
-        let [_, _, thread] = p.handles;
+        let [_, _, thread, _] = p.handles;
         drop(p.cspace.lock().delete(thread));
     }
     ensure!(quota.used() == used0);

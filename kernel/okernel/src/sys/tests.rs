@@ -153,6 +153,7 @@ fn as_outras_nao_sao_suportadas_aqui() {
                 | Syscall::VmProtect
                 | Syscall::SchedConfigure
                 | Syscall::SchedBind
+                | Syscall::ThreadConfigure
         );
         // Precisam de capability válida ou da thread atual.
         let sync = matches!(
@@ -289,4 +290,132 @@ fn notificacao_por_handles() {
         ),
         Err(Error::NotSupported)
     );
+}
+
+/// Cria um objeto de `ty` e devolve o handle cru.
+fn create(space: &Arc<SharedCapSpace>, q: u64, ty: ObjectType) -> u64 {
+    call(space, Syscall::ObjCreate, [q, ty.to_raw(), 0, 0, 0, 0]).unwrap()[0]
+}
+
+fn get(space: &SharedCapSpace, h: u64) -> Cap {
+    let h = Handle::from_raw(u32::try_from(h).unwrap());
+    space.lock().get(h).unwrap().clone()
+}
+
+#[test]
+fn mint_para_outro_cap_space() {
+    let (_root, space, q) = setup();
+    let other = create(&space, q, ObjectType::CapSpace);
+    let target = Arc::clone(get(&space, other).object.as_cap_space().unwrap());
+    let send = u64::from(Rights::CREATE.bits());
+    // Sem MANAGE no destino, nada é copiado.
+    let no_manage = u64::from(Rights::NONE.bits());
+    let [weak, ..] = call(&space, Syscall::CapMint, [other, no_manage, 0, 0, 0, 0]).unwrap();
+    assert_eq!(
+        call(&space, Syscall::CapMint, [q, send, 0, weak, 0, 0]),
+        Err(Error::AccessDenied)
+    );
+    assert_eq!(
+        call(&space, Syscall::CapMint, [q, send, 0, q, 0, 0]),
+        Err(Error::AccessDenied)
+    );
+    let before = space.lock().len();
+    let [h, ..] = call(&space, Syscall::CapMint, [q, send, 9, other, 0, 0]).unwrap();
+    // A cópia está só no destino, com direitos reduzidos e o badge.
+    assert_eq!(space.lock().len(), before);
+    let copy = get(&target, h);
+    assert_eq!((copy.rights, copy.badge), (Rights::CREATE, 9));
+    assert!(copy.object.same(&get(&space, q).object));
+    // Badge sobre capability com badge continua recusado, sem sobrar cópia.
+    let [badged, ..] = call(&space, Syscall::CapMint, [q, send, 3, 0, 0, 0]).unwrap();
+    let before = (space.lock().len(), target.lock().len());
+    assert_eq!(
+        call(&space, Syscall::CapMint, [badged, send, 4, other, 0, 0]),
+        Err(Error::AccessDenied)
+    );
+    assert_eq!((space.lock().len(), target.lock().len()), before);
+}
+
+/// A cópia que `cap_mint` faz em outro `CapSpace` é filha remota da origem
+/// (ADR 0029 sobre a árvore da ADR 0028): revogar a origem a apaga no
+/// destino, com o que tiver sido derivado dela lá; apagar a origem sem
+/// revogar não a apaga.
+#[test]
+fn revogar_a_origem_apaga_a_copia_de_cap_mint_no_destino() {
+    let (_root, space, q) = setup();
+    let other = create(&space, q, ObjectType::CapSpace);
+    let target = Arc::clone(get(&space, other).object.as_cap_space().unwrap());
+    let n = create(&space, q, ObjectType::Notification);
+    let signal = u64::from(Rights::SIGNAL.bits());
+    let info = |s: &Arc<SharedCapSpace>, h: u64| call(s, Syscall::CapInfo, [h, 0, 0, 0, 0, 0]);
+    let [copy, ..] = call(&space, Syscall::CapMint, [n, signal, 5, other, 0, 0]).unwrap();
+    let [grand, ..] = call(&target, Syscall::CapMint, [copy, signal, 0, 0, 0, 0]).unwrap();
+    assert_eq!(
+        info(&target, copy),
+        Ok([ObjectType::Notification.to_raw(), signal, 5])
+    );
+    let before = target.lock().len();
+    call(&space, Syscall::CapRevoke, [n, 0, 0, 0, 0, 0]).unwrap();
+    assert_eq!(info(&target, copy), Err(Error::InvalidHandle));
+    assert_eq!(info(&target, grand), Err(Error::InvalidHandle));
+    assert_eq!(target.lock().len(), before - 2);
+    // A origem segue valendo e pode copiar de novo.
+    assert!(info(&space, n).is_ok());
+    let [again, ..] = call(&space, Syscall::CapMint, [n, signal, 0, other, 0, 0]).unwrap();
+    // Apagar a origem não leva a cópia (fica um marcador), mas revogar o
+    // ancestral local da origem ainda a alcança.
+    let [mid, ..] = call(&space, Syscall::CapMint, [n, signal, 0, 0, 0, 0]).unwrap();
+    let [deep, ..] = call(&space, Syscall::CapMint, [mid, signal, 0, other, 0, 0]).unwrap();
+    call(&space, Syscall::CapDelete, [mid, 0, 0, 0, 0, 0]).unwrap();
+    assert!(info(&target, deep).is_ok());
+    call(&space, Syscall::CapRevoke, [n, 0, 0, 0, 0, 0]).unwrap();
+    assert_eq!(info(&target, again), Err(Error::InvalidHandle));
+    assert_eq!(info(&target, deep), Err(Error::InvalidHandle));
+}
+
+#[test]
+fn thread_configure_confere_tudo_antes() {
+    use kabi::thread::{CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER};
+    platform::install(fake_platform(1000).1);
+    let (_root, space, q) = setup();
+    let t = create(&space, q, ObjectType::Thread);
+    let cs = create(&space, q, ObjectType::CapSpace);
+    let a = create(&space, q, ObjectType::AddressSpace);
+    let thread = Arc::clone(get(&space, t).object.as_thread().unwrap());
+    let conf = |args: [u64; 6]| call(&space, Syscall::ThreadConfigure, args);
+    let buf = 0x50_0000;
+    let both = CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION;
+    assert_eq!(
+        conf([t, cs, a, buf, 0, 1 << 5]),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(conf([t, cs, 0, buf, 0, both]), Err(Error::InvalidArgument));
+    assert_eq!(conf([t, a, cs, buf, 0, both]), Err(Error::AccessDenied));
+    assert_eq!(conf([cs, cs, a, buf, 0, both]), Err(Error::AccessDenied));
+    // Buffer desalinhado: nada muda, nem a ligação.
+    assert_eq!(
+        conf([t, cs, a, buf + 8, 7, both]),
+        Err(Error::InvalidArgument)
+    );
+    assert!(thread.aspace().is_none() && thread.ipc_buffer().is_none());
+    let read = u64::from(Rights::READ_STATE.bits());
+    let [t_ro, ..] = call(&space, Syscall::CapMint, [t, read, 0, 0, 0, 0]).unwrap();
+    assert_eq!(conf([t_ro, cs, a, buf, 7, both]), Err(Error::AccessDenied));
+    assert_eq!(conf([t, cs, a, buf, 7, both]), Ok([0; 3]));
+    assert!(thread.aspace().is_some() && thread.cspace().is_some());
+    assert_eq!(thread.ipc_buffer(), Some(buf));
+    assert_eq!(thread.exception_handler(), Some(Handle::from_raw(7)));
+    // Só o buffer muda; a exceção fica.
+    assert_eq!(conf([t, 0, 0, 0, 0, CONFIGURE_IPC_BUFFER]), Ok([0; 3]));
+    assert_eq!(thread.ipc_buffer(), None);
+    assert_eq!(thread.exception_handler(), Some(Handle::from_raw(7)));
+    // Depois da partida, religar dá Busy; buffer e exceção ainda mudam.
+    thread.set_state(crate::thread::RunState::Running);
+    assert_eq!(conf([t, cs, a, 0, 0, 0]), Err(Error::Busy));
+    assert_eq!(conf([t, 0, 0, buf, 0, both]), Ok([0; 3]));
+    assert_eq!(
+        (thread.ipc_buffer(), thread.exception_handler()),
+        (Some(buf), None)
+    );
+    thread.set_state(crate::thread::RunState::Exited);
 }

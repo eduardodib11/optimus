@@ -109,11 +109,7 @@ pub fn invoke(
     env: &mut dyn Env,
 ) -> Result<Values, Error> {
     match call {
-        Syscall::CapMint => {
-            let badge = (a[2] != 0).then_some(a[2]);
-            let h = xcdt::mint(space, handle(a[0])?, rights(a[1])?, badge)?;
-            Ok([u64::from(h.raw()), 0, 0])
-        }
+        Syscall::CapMint => mint(space, a),
         Syscall::CapDelete => {
             xcdt::delete(space, handle(a[0])?)?;
             Ok([0; 3])
@@ -179,8 +175,71 @@ pub fn invoke(
             t.bind_sched(Arc::clone(sc_obj))?;
             Ok([0; 3])
         }
+        Syscall::ThreadConfigure => thread_configure(space, a).map(|()| [0; 3]),
         _ => invoke_sync(space, call, a, env),
     }
+}
+
+/// `cap_mint(origem, máscara, badge, destino)`: com `destino` (um
+/// `CapSpace` com `MANAGE`) diferente da própria tabela, a cópia, com as
+/// regras de `mint`, nasce lá como filha remota da origem (ADR 0029 sobre
+/// a árvore da ADR 0028): revogar a origem apaga a cópia.
+fn mint(space: &Arc<SharedCapSpace>, a: [u64; 6]) -> Result<Values, Error> {
+    let badge = (a[2] != 0).then_some(a[2]);
+    let (src, mask) = (handle(a[0])?, rights(a[1])?);
+    let h = match a[3] {
+        0 => xcdt::mint(space, src, mask, badge)?,
+        raw => {
+            let cap = cap_with(space, raw, Rights::MANAGE)?;
+            let dest = Arc::clone(cap.object.as_cap_space()?);
+            drop(cap);
+            xcdt::mint_into(space, src, mask, badge, &dest)?
+        }
+    };
+    Ok([u64::from(h.raw()), 0, 0])
+}
+
+/// `thread_configure(thread, cspace, aspace, buffer, exceção, flags)`
+/// (ADR 0029): confere tudo antes de mudar qualquer campo.
+fn thread_configure(space: &SharedCapSpace, a: [u64; 6]) -> Result<(), Error> {
+    use kabi::thread::{CONFIGURE_ALL, CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER};
+    let flags = a[5];
+    if flags & !CONFIGURE_ALL != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let thread = cap_with(space, a[0], Rights::WRITE_STATE)?;
+    let t = thread.object.as_thread()?;
+    let bind = match (a[1], a[2]) {
+        (0, 0) => None,
+        (0, _) | (_, 0) => return Err(Error::InvalidArgument),
+        (c, s) => {
+            let cspace = cap_with(space, c, Rights::MANAGE)?;
+            let aspace = cap_with(space, s, Rights::MAP)?;
+            Some((
+                Arc::clone(cspace.object.as_cap_space()?),
+                Arc::clone(aspace.object.as_address_space()?),
+            ))
+        }
+    };
+    let buffer = flags & CONFIGURE_IPC_BUFFER != 0;
+    if buffer && !Thread::valid_ipc_buffer(a[3]) {
+        return Err(Error::InvalidArgument);
+    }
+    let exception = if flags & CONFIGURE_EXCEPTION != 0 {
+        Some(handle(a[4])?)
+    } else {
+        None
+    };
+    if let Some((cspace, aspace)) = bind {
+        t.configure(cspace, aspace)?;
+    }
+    if buffer {
+        t.set_ipc_buffer(a[3])?;
+    }
+    if let Some(h) = exception {
+        t.set_exception_handler(h);
+    }
+    Ok(())
 }
 
 /// Notificações, interrupções e futex (T-209).

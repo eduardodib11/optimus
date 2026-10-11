@@ -14,3 +14,4 @@ workspace = true
 
 [dependencies]
 kabi = { path = "../../kernel/kabi" }
+oelf = { path = "../oelf" }
