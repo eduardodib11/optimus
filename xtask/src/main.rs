@@ -24,8 +24,12 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("kabi", "kernel/kabi/src/lib.rs", KERNEL_TARGET),
     ("okernel", "kernel/okernel/src/main.rs", KERNEL_TARGET),
     ("oelf", "lib/oelf/src/lib.rs", KERNEL_TARGET),
+    ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
 ];
+
+/// Bibliotecas portáveis cujos testes rodam no host.
+const HOST_TESTED: &[&str] = &["oelf", "optcrypt"];
 
 const PROFILES: &[&str] = &["lite", "basic", "jarvis", "premium", "server"];
 
@@ -663,15 +667,17 @@ fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
     status(cargo().args(["clippy", "--package", "xtask", "--", "-D", "warnings"]))?;
     // Bibliotecas testadas no host também passam pelo clippy com os testes.
-    status(cargo().args([
-        "clippy",
-        "--package",
-        "oelf",
-        "--tests",
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
+    for package in HOST_TESTED {
+        status(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--tests",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+    }
     status(cargo().args([
         "clippy",
         "--package",
