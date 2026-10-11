@@ -12,6 +12,7 @@ pub mod acpi;
 pub mod cap;
 pub mod console;
 pub mod futex;
+pub mod ipc;
 pub mod log;
 pub mod mm;
 pub mod notify;
