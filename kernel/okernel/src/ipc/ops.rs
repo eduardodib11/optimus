@@ -505,4 +505,6 @@ pub fn invoke(
 }
 
 #[cfg(test)]
+mod model;
+#[cfg(test)]
 pub(crate) mod tests;
