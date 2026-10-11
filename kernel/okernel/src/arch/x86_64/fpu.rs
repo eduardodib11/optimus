@@ -27,6 +27,7 @@ const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
 
 static XSAVE: AtomicBool = AtomicBool::new(false);
+static XSAVEOPT: AtomicBool = AtomicBool::new(false);
 static AREA_BYTES: AtomicUsize = AtomicUsize::new(FXSAVE_BYTES);
 
 /// Liga SSE para o anel 3 e, se houver, XSAVE; mede a área.
@@ -56,6 +57,7 @@ pub fn init() {
         FXSAVE_BYTES
     };
     XSAVE.store(xsave, Ordering::Relaxed);
+    XSAVEOPT.store(xsave && cpu::cpuid(0xd, 1).eax & 1 != 0, Ordering::Relaxed);
     AREA_BYTES.store(bytes.max(FXSAVE_BYTES), Ordering::Relaxed);
 }
 
@@ -87,7 +89,16 @@ pub fn uses_xsave() -> bool {
 /// `area` aponta [`area_bytes`] bytes graváveis, alinhados a 64, só desta
 /// thread.
 pub unsafe fn save(area: *mut u8) {
-    if uses_xsave() {
+    if XSAVEOPT.load(Ordering::Relaxed) {
+        // SAFETY: como abaixo. XSAVEOPT deixa de gravar componentes no
+        // estado inicial ou não modificados desde o último XRSTOR, se foi
+        // desta mesma área; ela só é salva para a thread que sai da CPU,
+        // cujo XRSTOR foi o último (na troca para ela), e ninguém grava a
+        // área enquanto a thread roda.
+        unsafe {
+            asm!("xsaveopt64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
+        }
+    } else if uses_xsave() {
         // SAFETY: contrato do chamador; EDX:EAX todo um salva tudo o que o
         // XCR0 liga.
         unsafe {
