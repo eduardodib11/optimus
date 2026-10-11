@@ -16,6 +16,8 @@
 //!
 //! Os slots livres formam uma lista encadeada por índice: alocar e liberar
 //! custam O(1), sem varrer a folha.
+//!
+//! A árvore de derivação e a revogação fatiada (T-204) ficam em [`cdt`].
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -27,6 +29,9 @@ use kabi::{Badge, CAPSPACE_SLOTS_PER_LEVEL, Error, Handle, ObjectType, Rights};
 use super::object::{Object, default_rights, obj_create, object_bytes};
 use super::quota::{Charge, MemoryQuota};
 use crate::sync::SpinLock;
+
+pub mod cdt;
+pub use cdt::{MAX_DERIVATION_DEPTH, Revoke};
 
 /// Fim de lista.
 const NIL: u32 = u32::MAX;
@@ -55,13 +60,18 @@ pub struct CapInfo {
     pub badge: Badge,
 }
 
-/// Um slot da tabela.
+/// Um slot da tabela: a capability, a geração e os elos da árvore de
+/// derivação, todos por índice (`NIL` = nenhum).
 #[derive(Debug)]
 struct Slot {
     cap: Option<Cap>,
     generation: u8,
-    /// Próximo slot livre, quando este está livre.
-    next_free: u32,
+    /// Pai na árvore de derivação (`NIL`: raiz, de `obj_create`/`insert`).
+    parent: u32,
+    first_child: u32,
+    /// Próximo irmão; num slot livre, o próximo da lista livre.
+    next: u32,
+    prev: u32,
 }
 
 impl Slot {
@@ -69,7 +79,10 @@ impl Slot {
         Self {
             cap: None,
             generation: 0,
-            next_free: NIL,
+            parent: NIL,
+            first_child: NIL,
+            next: NIL,
+            prev: NIL,
         }
     }
 }
@@ -85,6 +98,8 @@ pub struct CapSpace<const N: usize = CAPSPACE_SLOTS_PER_LEVEL> {
     /// Topo da lista de slots livres.
     free: u32,
     live: u32,
+    /// Slot cuja revogação está em andamento.
+    revoking: Option<u32>,
 }
 
 impl<const N: usize> CapSpace<N> {
@@ -112,6 +127,7 @@ impl<const N: usize> CapSpace<N> {
             fresh: 1,
             free: NIL,
             live: 0,
+            revoking: None,
         })
     }
 
@@ -175,7 +191,7 @@ impl<const N: usize> CapSpace<N> {
     fn alloc_slot(&mut self) -> Result<u32, Error> {
         if self.free != NIL {
             let index = self.free;
-            self.free = self.slot(index).next_free;
+            self.free = self.slot(index).next;
             return Ok(index);
         }
         if self.fresh >= Self::CAPACITY {
@@ -188,23 +204,32 @@ impl<const N: usize> CapSpace<N> {
         Ok(self.fresh - 1)
     }
 
-    /// Ocupa um slot com `cap` e devolve o handle.
+    /// Ocupa um slot com `cap`, sem pai e sem filhos, e devolve o handle.
     fn occupy(&mut self, index: u32, cap: Cap) -> Handle {
-        self.slot_mut(index).cap = Some(cap);
+        let slot = self.slot_mut(index);
+        *slot = Slot {
+            cap: Some(cap),
+            generation: slot.generation,
+            ..Slot::empty()
+        };
         self.live += 1;
         self.handle(index)
     }
 
-    /// Esvazia o slot, avança a geração e o devolve à lista livre (ou o
-    /// aposenta). Devolve a capability que estava nele.
+    /// Esvazia o slot (já fora da árvore), avança a geração e o devolve à
+    /// lista livre (ou o aposenta). Devolve a capability que estava nele.
     fn release(&mut self, index: u32) -> Option<Cap> {
         let free = self.free;
         let slot = self.slot_mut(index);
         let cap = slot.cap.take()?;
-        slot.generation += 1;
-        let retired = slot.generation == RETIRED_GENERATION;
+        let generation = slot.generation + 1;
+        let retired = generation == RETIRED_GENERATION;
+        *slot = Slot {
+            generation,
+            next: if retired { NIL } else { free },
+            ..Slot::empty()
+        };
         if !retired {
-            slot.next_free = free;
             self.free = index;
         }
         self.live -= 1;
@@ -247,8 +272,8 @@ impl<const N: usize> CapSpace<N> {
         })
     }
 
-    /// `cap_mint`: cópia de `src` com os direitos de `src` reduzidos por
-    /// `mask` e, opcionalmente, um badge.
+    /// `cap_mint`: cópia de `src`, filha dela na árvore de derivação, com os
+    /// direitos de `src` reduzidos por `mask` e, opcionalmente, um badge.
     ///
     /// Os direitos da cópia são `src.rights.derive(mask)`, sempre contidos
     /// nos de `src`. Só uma capability sem badge (badge 0) recebe badge:
@@ -256,16 +281,19 @@ impl<const N: usize> CapSpace<N> {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHandle`] para `src` inválido; [`Error::AccessDenied`]
-    /// para badge sobre capability que já tem um; [`Error::QuotaExceeded`]
-    /// sem slot.
+    /// [`Error::InvalidHandle`] para `src` inválido; [`Error::Busy`] se `src`
+    /// estiver numa subárvore em revogação; [`Error::InvalidArgument`] além
+    /// de [`MAX_DERIVATION_DEPTH`]; [`Error::AccessDenied`] para badge sobre
+    /// capability que já tem um; [`Error::QuotaExceeded`] sem slot.
     pub fn mint(
         &mut self,
         src: Handle,
         mask: Rights,
         badge: Option<Badge>,
     ) -> Result<Handle, Error> {
-        let parent = self.get(src)?;
+        let src = self.index_of(src)?;
+        self.check_mint_parent(src)?;
+        let parent = self.slot(src).cap.as_ref().ok_or(Error::InvalidHandle)?;
         let badge = match badge {
             Some(_) if parent.badge != 0 => return Err(Error::AccessDenied),
             Some(b) => b,
@@ -276,17 +304,27 @@ impl<const N: usize> CapSpace<N> {
             rights: parent.rights.derive(mask),
             badge,
         };
-        self.insert(cap)
+        let index = self.alloc_slot()?;
+        let h = self.occupy(index, cap);
+        self.link_child(src, index);
+        Ok(h)
     }
 
     /// `cap_delete`: libera o slot de `h` e devolve a capability, para quem
-    /// chama destruí-la (e talvez o objeto) depois de soltar a trava.
+    /// chama destruí-la (e talvez o objeto) depois de soltar a trava. Os
+    /// filhos sobem para o avô (ou viram raízes); os direitos deles seguem
+    /// contidos nos do novo pai, por transitividade.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHandle`] como em [`get`](Self::get).
+    /// [`Error::InvalidHandle`] como em [`get`](Self::get); [`Error::Busy`]
+    /// se `h` for o alvo de uma revogação em andamento.
     pub fn delete(&mut self, h: Handle) -> Result<Cap, Error> {
         let index = self.index_of(h)?;
+        if self.revoking == Some(index) {
+            return Err(Error::Busy);
+        }
+        self.unlink_lifting_children(index);
         self.release(index).ok_or(Error::InvalidHandle)
     }
 
