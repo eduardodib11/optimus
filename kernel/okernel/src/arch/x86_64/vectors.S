@@ -98,6 +98,20 @@ isr_common:
     add rsp, 16
     iretq
 
+/* Portas dos vetores 32 a 255 (interrupções), 16 bytes cada, a partir de
+   `irq_stubs`: a do vetor v fica em irq_stubs + (v - 32) * 16. */
+.balign 16
+.global irq_stubs
+irq_stubs:
+.set vec, 32
+.rept 224
+    .balign 16
+    push 0
+    push vec
+    jmp isr_common
+    .set vec, vec + 1
+.endr
+
 /* Endereços das 32 portas, na ordem dos vetores. Cada `.quad` vira uma
    relocação R_X86_64_RELATIVE, ajustada pelo optboot ao KASLR. */
 .section .data.rel.ro.isr_table, "a"

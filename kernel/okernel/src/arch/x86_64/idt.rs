@@ -1,4 +1,5 @@
-//! IDT e tratadores das exceções 0 a 31 (T-105).
+//! IDT e tratadores das exceções 0 a 31 (T-105) e das interrupções 32 a 255
+//! (T-109, despachadas para [`super::apic::dispatch`]).
 //!
 //! Toda exceção despeja os registradores na serial e congela a CPU: o kernel
 //! nunca segue em estado inconsistente (SDD v1.0, seção 6.5). A única
@@ -93,6 +94,8 @@ static mut IDT: [Gate; 256] = [Gate::EMPTY; 256];
 unsafe extern "C" {
     /// Endereços das portas 0 a 31, definidos em `vectors.S`.
     static isr_table: [u64; 32];
+    /// Portas dos vetores 32 a 255, 16 bytes cada.
+    static irq_stubs: u8;
 }
 
 /// Mnemônico e descrição de cada exceção (Intel SDM vol. 3, tabela 6-1).
@@ -131,7 +134,7 @@ const NAMES: [(&str, &str); 32] = [
     ("---", "reservada"),
 ];
 
-/// Preenche as portas 0 a 31 e carrega a IDT.
+/// Preenche as portas 0 a 255 e carrega a IDT.
 ///
 /// # Safety
 ///
@@ -150,6 +153,10 @@ pub unsafe fn init() {
                 _ => 0,
             };
             (*idt)[vector] = Gate::new(handler, ist);
+        }
+        let stubs = (&raw const irq_stubs).addr() as u64;
+        for vector in 32..256 {
+            (*idt)[vector] = Gate::new(stubs + (vector as u64 - 32) * 16, 0);
         }
         let pointer = Pointer {
             limit: (size_of::<[Gate; 256]>() - 1) as u16,
@@ -182,6 +189,10 @@ fn control_registers() -> [u64; 4] {
 /// da CPU na serial e congela.
 #[unsafe(no_mangle)]
 extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
+    if frame.vector >= 32 {
+        super::apic::dispatch(frame.vector);
+        return;
+    }
     if super::probe::fixup(frame, control_registers()[1]) {
         return;
     }

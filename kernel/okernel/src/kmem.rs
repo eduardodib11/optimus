@@ -116,6 +116,18 @@ pub fn protect(virt: u64, size: PageSize, flags: Flags) -> Result<(), MapError> 
     Ok(())
 }
 
+/// Deixa sem cache o apelido no mapa direto da página de MMIO em `phys`,
+/// para registradores de dispositivo (APIC, HPET); devolve o endereço virtual.
+pub fn mmio(phys: u64) -> Result<u64, MapError> {
+    let virt = direct(PhysAddr(phys & !0xfff));
+    let flags = Flags {
+        uncached: true,
+        ..Flags::RW
+    };
+    protect(virt, PageSize::Size4K, flags)?;
+    Ok(virt + (phys & 0xfff))
+}
+
 /// A folha que mapeia `virt`.
 pub fn translate(virt: u64) -> Option<Mapping> {
     KERNEL_PT.lock().as_mut()?.translate(virt)

@@ -3,8 +3,10 @@
 
 use core::arch::{asm, global_asm};
 
+pub mod apic;
 pub mod cpu;
 pub mod gdt;
+pub mod hpet;
 pub mod idt;
 pub mod probe;
 pub mod serial;

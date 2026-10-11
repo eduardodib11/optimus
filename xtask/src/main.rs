@@ -41,6 +41,7 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: mapa de memória",
     "okernel: identidade removida",
     "okernel: heap: slab   16 B",
+    "okernel: relógio: TSC de",
 ];
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
 const KERNEL_EXIT_OK: i32 = 33;
@@ -304,8 +305,9 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     if kvm_usable() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
     } else {
-        // Sem KVM, o TCG emula tudo o que sabe (SMEP, SMAP, UMIP, x2APIC),
-        // para os testes de kernel exercitarem esses caminhos.
+        // Sem KVM, o TCG emula tudo o que sabe (SMEP, SMAP, UMIP; x2APIC só
+        // a partir do QEMU 9.0), para os testes de kernel exercitarem esses
+        // caminhos.
         cmd.args(["-cpu", "max"]);
     }
     if opts.gdb {
@@ -659,7 +661,8 @@ mod tests {
                   info  okernel: kaslr_slide 0x200000\r\n\
                   info  okernel: mapa de memória com 24 faixas\r\n\
                   info  okernel: identidade removida; 40 páginas\r\n\
-                  info  okernel: heap: slab   16 B: 0 slabs\r\n";
+                  info  okernel: heap: slab   16 B: 0 slabs\r\n\
+                  info  okernel: relógio: TSC de 2100000 kHz\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
         assert!(check("Optimus OS \u{2014} optboot\r\n").is_err());
