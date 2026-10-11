@@ -27,7 +27,7 @@ mod kthread;
 mod ktime;
 mod kvm;
 
-use kabi::boot::BootInfo;
+use kabi::boot::{BootInfo, direct_map_base_valid};
 use kabi::{SYSCALL_COUNT, Syscall};
 use okernel::log::{Level, level_from_cmdline, option};
 
@@ -54,6 +54,16 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         "okernel: kaslr_slide {:#x}, kernel_main em {:p}",
         info.kaslr_slide, kernel_main as *const ()
     );
+    let limit = bootinfo::memory_map(info).map_or(0, bootinfo::direct_map_limit);
+    if !direct_map_base_valid(info.direct_map_base, limit) {
+        error!(
+            "okernel: base do mapa direto inválida: {:#x}",
+            info.direct_map_base
+        );
+        qemu_exit(QemuExit::Failure);
+    }
+    kmem::set_direct_base(info.direct_map_base);
+    info!("okernel: mapa direto em {:#x}", info.direct_map_base);
     debug!(
         "okernel: cmdline \"{cmdline}\", boot em {} ns",
         info.boot_time_ns

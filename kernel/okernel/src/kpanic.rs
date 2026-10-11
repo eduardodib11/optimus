@@ -18,7 +18,7 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use kabi::boot::{DIRECT_MAP_BASE, PixelFormat};
+use kabi::boot::PixelFormat;
 use okernel::console::{FixedBuf, Surface, panic_screen};
 use okernel::log::option;
 use okernel::time::NS_PER_SEC;
@@ -106,8 +106,9 @@ fn draw(location: &str, message: &str) -> Option<(u32, u32)> {
     // SAFETY: o framebuffer do GOP é memória de vídeo fora da RAM do kernel,
     // inteira no mapa direto (conferido contra o limite) e com `pixels`
     // pixels de 32 bits; só o pânico escreve nele, com tudo mais parado.
-    let pixels =
-        unsafe { core::slice::from_raw_parts_mut((DIRECT_MAP_BASE + fb.base) as *mut u32, pixels) };
+    let pixels = unsafe {
+        core::slice::from_raw_parts_mut((crate::kmem::direct_base() + fb.base) as *mut u32, pixels)
+    };
     let mut surface = Surface::new(pixels, width, height, stride)?;
     panic_screen(&mut surface, format, location, message);
     Some((fb.width, fb.height))

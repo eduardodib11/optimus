@@ -10,7 +10,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
 
-use kabi::boot::DIRECT_MAP_BASE;
 use okernel::mm::PhysAddr;
 use okernel::mm::slab::{CLASSES, Heap, HeapError, PageSource};
 use okernel::sync::SpinLock;
@@ -32,7 +31,7 @@ impl PageSource for DirectPages {
     }
 
     fn free_pages(&mut self, addr: u64, order: usize) {
-        kmem::free_frames(PhysAddr(addr - DIRECT_MAP_BASE), order);
+        kmem::free_frames(PhysAddr(addr - kmem::direct_base()), order);
     }
 
     fn read(&mut self, addr: u64) -> u64 {

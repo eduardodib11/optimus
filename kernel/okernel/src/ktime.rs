@@ -12,7 +12,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use kabi::boot::{BootInfo, DIRECT_MAP_BASE};
+use kabi::boot::BootInfo;
 use okernel::acpi::{self, PhysRead};
 use okernel::time::{Clock, Scale, hpet_ticks_to_ns, hz_from};
 
@@ -40,14 +40,14 @@ impl PhysRead for DirectRead {
         };
         let mapped = (phys & !0xfff..end)
             .step_by(4096)
-            .all(|p| kmem::translate(DIRECT_MAP_BASE + p).is_some());
+            .all(|p| kmem::translate(kmem::direct_base() + p).is_some());
         if mapped {
             // SAFETY: todas as páginas da faixa estão no mapa direto (só
             // leitura ou mais), e `buf` não as sobrepõe (está na pilha ou no
             // kernel, fora das tabelas ACPI).
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    (DIRECT_MAP_BASE + phys) as *const u8,
+                    (kmem::direct_base() + phys) as *const u8,
                     buf.as_mut_ptr(),
                     buf.len(),
                 );
@@ -94,7 +94,7 @@ pub fn init(info: &BootInfo) {
     if let Err(e) = kmem::mmio(apic::xapic_phys()) {
         warn!("okernel: APIC sem mapeamento sem cache: {e:?}");
     }
-    let mode = apic::init(DIRECT_MAP_BASE);
+    let mode = apic::init(kmem::direct_base());
     let period = info
         .acpi_rsdp()
         .ok_or(acpi::AcpiError::NotFound)

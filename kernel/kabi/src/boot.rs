@@ -6,8 +6,9 @@
 //! métodos devolvem `Option`.
 //!
 //! Os ponteiros (`memory_map`) e o endereço da própria `BootInfo` são endereços
-//! virtuais no mapa direto da memória física ([`DIRECT_MAP_BASE`]), válidos
-//! depois que o kernel desfizer o mapa de identidade temporário.
+//! virtuais no mapa direto da memória física, que começa em
+//! [`BootInfo::direct_map_base`] (ADR 0026), válidos depois que o kernel
+//! desfizer o mapa de identidade temporário.
 
 use crate::UnknownValue;
 
@@ -19,11 +20,49 @@ pub const BOOT_VERSION: u32 = 1;
 pub const CMDLINE_MAX: usize = 1024;
 /// Bytes da semente inicial do CSPRNG.
 pub const RNG_SEED_LEN: usize = 64;
-/// Início do mapa direto da memória física (seção 6.4).
-///
-/// O SDD prevê um deslocamento aleatório aqui; a v1 da `BootInfo` não tem campo
-/// para ele, então o mapa direto fica fixo até uma ADR acrescentar o campo.
-pub const DIRECT_MAP_BASE: u64 = 0xffff_8000_0000_0000;
+/// Início da faixa onde o mapa direto da memória física pode ficar (seção
+/// 6.4; ADR 0026).
+pub const DIRECT_MAP_START: u64 = 0xffff_8000_0000_0000;
+/// Fim (exclusivo) da faixa do mapa direto: começam aí os objetos do kernel.
+pub const DIRECT_MAP_END: u64 = 0xffff_c000_0000_0000;
+/// Passo do deslocamento aleatório do mapa direto: 1 GiB (ADR 0026).
+pub const DIRECT_MAP_ALIGN: u64 = 1 << 30;
+
+/// Posições possíveis do mapa direto para `limit` bytes de memória física:
+/// toda base alinhada a [`DIRECT_MAP_ALIGN`] com `[base, base + limit)` dentro
+/// da faixa. `limit` é arredondado para 1 GiB; zero se não couber.
+#[must_use]
+pub const fn direct_map_slots(limit: u64) -> u64 {
+    let span = DIRECT_MAP_END - DIRECT_MAP_START;
+    let Some(limit) = limit.checked_next_multiple_of(DIRECT_MAP_ALIGN) else {
+        return 0;
+    };
+    if limit > span {
+        0
+    } else {
+        (span - limit) / DIRECT_MAP_ALIGN + 1
+    }
+}
+
+/// Base do mapa direto sorteada com `random` para `limit` bytes de memória
+/// física (ADR 0026); `None` se a memória não couber na faixa.
+#[must_use]
+pub const fn choose_direct_map_base(random: u64, limit: u64) -> Option<u64> {
+    let slots = direct_map_slots(limit);
+    if slots == 0 {
+        return None;
+    }
+    Some(DIRECT_MAP_START + (random % slots) * DIRECT_MAP_ALIGN)
+}
+
+/// `base` é uma base válida de mapa direto para `limit` bytes: alinhada a
+/// 1 GiB e com o mapa inteiro dentro da faixa.
+#[must_use]
+pub const fn direct_map_base_valid(base: u64, limit: u64) -> bool {
+    base >= DIRECT_MAP_START
+        && base.is_multiple_of(DIRECT_MAP_ALIGN)
+        && (base - DIRECT_MAP_START) / DIRECT_MAP_ALIGN < direct_map_slots(limit)
+}
 /// Endereço de ligação da imagem do kernel, antes do deslocamento de KASLR.
 pub const KERNEL_LINK_BASE: u64 = 0xffff_ffff_8000_0000;
 
@@ -172,6 +211,8 @@ pub struct BootInfo {
     pub rng_seed: [u8; RNG_SEED_LEN],
     /// Deslocamento de KASLR somado ao endereço de ligação do kernel.
     pub kaslr_slide: u64,
+    /// Endereço virtual onde o optboot mapeou o endereço físico 0 (ADR 0026).
+    pub direct_map_base: u64,
     /// Log de medições do TPM; vazio enquanto não houver medição (seção 5.1).
     pub tpm_event_log: PhysRange,
     /// Instante da entrega ao kernel, em ns desde o reset da CPU.
@@ -202,6 +243,7 @@ impl BootInfo {
             cmdline_len: 0,
             rng_seed: [0; RNG_SEED_LEN],
             kaslr_slide: 0,
+            direct_map_base: DIRECT_MAP_START,
             tpm_event_log: PhysRange { base: 0, len: 0 },
             boot_time_ns: 0,
         }
