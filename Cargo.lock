@@ -7,6 +7,20 @@ name = "kabi"
 version = "0.1.0"
 
 [[package]]
+name = "mkobfs"
+version = "0.1.0"
+dependencies = [
+ "obfs",
+]
+
+[[package]]
+name = "obfs"
+version = "0.1.0"
+dependencies = [
+ "optcrypt",
+]
+
+[[package]]
 name = "oelf"
 version = "0.1.0"
 
@@ -15,6 +29,8 @@ name = "okernel"
 version = "0.1.0"
 dependencies = [
  "kabi",
+ "obfs",
+ "oelf",
 ]
 
 [[package]]
@@ -22,14 +38,26 @@ name = "optboot"
 version = "0.1.0"
 dependencies = [
  "kabi",
+ "obfs",
  "oelf",
 ]
+
+[[package]]
+name = "optcrypt"
+version = "0.1.0"
 
 [[package]]
 name = "ostd"
 version = "0.1.0"
 dependencies = [
  "kabi",
+]
+
+[[package]]
+name = "root"
+version = "0.1.0"
+dependencies = [
+ "ostd",
 ]
 
 [[package]]

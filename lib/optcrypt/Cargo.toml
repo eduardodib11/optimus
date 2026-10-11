@@ -1,0 +1,13 @@
+[package]
+name = "optcrypt"
+description = "Criptografia do Optimus OS (por ora, BLAKE3 de referência provisório)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

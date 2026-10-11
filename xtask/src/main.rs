@@ -24,8 +24,14 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("kabi", "kernel/kabi/src/lib.rs", KERNEL_TARGET),
     ("okernel", "kernel/okernel/src/main.rs", KERNEL_TARGET),
     ("oelf", "lib/oelf/src/lib.rs", KERNEL_TARGET),
+    ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
+    ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
+    ("root", "services/root/src/main.rs", USER_TARGET),
 ];
+
+/// Bibliotecas portáveis cujos testes rodam no host.
+const HOST_TESTED: &[&str] = &["obfs", "oelf", "optcrypt"];
 
 const PROFILES: &[&str] = &["lite", "basic", "jarvis", "premium", "server"];
 
@@ -35,6 +41,7 @@ const BOOT_MARKERS: &[&str] = &[
     "optboot: kernel carregado",
     "optboot: mapa de memória",
     "optboot: KASLR",
+    "entradas verificadas (BLAKE3)",
     "saindo dos serviços de boot",
     "okernel: hello",
     "okernel: GDT, TSS e IDT carregadas",
@@ -44,6 +51,9 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: heap: slab   16 B",
     "okernel: cota raiz de ",
     "okernel: relógio: TSC de",
+    "okernel: root carregado do bootfs",
+    "root: iniciado",
+    "okernel: root terminou",
 ];
 /// Status do QEMU quando o kernel escreve 0x10 no `isa-debug-exit`: `(0x10 << 1) | 1`.
 const KERNEL_EXIT_OK: i32 = 33;
@@ -230,6 +240,9 @@ fn build(opts: &Options) -> Result {
 fn rustc_flags(package: &str) -> &'static [&'static str] {
     match package {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
+        // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
+        // (o kernel ainda não reloca processos; ASLR de usuário depois).
+        "root" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -250,6 +263,7 @@ fn image(opts: &Options, cmdline: &str) -> Result<PathBuf> {
     let kernel = root().join(format!("target/{KERNEL_TARGET}/{}/okernel", mode(opts)));
     fs::copy(&kernel, optimus.join("okernel.elf"))
         .map_err(|e| format!("copiando {}: {e}", kernel.display()))?;
+    bootfs(opts, &optimus.join("bootfs.obfs"))?;
     let cmdline_file = optimus.join("cmdline.txt");
     if cmdline.is_empty() {
         let _ = fs::remove_file(&cmdline_file);
@@ -259,6 +273,21 @@ fn image(opts: &Options, cmdline: &str) -> Result<PathBuf> {
     }
     println!("xtask: ESP pronta em {}", esp.display());
     Ok(esp)
+}
+
+/// Serviços do bootfs: (nome na imagem, binário de usuário).
+const BOOTFS: &[(&str, &str)] = &[("root", "root")];
+
+/// Monta o bootfs com `tools/mkobfs` a partir dos binários de usuário.
+fn bootfs(opts: &Options, output: &Path) -> Result {
+    let bin = root().join(format!("target/{USER_TARGET}/{}", mode(opts)));
+    let mut cmd = cargo();
+    cmd.args(["run", "--quiet", "--package", "mkobfs", "--", "-o"])
+        .arg(output);
+    for (name, file) in BOOTFS {
+        cmd.arg(format!("{name}={}", bin.join(file).display()));
+    }
+    status(&mut cmd)
 }
 
 /// Procura o firmware OVMF: variáveis `OVMF_CODE`/`OVMF_VARS` ou caminhos comuns.
@@ -645,6 +674,8 @@ fn test(opts: &Options) -> Result {
             "optboot",
             "--exclude",
             "ostd",
+            "--exclude",
+            "root",
         ]))?;
         // A lógica portável do kernel (biblioteca `okernel`) roda no host.
         status(cargo().args(["test", "--package", "okernel", "--lib"]))?;
@@ -661,17 +692,29 @@ fn test(opts: &Options) -> Result {
 /// Formatação, clippy em cada alvo e a regra de `unsafe` da seção 17.1.
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
-    status(cargo().args(["clippy", "--package", "xtask", "--", "-D", "warnings"]))?;
+    for tool in ["xtask", "mkobfs"] {
+        status(cargo().args([
+            "clippy",
+            "--package",
+            tool,
+            "--tests",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+    }
     // Bibliotecas testadas no host também passam pelo clippy com os testes.
-    status(cargo().args([
-        "clippy",
-        "--package",
-        "oelf",
-        "--tests",
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
+    for package in HOST_TESTED {
+        status(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--tests",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+    }
     status(cargo().args([
         "clippy",
         "--package",
@@ -735,7 +778,7 @@ fn check_unsafe() -> Result {
     let crates = CRATES
         .iter()
         .map(|(_, file, _)| *file)
-        .chain(["xtask/src/main.rs"]);
+        .chain(["xtask/src/main.rs", "tools/mkobfs/src/main.rs"]);
     for file in crates {
         let dir = file.split("/src/").next().unwrap_or(file);
         let allowed = allowlist.contains(&format!("\"{dir}\""));
@@ -799,6 +842,7 @@ mod tests {
                   optboot: kernel carregado, entrada 0xffffffff80000000\r\n\
                   optboot: mapa de memória: 24 regiões, 517896 KiB usáveis\r\n\
                   optboot: KASLR: deslocamento 0x200000\r\n\
+                  optboot: bootfs com 1 entradas verificadas (BLAKE3) em 0x1000\r\n\
                   optboot: tabelas de página prontas; saindo dos serviços de boot\r\n\
                   info  okernel: hello\r\n\
                   info  okernel: GDT, TSS e IDT carregadas\r\n\
@@ -807,7 +851,10 @@ mod tests {
                   info  okernel: identidade removida; 40 páginas\r\n\
                   info  okernel: heap: slab   16 B: 0 slabs\r\n\
                   info  okernel: cota raiz de 28000 KiB\r\n\
-                  info  okernel: relógio: TSC de 2100000 kHz\r\n";
+                  info  okernel: relógio: TSC de 2100000 kHz\r\n\
+                  info  okernel: root carregado do bootfs (856 KiB), iniciando no anel 3\r\n\
+                  info  root: iniciado\r\n\
+                  info  okernel: root terminou\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
         assert!(check("Optimus OS \u{2014} optboot\r\n").is_err());

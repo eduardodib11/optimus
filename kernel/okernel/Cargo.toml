@@ -15,3 +15,5 @@ workspace = true
 
 [dependencies]
 kabi = { path = "../kabi" }
+obfs = { path = "../../lib/obfs" }
+oelf = { path = "../../lib/oelf" }

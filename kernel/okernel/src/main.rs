@@ -22,6 +22,7 @@ mod kheap;
 mod kirq;
 mod kmem;
 mod kpanic;
+mod kroot;
 mod kthread;
 mod ktime;
 mod kvm;
@@ -77,7 +78,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         }
         Some("kernel") => ktest::run(option(cmdline, "ktest")),
         Some("panic") => panic!("pânico de teste proposital (test=panic)"),
-        _ => {}
+        _ => kroot::run(),
     }
     kheap::log_stats();
     info!("okernel: desligando");

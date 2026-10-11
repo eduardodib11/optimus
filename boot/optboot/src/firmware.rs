@@ -13,6 +13,9 @@ use crate::{BootServices, Error, Guid, Status, SystemTable, efi};
 /// usa para tudo o que passa a ser do kernel: imagem, pilha, tabelas de página
 /// e `BootInfo`. Assim o mapa do firmware já separa essas faixas.
 pub const KERNEL_MEMORY: u32 = 0x8000_0000;
+/// Tipo de memória UEFI da imagem do bootfs (seção 5.3), que vira
+/// `MemKind::Bootfs` no mapa entregue ao kernel.
+pub const BOOTFS_MEMORY: u32 = 0x8000_0001;
 
 /// `EFI_MEMORY_DESCRIPTOR`.
 #[repr(C)]
@@ -202,6 +205,7 @@ fn kind(efi_type: u32) -> MemKind {
         9 | 10 => MemKind::Acpi,
         11 | 12 => MemKind::Mmio,
         KERNEL_MEMORY => MemKind::Kernel,
+        BOOTFS_MEMORY => MemKind::Bootfs,
         _ => MemKind::Reserved,
     }
 }

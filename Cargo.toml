@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oelf", "lib/ostd"]
+members = ["xtask", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/obfs", "lib/oelf", "lib/optcrypt", "lib/ostd", "services/root", "tools/mkobfs"]
 # Só o xtask roda no host (os testes das bibliotecas também); as demais crates
 # são compiladas por `cargo xtask build`.
 default-members = ["xtask"]
