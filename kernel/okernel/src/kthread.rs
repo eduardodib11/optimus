@@ -266,6 +266,9 @@ enum Why {
     Yield,
     /// A atual terminou.
     Exit,
+    /// A atual bloqueou (notificação ou futex) e sai da CPU sem voltar à
+    /// fila; quem a acordar a devolve.
+    Block,
     /// Timer ou ponto de preempção: a atual segue, a menos que o orçamento
     /// ou a fatia tenha acabado ou haja alguém mais prioritário.
     Preempt,
@@ -301,10 +304,10 @@ fn schedule(why: Why) {
     }
     let prev = s.current.take();
     if let Some(p) = &prev {
-        if why == Why::Exit {
-            p.set_state(RunState::Exited);
-        } else {
-            enqueue(&mut s, Arc::clone(p), now);
+        match why {
+            Why::Exit => p.set_state(RunState::Exited),
+            Why::Block => {}
+            Why::Yield | Why::Preempt => enqueue(&mut s, Arc::clone(p), now),
         }
     }
     let next = s.ready.pop().map(|(_, t)| t);
@@ -409,10 +412,52 @@ pub fn yield_now() {
     schedule(Why::Yield);
 }
 
+/// Acorda uma thread bloqueada com `value` como resultado da espera e a
+/// põe na fila; não troca de thread (quem chama decide se preempta).
+pub fn wake(thread: Arc<Thread>, value: u64) {
+    thread.set_wake_value(value);
+    let mut s = SCHED.lock();
+    if thread.state() == RunState::Blocked {
+        enqueue(&mut s, thread, ktime::now_ns());
+    }
+}
+
+/// Ponto de preempção: a atual segue, a menos que haja alguém mais
+/// prioritário ou a fatia dela tenha acabado.
+pub fn preempt() {
+    schedule(Why::Preempt);
+}
+
+/// O que o despacho portável pede ao kernel (`okernel::sys::Env`).
+struct KernelEnv;
+
+impl sys::Env for KernelEnv {
+    fn preempt(&mut self) {
+        preempt();
+    }
+
+    fn wake(&mut self, thread: Arc<Thread>, value: u64) {
+        wake(thread, value);
+    }
+
+    fn current(&self) -> Option<Arc<Thread>> {
+        current()
+    }
+
+    fn block(&mut self) {
+        schedule(Why::Block);
+    }
+
+    fn read_u32(&mut self, addr: u64) -> Option<u32> {
+        let mut word = [0u8; 4];
+        probe::copy_from_user(&mut word, addr).then_some(u32::from_le_bytes(word))
+    }
+}
+
 /// Disparo do timer do APIC (com o EOI já feito), vindo do anel 3 ou do
 /// ocioso: reavalia quem roda.
 pub fn on_timer() {
-    schedule(Why::Preempt);
+    preempt();
 }
 
 /// Liga o registro de eventos do escalonador com espaço para `capacity`
@@ -470,9 +515,7 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
             let space = current()
                 .and_then(|t| t.cspace())
                 .ok_or(Error::NotSupported)?;
-            // Entre fatias de `cap_revoke`, o ponto de preempção (ADR 0009).
-            let mut preempt = || schedule(Why::Preempt);
-            sys::invoke(&space, call, a, kcap::REVOKE_SLICE_BUDGET, &mut preempt)
+            sys::invoke(&space, call, a, kcap::REVOKE_SLICE_BUDGET, &mut KernelEnv)
         }
     }
 }

@@ -5,6 +5,7 @@
 //! objeto aloca por conta própria. Quando a última referência some, o
 //! `Charge` é destruído com o objeto e os bytes voltam à cota.
 //!
+//! `Notification` e `Interrupt` vêm do T-209.
 //! `AddressSpace`, `MemoryObject` (T-205) e `Thread` (T-206) usam a [`Platform`](crate::platform::Platform)
 //! instalada pelo kernel. Os tipos que dependem de tarefas futuras (IPC,
 //! interrupções, DMA) respondem [`Error::NotSupported`] por enquanto.
@@ -17,6 +18,7 @@ use kabi::{Error, ObjectType, Rights};
 
 use super::quota::MemoryQuota;
 use super::space::CapSpace;
+use crate::notify::{Interrupt, Notification};
 use crate::platform;
 use crate::sched::SchedContext;
 use crate::sync::SpinLock;
@@ -42,6 +44,10 @@ pub enum Object {
     Thread(Arc<Thread>),
     /// Orçamento de CPU e prioridade.
     SchedContext(Arc<SchedContext>),
+    /// Palavra de sinais assíncronos.
+    Notification(Arc<Notification>),
+    /// Linha de IRQ.
+    Interrupt(Arc<Interrupt>),
 }
 
 impl fmt::Debug for Object {
@@ -53,6 +59,8 @@ impl fmt::Debug for Object {
             Self::MemoryObject(m) => Arc::as_ptr(m).addr(),
             Self::Thread(t) => Arc::as_ptr(t).addr(),
             Self::SchedContext(s) => Arc::as_ptr(s).addr(),
+            Self::Notification(n) => Arc::as_ptr(n).addr(),
+            Self::Interrupt(i) => Arc::as_ptr(i).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -69,6 +77,8 @@ impl Object {
             Self::MemoryObject(_) => ObjectType::MemoryObject,
             Self::Thread(_) => ObjectType::Thread,
             Self::SchedContext(_) => ObjectType::SchedContext,
+            Self::Notification(_) => ObjectType::Notification,
+            Self::Interrupt(_) => ObjectType::Interrupt,
         }
     }
 
@@ -82,6 +92,8 @@ impl Object {
             (Self::MemoryObject(a), Self::MemoryObject(b)) => Arc::ptr_eq(a, b),
             (Self::Thread(a), Self::Thread(b)) => Arc::ptr_eq(a, b),
             (Self::SchedContext(a), Self::SchedContext(b)) => Arc::ptr_eq(a, b),
+            (Self::Notification(a), Self::Notification(b)) => Arc::ptr_eq(a, b),
+            (Self::Interrupt(a), Self::Interrupt(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -157,6 +169,30 @@ impl Object {
             _ => Err(Error::WrongType),
         }
     }
+
+    /// A notificação, se o objeto for uma.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_notification(&self) -> Result<&Arc<Notification>, Error> {
+        match self {
+            Self::Notification(n) => Ok(n),
+            _ => Err(Error::WrongType),
+        }
+    }
+
+    /// A interrupção, se o objeto for uma.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_interrupt(&self) -> Result<&Arc<Interrupt>, Error> {
+        match self {
+            Self::Interrupt(i) => Ok(i),
+            _ => Err(Error::WrongType),
+        }
+    }
 }
 
 /// Bytes que um `Arc<T>` ocupa no heap: dois contadores mais o valor.
@@ -205,7 +241,9 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 /// folhas da tabela são cobradas da mesma cota à medida que ela cresce);
 /// `AddressSpace`, zero (tabelas e regiões são cobradas ao mapear);
 /// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB; `Thread` e
-/// `SchedContext`, zero (este nasce sem configuração).
+/// `SchedContext` e `Notification`, zero (o primeiro nasce sem
+/// configuração). `Interrupt` só o kernel cria (o `root` as recebe), e
+/// `obj_create` a recusa com `NotSupported`.
 /// Os direitos sobre `quota`
 /// (`CREATE`, e `SPLIT` para cotas) são conferidos por quem chama, que tem a
 /// capability.
@@ -226,7 +264,9 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
                 args, charge,
             ))))
         }
-        ObjectType::CapSpace | ObjectType::AddressSpace if args != 0 => Err(Error::InvalidArgument),
+        ObjectType::CapSpace | ObjectType::AddressSpace | ObjectType::Notification if args != 0 => {
+            Err(Error::InvalidArgument)
+        }
         ObjectType::CapSpace => Ok(Object::CapSpace(Arc::new(SpinLock::new(CapSpace::new(
             quota,
         )?)))),
@@ -248,6 +288,7 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
             let charge = quota.charge(object_bytes::<SchedContext>())?;
             Ok(Object::SchedContext(Arc::new(SchedContext::new(charge))))
         }
+        ObjectType::Notification => Ok(Object::Notification(Arc::new(Notification::new(quota)?))),
         _ => Err(Error::NotSupported),
     }
 }

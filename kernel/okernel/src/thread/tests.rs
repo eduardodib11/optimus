@@ -39,9 +39,17 @@ fn configura_so_antes_de_iniciar() {
         .unwrap();
     assert_eq!(t.root(), Some(root.0));
     assert!(t.cspace().is_some_and(|c| Arc::ptr_eq(&c, &cspace)));
+    assert!(t.aspace().is_some_and(|a| Arc::ptr_eq(&a, &aspace)));
+    t.set_wake_value(0b101);
+    assert_eq!(t.wake_value(), 0b101);
     t.set_state(RunState::Ready);
     assert_eq!(t.configure(cspace, aspace), Err(Error::Busy));
-    for s in [RunState::Running, RunState::Throttled, RunState::Exited] {
+    for s in [
+        RunState::Running,
+        RunState::Throttled,
+        RunState::Exited,
+        RunState::Blocked,
+    ] {
         t.set_state(s);
         assert_eq!(t.state(), s);
     }
