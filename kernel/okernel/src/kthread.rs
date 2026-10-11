@@ -445,6 +445,27 @@ impl sys::Env for KernelEnv {
         let mut word = [0u8; 4];
         probe::copy_from_user(&mut word, addr).then_some(u32::from_le_bytes(word))
     }
+
+    fn now(&self) -> u64 {
+        ktime::now_ns()
+    }
+
+    fn block_until(&mut self, _deadline: u64) {
+        schedule(Why::Block);
+    }
+
+    fn handoff(&mut self, to: Arc<Thread>, _deadline: u64) {
+        wake(to, 0);
+        schedule(Why::Block);
+    }
+
+    fn read_buffer(&mut self, _thread: &Thread, _at: usize, _out: &mut [u64]) -> bool {
+        false
+    }
+
+    fn write_buffer(&mut self, _thread: &Thread, _at: usize, _data: &[u64]) -> bool {
+        false
+    }
 }
 
 /// Disparo do timer do APIC (com o EOI já feito), vindo do anel 3 ou do

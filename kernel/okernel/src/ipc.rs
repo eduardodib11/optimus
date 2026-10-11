@@ -8,7 +8,8 @@
 //!
 //! O que a thread leva ou recebe fica no [`IpcSlot`] dela: a mensagem de
 //! saída enquanto espera na fila de envio, a de entrada entregue por quem a
-//! acordou, onde está bloqueada e o resultado da espera.
+//! acordou, onde está bloqueada e o resultado da espera. As syscalls ficam
+//! em [`ops`].
 //!
 //! Travas (seção 6.9): a fila do objeto (`Endpoint` ou `Reply`) antes do
 //! `IpcSlot` de uma thread; nada aqui segura duas delas ao mesmo tempo.
@@ -28,6 +29,8 @@ use crate::cap::object::object_bytes;
 use crate::cap::{Cap, Charge, MemoryQuota};
 use crate::sync::SpinLock;
 use crate::thread::Thread;
+
+pub mod ops;
 
 /// Rótulo, `info` e palavras em registradores.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
