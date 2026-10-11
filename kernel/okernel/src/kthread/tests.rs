@@ -19,6 +19,7 @@ use crate::ktest::{Outcome, Test};
 use crate::kvm::activate;
 
 mod sched;
+mod sync;
 
 /// Testes de kernel de threads de usuário.
 pub const TESTS: &[Test] = &[
@@ -37,6 +38,14 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "sched.sem_orcamento_espera_o_proximo_periodo",
         run: sched::sem_orcamento_espera,
+    },
+    Test {
+        name: "ntfy.irq_acorda_thread_esperando",
+        run: sync::irq_acorda,
+    },
+    Test {
+        name: "futex.mutex_de_usuario_com_4_threads",
+        run: sync::mutex_4_threads,
     },
 ];
 

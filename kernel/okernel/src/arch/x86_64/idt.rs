@@ -191,7 +191,12 @@ fn control_registers() -> [u64; 4] {
 #[unsafe(no_mangle)]
 extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
     if frame.vector >= 32 {
-        if super::apic::dispatch(frame.vector) {
+        if crate::kirq::fire(frame.vector) {
+            // Linha de um objeto `Interrupt` (T-209): a notificação ligada
+            // pode ter acordado alguém mais prioritário.
+            super::apic::eoi();
+            crate::kthread::preempt();
+        } else if super::apic::dispatch(frame.vector) {
             crate::kthread::on_timer();
         }
         return;

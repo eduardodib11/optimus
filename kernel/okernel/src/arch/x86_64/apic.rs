@@ -189,6 +189,27 @@ pub fn arm_timer(deadline_tsc: u64, ticks: u32) {
     }
 }
 
+/// Fim de interrupção (EOI) de um vetor tratado fora de [`dispatch`].
+pub fn eoi() {
+    write(REG_EOI, 0);
+}
+
+/// Manda a esta CPU uma interrupção fixa no vetor `vector` (self-IPI),
+/// entregue quando as interrupções forem ligadas.
+pub fn self_ipi(vector: u8) {
+    // Entrega fixa (000b), nível de asserção, destino "esta CPU" (01b).
+    let icr: u32 = u32::from(vector) | (1 << 14) | (0b01 << 18);
+    match mode() {
+        // SAFETY: ICR do x2APIC; uma interrupção comum só para esta CPU.
+        Mode::X2Apic => unsafe { wrmsr(0x800 + (REG_ICR >> 4), u64::from(icr)) },
+        Mode::XApic => {
+            write(REG_ICR_HIGH, 0);
+            write(REG_ICR, icr);
+        }
+        Mode::Off => {}
+    }
+}
+
 /// Manda NMI a todas as outras CPUs (para congelá-las no pânico).
 fn nmi_others() {
     // Entrega NMI (100b), nível de asserção, destino "todas menos esta".
