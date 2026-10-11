@@ -25,11 +25,12 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("okernel", "kernel/okernel/src/main.rs", KERNEL_TARGET),
     ("oelf", "lib/oelf/src/lib.rs", KERNEL_TARGET),
     ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
+    ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
 ];
 
 /// Bibliotecas portáveis cujos testes rodam no host.
-const HOST_TESTED: &[&str] = &["oelf", "optcrypt"];
+const HOST_TESTED: &[&str] = &["obfs", "oelf", "optcrypt"];
 
 const PROFILES: &[&str] = &["lite", "basic", "jarvis", "premium", "server"];
 

@@ -7,6 +7,13 @@ name = "kabi"
 version = "0.1.0"
 
 [[package]]
+name = "obfs"
+version = "0.1.0"
+dependencies = [
+ "optcrypt",
+]
+
+[[package]]
 name = "oelf"
 version = "0.1.0"
 

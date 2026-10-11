@@ -1,0 +1,20 @@
+[package]
+name = "obfs"
+description = "Formato OBFS do bootfs: parser sem alocação e montagem da imagem."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[features]
+# Montagem da imagem (`build`), só para ferramentas de host como o mkobfs.
+alloc = []
+
+[dependencies]
+optcrypt = { path = "../optcrypt" }
+
+[lints]
+workspace = true
