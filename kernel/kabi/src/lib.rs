@@ -66,6 +66,7 @@ macro_rules! abi_enum {
 
 pub mod boot;
 pub mod fuzz;
+pub mod fault;
 pub mod ipc;
 
 abi_enum! {

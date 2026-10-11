@@ -15,10 +15,10 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use kabi::Error;
 use kabi::vm::{PAGE_SIZE, USER_END, USER_START};
+use kabi::{Error, Handle};
 
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
@@ -99,10 +99,16 @@ pub struct Thread {
     /// `SchedContext` em que a thread roda; trava folha (nada é tomado
     /// com ela na mão), lida pelo escalonador.
     sched: SpinLock<Option<Arc<SchedContext>>>,
+    /// `SchedContext` doado por quem chamou, enquanto a thread atende a
+    /// chamada (seção 6.6); vale no lugar de `sched`. Trava folha.
+    donated: SpinLock<Option<Arc<SchedContext>>>,
     /// Estado de IPC (T-208); trava folha, depois da fila do objeto.
     ipc: SpinLock<IpcSlot>,
     /// Endereço de usuário do buffer de IPC (zero: sem buffer).
     ipc_buffer: AtomicU64,
+    /// Handle cru, no `CapSpace` da thread, do endpoint de exceções (T-210;
+    /// zero: sem endpoint).
+    exception: AtomicU32,
 }
 
 impl fmt::Debug for Thread {
@@ -144,9 +150,17 @@ impl Thread {
             fpu_addr,
             binding: SpinLock::new(Binding::default()),
             sched: SpinLock::new(None),
+            donated: SpinLock::new(None),
             ipc: SpinLock::new(IpcSlot::default()),
             ipc_buffer: AtomicU64::new(0),
+            exception: AtomicU32::new(0),
         })
+    }
+
+    /// A plataforma da thread (quem a põe de volta na fila).
+    #[must_use]
+    pub fn platform(&self) -> &'static dyn Platform {
+        self.platform
     }
 
     /// Pilha de kernel.
@@ -247,10 +261,26 @@ impl Thread {
         Ok(())
     }
 
-    /// O `SchedContext` da thread, se ligado.
+    /// O `SchedContext` em que a thread roda: o doado, se ela atende uma
+    /// chamada, ou o dela, se ligado.
     #[must_use]
     pub fn sched_context(&self) -> Option<Arc<SchedContext>> {
-        self.sched.lock().clone()
+        let donated = self.donated.lock().clone();
+        donated.or_else(|| self.sched.lock().clone())
+    }
+
+    /// Doação em `ipc_call` (seção 6.6): a thread passa a rodar com `sc`,
+    /// o tempo e a prioridade de quem chamou, até [`undonate`](Self::undonate).
+    pub fn donate(&self, sc: Arc<SchedContext>) {
+        *self.donated.lock() = Some(sc);
+    }
+
+    /// Devolve a doação `sc`, se for a que a thread usa agora.
+    pub fn undonate(&self, sc: &Arc<SchedContext>) {
+        let mut donated = self.donated.lock();
+        if donated.as_ref().is_some_and(|d| Arc::ptr_eq(d, sc)) {
+            *donated = None;
+        }
     }
 
     /// O `AddressSpace` da thread, se configurada.
@@ -286,6 +316,21 @@ impl Thread {
         }
         self.ipc_buffer.store(va, Ordering::Release);
         Ok(())
+    }
+
+    /// Fixa o endpoint de exceções (parte de `thread_configure`, T-210): o
+    /// handle, no `CapSpace` da thread, procurado a cada falta; o handle
+    /// nulo tira o endpoint. Como só o handle fica guardado, apagar ou
+    /// revogar a capability também o tira.
+    pub fn set_exception_handler(&self, h: Handle) {
+        self.exception.store(h.raw(), Ordering::Release);
+    }
+
+    /// O handle do endpoint de exceções, se houver.
+    #[must_use]
+    pub fn exception_handler(&self) -> Option<Handle> {
+        let raw = self.exception.load(Ordering::Acquire);
+        (raw != 0).then(|| Handle::from_raw(raw))
     }
 
     /// O `CapSpace` da thread, se configurada.

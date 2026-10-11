@@ -11,12 +11,14 @@
 //! mapeados e servem de guarda contra estouro.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use okernel::mm::PhysAddr;
 use okernel::mm::paging::{Flags, PageSize, TableMemory};
 use okernel::platform::{self, KERNEL_STACK_BYTES, KernelStack, Platform};
 use okernel::sync::SpinLock;
+use okernel::thread::Thread;
 
 use crate::arch::x86_64::{cpu, fpu};
 use crate::kmem::{self, DirectMap};
@@ -115,6 +117,10 @@ impl Platform for KernelPlatform {
 
     fn fpu_area_bytes(&self) -> usize {
         fpu::area_bytes()
+    }
+
+    fn wake(&self, thread: Arc<Thread>) {
+        crate::kthread::wake(thread, 0);
     }
 }
 

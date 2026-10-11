@@ -17,8 +17,10 @@
 //! endpoint pela qual o servidor recebeu a chamada (definido aqui).
 //!
 //! A capability transferida é uma cópia com os mesmos direitos e badge,
-//! inserida como raiz da árvore de derivação do `CapSpace` do receptor (a
-//! árvore é por `CapSpace`; revogar a original não alcança a cópia).
+//! filha da original na árvore de derivação (ADR 0028,
+//! [`xcdt::transfer`]): revogar a original apaga a cópia. Os handles são
+//! conferidos no envio e copiados na entrega; o que sumiu do remetente
+//! entre um e outro não chega.
 //! Receptor sem buffer de IPC, ou sem espaço no `CapSpace`, recebe menos
 //! capabilities e palavras longas; `info` diz quantas chegaram.
 //!
@@ -26,6 +28,11 @@
 //! zero), a syscall não bloqueia e devolve `TimedOut` se não houver par
 //! pronto; [`FLAG_NONBLOCK`] faz o mesmo com `WouldBlock`. O prazo de
 //! `ipc_call` vale também para a espera da resposta.
+//!
+//! Doação de `SchedContext` (seção 6.6): quem recebe uma chamada roda com
+//! o `SchedContext` de quem chamou (o tempo e a prioridade dele) até
+//! responder pelo `Reply`, ou até a espera acabar de outro jeito (prazo,
+//! `Reply` destruído); a doação passa adiante em chamadas aninhadas.
 //!
 //! Caminho rápido (seção 6.7): `ipc_call` que encontra o servidor esperando
 //! e `ipc_reply_recv` que não encontra outro remetente, ambos só com
@@ -38,13 +45,13 @@
 
 #![forbid(unsafe_code)]
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use kabi::ipc::{FLAG_NONBLOCK, IpcBuffer, MsgInfo, split_recv_target};
 use kabi::{Error, Handle, MSG_MAX_CAPS, MSG_REG_WORDS, Rights, Syscall};
 
 use super::{Blocked, Endpoint, Message, Outgoing, Reply};
-use crate::cap::{Cap, Object, SharedCapSpace};
+use crate::cap::{Cap, Object, SharedCapSpace, xcdt};
 use crate::sys::Env;
 use crate::thread::{RunState, Thread};
 
@@ -127,7 +134,7 @@ fn handle(raw: u64) -> Result<Handle, Error> {
 /// Monta a mensagem de saída da thread atual: só as palavras declaradas,
 /// e as capabilities do cabeçalho do buffer dela, se `grant` permitir.
 fn outgoing(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     me: &Thread,
     regs: &Regs,
     grant: bool,
@@ -160,9 +167,11 @@ fn outgoing(
         let s = space.lock();
         for (i, slot) in out.caps.iter_mut().take(usize::from(info.caps)).enumerate() {
             #[allow(clippy::cast_possible_truncation, reason = "metade de 32 bits")]
-            let raw = (header[i / 2] >> (32 * (i % 2))) as u32;
-            *slot = Some(s.get(Handle::from_raw(raw))?.clone());
+            let h = Handle::from_raw((header[i / 2] >> (32 * (i % 2))) as u32);
+            s.get(h)?;
+            *slot = Some(h);
         }
+        out.from = Some(Arc::downgrade(space));
     }
     Ok(out)
 }
@@ -183,22 +192,27 @@ fn copy_words(from: &Thread, to: &Thread, count: u16, env: &mut dyn Env) -> u16 
     done
 }
 
-/// Insere as capabilities no `CapSpace` de `to` e grava os handles no
-/// buffer dela; quantas chegaram (as que não couberem morrem com `caps`).
-fn transfer_caps(to: &Thread, caps: [Option<Cap>; MSG_MAX_CAPS], env: &mut dyn Env) -> u8 {
-    let Some(space) = to.cspace() else { return 0 };
+/// Copia as capabilities de `from` para o `CapSpace` de `to` e grava os
+/// handles no buffer dela; quantas chegaram (para na primeira que não
+/// couber ou que sumiu do remetente).
+fn transfer_caps(
+    to: &Thread,
+    from: Option<Weak<SharedCapSpace>>,
+    caps: [Option<Handle>; MSG_MAX_CAPS],
+    env: &mut dyn Env,
+) -> u8 {
+    let (Some(space), Some(from)) = (to.cspace(), from.and_then(|f| f.upgrade())) else {
+        return 0;
+    };
     let mut handles = [0u32; MSG_MAX_CAPS];
     let mut n = 0;
-    {
-        let mut s = space.lock();
-        for c in caps.into_iter().flatten() {
-            match s.insert(c) {
-                Ok(h) => {
-                    handles[n] = h.raw();
-                    n += 1;
-                }
-                Err(_) => break,
+    for h in caps.into_iter().flatten() {
+        match xcdt::transfer(&from, h, &space) {
+            Ok(h) => {
+                handles[n] = h.raw();
+                n += 1;
             }
+            Err(_) => break,
         }
     }
     let header = [
@@ -206,9 +220,8 @@ fn transfer_caps(to: &Thread, caps: [Option<Cap>; MSG_MAX_CAPS], env: &mut dyn E
         u64::from(handles[2]) | (u64::from(handles[3]) << 32),
     ];
     if n > 0 && !env.write_buffer(to, 0, &header) {
-        let mut s = space.lock();
         for &h in &handles[..n] {
-            drop(s.delete(Handle::from_raw(h)));
+            let _ = xcdt::delete(&space, Handle::from_raw(h));
         }
         return 0;
     }
@@ -228,7 +241,7 @@ fn deliver(from: &Thread, out: Outgoing, to: &Thread, env: &mut dyn Env) {
         0
     };
     msg.info.caps = if has_buffer {
-        transfer_caps(to, out.caps, env)
+        transfer_caps(to, out.from, out.caps, env)
     } else {
         0
     };
@@ -260,7 +273,7 @@ fn unblock(me: &Thread) {
 
 /// Envio ou chamada num endpoint.
 fn send(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     me: &Arc<Thread>,
     ep_cap: &Cap,
     regs: &Regs,
@@ -276,6 +289,18 @@ fn send(
     let mut out = outgoing(space, me, regs, ep_cap.rights.contains(Rights::GRANT), env)?;
     out.badge = ep_cap.badge;
     out.call = call;
+    send_out(me, ep, out, wait, env)
+}
+
+/// Entrega `out` ao primeiro receptor de `ep` ou põe `me` na fila de envio.
+fn send_out(
+    me: &Arc<Thread>,
+    ep: &Arc<Endpoint>,
+    out: Outgoing,
+    wait: Wait,
+    env: &mut dyn Env,
+) -> Result<Step, Error> {
+    let call = out.call;
     let fast = out.msg.info.registers_only();
     let Some(r) = ep.pop_receiver() else {
         if let Some(e) = wait.refuse {
@@ -305,6 +330,7 @@ fn send(
     };
     // O receptor só entra na fila com o `Reply` vazio.
     let _ = reply.bind(Arc::clone(me), grant);
+    reply.donate(&r);
     block(me, Blocked::Reply(Arc::downgrade(&reply)), None);
     let handoff = if fast {
         Some(r)
@@ -320,7 +346,7 @@ fn send(
 
 /// Resposta pelo `Reply` (sem receber); devolve quem foi acordado.
 fn reply_to(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     me: &Thread,
     reply: &Reply,
     regs: &Regs,
@@ -360,13 +386,21 @@ fn receive(
     Ok(Some(s))
 }
 
-/// Entrega a mensagem do remetente `s`, já fora da fila, a `me`.
-fn take_from(me: &Thread, s: Arc<Thread>, reply: &Arc<Reply>, grant: bool, env: &mut dyn Env) {
+/// Entrega a mensagem do remetente `s`, já fora da fila, a `me`; devolve
+/// se era uma chamada (e `me` passou a rodar com o tempo de `s`).
+fn take_from(
+    me: &Arc<Thread>,
+    s: Arc<Thread>,
+    reply: &Arc<Reply>,
+    grant: bool,
+    env: &mut dyn Env,
+) -> bool {
     let out = s.ipc().lock().out.take().unwrap_or_default();
     let call = out.call;
     deliver(&s, out, me, env);
     if call {
         let _ = reply.bind(Arc::clone(&s), grant);
+        reply.donate(me);
         s.ipc().lock().blocked = Blocked::Reply(Arc::downgrade(reply));
     } else {
         let mut slot = s.ipc().lock();
@@ -375,6 +409,7 @@ fn take_from(me: &Thread, s: Arc<Thread>, reply: &Arc<Reply>, grant: bool, env: 
         drop(slot);
         env.wake(s, 0);
     }
+    call
 }
 
 fn recv_caps(space: &SharedCapSpace, target: u64) -> Result<(Cap, Arc<Reply>), Error> {
@@ -391,7 +426,7 @@ fn recv_caps(space: &SharedCapSpace, target: u64) -> Result<(Cap, Arc<Reply>), E
 ///
 /// Os da syscall (ver o módulo).
 pub fn begin(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     call: Syscall,
     regs: &Regs,
     env: &mut dyn Env,
@@ -428,9 +463,13 @@ pub fn begin(
             };
             match receive(&me, ep, &reply, grant, wait) {
                 Ok(Some(s)) => {
-                    take_from(&me, s, &reply, grant, env);
-                    if let Some((caller, _)) = replied {
-                        env.wake(caller, 0);
+                    let donated = take_from(&me, s, &reply, grant, env);
+                    if let Some((caller, _)) = &replied {
+                        env.wake(Arc::clone(caller), 0);
+                    }
+                    // Acordou alguém ou mudou o `SchedContext` em que roda:
+                    // o escalonador reavalia (e passa a cobrar o certo).
+                    if donated || replied.is_some() {
                         env.preempt();
                     }
                     Ok(Step::Done(finish(&me)?))
@@ -483,25 +522,70 @@ pub fn finish(me: &Thread) -> Result<Out, Error> {
 ///
 /// Os da syscall (ver o módulo).
 pub fn invoke(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     call: Syscall,
     regs: &Regs,
     env: &mut dyn Env,
 ) -> Result<Out, Error> {
-    match begin(space, call, regs, env)? {
+    let step = begin(space, call, regs, env)?;
+    let me = env.current().ok_or(Error::NotSupported)?;
+    let out = wait_for(&me, step, env)?;
+    Ok(if call == Syscall::IpcSend {
+        Out::default()
+    } else {
+        out
+    })
+}
+
+/// Espera o fim de `step` (bloqueando `me`, se for o caso) e devolve o que
+/// chegou.
+fn wait_for(me: &Thread, step: Step, env: &mut dyn Env) -> Result<Out, Error> {
+    match step {
         Step::Done(out) => Ok(out),
         Step::Block { deadline, handoff } => {
-            let me = env.current().ok_or(Error::NotSupported)?;
             match handoff {
                 Some(to) => env.handoff(to, deadline),
                 None => env.block_until(deadline),
             }
-            match call {
-                Syscall::IpcSend => finish(&me).map(|_| Out::default()),
-                _ => finish(&me),
-            }
+            finish(me)
         }
     }
+}
+
+/// `ipc_call` feito pelo kernel em nome de `me`, a thread atual, pela
+/// capability `ep_cap` (falta de usuário, T-210): `msg` só em
+/// registradores, sem capabilities e sem prazo. Devolve a resposta.
+///
+/// `ep_cap` é solta antes de esperar: a espera não mantém o endpoint vivo.
+///
+/// # Errors
+///
+/// [`Error::WrongType`] se `ep_cap` não for de endpoint;
+/// [`Error::AccessDenied`] sem `SEND`; o erro da espera (`PeerClosed` se o
+/// endpoint ou o `Reply` morrer antes da resposta).
+pub fn kernel_call(
+    me: &Arc<Thread>,
+    ep_cap: Cap,
+    msg: Message,
+    env: &mut dyn Env,
+) -> Result<Out, Error> {
+    let ep = ep_cap.object.as_endpoint()?;
+    if !ep_cap.rights.contains(Rights::SEND) {
+        return Err(Error::AccessDenied);
+    }
+    let out = Outgoing {
+        msg,
+        badge: ep_cap.badge,
+        call: true,
+        ..Outgoing::default()
+    };
+    let wait = Wait {
+        deadline: 0,
+        refuse: None,
+    };
+    let step = send_out(me, ep, out, wait, env)?;
+    drop(ep_cap);
+    wait_for(me, step, env)
 }
 
 #[cfg(test)]

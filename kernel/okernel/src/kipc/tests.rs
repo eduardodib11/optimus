@@ -1,15 +1,17 @@
 //! Testes de kernel do IPC (T-208): ping-pong entre duas threads de
 //! usuário em processos diferentes, transferência de capability com e sem
-//! `GRANT` e prazo vencido.
+//! `GRANT` (e a revogação que alcança a cópia, ADR 0028), prazo vencido e
+//! `PeerClosed` quando o objeto morre e a doação de `SchedContext`.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use kabi::ipc::{MsgInfo, recv_target};
 use kabi::vm::PAGE_SIZE;
-use kabi::{Error, Handle, ObjectType, Rights, STATUS_OK};
+use kabi::{Error, Handle, ObjectType, Rights, STATUS_OK, Syscall};
 use okernel::cap::{Cap, Object};
-use okernel::thread::Thread;
+use okernel::sys;
+use okernel::thread::{RunState, Thread};
 
 use crate::arch::x86_64::{cpu, probe};
 use crate::kcap::root_quota;
@@ -17,9 +19,11 @@ use crate::ktest::{Outcome, Test};
 use crate::kthread::tests::{
     DATA_VA, Process, delete, process, run_until_exit, thread, user_symbol,
 };
-use crate::kthread::{UserEntry, fast_switches, start};
+use crate::kthread::{KernelEnv, UserEntry, fast_switches, start, yield_now};
 use crate::ktime;
 use crate::kvm::activate;
+
+mod doacao;
 
 /// Testes de kernel do IPC.
 pub const TESTS: &[Test] = &[
@@ -35,6 +39,14 @@ pub const TESTS: &[Test] = &[
         name: "ipc.prazo_vencido_devolve_timed_out",
         run: prazo,
     },
+    Test {
+        name: "ipc.objeto_destruido_acorda_com_peer_closed",
+        run: peer_closed,
+    },
+    Test {
+        name: "ipc.doacao_de_schedcontext_evita_inversao_de_prioridade",
+        run: doacao::sem_inversao_de_prioridade,
+    },
 ];
 
 unsafe extern "C" {
@@ -45,10 +57,10 @@ unsafe extern "C" {
 }
 
 const VOLTAS: u64 = 10_000;
-const BADGE: u64 = 0x77;
+pub(crate) const BADGE: u64 = 0x77;
 
 /// Lê ou grava `N` palavras do usuário em `va`, no espaço de `p`.
-fn user_words<const N: usize>(
+pub(crate) fn user_words<const N: usize>(
     p: &Process,
     va: u64,
     write: Option<[u64; N]>,
@@ -84,7 +96,12 @@ fn user_words<const N: usize>(
 }
 
 /// Guarda em `p` uma capability de `object`.
-fn give(p: &Process, object: &Object, rights: Rights, badge: u64) -> Result<Handle, &'static str> {
+pub(crate) fn give(
+    p: &Process,
+    object: &Object,
+    rights: Rights,
+    badge: u64,
+) -> Result<Handle, &'static str> {
     p.cspace
         .lock()
         .insert(Cap {
@@ -96,7 +113,7 @@ fn give(p: &Process, object: &Object, rights: Rights, badge: u64) -> Result<Hand
 }
 
 /// Objeto novo de `ty` na cota de `p`, com a capability de `obj_create`.
-fn create(p: &Process, ty: ObjectType) -> Result<(Handle, Object), &'static str> {
+pub(crate) fn create(p: &Process, ty: ObjectType) -> Result<(Handle, Object), &'static str> {
     let h = p
         .cspace
         .lock()
@@ -108,7 +125,7 @@ fn create(p: &Process, ty: ObjectType) -> Result<(Handle, Object), &'static str>
 
 /// Inicia em `p` uma thread em `sym` com a pilha no topo da página
 /// `stack_page` de dados e o buffer de IPC na página 0.
-fn spawn(
+pub(crate) fn spawn(
     p: &Process,
     sym: *const u8,
     args: [u64; 3],
@@ -232,6 +249,16 @@ fn transferencia() -> Outcome {
             let cap = s.get(h).map_err(|_| "capability recebida")?;
             ensure!(cap.object.same(&ntfy) && cap.rights == Rights::SIGNAL);
             ensure!(s.len() == before + 1);
+            drop(s);
+            // A cópia é filha da original (ADR 0028): `cap_revoke` no
+            // cliente a apaga no servidor.
+            let revoke = [u64::from(ntfy_h.raw()), 0, 0, 0, 0, 0];
+            let space = &client.cspace;
+            let revoked = sys::invoke(space, Syscall::CapRevoke, revoke, 4, &mut KernelEnv);
+            info!("ktest: · cap_revoke no cliente: {revoked:?}");
+            ensure!(revoked.is_ok());
+            ensure!(server.cspace.lock().get(h).err() == Some(Error::InvalidHandle));
+            ensure!(server.cspace.lock().len() == before);
         } else {
             ensure!(first == Error::AccessDenied.to_raw() && second == STATUS_OK);
             ensure!(label == 0x12 && info.caps == 0);
@@ -264,5 +291,66 @@ fn prazo() -> Outcome {
     ensure!(ns >= 2_000_000);
     drop(t);
     delete(&server, &[h])?;
+    Ok(())
+}
+
+/// Roda as prontas até `t` bloquear.
+pub(crate) fn run_until_blocked(t: &Thread) -> Outcome {
+    for _ in 0..1000 {
+        if t.state() == RunState::Blocked {
+            return Ok(());
+        }
+        yield_now();
+    }
+    Err("a thread não bloqueou")
+}
+
+/// Quem espera num endpoint ou num `Reply` cuja última capability some
+/// acorda com `PeerClosed`, em vez de esperar para sempre.
+fn peer_closed() -> Outcome {
+    let quota = root_quota().ok_or("sem cota raiz")?;
+    let used0 = quota.used();
+    {
+        // Receptor esperando; o endpoint é apagado.
+        let server = process(1)?;
+        let (ep_h, ep) = create(&server, ObjectType::Endpoint)?;
+        let (reply, _) = create(&server, ObjectType::Reply)?;
+        drop(ep);
+        let args = [recv_target(ep_h, reply), 0, DATA_VA];
+        let (h, t) = spawn(&server, &raw const user_ipc_recv, args, 0)?;
+        run_until_blocked(&t)?;
+        delete(&server, &[ep_h])?;
+        run_until_exit(&[Arc::clone(&t)])?;
+        let [recv_status] = user_words::<1>(&server, DATA_VA + 16, None)?;
+        drop(t);
+        delete(&server, &[h])?;
+        // Quem chamou espera a resposta; o servidor recebe, termina sem
+        // responder e o Reply é apagado.
+        let (client, server) = (process(1)?, process(1)?);
+        let (ep_h, ep) = create(&server, ObjectType::Endpoint)?;
+        let (reply, _) = create(&server, ObjectType::Reply)?;
+        let c_ep = give(&client, &ep, Rights::SEND, BADGE)?;
+        drop(ep);
+        let args = [recv_target(ep_h, reply), 0, DATA_VA];
+        let (hs, ts) = spawn(&server, &raw const user_ipc_recv, args, 0)?;
+        let args = [u64::from(c_ep.raw()), 1, DATA_VA];
+        let (hc, tc) = spawn(&client, &raw const user_ipc_client, args, 0)?;
+        run_until_exit(&[Arc::clone(&ts)])?;
+        run_until_blocked(&tc)?;
+        delete(&server, &[reply])?;
+        run_until_exit(&[Arc::clone(&tc)])?;
+        let [call_status] = user_words::<1>(&client, DATA_VA, None)?;
+        info!(
+            "ktest: · ipc_recv: {:?}; ipc_call: {:?}",
+            Error::try_from(recv_status).ok(),
+            Error::try_from(call_status).ok()
+        );
+        ensure!(recv_status == Error::PeerClosed.to_raw());
+        ensure!(call_status == Error::PeerClosed.to_raw());
+        drop((ts, tc));
+        delete(&server, &[hs])?;
+        delete(&client, &[hc])?;
+    }
+    ensure!(quota.used() == used0);
     Ok(())
 }

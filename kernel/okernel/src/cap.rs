@@ -11,6 +11,7 @@
 pub mod object;
 pub mod quota;
 pub mod space;
+pub mod xcdt;
 
 pub use object::{Object, SharedCapSpace, default_rights, obj_create};
 pub use quota::{Charge, MemoryQuota};

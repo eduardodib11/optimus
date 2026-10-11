@@ -9,6 +9,7 @@ use super::*;
 use crate::mm::FRAME_SIZE;
 use crate::mm::paging::{ENTRIES, Table, TableMemory};
 use crate::platform::KernelStack;
+use crate::thread::Thread;
 
 /// PML4 do kernel na plataforma falsa.
 pub(crate) const KERNEL_ROOT: PhysAddr = PhysAddr(0x7f00_0000);
@@ -21,6 +22,8 @@ pub(crate) struct Fake {
     pub(crate) frames_live: AtomicI64,
     pub(crate) tables_live: AtomicI64,
     pub(crate) stacks_live: AtomicI64,
+    /// Threads acordadas por objeto de IPC destruído.
+    pub(crate) woken: AtomicU64,
     pub(crate) frame_limit: i64,
     pub(crate) flushes: Mutex<Vec<u64>>,
 }
@@ -62,6 +65,7 @@ impl Fake {
             frames_live: AtomicI64::new(0),
             tables_live: AtomicI64::new(0),
             stacks_live: AtomicI64::new(0),
+            woken: AtomicU64::new(0),
             frame_limit,
             flushes: Mutex::new(Vec::new()),
         }))
@@ -114,6 +118,9 @@ impl Platform for Leaked {
     }
     fn fpu_area_bytes(&self) -> usize {
         832
+    }
+    fn wake(&self, _: Arc<Thread>) {
+        self.0.woken.fetch_add(1, Ordering::Relaxed);
     }
 }
 

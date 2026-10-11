@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod acpi;
 pub mod cap;
 pub mod console;
+pub mod fault;
 pub mod futex;
 pub mod ipc;
 pub mod log;

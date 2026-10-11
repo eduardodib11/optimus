@@ -80,6 +80,10 @@ struct Sched {
     current: Option<Arc<Thread>>,
     /// Quando a atual foi cobrada pela última vez.
     charged_at: u64,
+    /// O `SchedContext` em que a atual roda desde então (o dela ou o
+    /// doado numa chamada, seção 6.6): o tempo vai para ele mesmo que a
+    /// doação acabe antes da cobrança.
+    charging: Option<Arc<SchedContext>>,
     /// Quando a atual começou a rodar e quando acaba a fatia dela.
     started_at: u64,
     slice_end: u64,
@@ -99,6 +103,7 @@ struct Sched {
 static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     current: None,
     charged_at: 0,
+    charging: None,
     started_at: 0,
     slice_end: 0,
     ready: RunQueue::new(),
@@ -217,13 +222,17 @@ fn enqueue(s: &mut Sched, t: Arc<Thread>, now: u64) {
     }
 }
 
-/// Desconta da atual o tempo desde a última cobrança.
+/// Desconta do `SchedContext` da atual o tempo desde a última cobrança e
+/// passa a cobrar o que ela usa agora.
 fn charge_current(s: &mut Sched, now: u64) {
-    if let Some((sc, p)) = s.current.as_deref().and_then(sc_of) {
+    if let Some(sc) = s.charging.take()
+        && let Some(p) = sc.params()
+    {
         let mut b = sc.budget();
         b.consume(&p, now.saturating_sub(s.charged_at));
         sc.set_budget(b);
     }
+    s.charging = s.current.as_deref().and_then(Thread::sched_context);
     s.charged_at = now;
 }
 
@@ -408,6 +417,7 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         s.slice_end = now.saturating_add(DEFAULT_SLICE_NS);
     }
     s.current.clone_from(&next);
+    s.charging = next.as_deref().and_then(Thread::sched_context);
     program_timer(&s, now);
     if same {
         return;
@@ -594,8 +604,9 @@ pub fn trace_take() -> Vec<Event> {
     core::mem::take(&mut SCHED.lock().trace)
 }
 
-/// `thread_exit`: a thread atual termina.
-fn exit_current() -> ! {
+/// `thread_exit`: a thread atual termina. Quem chama solta antes as
+/// referências que tiver na pilha: esta função nunca volta.
+pub fn exit_current() -> ! {
     schedule(Why::Exit);
     unreachable!("thread terminada voltou a rodar");
 }

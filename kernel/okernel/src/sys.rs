@@ -10,8 +10,10 @@
 //! fora daqui (yield, saída e partida de threads, tempo) e as ainda não implementadas
 //! devolvem [`Error::NotSupported`].
 //!
-//! Ordem de travas (seção 6.9): o `CapSpace` é solto antes de tocar no
-//! objeto; capabilities apagadas morrem já sem a trava.
+//! Ordem de travas (seção 6.9, com a `CDT` da ADR 0028 à frente): o
+//! `CapSpace` é solto antes de tocar no objeto; capabilities apagadas
+//! morrem já sem a trava. `cap_mint`, `cap_delete` e `cap_revoke` passam
+//! pela árvore entre tabelas ([`xcdt`]).
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +23,7 @@ use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Handle, ObjectType, Rights, Syscall};
 
 use crate::cap::space::Revoke;
-use crate::cap::{Cap, SharedCapSpace};
+use crate::cap::{Cap, SharedCapSpace, xcdt};
 use crate::futex::FUTEXES;
 use crate::notify::Wait;
 use crate::sched::Params;
@@ -100,7 +102,7 @@ fn futex_key(thread: &Thread, addr: u64) -> Result<u64, Error> {
 ///
 /// Os da syscall; [`Error::NotSupported`] para as tratadas fora daqui.
 pub fn invoke(
-    space: &SharedCapSpace,
+    space: &Arc<SharedCapSpace>,
     call: Syscall,
     a: [u64; 6],
     revoke_budget: u32,
@@ -109,18 +111,22 @@ pub fn invoke(
     match call {
         Syscall::CapMint => {
             let badge = (a[2] != 0).then_some(a[2]);
-            let h = space.lock().mint(handle(a[0])?, rights(a[1])?, badge)?;
+            let h = xcdt::mint(space, handle(a[0])?, rights(a[1])?, badge)?;
             Ok([u64::from(h.raw()), 0, 0])
         }
         Syscall::CapDelete => {
-            let cap = space.lock().delete(handle(a[0])?)?;
-            drop(cap);
+            xcdt::delete(space, handle(a[0])?)?;
             Ok([0; 3])
         }
         Syscall::CapRevoke => {
             let h = handle(a[0])?;
-            while space.lock().revoke(h, revoke_budget)? == Revoke::Continue {
+            while xcdt::revoke(space, h, revoke_budget)? == Revoke::Continue {
                 env.preempt();
+                // Entre as fatias, uma revogação de fora pode ter apagado
+                // o alvo (ADR 0028).
+                if space.lock().get(h).is_err() {
+                    return Err(Error::Revoked);
+                }
             }
             Ok([0; 3])
         }
