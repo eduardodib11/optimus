@@ -54,8 +54,9 @@ todas foram normais, a da última thread.
 Leitura: `sys_info(classe = 1 /*EXIT*/, handle)` devolve `[cause, code,
 aux]`; `cause = 0` significa "ainda vivo". Exige `READ_STATE` na `Thread`
 ou `MANAGE` no `CapSpace`. As classes de `sys_info` ficam reservadas
-assim: 1 = morte (esta ADR), 2 = memória (ADR 0038); a classe 0 é
-reservada à versão da ABI.
+assim: 1 = morte (esta ADR), 2 = memória (ADR 0038), 3 = hora de boot
+(ADR 0037), 4 = aleatoriedade (ADR 0039); a classe 0 é reservada à versão
+da ABI.
 
 ### 3. `obj_bind_notify` estendido
 
@@ -70,6 +71,7 @@ onde não são usados (senão `InvalidArgument`).
 | `Thread` | 0 | 0 | 0 | a thread morreu |
 | `CapSpace` | 0 | 0 | 0 | `live_threads` chegou a zero |
 | `Timer` | prazo | período | flags | vencimento (item 6) |
+| `DebugLog` | 0 | 0 | 0 | registro novo no log do kernel (ADR 0036) |
 
 Regras:
 1. Exige `BIND` em `obj` e `SIGNAL` em `ntfy`. `BIND` passa a valer
@@ -115,6 +117,11 @@ Invariante: depois que `cap_delete(..., DESTROY)` retorna, nenhuma thread
 do processo está pronta para rodar; o evento do `CapSpace` só dispara
 quando a última deixou de executar de fato. O `svcmgr` só reinicia depois
 do evento (sem janela em que a instância velha ainda execute).
+
+`thread_exit(código, flags)` (`rdi`, `rsi`): `flags & EXIT_GROUP` (1,
+ADR 0039) encerra o processo inteiro, como um `DESTROY` sobre o próprio
+`CapSpace` que dispensa o direito (auto-encerramento); as demais threads
+terminam como `Killed` e a causa do processo é `Exited` com o código dado.
 
 ### 5. Limite de threads: `max_threads`
 

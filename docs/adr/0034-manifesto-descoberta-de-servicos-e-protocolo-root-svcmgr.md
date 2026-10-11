@@ -60,6 +60,7 @@ interface Root {
     split_quota(bytes: u64) -> result<handle<MemoryQuota>, RootError>;
     spawn(binary: string<63>, quota: handle<MemoryQuota>,
           priority: u8, max_threads: u16) -> result<Spawned, RootError>;
+    set_exception(child: u32, ep: handle<Endpoint>) -> result<(), RootError>;
     start(child: u32, a0: u64, a1: u64) -> result<(), RootError>;
     reap(child: u32) -> result<(), RootError>;
 }
@@ -76,6 +77,10 @@ enum RootError : u8 { AccessDenied, NoSuchBinary, QuotaExceeded, Busy, Io }
   `START`; direitos de ciclo de vida da ADR 0035) como
   capabilities da resposta (2 de no máximo 4) e o `child` que o `root`
   guarda.
+- `set_exception` entrega ao filho, antes de `start`, o endpoint de
+  exceções (em geral uma capability do `memd` com badge = id do processo,
+  ADR 0038); o `root` a coloca no `CapSpace` do filho e a registra em
+  `thread_configure`.
 - `start` é o único jeito de iniciar: o `root` chama `thread_start` com
   `a0` e `a1` (`a0` = handle, no `CapSpace` do filho, do canal de controle
   do item 5). O `svcmgr` só chama `start` depois de entregar as caps.
@@ -150,7 +155,7 @@ leitor é um alvo de fuzzing, 17.3), inclusive a ausência de ciclo.
 | `mem:quota:32MiB` | 2 | `MemoryQuota` com `CREATE|SPLIT` e esse orçamento | `root`, pedido pelo `svcmgr` |
 | `dev:net/*` | 3 | MMIO, `Interrupt` e `DmaDomain` do padrão | `devmgr` (**não existe no M3**) |
 | `fs:<dir>[:ro|:rw]` | 4 | `Endpoint` de diretório (ADR 0011) | `storaged`/`optfs` (**fora do M3**) |
-| `kernel:debug`, `kernel:sysinfo` | 5 | capability de origem do kernel | `root` (do kernel pool) |
+| `kernel:debug`, `kernel:mem-pressure` | 5 | capability de origem do kernel (`DebugLog`, `Interrupt` de pressão; ADRs 0036 e 0038) | `root` (do kernel pool) |
 
 Os nomes do SDD `log:write` e `time:read` são apelidos, aceitos pelo
 compilador e substituídos por `svc:optimus.log.Log@1` e
@@ -181,6 +186,10 @@ interface Supervisor {
     ready() -> result<(), SvcError>;                        // fim da partida
     connect(interface: u32, minor: u16)
         -> result<handle<Endpoint>, SvcError>;              // lazy / reconexão
+    name_of(id: u32) -> result<string<31>, SvcError>;       // id do badge -> nome
+}
+interface Control {      // só para quem o manifesto autoriza (memd no M3)
+    kill(process: u32, reason: u8) -> result<(), SvcError>;
 }
 struct CapDesc { kind: u8, index: u16, handle: u32, name_hash: u32 }
 struct Boot { caps: vec<CapDesc, 64>, generation: u16 }
@@ -190,7 +199,8 @@ enum SvcError : u8 { NotInManifest, NotRunning, VersionTooOld, Busy }
 `CapDesc.handle` é o handle já presente no `CapSpace` do filho
 (`index` = posição em `needs`/`provides`); `name_hash` = `interface_id` do
 ADR 0033. O descritor cabe numa mensagem (64 × 16 + 16 < 4032).
-`connect` serve a reconexão depois de `PeerClosed` e as dependências
+`name_of` só atende serviços que o manifesto do `svcmgr` marca como
+consumidores de nomes (`logd`); `Control.kill` só atende o `memd`. `connect` serve a reconexão depois de `PeerClosed` e as dependências
 `opcional`; só atende o que está em `needs` (`NotInManifest` senão, que no
 kabi corresponde a `AccessDenied` para o chamador do kernel quando for
 syscall).
