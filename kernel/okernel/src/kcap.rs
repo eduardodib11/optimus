@@ -6,7 +6,8 @@
 
 use alloc::sync::Arc;
 
-use okernel::cap::MemoryQuota;
+use kabi::{Error, Handle, ObjectType};
+use okernel::cap::{Cap, MemoryQuota, Object, SharedCapSpace, default_rights, obj_create};
 use okernel::sync::SpinLock;
 
 use crate::kheap;
@@ -32,4 +33,24 @@ pub fn init() {
 /// A cota raiz, de onde o `root` recebe toda a memória de objetos.
 pub fn root_quota() -> Option<Arc<MemoryQuota>> {
     ROOT.lock().clone()
+}
+
+/// Cria um `CapSpace` cobrado da cota raiz com uma capability para a
+/// própria cota raiz, como o do processo `root` (T-211). Devolve a tabela e
+/// o handle da cota.
+///
+/// # Errors
+///
+/// [`Error::NotSupported`] antes de [`init`]; [`Error::QuotaExceeded`] sem
+/// memória na cota raiz.
+pub fn root_cap_space() -> Result<(Arc<SharedCapSpace>, Handle), Error> {
+    let root = root_quota().ok_or(Error::NotSupported)?;
+    let space = obj_create(&root, ObjectType::CapSpace, 0)?;
+    let space = Arc::clone(space.as_cap_space()?);
+    let quota = space.lock().insert(Cap {
+        object: Object::MemoryQuota(root),
+        rights: default_rights(ObjectType::MemoryQuota),
+        badge: 0,
+    })?;
+    Ok((space, quota))
 }
