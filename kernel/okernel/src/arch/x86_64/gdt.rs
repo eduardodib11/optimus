@@ -1,9 +1,11 @@
 //! GDT e TSS com pilhas IST (T-105).
 //!
-//! No modo longo a segmentação quase não importa: a GDT tem só o código e os
-//! dados do kernel e o descritor da TSS. A TSS serve para as pilhas IST, que
-//! dão pilha conhecida e boa a faltas que podem chegar com a pilha estragada
-//! (falta dupla), a qualquer momento (NMI) ou com a máquina instável (MCE).
+//! No modo longo a segmentação quase não importa: a GDT tem o código e os
+//! dados do kernel, os do usuário (T-206) na ordem que SYSRET exige e o
+//! descritor da TSS. A TSS dá a pilha de kernel da thread atual (RSP0, para
+//! interrupções vindas do anel 3) e as pilhas IST, que dão pilha conhecida
+//! e boa a faltas que podem chegar com a pilha estragada (falta dupla), a
+//! qualquer momento (NMI) ou com a máquina instável (MCE).
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -17,8 +19,17 @@ use core::mem::size_of;
 pub const KERNEL_CODE: u16 = 0x08;
 /// Seletor dos dados do kernel (índice 2, anel 0).
 pub const KERNEL_DATA: u16 = 0x10;
-/// Seletor da TSS (índices 3 e 4).
-pub const TSS_SELECTOR: u16 = 0x18;
+/// Base dos seletores de usuário no STAR: SYSRET carrega SS = base + 8 e
+/// CS = base + 16 (índice 3 seria o código de 32 bits, ausente).
+pub const SYSRET_BASE: u16 = 0x18;
+/// Seletor dos dados do usuário (índice 4, anel 3).
+pub const USER_DATA: u16 = 0x20 | 3;
+/// Seletor do código de 64 bits do usuário (índice 5, anel 3).
+pub const USER_CODE: u16 = 0x28 | 3;
+/// Seletor da TSS (índices 6 e 7).
+pub const TSS_SELECTOR: u16 = 0x30;
+/// Entradas da GDT.
+pub const GDT_ENTRIES: usize = 8;
 
 /// Índices de IST (1 a 7; zero quer dizer "sem IST") usados na IDT.
 pub const IST_DOUBLE_FAULT: u8 = 1;
@@ -68,12 +79,17 @@ static mut TSS: Tss = Tss {
     iomap_base: size_of::<Tss>() as u16,
 };
 
-/// Nula, código 64 bits, dados e os dois descritores da TSS. Fica gravável
-/// porque `ltr` marca a TSS como ocupada no descritor.
-static mut GDT: [u64; 5] = [
+/// Nula, código e dados do kernel, código de 32 bits do usuário (ausente:
+/// o kernel nunca volta ao modo de compatibilidade), dados e código de 64
+/// bits do usuário e os dois descritores da TSS. Fica gravável porque `ltr`
+/// marca a TSS como ocupada no descritor.
+static mut GDT: [u64; GDT_ENTRIES] = [
     0,
     0x00af_9a00_0000_ffff, // código: presente, anel 0, executável, L=1
     0x00cf_9200_0000_ffff, // dados: presente, anel 0, gravável
+    0,
+    0x00cf_f200_0000_ffff, // dados: presente, anel 3, gravável
+    0x00af_fa00_0000_ffff, // código: presente, anel 3, executável, L=1
     0,
     0,
 ];
@@ -115,10 +131,10 @@ pub unsafe fn init() {
         }
         let gdt = &raw mut GDT;
         let [low, high] = tss_descriptor(tss.addr() as u64);
-        (*gdt)[3] = low;
-        (*gdt)[4] = high;
+        (*gdt)[6] = low;
+        (*gdt)[7] = high;
         let pointer = Pointer {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; GDT_ENTRIES]>() - 1) as u16,
             base: gdt.addr() as u64,
         };
         asm!(
@@ -142,5 +158,20 @@ pub unsafe fn init() {
             tss = in(reg) TSS_SELECTOR,
             tmp = out(reg) _,
         );
+    }
+}
+
+/// Pilha de kernel usada quando uma interrupção chega no anel 3 (RSP0).
+///
+/// # Safety
+///
+/// Só com interrupções desligadas, depois de [`init`]; `top` é o topo de
+/// uma pilha de kernel mapeada que a thread atual vai usar.
+pub unsafe fn set_kernel_stack(top: u64) {
+    // SAFETY: contrato acima; a TSS é empacotada, então a escrita não pode
+    // supor alinhamento de 8.
+    unsafe {
+        let rsp = &raw mut TSS.rsp;
+        rsp.cast::<u64>().write_unaligned(top);
     }
 }

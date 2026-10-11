@@ -253,6 +253,10 @@ fn harden_cpu() {
     // SAFETY: só liga proteções que a CPU anuncia; o kernel não tem páginas
     // de usuário nem usa as instruções que UMIP restringe no anel 3.
     unsafe { cpu::write_cr4(cr4) };
+    cpu::SMAP_ENABLED.store(
+        cr4 & cpu::CR4_SMAP != 0,
+        core::sync::atomic::Ordering::Relaxed,
+    );
     // SAFETY: EFER existe em toda CPU x86-64.
     let efer = unsafe { cpu::rdmsr(cpu::MSR_EFER) };
     let nx = efer & cpu::EFER_NXE != 0;

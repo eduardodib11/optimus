@@ -1,0 +1,240 @@
+//! Testes de kernel de threads de usuário e syscalls (T-206).
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use kabi::vm::{EXEC, PAGE_SIZE, WRITE};
+use kabi::{Error, Handle, ObjectType};
+use okernel::cap::{Cap, SharedCapSpace};
+use okernel::thread::{RunState, Thread};
+use okernel::vm::vm_map;
+
+use super::{UserEntry, start, take_debug_log, yield_now};
+use crate::arch::x86_64::{cpu, probe};
+use crate::kcap::{root_cap_space, root_quota};
+use crate::kmem;
+use crate::ktest::{Outcome, Test};
+use crate::kvm::activate;
+
+/// Testes de kernel de threads de usuário.
+pub const TESTS: &[Test] = &[
+    Test {
+        name: "thread.duas_threads_de_usuario_alternam",
+        run: alternam,
+    },
+    Test {
+        name: "thread.start_recusa_rip_de_kernel",
+        run: start_recusa,
+    },
+    Test {
+        name: "thread.copias_de_usuario_so_na_metade_baixa",
+        run: copias,
+    },
+];
+
+unsafe extern "C" {
+    static user_test_start: u8;
+    static user_test_end: u8;
+    static user_alternate: u8;
+}
+
+/// Onde o teste mapeia o código (RX) e os dados (RW) do usuário.
+pub const CODE_VA: u64 = 0x40_0000;
+/// Páginas de dados, uma por thread.
+pub const DATA_VA: u64 = 0x50_0000;
+const VOLTAS: u64 = 8;
+
+/// Um processo de teste: tabela de capabilities, espaço e o código de
+/// `user.S` mapeado.
+pub struct Process {
+    /// Tabela de capabilities (com a cota raiz).
+    pub cspace: Arc<SharedCapSpace>,
+    /// Handle da cota.
+    pub quota: Handle,
+    /// Capability do espaço.
+    pub aspace: Cap,
+}
+
+fn cap(space: &SharedCapSpace, h: Handle) -> Result<Cap, &'static str> {
+    space.lock().get(h).cloned().map_err(|_| "handle")
+}
+
+/// Endereço de usuário de um símbolo de `user.S`.
+pub fn user_symbol(sym: *const u8) -> u64 {
+    let start = (&raw const user_test_start).addr();
+    CODE_VA + (sym.addr() - start) as u64
+}
+
+/// Cria o processo: código RX em [`CODE_VA`] e `data_pages` páginas RW em
+/// [`DATA_VA`].
+pub fn process(data_pages: u64) -> Result<Process, &'static str> {
+    let (cspace, quota) = root_cap_space().map_err(|_| "cspace")?;
+    let start = (&raw const user_test_start).addr();
+    let len = (&raw const user_test_end).addr() - start;
+    ensure!(len as u64 <= PAGE_SIZE);
+    let (a, code, data) = {
+        let mut s = cspace.lock();
+        let a = s.obj_create(quota, ObjectType::AddressSpace, 0);
+        let c = s.obj_create(quota, ObjectType::MemoryObject, PAGE_SIZE);
+        let d = s.obj_create(quota, ObjectType::MemoryObject, data_pages * PAGE_SIZE);
+        (a, c, d)
+    };
+    let (a, code, data) = (
+        cap(&cspace, a.map_err(|_| "aspace")?)?,
+        cap(&cspace, code.map_err(|_| "code")?)?,
+        cap(&cspace, data.map_err(|_| "data")?)?,
+    );
+    let frame = code
+        .object
+        .as_memory_object()
+        .map_err(|_| "tipo")?
+        .frame(0)
+        .ok_or("frame")?;
+    // SAFETY: `user.S` fica nos dados só de leitura do kernel, `len` bytes
+    // a partir de `start`; o frame é do objeto recém-criado, no mapa direto.
+    unsafe {
+        core::ptr::copy_nonoverlapping(start as *const u8, kmem::direct(frame) as *mut u8, len);
+    }
+    ensure!(vm_map(&a, &code, CODE_VA, 0, PAGE_SIZE, EXEC).is_ok());
+    ensure!(vm_map(&a, &data, DATA_VA, 0, data_pages * PAGE_SIZE, WRITE).is_ok());
+    Ok(Process {
+        cspace,
+        quota,
+        aspace: a,
+    })
+}
+
+/// Cria uma thread no processo, configurada, ainda sem iniciar; devolve
+/// o handle dela também, para o teste apagá-la no fim.
+pub fn thread(p: &Process) -> Result<(Handle, Arc<Thread>), &'static str> {
+    let h = p
+        .cspace
+        .lock()
+        .obj_create(p.quota, ObjectType::Thread, 0)
+        .map_err(|_| "obj_create(Thread)")?;
+    let t = Arc::clone(cap(&p.cspace, h)?.object.as_thread().map_err(|_| "tipo")?);
+    let aspace = Arc::clone(p.aspace.object.as_address_space().map_err(|_| "tipo")?);
+    t.configure(Arc::clone(&p.cspace), aspace)
+        .map_err(|_| "configure")?;
+    Ok((h, t))
+}
+
+/// Roda as prontas até todas as `threads` saírem (ou um limite de voltas).
+pub fn run_until_exit(threads: &[Arc<Thread>]) -> Outcome {
+    for _ in 0..100_000 {
+        if threads.iter().all(|t| t.state() == RunState::Exited) {
+            return Ok(());
+        }
+        yield_now();
+    }
+    Err("as threads não terminaram")
+}
+
+/// Apaga as capabilities das threads (quebra o ciclo thread ↔ `CapSpace`).
+pub fn delete(p: &Process, handles: &[Handle]) -> Outcome {
+    for &h in handles {
+        let cap = p.cspace.lock().delete(h).map_err(|_| "delete")?;
+        drop(cap);
+    }
+    Ok(())
+}
+
+fn alternam() -> Outcome {
+    let quota = root_quota().ok_or("sem cota raiz")?;
+    let used0 = quota.used();
+    {
+        let p = process(2)?;
+        let entry = user_symbol(&raw const user_alternate);
+        let mut handles = Vec::new();
+        let mut threads = Vec::new();
+        for (i, letter) in b"AB".iter().copied().enumerate() {
+            let (h, t) = thread(&p)?;
+            let page = DATA_VA + i as u64 * PAGE_SIZE;
+            let e = UserEntry {
+                rip: entry,
+                rsp: page + PAGE_SIZE,
+                args: [u64::from(letter), VOLTAS, page],
+            };
+            ensure!(start(&t, &e).is_ok());
+            ensure!(start(&t, &e) == Err(Error::Busy));
+            handles.push(h);
+            threads.push(t);
+        }
+        let _ = take_debug_log();
+        run_until_exit(&threads)?;
+        let (log, len) = take_debug_log();
+        let text = core::str::from_utf8(&log[..len]).unwrap_or("?");
+        info!("ktest: · sequência impressa pelas threads: {text}");
+        ensure!(len as u64 == 2 * VOLTAS);
+        ensure!(log[..len].chunks(2).all(|pair| pair == b"AB"));
+        delete(&p, &handles)?;
+    }
+    ensure!(quota.used() == used0);
+    Ok(())
+}
+
+fn start_recusa() -> Outcome {
+    let p = process(1)?;
+    let (h, t) = thread(&p)?;
+    let kernel = start_recusa as *const () as u64;
+    let bad = [
+        (kernel, DATA_VA),
+        (CODE_VA, kernel),
+        (0, DATA_VA),
+        (kabi::vm::USER_END, DATA_VA),
+    ];
+    for (rip, rsp) in bad {
+        let e = UserEntry {
+            rip,
+            rsp,
+            args: [0; 3],
+        };
+        ensure!(start(&t, &e) == Err(Error::InvalidArgument));
+    }
+    ensure!(t.state() == RunState::Inactive);
+    // Sem `thread_configure`, também não.
+    let lone = p
+        .cspace
+        .lock()
+        .obj_create(p.quota, ObjectType::Thread, 0)
+        .map_err(|_| "obj_create")?;
+    let lone_t = Arc::clone(
+        cap(&p.cspace, lone)?
+            .object
+            .as_thread()
+            .map_err(|_| "tipo")?,
+    );
+    let e = UserEntry {
+        rip: CODE_VA,
+        rsp: DATA_VA,
+        args: [0; 3],
+    };
+    ensure!(start(&lone_t, &e) == Err(Error::InvalidArgument));
+    delete(&p, &[h, lone])?;
+    Ok(())
+}
+
+fn copias() -> Outcome {
+    let p = process(1)?;
+    let root = p
+        .aspace
+        .object
+        .as_address_space()
+        .map_err(|_| "tipo")?
+        .lock()
+        .root();
+    // SAFETY: o espaço segue vivo (em `p`) até o CR3 voltar.
+    let old = unsafe { activate(root) };
+    let wrote = probe::copy_to_user(DATA_VA + 8, b"optimus");
+    let mut back = [0u8; 7];
+    let read = probe::copy_from_user(&mut back, DATA_VA + 8);
+    // Página não mapeada, ponteiro de kernel e faixa que cruza a metade.
+    let unmapped = probe::copy_from_user(&mut back, DATA_VA + PAGE_SIZE);
+    let kernel = probe::copy_from_user(&mut back[..1], copias as *const () as u64);
+    let across = probe::copy_to_user(kabi::vm::USER_END - 4, b"optimus");
+    // SAFETY: o CR3 anterior era o do kernel.
+    unsafe { cpu::write_cr3(old) };
+    ensure!(wrote && read && &back == b"optimus");
+    ensure!(!unmapped && !kernel && !across);
+    Ok(())
+}

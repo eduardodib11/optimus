@@ -2,6 +2,12 @@
 //! TLB, TSC e interrupções.
 
 use core::arch::asm;
+use core::sync::atomic::AtomicBool;
+
+/// SMAP ligado no CR4: o asm de entrada e de cópia de usuário só usa
+/// STAC/CLAC com ele (sem SMAP essas instruções dão #UD).
+#[unsafe(no_mangle)]
+pub static SMAP_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Resultado de CPUID.
 pub struct CpuidResult {
@@ -70,6 +76,17 @@ read_control_register!(read_cr4, "cr4", "CR4");
 pub unsafe fn write_cr3(value: u64) {
     // SAFETY: contrato do chamador.
     unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack)) };
+}
+
+/// Grava o CR0.
+///
+/// # Safety
+///
+/// O valor não pode desligar proteções nem a paginação de que o kernel
+/// depende.
+pub unsafe fn write_cr0(value: u64) {
+    // SAFETY: contrato do chamador.
+    unsafe { asm!("mov cr0, {}", in(reg) value, options(nostack)) };
 }
 
 /// Grava o CR4.

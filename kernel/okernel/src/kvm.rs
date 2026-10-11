@@ -1,18 +1,36 @@
-//! Memória virtual de usuário sobre o hardware (T-205).
+//! Memória virtual de usuário e pilhas de kernel sobre o hardware (T-205,
+//! T-206).
 //!
 //! A [`Platform`] do kernel entrega aos objetos portáveis de `okernel::vm`
 //! frames zerados do buddy, tabelas pelo mapa direto e invalidação da TLB
 //! (`invlpg` quando o espaço é o do CR3; os outros espaços não têm
 //! traduções em cache, porque a troca de CR3 sem PCID descarta a TLB).
+//!
+//! As pilhas de kernel das threads (16 KiB) ficam na faixa de pilhas da
+//! seção 6.4, uma por fatia de 32 KiB: os 16 KiB de baixo nunca são
+//! mapeados e servem de guarda contra estouro.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use okernel::mm::PhysAddr;
-use okernel::mm::paging::TableMemory;
-use okernel::platform::{self, Platform};
+use okernel::mm::paging::{Flags, PageSize, TableMemory};
+use okernel::platform::{self, KERNEL_STACK_BYTES, KernelStack, Platform};
+use okernel::sync::SpinLock;
 
-use crate::arch::x86_64::cpu;
+use crate::arch::x86_64::{cpu, fpu};
 use crate::kmem::{self, DirectMap};
+
+/// Início das pilhas de kernel das threads, na faixa de pilhas da seção 6.4
+/// (`0xFFFF_E000_0000_0000`); o primeiro MiB dela fica com a pilha
+/// provisória que o optboot deixou mapeada.
+const STACKS_BASE: u64 = 0xffff_e000_0010_0000;
+/// Fatia de cada pilha: guarda embaixo, pilha em cima.
+const STACK_SLOT: u64 = 2 * KERNEL_STACK_BYTES;
+const PAGE: u64 = 4096;
+
+/// Fatias de pilha: a próxima nunca usada e as devolvidas.
+static STACK_SLOTS: SpinLock<(u32, Vec<u32>)> = SpinLock::new((0, Vec::new()));
 
 mod tests;
 pub use tests::TESTS;
@@ -51,10 +69,59 @@ impl Platform for KernelPlatform {
             cpu::invlpg(virt);
         }
     }
+
+    fn alloc_kernel_stack(&self) -> Option<KernelStack> {
+        let slot = {
+            let mut slots = STACK_SLOTS.lock();
+            if let Some(slot) = slots.1.pop() {
+                slot
+            } else {
+                slots.0 = slots.0.checked_add(1)?;
+                slots.0 - 1
+            }
+        };
+        let top = STACKS_BASE + (u64::from(slot) + 1) * STACK_SLOT;
+        let stack = KernelStack { top, slot };
+        let bottom = top - KERNEL_STACK_BYTES;
+        for page in (0..KERNEL_STACK_BYTES / PAGE).map(|i| bottom + i * PAGE) {
+            let mapped = kmem::alloc_frames(0).is_some_and(|frame| {
+                let ok = kmem::map(page, frame, PageSize::Size4K, Flags::RW).is_ok();
+                if !ok {
+                    kmem::free_frames(frame, 0);
+                }
+                ok
+            });
+            if !mapped {
+                self.free_kernel_stack(stack);
+                return None;
+            }
+        }
+        Some(stack)
+    }
+
+    fn free_kernel_stack(&self, stack: KernelStack) {
+        let bottom = stack.top - KERNEL_STACK_BYTES;
+        for page in (0..KERNEL_STACK_BYTES / PAGE).map(|i| bottom + i * PAGE) {
+            if let Ok(frame) = kmem::unmap(page, PageSize::Size4K) {
+                kmem::free_frames(frame, 0);
+            }
+        }
+        let mut slots = STACK_SLOTS.lock();
+        // Sem memória para a lista, a fatia só deixa de ser reutilizada.
+        if slots.1.try_reserve(1).is_ok() {
+            slots.1.push(stack.slot);
+        }
+    }
+
+    fn fpu_area_bytes(&self) -> usize {
+        fpu::area_bytes()
+    }
 }
 
-/// Instala a plataforma; chamar depois de `kmem::init`.
+/// Liga a FPU para o usuário e instala a plataforma; chamar depois de
+/// `kmem::init`.
 pub fn init() {
+    fpu::init();
     platform::install(&PLATFORM);
 }
 

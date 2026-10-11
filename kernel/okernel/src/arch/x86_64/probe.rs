@@ -9,7 +9,8 @@ unsafe extern "C" {
     fn probe_write_byte(addr: *mut u8, value: u8) -> u64;
     fn probe_read_byte(addr: *const u8, out: *mut u8) -> u64;
     fn probe_exec(target: *const u8) -> u64;
-    static probe_extable: [[u64; 2]; 2];
+    static probe_extable: [[u64; 2]; 3];
+    fn copy_user(dst: *mut u8, src: *const u8, len: u64) -> u64;
     static probe_fault: u8;
 }
 
@@ -84,6 +85,34 @@ pub unsafe fn exec(addr: u64) -> Result<(), Fault> {
         0 => Ok(()),
         _ => Err(last_fault()),
     }
+}
+
+/// Faixa `[addr, addr + len)` toda na metade de usuário.
+fn user_range(addr: u64, len: u64) -> bool {
+    addr.checked_add(len)
+        .is_some_and(|end| addr >= kabi::vm::USER_START && end <= kabi::vm::USER_END)
+}
+
+/// Copia `dst.len()` bytes da memória de usuário em `src` (do espaço
+/// ativo); `false` se a faixa sair da metade de usuário ou faltar.
+pub fn copy_from_user(dst: &mut [u8], src: u64) -> bool {
+    if !user_range(src, dst.len() as u64) {
+        return false;
+    }
+    // SAFETY: `dst` é memória do kernel gravável do tamanho pedido; `src`
+    // está na metade de usuário (não alcança o kernel), e uma falta lá
+    // volta pela tabela de exceções.
+    unsafe { copy_user(dst.as_mut_ptr(), src as *const u8, dst.len() as u64) == 0 }
+}
+
+/// Copia `src` para a memória de usuário em `dst` (do espaço ativo);
+/// `false` se a faixa sair da metade de usuário ou faltar.
+pub fn copy_to_user(dst: u64, src: &[u8]) -> bool {
+    if !user_range(dst, src.len() as u64) {
+        return false;
+    }
+    // SAFETY: idem a `copy_from_user`: só escreve na metade de usuário.
+    unsafe { copy_user(dst as *mut u8, src.as_ptr(), src.len() as u64) == 0 }
 }
 
 /// Gancho do tratador de exceções: se a falta veio de uma sonda, registra e

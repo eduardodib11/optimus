@@ -35,7 +35,7 @@ fn tabelas_carregadas() -> Outcome {
     }
     let (gdt_base, gdt_limit) = (gdtr.base, gdtr.limit);
     let (idt_base, idt_limit) = (idtr.base, idtr.limit);
-    ensure!(gdt_base == gdt::table_addr() && gdt_limit == 5 * 8 - 1);
+    ensure!(gdt_base == gdt::table_addr() && usize::from(gdt_limit) == gdt::GDT_ENTRIES * 8 - 1);
     ensure!(idt_base == idt::table_addr() && idt_limit == 256 * 16 - 1);
     ensure!(tr == gdt::TSS_SELECTOR);
     Ok(())

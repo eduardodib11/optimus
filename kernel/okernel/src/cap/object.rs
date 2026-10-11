@@ -5,9 +5,9 @@
 //! objeto aloca por conta própria. Quando a última referência some, o
 //! `Charge` é destruído com o objeto e os bytes voltam à cota.
 //!
-//! `AddressSpace` e `MemoryObject` (T-205) usam a [`Platform`](crate::platform::Platform)
-//! instalada pelo kernel. Os tipos que dependem de tarefas futuras (threads,
-//! IPC) respondem [`Error::NotSupported`] por enquanto.
+//! `AddressSpace`, `MemoryObject` (T-205) e `Thread` (T-206) usam a [`Platform`](crate::platform::Platform)
+//! instalada pelo kernel. Os tipos que dependem de tarefas futuras (IPC,
+//! escalonador) respondem [`Error::NotSupported`] por enquanto.
 
 use alloc::sync::Arc;
 use core::fmt;
@@ -19,6 +19,7 @@ use super::quota::MemoryQuota;
 use super::space::CapSpace;
 use crate::platform;
 use crate::sync::SpinLock;
+use crate::thread::Thread;
 use crate::vm::{AddressSpace, MemoryObject, SharedAddressSpace};
 
 /// `CapSpace` compartilhado, com a trava que a seção 6.9 põe à frente de
@@ -36,6 +37,8 @@ pub enum Object {
     AddressSpace(Arc<SharedAddressSpace>),
     /// Páginas físicas.
     MemoryObject(Arc<MemoryObject>),
+    /// Contexto de execução.
+    Thread(Arc<Thread>),
 }
 
 impl fmt::Debug for Object {
@@ -45,6 +48,7 @@ impl fmt::Debug for Object {
             Self::CapSpace(c) => Arc::as_ptr(c).addr(),
             Self::AddressSpace(a) => Arc::as_ptr(a).addr(),
             Self::MemoryObject(m) => Arc::as_ptr(m).addr(),
+            Self::Thread(t) => Arc::as_ptr(t).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -59,6 +63,7 @@ impl Object {
             Self::CapSpace(_) => ObjectType::CapSpace,
             Self::AddressSpace(_) => ObjectType::AddressSpace,
             Self::MemoryObject(_) => ObjectType::MemoryObject,
+            Self::Thread(_) => ObjectType::Thread,
         }
     }
 
@@ -70,6 +75,7 @@ impl Object {
             (Self::CapSpace(a), Self::CapSpace(b)) => Arc::ptr_eq(a, b),
             (Self::AddressSpace(a), Self::AddressSpace(b)) => Arc::ptr_eq(a, b),
             (Self::MemoryObject(a), Self::MemoryObject(b)) => Arc::ptr_eq(a, b),
+            (Self::Thread(a), Self::Thread(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -121,6 +127,18 @@ impl Object {
             _ => Err(Error::WrongType),
         }
     }
+
+    /// A thread, se o objeto for uma.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_thread(&self) -> Result<&Arc<Thread>, Error> {
+        match self {
+            Self::Thread(t) => Ok(t),
+            _ => Err(Error::WrongType),
+        }
+    }
 }
 
 /// Bytes que um `Arc<T>` ocupa no heap: dois contadores mais o valor.
@@ -168,7 +186,7 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 /// sai de `quota` junto com o tamanho do objeto); `CapSpace`, zero (as
 /// folhas da tabela são cobradas da mesma cota à medida que ela cresce);
 /// `AddressSpace`, zero (tabelas e regiões são cobradas ao mapear);
-/// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB.
+/// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB; `Thread`, zero.
 /// Os direitos sobre `quota`
 /// (`CREATE`, e `SPLIT` para cotas) são conferidos por quem chama, que tem a
 /// capability.
@@ -202,6 +220,10 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
             let platform = platform::get().ok_or(Error::NotSupported)?;
             let memory = MemoryObject::new(quota, args, platform)?;
             Ok(Object::MemoryObject(Arc::new(memory)))
+        }
+        ObjectType::Thread => {
+            let platform = platform::get().ok_or(Error::NotSupported)?;
+            Ok(Object::Thread(Arc::new(Thread::new(quota, platform)?)))
         }
         _ => Err(Error::NotSupported),
     }

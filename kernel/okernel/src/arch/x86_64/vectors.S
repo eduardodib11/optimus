@@ -11,6 +11,12 @@
  * (da CPU), erro, vetor, r15 ... rax. São 22 palavras = 176 bytes; como a CPU
  * alinha RSP a 16 antes de empilhar, o `call` sai alinhado como pede o
  * System V.
+ *
+ * Vinda do anel 3 (T-206), a entrada faz SWAPGS (ver syscall.S) e a saída
+ * o desfaz antes do IRETQ. Toda entrada faz CLAC quando há SMAP: o usuário
+ * pode deixar RFLAGS.AC ligado, e uma interrupção não o limpa. `isr_exit`
+ * também é a volta das syscalls que não podem usar SYSRET e a primeira
+ * entrada de uma thread no anel 3.
  */
 
 .macro ISR_NOERR n
@@ -61,6 +67,14 @@ ISR_ERR   30
 ISR_NOERR 31
 
 isr_common:
+    test byte ptr [rsp + 24], 3     /* CS interrompido: anel 3? */
+    jz 1f
+    swapgs
+1:
+    test byte ptr [rip + SMAP_ENABLED], 1
+    jz 2f
+    clac
+2:
     push r15
     push r14
     push r13
@@ -79,6 +93,8 @@ isr_common:
     cld
     mov rdi, rsp
     call exception_handler
+.global isr_exit
+isr_exit:
     pop rax
     pop rbx
     pop rcx
@@ -96,6 +112,10 @@ isr_common:
     pop r15
     /* Vetor e código de erro. */
     add rsp, 16
+    test byte ptr [rsp + 8], 3      /* volta ao anel 3? */
+    jz 3f
+    swapgs
+3:
     iretq
 
 /* Portas dos vetores 32 a 255 (interrupções), 16 bytes cada, a partir de

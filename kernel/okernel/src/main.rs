@@ -21,6 +21,7 @@ mod kcap;
 mod kheap;
 mod kmem;
 mod kpanic;
+mod kthread;
 mod ktime;
 mod kvm;
 
