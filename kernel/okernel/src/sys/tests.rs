@@ -4,6 +4,8 @@ use alloc::sync::Arc;
 
 use kabi::vm::{PAGE_SIZE, WRITE};
 
+use alloc::vec::Vec;
+
 use super::*;
 use crate::cap::{Cap, MemoryQuota, Object, default_rights};
 use crate::platform;
@@ -24,8 +26,32 @@ fn setup() -> (Arc<MemoryQuota>, SharedCapSpace, u64) {
     (root, space, u64::from(q.raw()))
 }
 
+/// Ambiente falso: conta preempções e guarda quem foi acordado.
+#[derive(Default)]
+struct Fake {
+    preempts: u32,
+    woken: Vec<(Arc<Thread>, u64)>,
+    current: Option<Arc<Thread>>,
+}
+
+impl Env for Fake {
+    fn preempt(&mut self) {
+        self.preempts += 1;
+    }
+    fn wake(&mut self, thread: Arc<Thread>, value: u64) {
+        self.woken.push((thread, value));
+    }
+    fn current(&self) -> Option<Arc<Thread>> {
+        self.current.clone()
+    }
+    fn block(&mut self) {}
+    fn read_u32(&mut self, _addr: u64) -> Option<u32> {
+        None
+    }
+}
+
 fn call(space: &SharedCapSpace, c: Syscall, a: [u64; 6]) -> Result<Values, Error> {
-    invoke(space, c, a, 4, &mut || {})
+    invoke(space, c, a, 4, &mut Fake::default())
 }
 
 #[test]
@@ -47,18 +73,9 @@ fn mint_info_delete_e_revoke() {
     for _ in 0..20 {
         call(&space, Syscall::CapMint, [h, create, 0, 0, 0, 0]).unwrap();
     }
-    let mut slices = 0;
-    invoke(
-        &space,
-        Syscall::CapRevoke,
-        [h, 0, 0, 0, 0, 0],
-        4,
-        &mut || {
-            slices += 1;
-        },
-    )
-    .unwrap();
-    assert!(slices > 1, "revogação fatiada");
+    let mut env = Fake::default();
+    invoke(&space, Syscall::CapRevoke, [h, 0, 0, 0, 0, 0], 4, &mut env).unwrap();
+    assert!(env.preempts > 1, "revogação fatiada");
     assert_eq!(space.lock().len(), 2);
     call(&space, Syscall::CapDelete, [h, 0, 0, 0, 0, 0]).unwrap();
     assert_eq!(
@@ -124,6 +141,21 @@ fn as_outras_nao_sao_suportadas_aqui() {
                 | Syscall::SchedConfigure
                 | Syscall::SchedBind
         );
+        // Precisam de capability válida ou da thread atual.
+        let sync = matches!(
+            c,
+            Syscall::NtfySignal
+                | Syscall::NtfyWait
+                | Syscall::NtfyPoll
+                | Syscall::ObjBindNotify
+                | Syscall::IrqAck
+                | Syscall::FutexWait
+                | Syscall::FutexWake
+        );
+        if sync {
+            assert_ne!(call(&space, c, [0; 6]), Ok([0; 3]), "{c:?}");
+            continue;
+        }
         if !handled {
             assert_eq!(call(&space, c, [0; 6]), Err(Error::NotSupported), "{c:?}");
         }
@@ -167,4 +199,81 @@ fn sched_configure_e_bind_conferem_direitos() {
         .clone();
     let bound = thread.object.as_thread().unwrap().sched_context().unwrap();
     assert_eq!(bound.params().map(|p| p.priority), Some(120));
+}
+
+#[test]
+fn notificacao_por_handles() {
+    platform::install(fake_platform(1000).1);
+    let (root, space, q) = setup();
+    let [n, ..] = call(
+        &space,
+        Syscall::ObjCreate,
+        [q, ObjectType::Notification.to_raw(), 0, 0, 0, 0],
+    )
+    .unwrap();
+    let signal_only = u64::from(Rights::SIGNAL.bits());
+    let [ns, ..] = call(&space, Syscall::CapMint, [n, signal_only, 0b100, 0, 0, 0]).unwrap();
+    assert_eq!(
+        call(&space, Syscall::NtfyPoll, [ns, 0, 0, 0, 0, 0]),
+        Err(Error::AccessDenied)
+    );
+    assert_eq!(
+        call(&space, Syscall::NtfySignal, [n, 0, 0, 0, 0, 0]),
+        Err(Error::InvalidArgument)
+    );
+    // O badge entra na palavra junto com os bits.
+    call(&space, Syscall::NtfySignal, [ns, 1, 0, 0, 0, 0]).unwrap();
+    assert_eq!(
+        call(&space, Syscall::NtfyPoll, [n, 0, 0, 0, 0, 0]),
+        Ok([0b101, 0, 0])
+    );
+    // Quem espera é acordado pelo sinal, com a palavra.
+    let t = Arc::new(Thread::new(&root, fake_platform(1000).1).unwrap());
+    let mut env = Fake {
+        current: Some(Arc::clone(&t)),
+        ..Fake::default()
+    };
+    invoke(&space, Syscall::NtfyWait, [n, 0, 0, 0, 0, 0], 4, &mut env).unwrap();
+    assert_eq!(t.state(), crate::thread::RunState::Blocked);
+    invoke(
+        &space,
+        Syscall::NtfySignal,
+        [n, 0b10, 0, 0, 0, 0],
+        4,
+        &mut env,
+    )
+    .unwrap();
+    assert_eq!(env.woken.len(), 1);
+    assert!(Arc::ptr_eq(&env.woken[0].0, &t) && env.woken[0].1 == 0b10);
+    assert_eq!(env.preempts, 1);
+    // Interrupção ligada a um bit; obj_bind_notify confere tipos e direitos.
+    let irq = space
+        .lock()
+        .insert(Cap {
+            object: Object::Interrupt(Arc::new(
+                crate::notify::Interrupt::new(&root, 0x40).unwrap(),
+            )),
+            rights: default_rights(ObjectType::Interrupt),
+            badge: 0,
+        })
+        .unwrap();
+    let irq = u64::from(irq.raw());
+    let bind = |obj, ntfy| call(&space, Syscall::ObjBindNotify, [obj, ntfy, 3, 0, 0, 0]);
+    assert_eq!(bind(n, n), Err(Error::AccessDenied));
+    assert_eq!(bind(irq, irq), Err(Error::AccessDenied));
+    assert_eq!(bind(irq, n), Ok([0; 3]));
+    assert_eq!(bind(irq, n), Err(Error::Busy));
+    assert_eq!(
+        call(&space, Syscall::IrqAck, [irq, 0, 0, 0, 0, 0]),
+        Ok([0; 3])
+    );
+    // obj_create não cria interrupções.
+    assert_eq!(
+        call(
+            &space,
+            Syscall::ObjCreate,
+            [q, ObjectType::Interrupt.to_raw(), 0x40, 0, 0, 0]
+        ),
+        Err(Error::NotSupported)
+    );
 }
