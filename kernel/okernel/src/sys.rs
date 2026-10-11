@@ -45,6 +45,21 @@ pub trait Env {
     fn block(&mut self);
     /// Lê a palavra de 32 bits do usuário em `addr` (no espaço ativo).
     fn read_u32(&mut self, addr: u64) -> Option<u32>;
+    /// Relógio monotônico, em ns.
+    fn now(&self) -> u64;
+    /// Como [`block`](Self::block), mas acorda com `TimedOut` em
+    /// `deadline` (0 = sem prazo) se ninguém a acordar antes (IPC).
+    fn block_until(&mut self, deadline: u64);
+    /// Caminho rápido de IPC: a atual (já bloqueada) cede a CPU direto a
+    /// `to` (bloqueada, já atendida), sem passar pela fila; se `to` não
+    /// puder rodar agora, vale como acordá-la e [`block_until`](Self::block_until).
+    fn handoff(&mut self, to: Arc<Thread>, deadline: u64);
+    /// Lê palavras do buffer de IPC de `thread`, a partir da palavra `at`;
+    /// falso se não houver buffer ou a página não estiver mapeada.
+    fn read_buffer(&mut self, thread: &Thread, at: usize, out: &mut [u64]) -> bool;
+    /// Grava palavras no buffer de IPC de `thread`, a partir da palavra
+    /// `at`; falso se não houver buffer ou ele não for gravável.
+    fn write_buffer(&mut self, thread: &Thread, at: usize, data: &[u64]) -> bool;
 }
 
 fn handle(raw: u64) -> Result<Handle, Error> {

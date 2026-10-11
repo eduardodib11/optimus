@@ -45,7 +45,7 @@ fn root_inicia() -> Outcome {
         let (log, len) = take_debug_log();
         let text = core::str::from_utf8(&log[..len]).unwrap_or("?");
         info!("ktest: · o root imprimiu \"{text}\"");
-        ensure!(text == "root: iniciado");
+        ensure!(text == "root: iniciadoroot: IPC sem par: TimedOut e WouldBlock");
         // Quebra o ciclo thread ↔ CapSpace e devolve tudo à cota.
         let [_, _, thread] = p.handles;
         drop(p.cspace.lock().delete(thread));

@@ -48,6 +48,19 @@ impl Env for Fake {
     fn read_u32(&mut self, _addr: u64) -> Option<u32> {
         None
     }
+    fn now(&self) -> u64 {
+        0
+    }
+    fn block_until(&mut self, _deadline: u64) {}
+    fn handoff(&mut self, to: Arc<Thread>, _deadline: u64) {
+        self.woken.push((to, 0));
+    }
+    fn read_buffer(&mut self, _thread: &Thread, _at: usize, _out: &mut [u64]) -> bool {
+        false
+    }
+    fn write_buffer(&mut self, _thread: &Thread, _at: usize, _data: &[u64]) -> bool {
+        false
+    }
 }
 
 fn call(space: &SharedCapSpace, c: Syscall, a: [u64; 6]) -> Result<Values, Error> {

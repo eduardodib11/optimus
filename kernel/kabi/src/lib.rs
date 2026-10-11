@@ -65,6 +65,7 @@ macro_rules! abi_enum {
 }
 
 pub mod boot;
+pub mod ipc;
 
 abi_enum! {
 /// Números das syscalls da ABI v1 (seção 14.2), passados em `rax`.
@@ -201,8 +202,9 @@ impl From<u64> for MessageLabel {
 pub const MSG_REG_WORDS: usize = 6;
 /// Tamanho do buffer de IPC por thread, em bytes (seção 6.7).
 pub const IPC_BUFFER_BYTES: usize = 4096;
-/// Palavras de 64 bits no buffer de IPC (seção 6.7).
-pub const IPC_BUFFER_WORDS: usize = IPC_BUFFER_BYTES / 8;
+/// Palavras de 64 bits de mensagem no buffer de IPC: 4 KiB menos os 64
+/// bytes do cabeçalho com os handles das capabilities (ADR 0027).
+pub const IPC_BUFFER_WORDS: usize = (IPC_BUFFER_BYTES - 64) / 8;
 /// Máximo de capabilities transferidas por mensagem (seções 6.2 e 6.7).
 pub const MSG_MAX_CAPS: usize = 4;
 
@@ -264,7 +266,7 @@ mod tests {
 
     #[test]
     fn layout_de_mensagem() {
-        assert_eq!((MSG_REG_WORDS, IPC_BUFFER_WORDS, MSG_MAX_CAPS), (6, 512, 4));
+        assert_eq!((MSG_REG_WORDS, IPC_BUFFER_WORDS, MSG_MAX_CAPS), (6, 504, 4));
         assert_eq!(MessageLabel::from(7), MessageLabel(7));
     }
 }

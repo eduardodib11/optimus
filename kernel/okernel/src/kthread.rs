@@ -36,9 +36,9 @@ use crate::arch::x86_64::gdt::{USER_CODE, USER_DATA};
 use crate::arch::x86_64::idt::TrapFrame;
 use crate::arch::x86_64::syscall::{self, switch_context, thread_trampoline};
 use crate::arch::x86_64::{cpu, fpu, probe};
-use crate::{kcap, kmem, ktest, ktime};
+use crate::{kcap, kipc, kmem, ktest, ktime};
 
-mod tests;
+pub mod tests;
 pub use tests::TESTS;
 
 /// Registradores iniciais de uma thread de usuário.
@@ -86,6 +86,8 @@ struct Sched {
     ready: RunQueue<Arc<Thread>>,
     /// Sem orçamento, esperando o reabastecimento.
     throttled: Vec<Arc<Thread>>,
+    /// Bloqueadas por IPC com prazo (T-208): prazo e thread.
+    timeouts: Vec<(u64, Arc<Thread>)>,
     /// Thread que terminou e cuja pilha ainda estava em uso na troca; a
     /// próxima a rodar a solta.
     dead: Option<Arc<Thread>>,
@@ -101,11 +103,14 @@ static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     slice_end: 0,
     ready: RunQueue::new(),
     throttled: Vec::new(),
+    timeouts: Vec::new(),
     dead: None,
     trace: Vec::new(),
 });
 /// rsp salvo do ocioso.
 static IDLE_RSP: AtomicU64 = AtomicU64::new(0);
+/// Trocas diretas do caminho rápido de IPC.
+static FAST_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static DEBUG_LOG: SpinLock<([u8; 256], usize)> = SpinLock::new(([0; 256], 0));
 
 /// A thread na CPU (`None` no ocioso).
@@ -156,6 +161,10 @@ pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
     // nunca aloca.
     sched
         .throttled
+        .try_reserve(1)
+        .map_err(|_| Error::QuotaExceeded)?;
+    sched
+        .timeouts
         .try_reserve(1)
         .map_err(|_| Error::QuotaExceeded)?;
     // SAFETY: a pilha de kernel da thread está mapeada (RW) e é só dela;
@@ -247,6 +256,9 @@ fn program_timer(s: &Sched, now: u64) {
             at = at.min(sc.budget().replenish_at);
         }
     }
+    for &(deadline, _) in &s.timeouts {
+        at = at.min(deadline);
+    }
     if at != u64::MAX {
         ktime::set_timer_at(at);
     }
@@ -284,6 +296,67 @@ fn keeps_running(s: &Sched, t: &Thread, now: u64) -> bool {
 /// Escolhe a próxima thread e troca para ela. Volta quando a que chamou
 /// for escolhida de novo (nunca, se ela saiu).
 fn schedule(why: Why) {
+    schedule_to(why, None);
+}
+
+/// `direct` (bloqueada, já atendida por IPC) pode rodar já, sem passar
+/// pela fila: tem orçamento e ninguém pronto tem prioridade maior.
+fn runs_directly(s: &Sched, t: &Thread, now: u64) -> bool {
+    let Some((sc, p)) = sc_of(t) else {
+        return false;
+    };
+    let mut b = sc.budget();
+    b.refill(&p, now);
+    sc.set_budget(b);
+    !b.exhausted(&p) && s.ready.highest().is_none_or(|h| h <= p.priority)
+}
+
+/// Tira `t` da lista de prazos, se estiver nela.
+fn drop_timeout(s: &mut Sched, t: &Thread) {
+    if let Some(i) = s
+        .timeouts
+        .iter()
+        .position(|(_, w)| core::ptr::eq(Arc::as_ptr(w), t))
+    {
+        s.timeouts.swap_remove(i);
+    }
+}
+
+/// Acorda com `TimedOut` as threads cujo prazo de IPC venceu.
+fn expire_timeouts() {
+    loop {
+        let now = ktime::now_ns();
+        let expired = {
+            let mut s = SCHED.lock();
+            let i = s.timeouts.iter().position(|(d, _)| *d <= now);
+            i.map(|i| s.timeouts.swap_remove(i).1)
+        };
+        let Some(t) = expired else { return };
+        // A fila do objeto vem antes da do escalonador (seção 6.9): o
+        // cancelamento roda sem a trava dela.
+        if okernel::ipc::cancel(&t, Error::TimedOut) {
+            wake(t, 0);
+        }
+    }
+}
+
+/// A próxima a rodar: `direct`, se puder rodar já, ou a primeira da fila.
+fn pick_next(s: &mut Sched, direct: Option<Arc<Thread>>, now: u64) -> Option<Arc<Thread>> {
+    if let Some(t) = direct {
+        drop_timeout(s, &t);
+        if runs_directly(s, &t, now) {
+            FAST_SWITCHES.fetch_add(1, Ordering::Relaxed);
+            return Some(t);
+        }
+        enqueue(s, t, now);
+    }
+    s.ready.pop().map(|(_, t)| t)
+}
+
+/// Como [`schedule`], mas com `direct` como próxima (caminho rápido de
+/// IPC) se ela puder rodar já; senão, ela vai para a fila.
+fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
+    expire_timeouts();
     let now = ktime::now_ns();
     let mut s = SCHED.lock();
     charge_current(&mut s, now);
@@ -303,7 +376,7 @@ fn schedule(why: Why) {
             Why::Yield | Why::Preempt => enqueue(&mut s, Arc::clone(p), now),
         }
     }
-    let next = s.ready.pop().map(|(_, t)| t);
+    let next = pick_next(&mut s, direct, now);
     let same = match (&prev, &next) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
@@ -410,9 +483,44 @@ pub fn yield_now() {
 pub fn wake(thread: Arc<Thread>, value: u64) {
     thread.set_wake_value(value);
     let mut s = SCHED.lock();
+    drop_timeout(&mut s, &thread);
     if thread.state() == RunState::Blocked {
         enqueue(&mut s, thread, ktime::now_ns());
     }
+}
+
+/// Bloqueia a atual (já marcada) até alguém a acordar ou, com `deadline`
+/// não zero, até o prazo vencer (o IPC a acorda com `TimedOut`).
+pub fn block_until(deadline: u64) {
+    if deadline != 0 {
+        let mut s = SCHED.lock();
+        if let Some(t) = s.current.clone()
+            && s.timeouts.len() < s.timeouts.capacity()
+        {
+            s.timeouts.push((deadline, t));
+        }
+    }
+    schedule(Why::Block);
+}
+
+/// Caminho rápido de IPC: a atual (já bloqueada, com prazo `deadline`)
+/// cede a CPU direto a `to` se `to` puder rodar já; senão, `to` vai para a
+/// fila e o escalonador escolhe.
+pub fn handoff(to: Arc<Thread>, deadline: u64) {
+    if deadline != 0 {
+        let mut s = SCHED.lock();
+        if let Some(t) = s.current.clone()
+            && s.timeouts.len() < s.timeouts.capacity()
+        {
+            s.timeouts.push((deadline, t));
+        }
+    }
+    schedule_to(Why::Block, Some(to));
+}
+
+/// Trocas diretas do caminho rápido de IPC desde o boot.
+pub fn fast_switches() -> u64 {
+    FAST_SWITCHES.load(Ordering::Relaxed)
 }
 
 /// Ponto de preempção: a atual segue, a menos que haja alguém mais
@@ -422,7 +530,7 @@ pub fn preempt() {
 }
 
 /// O que o despacho portável pede ao kernel (`okernel::sys::Env`).
-struct KernelEnv;
+pub struct KernelEnv;
 
 impl sys::Env for KernelEnv {
     fn preempt(&mut self) {
@@ -444,6 +552,26 @@ impl sys::Env for KernelEnv {
     fn read_u32(&mut self, addr: u64) -> Option<u32> {
         let mut word = [0u8; 4];
         probe::copy_from_user(&mut word, addr).then_some(u32::from_le_bytes(word))
+    }
+
+    fn now(&self) -> u64 {
+        ktime::now_ns()
+    }
+
+    fn block_until(&mut self, deadline: u64) {
+        block_until(deadline);
+    }
+
+    fn handoff(&mut self, to: Arc<Thread>, deadline: u64) {
+        handoff(to, deadline);
+    }
+
+    fn read_buffer(&mut self, thread: &Thread, at: usize, out: &mut [u64]) -> bool {
+        kipc::read_buffer(thread, at, out)
+    }
+
+    fn write_buffer(&mut self, thread: &Thread, at: usize, data: &[u64]) -> bool {
+        kipc::write_buffer(thread, at, data)
     }
 }
 
@@ -476,6 +604,14 @@ fn exit_current() -> ! {
 /// volta pode usar SYSRET.
 #[unsafe(no_mangle)]
 extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
+    if let Ok(
+        call @ (Syscall::IpcSend | Syscall::IpcRecv | Syscall::IpcCall | Syscall::IpcReplyRecv),
+    ) = Syscall::try_from(frame.rax)
+    {
+        kipc::syscall(frame, call);
+        frame.rflags = syscall::user_rflags(frame.rflags);
+        return u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss));
+    }
     let args = [
         frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
     ];

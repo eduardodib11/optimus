@@ -5,4 +5,4 @@
 
 mod x86_64;
 
-pub use x86_64::{entry, syscall};
+pub use x86_64::{entry, ipc, syscall};

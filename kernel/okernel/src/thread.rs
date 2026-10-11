@@ -18,9 +18,11 @@ use core::fmt;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use kabi::Error;
+use kabi::vm::{PAGE_SIZE, USER_END, USER_START};
 
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
+use crate::ipc::IpcSlot;
 use crate::platform::{KERNEL_STACK_BYTES, KernelStack, Platform};
 use crate::sched::SchedContext;
 use crate::sync::SpinLock;
@@ -97,6 +99,10 @@ pub struct Thread {
     /// `SchedContext` em que a thread roda; trava folha (nada é tomado
     /// com ela na mão), lida pelo escalonador.
     sched: SpinLock<Option<Arc<SchedContext>>>,
+    /// Estado de IPC (T-208); trava folha, depois da fila do objeto.
+    ipc: SpinLock<IpcSlot>,
+    /// Endereço de usuário do buffer de IPC (zero: sem buffer).
+    ipc_buffer: AtomicU64,
 }
 
 impl fmt::Debug for Thread {
@@ -138,6 +144,8 @@ impl Thread {
             fpu_addr,
             binding: SpinLock::new(Binding::default()),
             sched: SpinLock::new(None),
+            ipc: SpinLock::new(IpcSlot::default()),
+            ipc_buffer: AtomicU64::new(0),
         })
     }
 
@@ -249,6 +257,35 @@ impl Thread {
     #[must_use]
     pub fn aspace(&self) -> Option<Arc<SharedAddressSpace>> {
         self.binding.lock().aspace.clone()
+    }
+
+    /// Estado de IPC da thread.
+    #[must_use]
+    pub const fn ipc(&self) -> &SpinLock<IpcSlot> {
+        &self.ipc
+    }
+
+    /// Endereço de usuário do buffer de IPC, se houver.
+    #[must_use]
+    pub fn ipc_buffer(&self) -> Option<u64> {
+        let va = self.ipc_buffer.load(Ordering::Acquire);
+        (va != 0).then_some(va)
+    }
+
+    /// Fixa o buffer de IPC (parte de `thread_configure`): uma página
+    /// alinhada na metade de usuário; zero tira o buffer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] para endereço desalinhado ou fora da
+    /// metade de usuário.
+    pub fn set_ipc_buffer(&self, va: u64) -> Result<(), Error> {
+        let ok = va == 0 || (va.is_multiple_of(PAGE_SIZE) && (USER_START..USER_END).contains(&va));
+        if !ok {
+            return Err(Error::InvalidArgument);
+        }
+        self.ipc_buffer.store(va, Ordering::Release);
+        Ok(())
     }
 
     /// O `CapSpace` da thread, se configurada.

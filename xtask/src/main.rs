@@ -54,6 +54,7 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: relógio: TSC de",
     "okernel: root carregado do bootfs",
     "root: iniciado",
+    "root: IPC sem par: TimedOut e WouldBlock",
     "okernel: root terminou",
 ];
 /// Linha em que o kernel diz onde ficou o mapa direto (ADR 0026).
@@ -88,6 +89,9 @@ const FAULT_MARKERS: &[&str] = &[
 /// Prefixo das linhas em que o `optboot` descreve cada segmento carregado.
 const SEGMENT_PREFIX: &str = "optboot: seg ";
 const SMOKE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Limite dos testes de kernel: o ping-pong de IPC (10⁴ idas e voltas) leva
+/// dezenas de segundos no build de depuração sob TCG.
+const KTEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 type Result<T = ()> = std::result::Result<T, String>;
 
@@ -545,7 +549,12 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
             screen = Some(shot);
         }
         let frozen = sc.exit.is_none() && seen_all(&raw);
-        if frozen || start.elapsed() > SMOKE_TIMEOUT {
+        let limit = if sc.ktest {
+            KTEST_TIMEOUT
+        } else {
+            SMOKE_TIMEOUT
+        };
+        if frozen || start.elapsed() > limit {
             let _ = child.kill();
             let _ = child.wait();
             break Err(frozen);
@@ -890,6 +899,7 @@ mod tests {
                   info  okernel: relógio: TSC de 2100000 kHz\r\n\
                   info  okernel: root carregado do bootfs (856 KiB), iniciando no anel 3\r\n\
                   info  root: iniciado\r\n\
+                  info  root: IPC sem par: TimedOut e WouldBlock\r\n\
                   info  okernel: root terminou\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
