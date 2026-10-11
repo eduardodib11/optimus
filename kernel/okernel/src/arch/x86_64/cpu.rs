@@ -47,6 +47,14 @@ pub fn hypervisor() -> Option<[u8; 12]> {
     Some(sig)
 }
 
+/// Roda sob o TCG do QEMU (CPU emulada, sem KVM). Lá o TSC segue o relógio
+/// do host, e uma preempção do processo do QEMU aparece em qualquer medida
+/// de tempo: os testes de latência só exigem estatísticas robustas (p99,
+/// mediana) e apenas registram o pior caso.
+pub fn under_tcg() -> bool {
+    hypervisor().is_some_and(|sig| &sig == b"TCGTCGTCGTCG")
+}
+
 /// Maior folha básica (`basic`) ou estendida de CPUID que a CPU oferece.
 pub fn max_leaf(extended: bool) -> u32 {
     cpuid(if extended { 0x8000_0000 } else { 0 }, 0).eax

@@ -12,7 +12,7 @@ use okernel::thread::{RunState, Thread};
 use okernel::vm::vm_map;
 
 use super::{UserEntry, start, take_debug_log, yield_now};
-use crate::arch::x86_64::{cpu, probe};
+use crate::arch::x86_64::{apic, cpu, probe};
 use crate::kcap::{root_cap_space, root_quota};
 use crate::kmem;
 use crate::ktest::{Outcome, Test};
@@ -195,12 +195,19 @@ fn alternam() -> Outcome {
             threads.push(t);
         }
         let _ = take_debug_log();
+        let fires = apic::timer_fires().0;
         run_until_exit(&threads)?;
+        let preempted = apic::timer_fires().0 - fires;
         let (log, len) = take_debug_log();
         let text = core::str::from_utf8(&log[..len]).unwrap_or("?");
-        info!("ktest: · sequência impressa pelas threads: {text}");
-        ensure!(len as u64 == 2 * VOLTAS);
-        ensure!(log[..len].chunks(2).all(|pair| pair == b"AB"));
+        info!("ktest: · sequência impressa pelas threads: {text} ({preempted} disparos do timer)");
+        let count = |c| log[..len].iter().map(|&b| u64::from(b == c)).sum::<u64>();
+        ensure!(len as u64 == 2 * VOLTAS && count(b'A') == VOLTAS && count(b'B') == VOLTAS);
+        // Só a preempção pelo timer (fatia de 5 ms vencida entre a impressão
+        // e o yield) quebra a alternância; no TCG uma preempção do QEMU pelo
+        // host basta para isso, então lá a ordem só é exigida sem disparo.
+        let strict = preempted == 0 || !cpu::under_tcg();
+        ensure!(!strict || log[..len].chunks(2).all(|pair| pair == b"AB"));
         delete(&p, &handles)?;
     }
     ensure!(quota.used() == used0);

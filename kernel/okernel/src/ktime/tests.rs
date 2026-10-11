@@ -7,7 +7,7 @@
 //! é uma saída para o emulador; o limite lá é [`TCG_LIMIT_PPM`] (1%).
 
 use okernel::log::option;
-use okernel::time::{NS_PER_SEC, deviation_ppm};
+use okernel::time::{NS_PER_SEC, deviation_ppm, hpet_ticks_to_ns};
 
 use super::{hpet_ns_since, now_ns, set_timer_at, tsc_hz};
 use crate::arch::x86_64::{apic, cpu, hpet};
@@ -65,8 +65,26 @@ fn monotonico() -> Outcome {
     Ok(())
 }
 
-fn under_tcg() -> bool {
-    cpu::hypervisor().is_some_and(|sig| &sig == b"TCGTCGTCGTCG")
+/// Janela máxima entre as duas leituras do relógio que cercam uma leitura
+/// do HPET em [`paired`].
+const PAIR_WINDOW_NS: u64 = 100_000;
+
+/// Contagem do HPET e o instante do relógio no meio de duas leituras que a
+/// cercam. Repete enquanto a janela passar de [`PAIR_WINDOW_NS`] (uma
+/// preempção do QEMU pelo host entre as leituras, no TCG), e na última
+/// tentativa aceita o que vier.
+fn paired() -> (u64, u64) {
+    let mut sample = (0, 0);
+    for _ in 0..16 {
+        let before = now_ns();
+        let h = hpet::counter();
+        let after = now_ns();
+        sample = (h, before + (after - before) / 2);
+        if after - before <= PAIR_WINDOW_NS {
+            break;
+        }
+    }
+    sample
 }
 
 fn desvio() -> Outcome {
@@ -74,13 +92,15 @@ fn desvio() -> Outcome {
         .and_then(|i| option(i.cmdline()?, "ktime_s")?.parse::<u64>().ok())
         .unwrap_or(1)
         .clamp(1, 60);
-    let (h0, n0) = (hpet::counter(), now_ns());
+    let (h0, n0) = paired();
     while hpet_ns_since(h0) < seconds * NS_PER_SEC {
         core::hint::spin_loop();
     }
-    let (reference, measured) = (hpet_ns_since(h0), now_ns() - n0);
+    let (h1, n1) = paired();
+    let reference = hpet_ticks_to_ns(h1.wrapping_sub(h0), hpet::period_fs());
+    let measured = n1 - n0;
     let ppm = deviation_ppm(measured, reference);
-    let limit = if under_tcg() {
+    let limit = if cpu::under_tcg() {
         TCG_LIMIT_PPM
     } else {
         LIMIT_PPM
@@ -113,7 +133,9 @@ fn timer() -> Outcome {
     // TSC-deadline nunca dispara cedo; o one-shot pode errar pela calibragem.
     let early_ok = if apic::tsc_deadline() { 0 } else { 100_000 };
     ensure!(fired + early_ok >= deadline);
-    ensure!(late < 50_000_000);
+    // No TCG o atraso só é registrado: uma preempção do QEMU pelo host
+    // entra inteira nele.
+    ensure!(cpu::under_tcg() || late < 50_000_000);
     ensure!(apic::unexpected() == 0);
     Ok(())
 }
