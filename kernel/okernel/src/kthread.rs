@@ -518,6 +518,11 @@ pub fn handoff(to: Arc<Thread>, deadline: u64) {
     schedule_to(Why::Block, Some(to));
 }
 
+/// Trocas diretas do caminho rápido de IPC desde o boot.
+pub fn fast_switches() -> u64 {
+    FAST_SWITCHES.load(Ordering::Relaxed)
+}
+
 /// Ponto de preempção: a atual segue, a menos que haja alguém mais
 /// prioritário ou a fatia dela tenha acabado.
 pub fn preempt() {

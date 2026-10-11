@@ -16,6 +16,9 @@ use crate::arch::x86_64::idt::TrapFrame;
 use crate::kmem;
 use crate::kthread::{KernelEnv, current};
 
+mod tests;
+pub use tests::TESTS;
+
 /// Executa a syscall de IPC `call` com os registradores de `frame` e grava
 /// o resultado nele.
 pub fn syscall(frame: &mut TrapFrame, call: Syscall) {

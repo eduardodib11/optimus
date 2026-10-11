@@ -88,6 +88,9 @@ const FAULT_MARKERS: &[&str] = &[
 /// Prefixo das linhas em que o `optboot` descreve cada segmento carregado.
 const SEGMENT_PREFIX: &str = "optboot: seg ";
 const SMOKE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Limite dos testes de kernel: o ping-pong de IPC (10⁴ idas e voltas) leva
+/// dezenas de segundos no build de depuração sob TCG.
+const KTEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 type Result<T = ()> = std::result::Result<T, String>;
 
@@ -545,7 +548,12 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
             screen = Some(shot);
         }
         let frozen = sc.exit.is_none() && seen_all(&raw);
-        if frozen || start.elapsed() > SMOKE_TIMEOUT {
+        let limit = if sc.ktest {
+            KTEST_TIMEOUT
+        } else {
+            SMOKE_TIMEOUT
+        };
+        if frozen || start.elapsed() > limit {
             let _ = child.kill();
             let _ = child.wait();
             break Err(frozen);
