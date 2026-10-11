@@ -28,6 +28,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
     ("root", "services/root/src/main.rs", USER_TARGET),
+    ("hello", "services/hello/src/main.rs", USER_TARGET),
 ];
 
 /// Bibliotecas portáveis cujos testes rodam no host.
@@ -55,6 +56,10 @@ const BOOT_MARKERS: &[&str] = &[
     "okernel: root carregado do bootfs",
     "root: iniciado",
     "root: IPC sem par: TimedOut e WouldBlock",
+    "hello: iniciado pelo root",
+    "root: o hello disse:",
+    "olá, root! aqui é o hello, pelo buffer de IPC",
+    " ns por ida e volta com o hello",
     "okernel: root terminou",
 ];
 /// Linha em que o kernel diz onde ficou o mapa direto (ADR 0026).
@@ -92,11 +97,20 @@ const SMOKE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Limite dos testes de kernel: o ping-pong de IPC (10⁴ idas e voltas) leva
 /// dezenas de segundos no build de depuração sob TCG.
 const KTEST_TIMEOUT: Duration = Duration::from_mins(5);
+/// Limite do `test hello`: 10⁶ idas e voltas levam por volta de um minuto
+/// no build de release sob TCG.
+const HELLO_TIMEOUT: Duration = Duration::from_mins(20);
+/// Idas e voltas entre o `hello` e o `root` no boot normal do `test all`
+/// (build de depuração) e no `test hello` (aceite do T-212, em release).
+const BOOT_ROUNDS: u64 = 10_000;
+const HELLO_ROUNDS: u64 = 1_000_000;
+/// Idas e voltas no boot dos testes de kernel (o teste do `root` as faz).
+const KTEST_ROUNDS: u64 = 100;
 
 type Result<T = ()> = std::result::Result<T, String>;
 
 /// Opções de linha de comando comuns aos subcomandos.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Options {
     arch: String,
     profile: String,
@@ -107,6 +121,9 @@ struct Options {
     suite: String,
     /// Linha de comando do kernel, gravada em `\EFI\optimus\cmdline.txt`.
     cmdline: String,
+    /// Idas e voltas do `hello` com o `root` (entrada `hello.rounds` do
+    /// bootfs); `None` deixa o padrão do `root`.
+    rounds: Option<u64>,
 }
 
 impl Default for Options {
@@ -120,6 +137,7 @@ impl Default for Options {
             mem: "512M".into(),
             suite: "all".into(),
             cmdline: String::new(),
+            rounds: None,
         }
     }
 }
@@ -145,7 +163,14 @@ fn parse(args: &[String]) -> Result<Options> {
             }
             "--mem" => opts.mem = value("--mem")?,
             "--cmdline" => opts.cmdline = value("--cmdline")?,
-            "unit" | "boot" | "kernel" | "all" => opts.suite.clone_from(arg),
+            "--rounds" => {
+                opts.rounds = Some(
+                    value("--rounds")?
+                        .parse()
+                        .map_err(|_| "--rounds espera um número")?,
+                );
+            }
+            "unit" | "boot" | "kernel" | "hello" | "all" => opts.suite.clone_from(arg),
             other => return Err(format!("opção desconhecida: {other}")),
         }
     }
@@ -173,7 +198,7 @@ fn main() -> ExitCode {
     };
     let result = parse(rest).and_then(|opts| match cmd.as_str() {
         "build" => build(&opts),
-        "image" => build(&opts).and_then(|()| image(&opts, &opts.cmdline).map(drop)),
+        "image" => build(&opts).and_then(|()| image(&opts, &opts.cmdline, opts.rounds).map(drop)),
         "run" => run(&opts),
         "test" => test(&opts),
         "check" => check(),
@@ -249,14 +274,15 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" => &["-C", "relocation-model=static"],
+        "root" | "hello" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
 
 /// Monta a ESP em `target/esp`, que o QEMU expõe como disco FAT virtual, com
-/// `cmdline` como linha de comando do kernel (vazia: sem arquivo).
-fn image(opts: &Options, cmdline: &str) -> Result<PathBuf> {
+/// `cmdline` como linha de comando do kernel (vazia: sem arquivo) e
+/// `rounds` idas e voltas do `hello`.
+fn image(opts: &Options, cmdline: &str, rounds: Option<u64>) -> Result<PathBuf> {
     let esp = root().join("target/esp");
     let boot = esp.join("EFI/BOOT");
     fs::create_dir_all(&boot).map_err(|e| format!("criando {}: {e}", boot.display()))?;
@@ -270,7 +296,7 @@ fn image(opts: &Options, cmdline: &str) -> Result<PathBuf> {
     let kernel = root().join(format!("target/{KERNEL_TARGET}/{}/okernel", mode(opts)));
     fs::copy(&kernel, optimus.join("okernel.elf"))
         .map_err(|e| format!("copiando {}: {e}", kernel.display()))?;
-    bootfs(opts, &optimus.join("bootfs.obfs"))?;
+    bootfs(opts, &optimus.join("bootfs.obfs"), rounds)?;
     let cmdline_file = optimus.join("cmdline.txt");
     if cmdline.is_empty() {
         let _ = fs::remove_file(&cmdline_file);
@@ -283,16 +309,23 @@ fn image(opts: &Options, cmdline: &str) -> Result<PathBuf> {
 }
 
 /// Serviços do bootfs: (nome na imagem, binário de usuário).
-const BOOTFS: &[(&str, &str)] = &[("root", "root")];
+const BOOTFS: &[(&str, &str)] = &[("root", "root"), ("hello", "hello")];
 
-/// Monta o bootfs com `tools/mkobfs` a partir dos binários de usuário.
-fn bootfs(opts: &Options, output: &Path) -> Result {
+/// Monta o bootfs com `tools/mkobfs` a partir dos binários de usuário e,
+/// com `rounds`, a entrada `hello.rounds` que o `root` lê.
+fn bootfs(opts: &Options, output: &Path, rounds: Option<u64>) -> Result {
     let bin = root().join(format!("target/{USER_TARGET}/{}", mode(opts)));
     let mut cmd = cargo();
     cmd.args(["run", "--quiet", "--package", "mkobfs", "--", "-o"])
         .arg(output);
     for (name, file) in BOOTFS {
         cmd.arg(format!("{name}={}", bin.join(file).display()));
+    }
+    if let Some(n) = rounds {
+        let file = root().join("target/hello.rounds");
+        fs::write(&file, format!("{n}\n"))
+            .map_err(|e| format!("gravando {}: {e}", file.display()))?;
+        cmd.arg(format!("hello.rounds={}", file.display()));
     }
     status(&mut cmd)
 }
@@ -382,7 +415,7 @@ fn kvm_usable() -> bool {
 
 fn run(opts: &Options) -> Result {
     build(opts)?;
-    let esp = image(opts, &opts.cmdline)?;
+    let esp = image(opts, &opts.cmdline, opts.rounds)?;
     let mut cmd = qemu(opts, &esp)?;
     let st = cmd
         .status()
@@ -408,6 +441,12 @@ struct Scenario {
     /// Captura a tela pelo monitor do QEMU quando o pânico pedir e confere
     /// a tela de pânico (T-110).
     screen: bool,
+    /// Idas e voltas do `hello` (entrada `hello.rounds` do bootfs).
+    rounds: Option<u64>,
+    /// Exige na serial que o `root` confirme as idas e voltas sem erro.
+    hello: bool,
+    /// Quanto esperar o QEMU.
+    timeout: Duration,
 }
 
 const SCENARIOS: &[Scenario] = &[
@@ -419,6 +458,9 @@ const SCENARIOS: &[Scenario] = &[
         exit: Some(KERNEL_EXIT_OK),
         ktest: false,
         screen: false,
+        rounds: Some(BOOT_ROUNDS),
+        hello: true,
+        timeout: SMOKE_TIMEOUT,
     },
     Scenario {
         name: "falta proposital",
@@ -428,6 +470,9 @@ const SCENARIOS: &[Scenario] = &[
         exit: None,
         ktest: false,
         screen: false,
+        rounds: None,
+        hello: false,
+        timeout: SMOKE_TIMEOUT,
     },
     Scenario {
         name: "pânico proposital",
@@ -437,6 +482,9 @@ const SCENARIOS: &[Scenario] = &[
         exit: Some(KERNEL_EXIT_FAILURE),
         ktest: false,
         screen: true,
+        rounds: None,
+        hello: false,
+        timeout: SMOKE_TIMEOUT,
     },
 ];
 
@@ -450,6 +498,24 @@ const KERNEL_SCENARIO: Scenario = Scenario {
     exit: Some(KERNEL_EXIT_OK),
     ktest: true,
     screen: false,
+    rounds: Some(KTEST_ROUNDS),
+    hello: false,
+    timeout: KTEST_TIMEOUT,
+};
+
+/// Aceite do T-212 (`cargo xtask test hello`): o boot normal com 10⁶ idas
+/// e voltas entre o `hello` e o `root`. Fica fora do `test all` pelo tempo.
+const HELLO_SCENARIO: Scenario = Scenario {
+    name: "hello com 10⁶ idas e voltas",
+    cmdline: "",
+    markers: BOOT_MARKERS,
+    forbidden: &["okernel: FALTA", "PÂNICO"],
+    exit: Some(KERNEL_EXIT_OK),
+    ktest: false,
+    screen: false,
+    rounds: Some(HELLO_ROUNDS),
+    hello: true,
+    timeout: HELLO_TIMEOUT,
 };
 /// Primeira linha do harness: `ktest: início, N testes`.
 const KTEST_START: &str = "ktest: início, ";
@@ -498,7 +564,7 @@ fn check_direct_map_bases(bases: &[u64]) -> Result {
 
 /// Dá boot num cenário e devolve a serial, se ela conferir.
 fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
-    let esp = image(opts, sc.cmdline)?;
+    let esp = image(opts, sc.cmdline, sc.rounds)?;
     let monitor = root().join("target/qemu-monitor.sock");
     let mut cmd = qemu(opts, &esp)?;
     if sc.screen {
@@ -549,12 +615,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
             screen = Some(shot);
         }
         let frozen = sc.exit.is_none() && seen_all(&raw);
-        let limit = if sc.ktest {
-            KTEST_TIMEOUT
-        } else {
-            SMOKE_TIMEOUT
-        };
-        if frozen || start.elapsed() > limit {
+        if frozen || start.elapsed() > sc.timeout {
             let _ = child.kill();
             let _ = child.wait();
             break Err(frozen);
@@ -565,6 +626,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     raw.extend(rx.try_iter().flatten());
     let serial = String::from_utf8_lossy(&raw);
     let result = check_serial(&serial, sc.markers, sc.forbidden)
+        .and_then(|()| check_hello(&serial, sc))
         .and_then(|()| {
             if sc.ktest {
                 check_ktest(&serial)
@@ -601,6 +663,22 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
             sc.name
         )),
     }
+}
+
+/// Com `sc.hello`, exige a confirmação do `root` das idas e voltas pedidas
+/// e mostra o tempo de cada uma.
+fn check_hello(serial: &str, sc: &Scenario) -> Result {
+    let Some(rounds) = sc.rounds.filter(|_| sc.hello) else {
+        return Ok(());
+    };
+    let ok = format!("root: hello: {rounds} idas e voltas sem erro");
+    if !serial.contains(&ok) {
+        return Err(format!("faltou \"{ok}\""));
+    }
+    if let Some(line) = serial.lines().find(|l| l.contains("ns por ida e volta")) {
+        println!("xtask: {}", line.trim().trim_start_matches("info  "));
+    }
+    Ok(())
 }
 
 /// Pede ao monitor do QEMU uma captura da tela e confere a tela de pânico:
@@ -729,6 +807,14 @@ fn test(opts: &Options) -> Result {
     }
     if matches!(opts.suite.as_str(), "kernel" | "all") {
         smoke(opts, &[KERNEL_SCENARIO])?;
+    }
+    if opts.suite == "hello" {
+        // 10⁶ idas e voltas no build de depuração levariam horas sob TCG.
+        let release = Options {
+            release: true,
+            ..opts.clone()
+        };
+        smoke(&release, &[HELLO_SCENARIO])?;
     }
     Ok(())
 }
@@ -869,6 +955,9 @@ mod tests {
             (4, "1G", true, "jarvis")
         );
         assert_eq!(opts.cmdline, "log=debug");
+        let opts = parse(&args(&["hello", "--rounds", "7"])).unwrap();
+        assert_eq!((opts.suite.as_str(), opts.rounds), ("hello", Some(7)));
+        assert!(parse(&args(&["--rounds", "x"])).is_err());
     }
 
     #[test]
@@ -900,6 +989,11 @@ mod tests {
                   info  okernel: root carregado do bootfs (856 KiB), iniciando no anel 3\r\n\
                   info  root: iniciado\r\n\
                   info  root: IPC sem par: TimedOut e WouldBlock\r\n\
+                  info  hello: iniciado pelo root\r\n\
+                  info  root: o hello disse:\r\n\
+                  info  olá, root! aqui é o hello, pelo buffer de IPC\r\n\
+                  info  root: 812 ns por ida e volta com o hello\r\n\
+                  info  root: hello: 10000 idas e voltas sem erro\r\n\
                   info  okernel: root terminou\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
@@ -908,6 +1002,9 @@ mod tests {
         assert!(check(&ok.replace("R-X", "RWX")).is_err());
         assert!(check(&ok.replace("optboot: seg", "x")).is_err());
         assert!(check(&format!("{ok}okernel: FALTA #GP\r\n")).is_err());
+        assert_eq!(check_hello(ok, &SCENARIOS[0]), Ok(()));
+        assert!(check_hello(ok, &HELLO_SCENARIO).is_err());
+        assert_eq!(check_hello("", &KERNEL_SCENARIO), Ok(()));
     }
 
     #[test]
