@@ -21,8 +21,10 @@ use okernel::sync::SpinLock;
 use crate::arch::x86_64::{cpu, fpu};
 use crate::kmem::{self, DirectMap};
 
-/// Início da faixa de pilhas de kernel (seção 6.4).
-const STACKS_BASE: u64 = 0xffff_e000_0000_0000;
+/// Início das pilhas de kernel das threads, na faixa de pilhas da seção 6.4
+/// (`0xFFFF_E000_0000_0000`); o primeiro MiB dela fica com a pilha
+/// provisória que o optboot deixou mapeada.
+const STACKS_BASE: u64 = 0xffff_e000_0010_0000;
 /// Fatia de cada pilha: guarda embaixo, pilha em cima.
 const STACK_SLOT: u64 = 2 * KERNEL_STACK_BYTES;
 const PAGE: u64 = 4096;

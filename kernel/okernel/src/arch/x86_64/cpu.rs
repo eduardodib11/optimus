@@ -2,6 +2,12 @@
 //! TLB, TSC e interrupções.
 
 use core::arch::asm;
+use core::sync::atomic::AtomicBool;
+
+/// SMAP ligado no CR4: o asm de entrada e de cópia de usuário só usa
+/// STAC/CLAC com ele (sem SMAP essas instruções dão #UD).
+#[unsafe(no_mangle)]
+pub static SMAP_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Resultado de CPUID.
 pub struct CpuidResult {

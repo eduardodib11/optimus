@@ -75,3 +75,45 @@ unsafe fn xsetbv(value: u64) {
     // SAFETY: contrato do chamador.
     unsafe { asm!("xsetbv", in("ecx") 0, in("eax") low, in("edx") high, options(nomem, nostack)) };
 }
+/// A CPU salva com XSAVE.
+pub fn uses_xsave() -> bool {
+    XSAVE.load(Ordering::Relaxed)
+}
+
+/// Salva o estado de FPU/SIMD da CPU em `area`.
+///
+/// # Safety
+///
+/// `area` aponta [`area_bytes`] bytes graváveis, alinhados a 64, só desta
+/// thread.
+pub unsafe fn save(area: *mut u8) {
+    if uses_xsave() {
+        // SAFETY: contrato do chamador; EDX:EAX todo um salva tudo o que o
+        // XCR0 liga.
+        unsafe {
+            asm!("xsave64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
+        }
+    } else {
+        // SAFETY: contrato do chamador (512 bytes alinhados a 16).
+        unsafe { asm!("fxsave64 [{}]", in(reg) area, options(nostack)) };
+    }
+}
+
+/// Carrega o estado de FPU/SIMD de `area`.
+///
+/// # Safety
+///
+/// `area` aponta uma área válida de [`area_bytes`] bytes, alinhada a 64,
+/// gravada por [`save`] ou iniciada como a de uma thread nova (cabeçalho
+/// XSAVE zerado, FCW e MXCSR válidos).
+pub unsafe fn restore(area: *const u8) {
+    if uses_xsave() {
+        // SAFETY: contrato do chamador.
+        unsafe {
+            asm!("xrstor64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
+        }
+    } else {
+        // SAFETY: contrato do chamador.
+        unsafe { asm!("fxrstor64 [{}]", in(reg) area, options(nostack)) };
+    }
+}

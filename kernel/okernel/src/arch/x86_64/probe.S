@@ -38,6 +38,34 @@ probe_exec:
     xor eax, eax
     ret
 
+/* u64 copy_user(u8 *dst, const u8 *src, u64 len): cópia de/para memória de
+ * usuário (T-206). Com SMAP, só esta janela roda com RFLAGS.AC ligado
+ * (STAC/CLAC); uma falta no meio volta por `copy_user_fault`. Quem chama
+ * confere antes que a faixa de usuário está na metade baixa. */
+.global copy_user
+copy_user:
+    mov rcx, rdx
+    test byte ptr [rip + SMAP_ENABLED], 1
+    jz 1f
+    stac
+1:
+copy_user_insn:
+    rep movsb
+    test byte ptr [rip + SMAP_ENABLED], 1
+    jz 2f
+    clac
+2:
+    xor eax, eax
+    ret
+
+copy_user_fault:
+    test byte ptr [rip + SMAP_ENABLED], 1
+    jz 3f
+    clac
+3:
+    mov eax, 1
+    ret
+
 .global probe_fault
 probe_fault:
     mov eax, 1
@@ -50,3 +78,4 @@ probe_fault:
 probe_extable:
     .quad probe_write_insn, probe_fault
     .quad probe_read_insn, probe_fault
+    .quad copy_user_insn, copy_user_fault

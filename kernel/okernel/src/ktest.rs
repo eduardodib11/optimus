@@ -10,7 +10,16 @@
 //! Um teste devolve `Err(mensagem)` para falhar; um pânico durante um teste
 //! derruba o kernel com status de falha, o que o xtask também reporta.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::arch::x86_64::{QemuExit, qemu_exit};
+
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// O kernel está rodando os testes (`test=kernel`).
+pub fn active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
 
 /// Resultado de um teste: `Err` leva o local e a condição que falhou.
 pub type Outcome = Result<(), &'static str>;
@@ -41,10 +50,12 @@ const SUITES: &[&[Test]] = &[
     crate::ktime::TESTS,
     crate::kcap::TESTS,
     crate::kvm::TESTS,
+    crate::kthread::TESTS,
 ];
 
 /// Roda os testes selecionados e desliga o QEMU com o resultado.
 pub fn run(filter: Option<&str>) -> ! {
+    ACTIVE.store(true, Ordering::Relaxed);
     let selected = || {
         SUITES
             .iter()
