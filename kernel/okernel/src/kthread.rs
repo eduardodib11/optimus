@@ -260,7 +260,7 @@ fn program_timer(s: &Sched, now: u64) {
         at = at.min(deadline);
     }
     if at != u64::MAX {
-        ktime::set_timer_at(at);
+        ktime::arm_by(at);
     }
 }
 
@@ -578,6 +578,7 @@ impl sys::Env for KernelEnv {
 /// Disparo do timer do APIC (com o EOI já feito), vindo do anel 3 ou do
 /// ocioso: reavalia quem roda.
 pub fn on_timer() {
+    ktime::timer_fired();
     preempt();
 }
 

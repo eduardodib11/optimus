@@ -29,6 +29,8 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// Multiplicador do relógio (`Scale::mult`), zero sem calibragem.
 static TSC_MULT: AtomicU64 = AtomicU64::new(0);
 static APIC_HZ: AtomicU64 = AtomicU64::new(0);
+/// Instante pedido ao timer armado e ainda não disparado (zero: nenhum).
+static ARMED: AtomicU64 = AtomicU64::new(0);
 
 /// Memória física lida pelo mapa direto, só onde houver mapeamento.
 struct DirectRead;
@@ -82,11 +84,31 @@ pub fn hpet_ns_since(start: u64) -> u64 {
 /// Arma o timer para disparar no instante `ns` do relógio.
 pub fn set_timer_at(ns: u64) {
     let Some(clock) = clock() else { return };
+    ARMED.store(ns, Ordering::Relaxed);
     let ahead = ns.saturating_sub(now_ns());
     let ticks = Scale::from_hz(APIC_HZ.load(Ordering::Relaxed)).map_or(u32::MAX, |s| {
         u32::try_from(s.ns_to_ticks(ahead)).unwrap_or(u32::MAX)
     });
     apic::arm_timer(clock.ticks_at(ns), ticks);
+}
+
+/// Garante um disparo do timer até o instante `ns`: se já há um armado
+/// para antes (ou para `ns`), não reprograma.
+///
+/// Disparar antes do necessário é inofensivo (quem trata reavalia e arma
+/// de novo); reprogramar a cada troca de contexto custa uma escrita no
+/// APIC (uma saída para o hipervisor no KVM). O tratador do timer avisa
+/// [`timer_fired`] para o próximo pedido armar de novo.
+pub fn arm_by(ns: u64) {
+    let armed = ARMED.load(Ordering::Relaxed);
+    if armed == 0 || armed > ns {
+        set_timer_at(ns);
+    }
+}
+
+/// O timer disparou: não há mais disparo pendente.
+pub fn timer_fired() {
+    ARMED.store(0, Ordering::Relaxed);
 }
 
 /// Acha o HPET, liga o APIC e calibra o TSC e o timer.
