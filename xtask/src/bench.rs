@@ -93,8 +93,9 @@ fn meta() -> Meta {
         .map_or(0, |d| d.as_secs());
     let commit = output(Command::new("git").args(["rev-parse", "--short", "HEAD"]))
         .unwrap_or_else(|| "desconhecido".into());
-    let dirty =
-        output(Command::new("git").args(["status", "--porcelain"])).is_some_and(|s| !s.is_empty());
+    // Relatórios ainda não commitados em docs/bench não sujam a árvore.
+    let status = ["status", "--porcelain", "--", ".", ":!docs/bench"];
+    let dirty = output(Command::new("git").args(status)).is_some_and(|s| !s.is_empty());
     let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     Meta {
         date: civil_date(secs),
