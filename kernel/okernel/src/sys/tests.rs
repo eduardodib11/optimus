@@ -121,9 +121,50 @@ fn as_outras_nao_sao_suportadas_aqui() {
                 | Syscall::VmMap
                 | Syscall::VmUnmap
                 | Syscall::VmProtect
+                | Syscall::SchedConfigure
+                | Syscall::SchedBind
         );
         if !handled {
             assert_eq!(call(&space, c, [0; 6]), Err(Error::NotSupported), "{c:?}");
         }
     }
+}
+
+#[test]
+fn sched_configure_e_bind_conferem_direitos() {
+    platform::install(fake_platform(1000).1);
+    let (_root, space, q) = setup();
+    let create =
+        |t: ObjectType| call(&space, Syscall::ObjCreate, [q, t.to_raw(), 0, 0, 0, 0]).unwrap()[0];
+    let (sc, t) = (create(ObjectType::SchedContext), create(ObjectType::Thread));
+    let ms = 1_000_000;
+    let conf = |sc| {
+        call(
+            &space,
+            Syscall::SchedConfigure,
+            [sc, ms, 10 * ms, 120, 0, 0],
+        )
+    };
+    let bind_only = u64::from(Rights::BIND.bits());
+    let [sc_bind, ..] = call(&space, Syscall::CapMint, [sc, bind_only, 0, 0, 0, 0]).unwrap();
+    assert_eq!(conf(sc_bind), Err(Error::AccessDenied));
+    assert_eq!(conf(t), Err(Error::WrongType));
+    assert_eq!(
+        call(&space, Syscall::SchedConfigure, [sc, 2 * ms, ms, 1, 0, 0]),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(conf(sc), Ok([0; 3]));
+    let read = u64::from(Rights::READ_STATE.bits());
+    let [t_ro, ..] = call(&space, Syscall::CapMint, [t, read, 0, 0, 0, 0]).unwrap();
+    let bind = |sc, t| call(&space, Syscall::SchedBind, [sc, t, 0, 0, 0, 0]);
+    assert_eq!(bind(sc, t_ro), Err(Error::AccessDenied));
+    assert_eq!(bind(sc_bind, t), Ok([0; 3]));
+    assert_eq!(bind(sc, t), Err(Error::Busy));
+    let thread = space
+        .lock()
+        .get(Handle::from_raw(u32::try_from(t).unwrap()))
+        .unwrap()
+        .clone();
+    let bound = thread.object.as_thread().unwrap().sched_context().unwrap();
+    assert_eq!(bound.params().map(|p| p.priority), Some(120));
 }
