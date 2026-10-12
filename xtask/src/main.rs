@@ -532,6 +532,17 @@ const KERNEL_SCENARIO: Scenario = Scenario {
     timeout: KTEST_TIMEOUT,
 };
 
+/// Aceite do T-324 (`cargo xtask test smp`): dois processos alternam 10⁶
+/// vezes cada, em CPUs distintas, só com despertares de uma CPU para a
+/// outra. Em release: cerca de um minuto sob TCG com 4 e 8 CPUs; com 2, o
+/// QEMU demora mais a tirar uma vCPU do `hlt` e leva uns cinco.
+const ALTERNATE_SCENARIO: Scenario = Scenario {
+    name: "dois processos alternando 10⁶ vezes em CPUs distintas",
+    cmdline: "test=kernel ktest=smp.dois_processos smp.alternate=1000000",
+    timeout: Duration::from_mins(15),
+    ..KERNEL_SCENARIO
+};
+
 /// Aceite do T-212 (`cargo xtask test hello`): o boot normal com 10⁶ idas
 /// e voltas entre o `hello` e o `root`. Fica fora do `test all` pelo tempo.
 const HELLO_SCENARIO: Scenario = Scenario {
@@ -864,9 +875,15 @@ const SMP_COUNTS: &[u32] = &[2, 4, 8];
 
 /// `cargo xtask test smp [--smp N]`: a suíte de kernel inteira com N CPUs
 /// (só N com `--smp` maior que 1; senão 2, 4 e 8), exigindo que todas
-/// tenham ligado.
+/// tenham ligado, o pânico numa CPU secundária e, em release, a alternância
+/// de 10⁶ vezes entre duas CPUs.
 fn smp(opts: &Options) -> Result {
     build(opts)?;
+    let release = Options {
+        release: true,
+        ..opts.clone()
+    };
+    build(&release)?;
     let counts = if opts.smp > 1 {
         vec![opts.smp]
     } else {
@@ -902,6 +919,15 @@ fn smp(opts: &Options) -> Result {
         )?;
         check_smp_panic(&serial, n, cpu)?;
         println!("xtask: -smp {n}: pânico na cpu{cpu} congelou as outras {cpu} CPUs");
+        bases.extend(direct_map_base(&serial));
+        let serial = boot_scenario(
+            &Options {
+                smp: n,
+                ..release.clone()
+            },
+            &ALTERNATE_SCENARIO,
+        )?;
+        println!("xtask: -smp {n}: dois processos alternaram 10⁶ vezes em CPUs distintas");
         bases.extend(direct_map_base(&serial));
     }
     check_direct_map_bases(&bases)

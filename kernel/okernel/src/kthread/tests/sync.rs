@@ -10,7 +10,7 @@ use okernel::futex::FUTEXES;
 use okernel::thread::RunState;
 
 use super::super::{UserEntry, start, yield_now};
-use super::{DATA_VA, Process, delete, process, run_until_exit, thread, user_symbol};
+use super::{DATA_VA, Process, delete, process, run_until_exit, settled, thread, user_symbol};
 use crate::arch::x86_64::{apic, cpu, probe};
 use crate::kcap::root_quota;
 use crate::ktest::Outcome;
@@ -28,7 +28,7 @@ const TEST_VECTOR: u8 = 0x40;
 const VOLTAS: u64 = 2000;
 
 /// Lê `N` palavras de 64 bits do usuário em `va`, no espaço de `p`.
-fn read_user<const N: usize>(p: &Process, va: u64) -> Result<[u64; N], &'static str> {
+pub(super) fn read_user<const N: usize>(p: &Process, va: u64) -> Result<[u64; N], &'static str> {
     let root = p
         .aspace
         .object
@@ -152,6 +152,6 @@ pub fn mutex_4_threads() -> Outcome {
         drop(threads);
         delete(&p, &handles)?;
     }
-    ensure!(quota.used() == used0);
+    ensure!(settled(&quota, used0));
     Ok(())
 }

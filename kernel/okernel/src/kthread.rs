@@ -15,9 +15,19 @@
 //! Estado por CPU (ADR 0032, item 1; T-323): cada CPU tem a sua `Sched`
 //! (atual, fila de prontas, sem orçamento, prazos de IPC, morta pendente e
 //! registro), sob a trava `RunQueue` com a chave do id da CPU. A `Thread`
-//! guarda a CPU dona (`Thread::cpu`): a fila, os prazos e o despertar dela
-//! são os dessa CPU. Até o T-324 só o BSP roda threads; os APs têm a
-//! própria `Sched`, vazia.
+//! guarda a CPU dona (`Thread::cpu`): a fila e os prazos dela são os dessa
+//! CPU.
+//!
+//! Toda CPU roda threads (T-324): o ocioso de cada AP pega as prontas da
+//! própria fila. `Thread::on_cpu` marca a pilha de kernel em uso, da
+//! escolha até a próxima terminar a troca ([`finish_switch`]), e nenhuma
+//! outra CPU roda a thread enquanto isso (ADR 0032, I1 e I3). [`wake`]
+//! ganha a thread com um `compare_exchange` de `Blocked` para `Ready`,
+//! escolhe a CPU pelo resumo atômico de cada uma (prioridade da atual e
+//! prontas) e manda o IPI de reescalonar quando o destino está ocioso ou
+//! roda algo menos prioritário. A troca direta do IPC só acontece com a
+//! outra thread já nesta CPU; entre CPUs, o despertar comum (a migração do
+//! servidor que segue quem chama vem com o T-327).
 //!
 //! Escalonamento (T-207, seção 6.6): prioridade fixa de 256 níveis com
 //! round-robin de [`DEFAULT_SLICE_NS`] dentro do nível; cada thread roda
@@ -30,7 +40,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 use kabi::MAX_CPUS;
@@ -46,7 +56,7 @@ use crate::arch::x86_64::gdt::{USER_CODE, USER_DATA};
 use crate::arch::x86_64::idt::TrapFrame;
 use crate::arch::x86_64::syscall::{self, switch_context, thread_trampoline};
 use crate::arch::x86_64::{cpu, fpu, percpu, probe};
-use crate::{kcap, kipc, kmem, ktest, ktime};
+use crate::{kcap, kipc, kmem, ksmp, ktest, ktime};
 
 pub mod tests;
 pub use tests::TESTS;
@@ -86,6 +96,8 @@ pub enum Event {
 }
 
 struct Sched {
+    /// Id da CPU dona.
+    id: u32,
     /// Thread na CPU; `None` é o ocioso (o contexto de boot).
     current: Option<Arc<Thread>>,
     /// Quando a atual foi cobrada pela última vez.
@@ -102,17 +114,19 @@ struct Sched {
     throttled: Vec<Arc<Thread>>,
     /// Bloqueadas por IPC com prazo (T-208): prazo e thread.
     timeouts: Vec<(u64, Arc<Thread>)>,
-    /// Thread que terminou e cuja pilha ainda estava em uso na troca; a
-    /// próxima a rodar a solta.
-    dead: Option<Arc<Thread>>,
+    /// A que acabou de sair da CPU, ainda com `on_cpu` (a pilha dela está
+    /// em uso até a troca terminar); a próxima a rodar a libera em
+    /// [`finish_switch`] e solta a referência (a última, se ela terminou).
+    switch_prev: Option<Arc<Thread>>,
     /// Registro de eventos dos testes (capacidade reservada antes; nunca
     /// aloca aqui).
     trace: Vec<Event>,
 }
 
 impl Sched {
-    const fn new() -> Self {
+    const fn new(id: u32) -> Self {
         Self {
+            id,
             current: None,
             charged_at: 0,
             charging: None,
@@ -121,14 +135,14 @@ impl Sched {
             ready: RunQueue::new(),
             throttled: Vec::new(),
             timeouts: Vec::new(),
-            dead: None,
+            switch_prev: None,
             trace: Vec::new(),
         }
     }
 }
 
 /// Escalonador do BSP (estático: existe antes do heap).
-static BSP_SCHED: SpinLock<Sched> = SpinLock::with_key(LockClass::RunQueue, 0, Sched::new());
+static BSP_SCHED: SpinLock<Sched> = SpinLock::with_key(LockClass::RunQueue, 0, Sched::new(0));
 /// Escalonador de cada AP, criado por [`init_cpu`] antes de ele ligar.
 static SCHEDS: [AtomicPtr<SpinLock<Sched>>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
@@ -166,12 +180,71 @@ pub fn init_cpu(cpu: u32) {
     let sched = Box::leak(Box::new(SpinLock::with_key(
         LockClass::RunQueue,
         cpu,
-        Sched::new(),
+        Sched::new(cpu),
     )));
     if let Some(slot) = SCHEDS.get(cpu as usize) {
         slot.store(sched, Ordering::Release);
     }
 }
+
+/// Resumo de cada CPU, lido sem trava para escolher onde acordar (ADR
+/// 0032, item 1): prioridade da atual mais um (zero no ocioso) e prontas
+/// na fila. Gravado com a trava da fila; valor velho só piora a escolha.
+static CUR_PRIO: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static NR_READY: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// Prioridade de `t` mais um, a escala de [`CUR_PRIO`] (zero sem
+/// `SchedContext`).
+fn rank(t: &Thread) -> u32 {
+    sc_of(t).map_or(0, |(_, p)| u32::from(p.priority) + 1)
+}
+
+/// Atualiza o resumo da CPU de `s` (com a trava dela): as prontas e, com
+/// `cur`, o [`rank`] da atual (quem chama já o tem, sem tomar de novo as
+/// travas do `SchedContext`).
+fn publish(s: &Sched, cur: Option<u32>) {
+    let i = s.id as usize;
+    let ready = u32::try_from(s.ready.len()).unwrap_or(u32::MAX);
+    if let Some(r) = NR_READY.get(i) {
+        r.store(ready, Ordering::Relaxed);
+    }
+    if let (Some(cur), Some(c)) = (cur, CUR_PRIO.get(i)) {
+        c.store(cur, Ordering::Relaxed);
+    }
+}
+
+/// A CPU `cpu` pode receber threads: ligada e com escalonador.
+fn usable(cpu: usize) -> bool {
+    cpu == 0
+        || (ksmp::start::is_online(cpu) && u32::try_from(cpu).is_ok_and(|c| sched_of(c).is_some()))
+}
+
+/// Onde acordar `t` (ADR 0032, item 5; sem máscara de afinidade até o
+/// T-325), com `p` o [`rank`] de `t`: a CPU dela, se ociosa ou rodando algo menos prioritário (cache
+/// quente); senão uma ociosa sem prontas, procurada a partir dela; senão a
+/// que roda a atual menos prioritária, se menos que `t`; senão a dela.
+fn choose_cpu(t: &Thread, p: u32) -> u32 {
+    let n = ksmp::count().clamp(1, MAX_CPUS);
+    let cur = |c: usize| CUR_PRIO[c].load(Ordering::Relaxed);
+    let home = t.cpu() as usize;
+    let home = if home < n && usable(home) { home } else { 0 };
+    let idle = |c: usize| cur(c) == 0 && NR_READY[c].load(Ordering::Relaxed) == 0;
+    let chosen = if cur(home) < p {
+        home
+    } else if let Some(c) = (1..n)
+        .map(|i| (home + i) % n)
+        .find(|&c| usable(c) && idle(c))
+    {
+        c
+    } else {
+        (0..n)
+            .filter(|&c| usable(c) && cur(c) < p)
+            .min_by_key(|&c| cur(c))
+            .unwrap_or(home)
+    };
+    u32::try_from(chosen).unwrap_or(0)
+}
+
 /// Trocas diretas do caminho rápido de IPC.
 static FAST_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static DEBUG_LOG: SpinLock<([u8; 256], usize)> =
@@ -195,6 +268,17 @@ fn user_addr(addr: u64) -> bool {
 /// `thread_configure` ou com `rip`/`rsp` fora da metade de usuário;
 /// [`Error::QuotaExceeded`] sem memória para a fila.
 pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
+    start_on(thread, entry, percpu::cpu_id())
+}
+
+/// Como [`start`], na fila da CPU `cpu` (os testes põem threads em CPUs
+/// escolhidas; sem afinidade, uma thread fica onde começou até bloquear).
+///
+/// # Errors
+///
+/// Os de [`start`]; [`Error::InvalidArgument`] também se `cpu` não pode
+/// receber threads.
+pub fn start_on(thread: &Arc<Thread>, entry: &UserEntry, cpu: u32) -> Result<(), Error> {
     if thread.state() != RunState::Inactive {
         return Err(Error::Busy);
     }
@@ -220,9 +304,11 @@ pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
     // Abaixo do quadro: rbp, rbx, r12-r15 zerados e o retorno de
     // `switch_context` para o trampolim.
     let switch_at = frame_at - 7 * 8;
-    let me = percpu::cpu_id();
-    thread.set_cpu(me);
-    let mut sched = this_sched().lock();
+    let target = sched_of(cpu)
+        .filter(|_| usable(cpu as usize))
+        .ok_or(Error::InvalidArgument)?;
+    thread.set_cpu(cpu);
+    let mut sched = target.lock();
     // Toda thread iniciada tem lugar reservado na espera: o escalonador
     // nunca aloca.
     sched
@@ -247,6 +333,11 @@ pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
     }
     thread.saved_rsp().store(switch_at, Ordering::Release);
     enqueue(&mut sched, Arc::clone(thread), ktime::now_ns());
+    publish(&sched, None);
+    drop(sched);
+    if cpu != percpu::cpu_id() {
+        ksmp::ipi::resched(cpu as usize);
+    }
     Ok(())
 }
 
@@ -257,9 +348,12 @@ fn sc_of(t: &Thread) -> Option<(Arc<SchedContext>, Params)> {
     Some((sc, params))
 }
 
-/// Põe `t` na fila do nível dela ou, sem orçamento, na espera.
-fn enqueue(s: &mut Sched, t: Arc<Thread>, now: u64) {
-    let Some((sc, p)) = sc_of(&t) else { return };
+/// Põe `t` na fila do nível dela ou, sem orçamento, na espera (devolve
+/// `false` nesse caso).
+fn enqueue(s: &mut Sched, t: Arc<Thread>, now: u64) -> bool {
+    let Some((sc, p)) = sc_of(&t) else {
+        return false;
+    };
     let mut b = sc.budget();
     b.refill(&p, now);
     sc.set_budget(b);
@@ -277,9 +371,11 @@ fn enqueue(s: &mut Sched, t: Arc<Thread>, now: u64) {
         if s.throttled.try_reserve(1).is_ok() {
             s.throttled.push(t);
         }
+        false
     } else {
         t.set_state(RunState::Ready);
         let _ = s.ready.push(p.priority, t);
+        true
     }
 }
 
@@ -423,6 +519,27 @@ fn pick_next(s: &mut Sched, direct: Option<Arc<Thread>>, now: u64) -> Option<Arc
     s.ready.pop().map(|(_, t)| t)
 }
 
+/// `n` passa a ser a atual desta CPU (`me`): estado, CPU dona, `on_cpu`
+/// se acabou de chegar (`arriving`) e início da janela de orçamento.
+/// Devolve o [`rank`] dela.
+fn run_here(n: &Thread, me: u32, arriving: bool, now: u64) -> u32 {
+    n.set_state(RunState::Running);
+    n.set_cpu(me);
+    if arriving {
+        // I3: só a anterior desta CPU (que não chega, segue) poderia estar
+        // com a pilha em uso; toda outra saiu de vez.
+        debug_assert!(!n.on_cpu(), "thread na fila ainda em outra CPU");
+        n.set_on_cpu(true);
+    }
+    let Some((sc, p)) = sc_of(n) else {
+        return 0;
+    };
+    let mut b = sc.budget();
+    b.activate(&p, now);
+    sc.set_budget(b);
+    u32::from(p.priority) + 1
+}
+
 /// Como [`schedule`], mas com `direct` como próxima (caminho rápido de
 /// IPC) se ela puder rodar já; senão, ela vai para a fila.
 fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
@@ -436,6 +553,7 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         && let Some(cur) = s.current.clone()
         && keeps_running(&s, &cur, now)
     {
+        publish(&s, None);
         program_timer(&s, now);
         return;
     }
@@ -444,7 +562,9 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         match why {
             Why::Exit => p.set_state(RunState::Exited),
             Why::Block => {}
-            Why::Yield | Why::Preempt => enqueue(&mut s, Arc::clone(p), now),
+            Why::Yield | Why::Preempt => {
+                enqueue(&mut s, Arc::clone(p), now);
+            }
         }
     }
     let next = pick_next(&mut s, direct, now);
@@ -453,15 +573,7 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         (None, None) => true,
         _ => false,
     };
-    if let Some(n) = &next {
-        n.set_state(RunState::Running);
-        n.set_cpu(me);
-        if let Some((sc, p)) = sc_of(n) {
-            let mut b = sc.budget();
-            b.activate(&p, now);
-            sc.set_budget(b);
-        }
-    }
+    let cur_rank = next.as_deref().map_or(0, |n| run_here(n, me, !same, now));
     if !same {
         if let Some(p) = &prev
             && s.trace.len() < s.trace.capacity()
@@ -481,6 +593,7 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     }
     s.current.clone_from(&next);
     s.charging = next.as_deref().and_then(Thread::sched_context);
+    publish(&s, Some(cur_rank));
     program_timer(&s, now);
     if same {
         return;
@@ -491,15 +604,12 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         .as_ref()
         .filter(|p| p.state() != RunState::Exited)
         .map(|p| p.fpu_area());
-    // A pilha da que saiu segue em uso até a troca; a fila (ou `dead`)
-    // mantém viva a anterior enquanto o asm grava em `prev_slot`.
-    let buried = if why == Why::Exit {
-        core::mem::replace(&mut s.dead, prev)
-    } else {
-        None
-    };
+    // A pilha da que saiu segue em uso até a troca: `switch_prev` a mantém
+    // viva (e com `on_cpu`) enquanto o asm grava em `prev_slot`, até a
+    // próxima a liberar em `finish_switch`.
+    debug_assert!(s.switch_prev.is_none(), "troca anterior não terminada");
+    s.switch_prev = prev;
     drop(s);
-    drop(buried);
     // SAFETY: as áreas são das threads (alinhadas a 64, do tamanho que
     // `fpu::area_bytes` pede), só a troca de contexto as acessa, e a pilha
     // de `next` está mapeada.
@@ -527,8 +637,8 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         unsafe { cpu::write_cr3(root) };
     }
     drop(next);
-    // SAFETY: `prev_slot` é o rsp salvo da anterior, viva (na fila, em
-    // `dead` ou o ocioso); `next_rsp` foi salvo por esta mesma função ou
+    // SAFETY: `prev_slot` é o rsp salvo da anterior, viva (em
+    // `switch_prev`) ou o ocioso; `next_rsp` foi salvo por esta mesma função ou
     // montado por `start`.
     crate::ksync::assert_none_held("switch_context");
     percpu::assert_no_borrows();
@@ -541,10 +651,15 @@ fn idle_rsp() -> u64 {
     percpu::with(|p| p.idle_rsp().load(Ordering::Acquire))
 }
 
-/// Solta a thread que terminou, já fora da pilha dela.
+/// Já na próxima: libera a pilha da anterior (`on_cpu` falso, ADR 0032,
+/// item 3, passo 8), que outra CPU pode passar a rodar, e solta a
+/// referência a ela (a última, se ela terminou).
 fn finish_switch() {
-    let dead = this_sched().lock().dead.take();
-    drop(dead);
+    let prev = this_sched().lock().switch_prev.take();
+    if let Some(p) = prev {
+        p.set_on_cpu(false);
+        drop(p);
+    }
 }
 
 /// Primeira execução de uma thread, chamada por `thread_trampoline`.
@@ -560,47 +675,91 @@ pub fn yield_now() {
 
 /// Acorda uma thread bloqueada com `value` como resultado da espera e a
 /// põe na fila; não troca de thread (quem chama decide se preempta).
+///
+/// Pode ser chamada de qualquer CPU, com trava de objeto na mão, e nunca
+/// espera (ADR 0032, item 5): só quem passa a thread de `Blocked` a
+/// `Ready` a enfileira. Ainda saindo da CPU dela (`on_cpu`), volta à fila
+/// dessa CPU, a única que pode pegá-la; senão, vai para a CPU de
+/// [`choose_cpu`]. Destino em outra CPU ociosa ou rodando algo menos
+/// prioritário recebe o IPI de reescalonar.
 pub fn wake(thread: Arc<Thread>, value: u64) {
-    thread.set_wake_value(value);
-    // Na CPU dona: lá estão os prazos dela (ADR 0032, I7). Escolher outra
-    // CPU para acordar vem com o T-324.
-    let Some(sched) = sched_of(thread.cpu()) else {
+    if !thread.claim_wake() {
         return;
+    }
+    thread.set_wake_value(value);
+    let home = thread.cpu();
+    let p = rank(&thread);
+    let dest = if thread.on_cpu() {
+        home
+    } else {
+        choose_cpu(&thread, p)
     };
+    // O prazo dela está na lista da CPU dona (I7): sai de lá antes de ela
+    // mudar de CPU, sem as duas filas na mão ao mesmo tempo.
+    if dest != home
+        && let Some(old) = sched_of(home)
+    {
+        drop_timeout(&mut old.lock(), &thread);
+    }
+    let sched = sched_of(dest).unwrap_or(&BSP_SCHED);
     let mut s = sched.lock();
     drop_timeout(&mut s, &thread);
-    if thread.state() == RunState::Blocked {
-        enqueue(&mut s, thread, ktime::now_ns());
+    let id = s.id;
+    thread.set_cpu(id);
+    let ready = enqueue(&mut s, thread, ktime::now_ns());
+    publish(&s, None);
+    // O resumo da atual do destino é exato com a trava dele na mão. Sem
+    // orçamento, o destino precisa rearmar o timer para o reabastecimento:
+    // também é motivo de aviso.
+    let kick =
+        id != percpu::cpu_id() && (CUR_PRIO[id as usize].load(Ordering::Relaxed) < p || !ready);
+    drop(s);
+    if kick {
+        ksmp::ipi::resched(id as usize);
     }
 }
 
 /// Bloqueia a atual (já marcada) até alguém a acordar ou, com `deadline`
 /// não zero, até o prazo vencer (o IPC a acorda com `TimedOut`).
 pub fn block_until(deadline: u64) {
-    if deadline != 0 {
-        let mut s = this_sched().lock();
-        if let Some(t) = s.current.clone()
-            && s.timeouts.len() < s.timeouts.capacity()
-        {
-            s.timeouts.push((deadline, t));
-        }
-    }
+    push_timeout(deadline);
     schedule(Why::Block);
+}
+
+/// Põe o prazo da atual na lista desta CPU, se ela ainda está bloqueada:
+/// quem a acordou antes (de outra CPU, com a trava desta fila) já tirou o
+/// prazo que haveria, e um prazo velho na lista seria vencido à toa.
+fn push_timeout(deadline: u64) {
+    if deadline == 0 {
+        return;
+    }
+    let mut s = this_sched().lock();
+    if let Some(t) = s.current.clone()
+        && t.state() == RunState::Blocked
+        && s.timeouts.try_reserve(1).is_ok()
+    {
+        s.timeouts.push((deadline, t));
+    }
 }
 
 /// Caminho rápido de IPC: a atual (já bloqueada, com prazo `deadline`)
 /// cede a CPU direto a `to` se `to` puder rodar já; senão, `to` vai para a
 /// fila e o escalonador escolhe.
+///
+/// Só com `to` nesta CPU (ADR 0032, item 6: o caminho rápido é o da mesma
+/// CPU) e ganha pelo `compare_exchange` do despertar; senão `to` acorda
+/// pelo caminho comum ([`wake`]), que escolhe a CPU e avisa.
 pub fn handoff(to: Arc<Thread>, deadline: u64) {
-    if deadline != 0 {
-        let mut s = this_sched().lock();
-        if let Some(t) = s.current.clone()
-            && s.timeouts.len() < s.timeouts.capacity()
-        {
-            s.timeouts.push((deadline, t));
-        }
+    push_timeout(deadline);
+    if to.cpu() != percpu::cpu_id() {
+        wake(to, 0);
+        schedule(Why::Block);
+    } else if to.claim_wake() {
+        schedule_to(Why::Block, Some(to));
+    } else {
+        // Alguém já a acordou (e a pôs numa fila).
+        schedule(Why::Block);
     }
-    schedule_to(Why::Block, Some(to));
 }
 
 /// Trocas diretas do caminho rápido de IPC desde o boot.
@@ -664,11 +823,6 @@ impl sys::Env for KernelEnv {
 /// ocioso: reavalia quem roda.
 pub fn on_timer() {
     ktime::timer_fired();
-    // Até os APs rodarem threads (T-324), o escalonador é só do BSP: o
-    // timer de um AP ocioso só o acorda.
-    if percpu::cpu_id() != 0 {
-        return;
-    }
     preempt();
 }
 

@@ -39,7 +39,8 @@ const CR4_FEATURES: [(u64, u32, u8, u32, &str); 6] = [
 ];
 
 /// Grava o estado do BSP para os APs (depois de `kmem::init` e
-/// `fpu::init`, que ligam as proteções e a FPU).
+/// `fpu::init`, que ligam as proteções e a FPU) e põe o id do BSP (zero) no
+/// `TSC_AUX`.
 pub fn capture() {
     // SAFETY: EFER e PAT existem em toda CPU x86-64.
     let (efer, pat) = unsafe { (rdmsr(cpu::MSR_EFER), rdmsr(MSR_PAT)) };
@@ -59,6 +60,16 @@ pub fn capture() {
         TSC_ADJUST.store(unsafe { rdmsr(MSR_TSC_ADJUST) }, Ordering::Relaxed);
         BSP_HAS_TSC_ADJUST.store(true, Ordering::Relaxed);
     }
+    if has_rdtscp() {
+        // SAFETY: a CPU anuncia `IA32_TSC_AUX`; ninguém o lê ainda. Como nos
+        // APs, vale o id lógico (zero no BSP), que `RDTSCP` devolve no anel 3.
+        unsafe { wrmsr(MSR_TSC_AUX, 0) };
+    }
+}
+
+/// Esta CPU tem `RDTSCP` e `IA32_TSC_AUX` (CPUID `0x8000_0001`, `EDX[27]`).
+fn has_rdtscp() -> bool {
+    cpu::max_leaf(true) >= 0x8000_0001 && cpu::cpuid(0x8000_0001, 0).edx & (1 << 27) != 0
 }
 
 /// Esta CPU tem `IA32_TSC_ADJUST` (CPUID 7, `EBX[1]`).
@@ -137,7 +148,7 @@ pub unsafe fn apply(cpu_id: u32) -> Result<(), &'static str> {
         if BSP_HAS_TSC_ADJUST.load(Ordering::Relaxed) && has_tsc_adjust() {
             wrmsr(MSR_TSC_ADJUST, TSC_ADJUST.load(Ordering::Relaxed));
         }
-        if cpu::max_leaf(true) >= 0x8000_0001 && cpu::cpuid(0x8000_0001, 0).edx & (1 << 27) != 0 {
+        if has_rdtscp() {
             wrmsr(MSR_TSC_AUX, u64::from(cpu_id));
         }
     }

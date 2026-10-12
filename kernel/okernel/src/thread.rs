@@ -15,7 +15,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use kabi::vm::{PAGE_SIZE, USER_END, USER_START};
 use kabi::{Error, Handle};
@@ -91,6 +91,10 @@ pub struct Thread {
     /// CPU dona da thread: a da fila em que está ou a última em que rodou
     /// (ADR 0032, item 1).
     cpu: AtomicU32,
+    /// A pilha de kernel da thread está em uso por uma CPU: ela é a atual
+    /// dessa CPU ou acabou de sair e a troca ainda não terminou (ADR 0032,
+    /// I1). Nenhuma outra CPU a roda enquanto isso (I3).
+    on_cpu: AtomicBool,
     /// Valor entregue a quem acorda a thread bloqueada (os bits da
     /// notificação, T-209).
     wake_value: AtomicU64,
@@ -149,6 +153,7 @@ impl Thread {
             root: AtomicU64::new(0),
             state: AtomicU8::new(RunState::Inactive as u8),
             cpu: AtomicU32::new(0),
+            on_cpu: AtomicBool::new(false),
             wake_value: AtomicU64::new(0),
             fpu,
             fpu_addr,
@@ -209,6 +214,20 @@ impl Thread {
         self.state.store(state as u8, Ordering::Release);
     }
 
+    /// Passa de `Blocked` a `Ready` se ainda estiver bloqueada; só quem
+    /// vence põe a thread numa fila (ADR 0032, item 5): dois despertares
+    /// ao mesmo tempo, de CPUs diferentes, nunca a enfileiram duas vezes.
+    pub fn claim_wake(&self) -> bool {
+        self.state
+            .compare_exchange(
+                RunState::Blocked as u8,
+                RunState::Ready as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     /// Bytes cobrados da cota.
     #[must_use]
     pub const fn charged(&self) -> u64 {
@@ -224,6 +243,18 @@ impl Thread {
     /// CPU dona da thread (a da fila em que está ou a última em que rodou).
     pub fn cpu(&self) -> u32 {
         self.cpu.load(Ordering::Acquire)
+    }
+
+    /// Marca a pilha de kernel em uso (ao virar a atual de uma CPU) ou
+    /// livre (pela CPU, depois de terminar a troca para outra).
+    pub fn set_on_cpu(&self, on: bool) {
+        self.on_cpu.store(on, Ordering::Release);
+    }
+
+    /// A pilha de kernel da thread está em uso por uma CPU.
+    #[must_use]
+    pub fn on_cpu(&self) -> bool {
+        self.on_cpu.load(Ordering::Acquire)
     }
 
     /// Guarda o valor que a thread recebe ao acordar.

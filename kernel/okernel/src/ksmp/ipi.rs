@@ -6,8 +6,8 @@
 //! trava, espera de outra CPU, entrada no ocioso), porque o kernel roda com
 //! IF=0 e só recebe a interrupção no anel 3 ou no ocioso.
 //!
-//! - `RESCHED` (`0xF0`): liga `need_resched` do destino ([`resched`]); quem
-//!   o consome é o escalonador por CPU (T-324).
+//! - `RESCHED` (`0xF0`): liga `need_resched` do destino ([`resched`]); o
+//!   tratador do IPI o consome e reavalia quem roda ([`on_ipi`], T-324).
 //! - `CALL` (`0xF1`): função remota síncrona ([`call_on`]), restrita a
 //!   funções que não tomam trava, não esperam e não mandam IPI.
 //! - `TLB` (`0xF2`): reservado ao shootdown (T-326).
@@ -76,9 +76,14 @@ pub fn call_on(cpu: usize, func: RemoteFn, arg: u64) -> bool {
     true
 }
 
-/// Tratador dos vetores de IPI (`0xF0`–`0xF2`), com o EOI já feito.
+/// Tratador dos vetores de IPI (`0xF0`–`0xF2`), com o EOI já feito,
+/// vindo do anel 3 ou do ocioso: atende a caixa e, com `need_resched`
+/// ligado, reavalia quem roda (T-324).
 pub fn on_ipi() {
     poll();
+    if percpu::mailbox().take_resched() {
+        crate::kthread::preempt();
+    }
 }
 
 /// Há `RESCHED` pendente na CPU `cpu`; com `take`, consome.

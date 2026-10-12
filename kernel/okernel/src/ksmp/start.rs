@@ -274,9 +274,8 @@ static AP_JOB_GEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Pede que cada AP ocioso rode `job` uma vez. O IPI de reescalonar acorda
 /// o AP na hora (sem ele, o timer o acordaria em até [`IDLE_TICK_NS`]).
-/// Para os testes de kernel que precisam de código longo em todas as CPUs
-/// ao mesmo tempo (a função remota tem de ser curta); provisório até o
-/// escalonador por CPU (T-324).
+/// Para os testes de kernel que precisam de código longo do kernel em
+/// todas as CPUs ao mesmo tempo (a função remota tem de ser curta).
 pub fn post_ap_job(job: fn()) {
     *AP_JOB.lock() = Some(job);
     AP_JOB_GEN.fetch_add(1, Ordering::AcqRel);
@@ -287,9 +286,11 @@ pub fn post_ap_job(job: fn()) {
     }
 }
 
-/// Laço ocioso de um AP: `sti; hlt` com o timer armado a cada
-/// [`IDLE_TICK_NS`]. Provisório até o escalonador por CPU (T-323 e T-324):
-/// sem IPIs nem fila, o timer é o que acorda a CPU para ela ver pedidos.
+/// Laço ocioso de um AP (ADR 0032, item 8, sem `mwait`): roda as prontas
+/// da própria fila e dorme em `sti; hlt` até um IPI (despertar vindo de
+/// outra CPU, função remota) ou o timer, armado a cada [`IDLE_TICK_NS`] no
+/// mínimo. O IPI que chega entre olhar a fila e o `hlt` fica pendente e
+/// acorda o `hlt` (a sombra do `sti`).
 fn idle() -> ! {
     let mut seen = AP_JOB_GEN.load(Ordering::Acquire);
     loop {
@@ -301,6 +302,7 @@ fn idle() -> ! {
                 job();
             }
         }
+        crate::kthread::yield_now();
         ktime::arm_by(ktime::now_ns() + IDLE_TICK_NS);
         cpu::wait_for_interrupt();
     }

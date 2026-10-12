@@ -54,3 +54,27 @@ fn configura_so_antes_de_iniciar() {
         assert_eq!(t.state(), s);
     }
 }
+
+#[test]
+fn so_um_despertar_vence() {
+    let (_, p) = platform(100);
+    let quota = MemoryQuota::root(1 << 20);
+    let t = Thread::new(&quota, p).unwrap();
+    assert!(!t.on_cpu());
+    for s in [RunState::Inactive, RunState::Ready, RunState::Running] {
+        t.set_state(s);
+        assert!(!t.claim_wake());
+        assert_eq!(t.state(), s);
+    }
+    t.set_state(RunState::Blocked);
+    let t = Arc::new(t);
+    let won: usize = std::thread::scope(|scope| {
+        let handles: std::vec::Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| usize::from(t.claim_wake())))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+    assert_eq!((won, t.state()), (1, RunState::Ready));
+    t.set_on_cpu(true);
+    assert!(t.on_cpu());
+}

@@ -17,7 +17,7 @@ use crate::arch::x86_64::{cpu, probe};
 use crate::kcap::root_quota;
 use crate::ktest::{Outcome, Test};
 use crate::kthread::tests::{
-    DATA_VA, Process, delete, process, run_until_exit, thread, user_symbol,
+    DATA_VA, Process, delete, process, run_until_exit, settled, thread, user_symbol,
 };
 use crate::kthread::{KernelEnv, UserEntry, fast_switches, start, yield_now};
 use crate::ktime;
@@ -192,7 +192,7 @@ fn ping_pong() -> Outcome {
         delete(&client, &[hc])?;
         delete(&server, &[hs])?;
     }
-    ensure!(quota.used() == used0);
+    ensure!(settled(&quota, used0));
     Ok(())
 }
 
@@ -351,6 +351,6 @@ fn peer_closed() -> Outcome {
         delete(&server, &[hs])?;
         delete(&client, &[hc])?;
     }
-    ensure!(quota.used() == used0);
+    ensure!(settled(&quota, used0));
     Ok(())
 }

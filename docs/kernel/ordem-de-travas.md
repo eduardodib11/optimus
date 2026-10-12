@@ -16,7 +16,7 @@ trava).
 | 3 | `Object` | `ipc::Endpoint.queues`, `ipc::Reply.caller`, `ipc::Reply.donation`, `notify::Notification.state`, `notify::Interrupt.line`, `futex::FutexTable.inner`, `thread::Thread.binding`, `kirq::LINES`, `kcap::ROOT` | uma por vez |
 | 4 | `IpcSlot` | `thread::Thread.ipc` | depois do objeto |
 | 5 | `AddressSpace` | `SharedAddressSpace` (`cap::object`, `obj_create`) | uma por vez |
-| 6 | `RunQueue` | escalonador de cada CPU (`kthread::BSP_SCHED` e `kthread::SCHEDS`, chave = id da CPU, T-323) | duas só em ordem crescente de id |
+| 6 | `RunQueue` | escalonador de cada CPU (`kthread::BSP_SCHED` e `kthread::SCHEDS`, chave = id da CPU, T-323) | duas só em ordem crescente de id; o despertar entre CPUs (T-324) toma a da CPU antiga e depois a do destino, nunca as duas juntas |
 | 7 | `SchedLeaf` | `thread::Thread.sched`, `thread::Thread.donated` | folha do escalonador |
 | 8 | `KernelStacks`, depois `KernelPageTables` | `kvm::STACK_SLOTS`, depois `kmem::KERNEL_PT` | nessa ordem |
 | 9 | `Heap`, depois `Frames` | `kheap::HEAP`, depois `kmem::FRAMES` | nessa ordem |
@@ -39,8 +39,9 @@ Notas:
   maior na mão pode violar a ordem: o `Drop` de `Endpoint` e de `Reply`
   toma a trava do objeto e acorda threads (fila), e o de `Thread` solta a
   pilha (`KernelStacks`) e, em cascata, o `CapSpace` e os objetos dele.
-  Por isso o escalonador solta a thread morta (`dead`) só depois de largar
-  a fila.
+  Por isso o escalonador solta a thread que saiu da CPU (`switch_prev`,
+  talvez a última referência de uma que terminou) só depois de largar a
+  fila, em `finish_switch`.
 
 ## Pontos sem nenhuma trava
 

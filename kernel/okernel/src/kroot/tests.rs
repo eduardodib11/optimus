@@ -3,6 +3,7 @@
 use super::{ROOT_NAME, bootfs, load, run_until_exit};
 use crate::kcap::root_quota;
 use crate::ktest::{Outcome, Test};
+use crate::kthread::tests::settled;
 use crate::kthread::{take_debug_log, yield_now};
 
 /// Testes de kernel do bootfs.
@@ -59,6 +60,6 @@ fn root_inicia() -> Outcome {
         let [_, _, thread, _] = p.handles;
         drop(p.cspace.lock().delete(thread));
     }
-    ensure!(quota.used() == used0);
+    ensure!(settled(&quota, used0));
     Ok(())
 }
