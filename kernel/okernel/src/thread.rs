@@ -88,6 +88,9 @@ pub struct Thread {
     /// PML4 do espaço da thread (zero sem espaço).
     root: AtomicU64,
     state: AtomicU8,
+    /// CPU dona da thread: a da fila em que está ou a última em que rodou
+    /// (ADR 0032, item 1).
+    cpu: AtomicU32,
     /// Valor entregue a quem acorda a thread bloqueada (os bits da
     /// notificação, T-209).
     wake_value: AtomicU64,
@@ -145,6 +148,7 @@ impl Thread {
             saved_rsp: AtomicU64::new(0),
             root: AtomicU64::new(0),
             state: AtomicU8::new(RunState::Inactive as u8),
+            cpu: AtomicU32::new(0),
             wake_value: AtomicU64::new(0),
             fpu,
             fpu_addr,
@@ -209,6 +213,17 @@ impl Thread {
     #[must_use]
     pub const fn charged(&self) -> u64 {
         self.charge.bytes()
+    }
+
+    /// Muda a CPU dona da thread (pelo escalonador, com a thread fora de
+    /// qualquer CPU).
+    pub fn set_cpu(&self, cpu: u32) {
+        self.cpu.store(cpu, Ordering::Release);
+    }
+
+    /// CPU dona da thread (a da fila em que está ou a última em que rodou).
+    pub fn cpu(&self) -> u32 {
+        self.cpu.load(Ordering::Acquire)
     }
 
     /// Guarda o valor que a thread recebe ao acordar.

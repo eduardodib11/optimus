@@ -43,7 +43,30 @@ pub const TESTS: &[Test] = &[
         name: "smp.ipi_ida_e_volta_entre_todos_os_pares",
         run: ipi_todos_os_pares,
     },
+    Test {
+        name: "smp.escalonador_por_cpu",
+        run: escalonador_por_cpu,
+    },
 ];
+
+/// Cada CPU ligada tem a própria `Sched` (T-323), distinta das outras;
+/// os APs ainda não têm prontas.
+fn escalonador_por_cpu() -> Outcome {
+    let n = super::start::online_count();
+    let mut seen = [0usize; 64];
+    for cpu in 0..n.min(64) {
+        let id = u32::try_from(cpu).map_err(|_| "id")?;
+        let (addr, ready) = crate::kthread::sched_info(id).ok_or("sem escalonador")?;
+        ensure!(!seen[..cpu].contains(&addr));
+        seen[cpu] = addr;
+        ensure!(cpu == 0 || ready == 0);
+    }
+    ensure!(
+        crate::kthread::sched_info(u32::try_from(super::count()).unwrap_or(u32::MAX)).is_none()
+    );
+    info!("ktest: · {n} escalonadores por CPU");
+    Ok(())
+}
 
 static LOCAL: AtomicU64 = AtomicU64::new(0);
 

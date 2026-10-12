@@ -16,7 +16,7 @@ trava).
 | 3 | `Object` | `ipc::Endpoint.queues`, `ipc::Reply.caller`, `ipc::Reply.donation`, `notify::Notification.state`, `notify::Interrupt.line`, `futex::FutexTable.inner`, `thread::Thread.binding`, `kirq::LINES`, `kcap::ROOT` | uma por vez |
 | 4 | `IpcSlot` | `thread::Thread.ipc` | depois do objeto |
 | 5 | `AddressSpace` | `SharedAddressSpace` (`cap::object`, `obj_create`) | uma por vez |
-| 6 | `RunQueue` | `kthread::SCHED` (chave 0 até o T-323, que a divide por CPU) | duas só em ordem crescente de id |
+| 6 | `RunQueue` | escalonador de cada CPU (`kthread::BSP_SCHED` e `kthread::SCHEDS`, chave = id da CPU, T-323) | duas só em ordem crescente de id |
 | 7 | `SchedLeaf` | `thread::Thread.sched`, `thread::Thread.donated` | folha do escalonador |
 | 8 | `KernelStacks`, depois `KernelPageTables` | `kvm::STACK_SLOTS`, depois `kmem::KERNEL_PT` | nessa ordem |
 | 9 | `Heap`, depois `Frames` | `kheap::HEAP`, depois `kmem::FRAMES` | nessa ordem |
@@ -24,7 +24,7 @@ trava).
 
 Notas:
 
-- O registro de eventos do escalonador (`trace`) mora dentro de `SCHED` e
+- O registro de eventos do escalonador (`trace`) mora dentro da `Sched` de cada CPU e
   não tem trava própria.
 - `platform::PLATFORM` não está na tabela da ADR: é o ponteiro para a
   plataforma, gravado uma vez no boot e só copiado depois, sem tomar outra
