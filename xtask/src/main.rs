@@ -192,7 +192,9 @@ fn parse(args: &[String]) -> Result<Options> {
                         .map_err(|_| "--rounds espera um número")?,
                 );
             }
-            "unit" | "boot" | "kernel" | "hello" | "fuzz" | "all" => opts.suite.clone_from(arg),
+            "unit" | "boot" | "kernel" | "smp" | "hello" | "fuzz" | "all" => {
+                opts.suite.clone_from(arg);
+            }
             other => return Err(format!("opção desconhecida: {other}")),
         }
     }
@@ -834,6 +836,9 @@ fn test(opts: &Options) -> Result {
     if matches!(opts.suite.as_str(), "kernel" | "all") {
         smoke(opts, &[KERNEL_SCENARIO])?;
     }
+    if opts.suite == "smp" {
+        smp(opts)?;
+    }
     if opts.suite == "hello" {
         // 10⁶ idas e voltas no build de depuração levariam horas sob TCG.
         let release = Options {
@@ -848,6 +853,54 @@ fn test(opts: &Options) -> Result {
         run_fuzz(opts, FUZZ_SHORT_SECONDS, FUZZ_SHORT_SEED)?;
     }
     Ok(())
+}
+
+/// CPUs de `cargo xtask test smp` sem `--smp` (T-320); o CI roda 2 e 4,
+/// um por job.
+const SMP_COUNTS: &[u32] = &[2, 4, 8];
+
+/// `cargo xtask test smp [--smp N]`: a suíte de kernel inteira com N CPUs
+/// (só N com `--smp` maior que 1; senão 2, 4 e 8), exigindo que todas
+/// tenham ligado.
+fn smp(opts: &Options) -> Result {
+    build(opts)?;
+    let counts = if opts.smp > 1 {
+        vec![opts.smp]
+    } else {
+        SMP_COUNTS.to_vec()
+    };
+    let mut bases = Vec::new();
+    for n in counts {
+        println!("xtask: suíte de kernel com -smp {n}");
+        let serial = boot_scenario(
+            &Options {
+                smp: n,
+                ..opts.clone()
+            },
+            &KERNEL_SCENARIO,
+        )?;
+        check_cpus_online(&serial, n)?;
+        println!("xtask: -smp {n}: {n} CPUs ligadas, suíte de kernel ok");
+        bases.extend(direct_map_base(&serial));
+    }
+    check_direct_map_bases(&bases)
+}
+
+/// Exige que o kernel tenha ligado todas as `n` CPUs da máquina.
+fn check_cpus_online(serial: &str, n: u32) -> Result {
+    if n < 2 {
+        return Ok(());
+    }
+    let want = format!("okernel: {n} de {n} CPU(s) ligadas");
+    if serial.contains(&want) {
+        Ok(())
+    } else {
+        let got = serial
+            .lines()
+            .find(|l| l.contains("CPU(s) ligadas"))
+            .map_or("nenhuma linha de CPUs ligadas", str::trim);
+        Err(format!("faltou \"{want}\" ({got})"))
+    }
 }
 
 /// Marcador de sucesso do `okfuzz`: a cota raiz voltou ao fim da rodada.
@@ -1179,6 +1232,18 @@ mod tests {
             check_ktest("info  ktest: início, 0 testes\r\nktest: fim: 0 ok, 0 falharam").is_err()
         );
         assert_eq!(parse(&args(&["kernel"])).unwrap().suite, "kernel");
+    }
+
+    #[test]
+    fn suite_smp_exige_todas_as_cpus() {
+        let opts = parse(&args(&["smp", "--smp", "4"])).unwrap();
+        assert_eq!((opts.suite.as_str(), opts.smp), ("smp", 4));
+        let serial = "info  okernel: cpu3 online (APIC 3)\r\n\
+                      info  okernel: 4 de 4 CPU(s) ligadas\r\n";
+        assert_eq!(check_cpus_online(serial, 4), Ok(()));
+        assert!(check_cpus_online(serial, 8).is_err());
+        assert!(check_cpus_online(&serial.replace("4 de 4", "3 de 4"), 4).is_err());
+        assert_eq!(check_cpus_online("", 1), Ok(()));
     }
 
     #[test]
