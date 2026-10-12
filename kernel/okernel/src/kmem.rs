@@ -8,18 +8,25 @@
 //! todos os apelidos) e liga SMEP, SMAP e UMIP quando a CPU os tem.
 //!
 //! Ordem das travas: tabelas de página antes de frames.
+//!
+//! Frames de 4 KiB passam pelo cache da CPU (T-328, `okernel::mm::cache`):
+//! sem trava, só a própria CPU o usa, e a trava do buddy só é tomada para
+//! trazer ou devolver um lote. [`frame_stats`] conta os frames parados nos
+//! caches como livres. Uma liberação dupla só é pega no cache da mesma CPU
+//! (o buddy pega as que chegam a ele).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kabi::boot::{DIRECT_MAP_START, MemRegion};
 use okernel::mm::buddy::{FrameAllocator, FrameMeta};
+use okernel::mm::cache::FRAME_BATCH;
 use okernel::mm::paging::{Flags, MapError, Mapping, PageSize, PageTables, Table, TableMemory};
 use okernel::mm::{FRAME_SIZE, PhysAddr, frames};
 use okernel::sync::{LockClass, SpinLock};
 use okernel::tlb::{Flush, KERNEL_ROOT};
 
-use crate::arch::x86_64::cpu;
-use crate::ksmp::tlb;
+use crate::arch::x86_64::{cpu, percpu};
+use crate::ksmp::{self, tlb};
 
 mod tests;
 pub use tests::TESTS;
@@ -30,6 +37,11 @@ static FRAMES: SpinLock<Option<FrameAllocator<'static>>> =
     SpinLock::with_class(LockClass::Frames, None);
 static KERNEL_PT: SpinLock<Option<PageTables<DirectMap>>> =
     SpinLock::with_class(LockClass::KernelPageTables, None);
+/// Faixa física gerida pelo buddy (`[início, fim)`), para conferir o que
+/// entra no cache sem tomar a trava.
+static MANAGED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Cache de frames por CPU ligado; desligar serve só para medir o ganho.
+static CACHE_ON: AtomicBool = AtomicBool::new(true);
 
 unsafe extern "C" {
     static __kernel_text_start: u8;
@@ -92,18 +104,89 @@ impl TableMemory for DirectMap {
     }
 }
 
-/// Aloca `2^order` frames contíguos.
+/// Aloca `2^order` frames contíguos (os de 4 KiB, pelo cache desta CPU).
 pub fn alloc_frames(order: usize) -> Option<PhysAddr> {
+    if order == 0 && CACHE_ON.load(Ordering::Relaxed) {
+        let frame = percpu::with_frame_cache(|c| {
+            if let Some(f) = c.pop() {
+                return Some(f);
+            }
+            let mut frames = FRAMES.lock();
+            let buddy = frames.as_mut()?;
+            c.refill(FRAME_BATCH, &mut || buddy.alloc(0).map(|f| f.0));
+            c.pop()
+        });
+        // Vazio aqui e no buddy: não há o que devolver desta CPU.
+        return frame.map(PhysAddr);
+    }
+    if let Some(frame) = FRAMES.lock().as_mut()?.alloc(order) {
+        return Some(frame);
+    }
+    // Os frames parados no cache desta CPU podem completar um bloco.
+    drain_frame_cache();
     FRAMES.lock().as_mut()?.alloc(order)
 }
 
 /// Devolve frames obtidos com [`alloc_frames`].
 pub fn free_frames(addr: PhysAddr, order: usize) {
-    if let Some(frames) = FRAMES.lock().as_mut()
-        && let Err(e) = frames.free(addr, order)
-    {
+    if order == 0 && CACHE_ON.load(Ordering::Relaxed) && managed(addr) {
+        percpu::with_frame_cache(|c| {
+            if c.contains(addr.0) {
+                error!("okernel: free_frames({:#x}, 0): já livre", addr.0);
+                return;
+            }
+            if c.push(addr.0) {
+                return;
+            }
+            if let Some(buddy) = FRAMES.lock().as_mut() {
+                c.spill(FRAME_BATCH, &mut |f| buddy_free(buddy, PhysAddr(f), 0));
+            }
+            if !c.push(addr.0) {
+                error!("okernel: cache de frames cheio depois de esvaziar");
+            }
+        });
+        return;
+    }
+    if let Some(buddy) = FRAMES.lock().as_mut() {
+        buddy_free(buddy, addr, order);
+    }
+}
+
+fn buddy_free(buddy: &mut FrameAllocator<'static>, addr: PhysAddr, order: usize) {
+    if let Err(e) = buddy.free(addr, order) {
         error!("okernel: free_frames({:#x}, {order}): {e:?}", addr.0);
     }
+}
+
+/// Frame de 4 KiB alinhado dentro da faixa do buddy.
+fn managed(addr: PhysAddr) -> bool {
+    let [start, end] = [0, 1].map(|i| MANAGED[i].load(Ordering::Relaxed));
+    addr.0.is_multiple_of(FRAME_SIZE) && (start..end).contains(&addr.0)
+}
+
+/// Devolve ao buddy todos os frames do cache desta CPU.
+pub fn drain_frame_cache() {
+    percpu::with_frame_cache(|c| {
+        if c.is_empty() {
+            return;
+        }
+        if let Some(buddy) = FRAMES.lock().as_mut() {
+            c.spill(usize::MAX, &mut |f| buddy_free(buddy, PhysAddr(f), 0));
+        }
+    });
+}
+
+/// Liga ou desliga o cache de frames por CPU (para medir); devolve o
+/// estado anterior. Desligado, os frames que já estão nos caches ficam
+/// lá até ele voltar.
+pub fn set_frame_cache(on: bool) -> bool {
+    CACHE_ON.swap(on, Ordering::AcqRel)
+}
+
+/// Frames parados nos caches de todas as CPUs (pode estar mudando).
+pub fn cached_frames() -> usize {
+    let aps = (1..ksmp::count()).filter_map(ksmp::start::percpu_of);
+    percpu::bsp().frames_cached() + aps.map(percpu::PerCpu::frames_cached).sum::<usize>()
 }
 
 /// PML4 do kernel.
@@ -111,12 +194,13 @@ pub fn kernel_root() -> Option<PhysAddr> {
     Some(KERNEL_PT.lock().as_ref()?.root())
 }
 
-/// Frames livres e gerenciados.
+/// Frames livres (no buddy e nos caches das CPUs) e gerenciados.
 pub fn frame_stats() -> (usize, usize) {
-    FRAMES
+    let (free, managed) = FRAMES
         .lock()
         .as_ref()
-        .map_or((0, 0), |f| (f.free_frames(), f.managed_frames()))
+        .map_or((0, 0), |f| (f.free_frames(), f.managed_frames()));
+    (free + cached_frames(), managed)
 }
 
 fn with_tables<T>(
@@ -263,6 +347,11 @@ fn init_frames(map: &[MemRegion]) {
         (buddy.free_frames() as u64 * FRAME_SIZE) >> 20,
         plan.meta_bytes >> 10,
         plan.meta.0
+    );
+    MANAGED[0].store(plan.base.0, Ordering::Relaxed);
+    MANAGED[1].store(
+        plan.base.0 + plan.frames as u64 * FRAME_SIZE,
+        Ordering::Relaxed,
     );
     *FRAMES.lock() = Some(buddy);
 }

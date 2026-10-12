@@ -32,7 +32,13 @@ Notas:
 - O logger da serial (`klog`) usa uma trava própria de teste-e-troca, fora
   de `SpinLock`: é a última folha (qualquer código pode registrar com
   travas na mão) e nada se toma com ela.
-- O cache de frames por CPU (T-328) não terá trava (ADR 0031, item 3).
+- Os caches por CPU de frames e de objetos do heap (T-328,
+  `docs/kernel/caches-por-cpu.md`) não têm trava (ADR 0031, item 3): só a
+  própria CPU os usa, com IF=0, por `percpu::with_frame_cache` e
+  `percpu::with_object_cache`, que acusam pânico na reentrada. Com o cache
+  de objetos emprestado, a CPU pode tomar `Heap` (para trazer ou devolver
+  um lote) e, por ele, `Frames` e o cache de frames; com o de frames, só
+  `Frames`.
 - Liberar memória (soltar um `Arc`) toma `Heap` e talvez `Frames`; por
   isso o alocador vem depois de tudo que pode soltar objetos com trava na
   mão. Soltar a última referência de um objeto com trava de nível 3 ou

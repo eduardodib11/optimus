@@ -8,7 +8,7 @@ use core::alloc::Layout;
 
 use okernel::mm::slab::HeapError;
 
-use super::{HEAP, set_limit, try_alloc, usage};
+use super::{drain_object_cache, live_blocks, set_limit, try_alloc, usage};
 use crate::kmem::frame_stats;
 use crate::ktest::{Outcome, Test};
 
@@ -32,12 +32,8 @@ pub const TESTS: &[Test] = &[
     },
 ];
 
-fn allocs() -> u64 {
-    HEAP.lock().cache_stats().iter().map(|s| s.allocs).sum()
-}
-
 fn colecoes() -> Outcome {
-    let before = allocs();
+    let before = live_blocks();
     let boxed = Box::new(0x0123_4567_89ab_cdefu64);
     let mut v: Vec<u32> = Vec::new();
     for i in 0..1000 {
@@ -47,7 +43,10 @@ fn colecoes() -> Outcome {
     ensure!(*boxed == 0x0123_4567_89ab_cdef);
     ensure!(v.iter().enumerate().all(|(i, &x)| x as usize == i * 3));
     ensure!(text == "1000 itens, soma 1498500");
-    ensure!(allocs() > before);
+    // A caixa, o vetor e o texto: contados mesmo vindo do cache da CPU.
+    ensure!(live_blocks() == before + 3);
+    drop((boxed, v, text));
+    ensure!(live_blocks() == before);
     Ok(())
 }
 
@@ -84,6 +83,8 @@ fn slabs_voltam() -> Outcome {
     // 2000 objetos de 128 bytes ocupam ao menos 64 slabs de 4 KiB.
     ensure!(free_during + 64 <= free_before);
     drop(objects);
+    // Os objetos parados no cache desta CPU seguram os slabs deles.
+    drain_object_cache();
     let (free_after, _) = frame_stats();
     // Só o slab vazio guardado pode continuar fora do buddy.
     ensure!(free_after + 1 >= free_before);

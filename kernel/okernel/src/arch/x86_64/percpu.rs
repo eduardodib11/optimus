@@ -7,10 +7,11 @@
 //! pilha de travas e o registro das sondas de memória. Continuam globais só
 //! a configuração comum a todas as CPUs (modo do APIC, calibragem do TSC,
 //! XSAVE), o dono do pânico e o escalonador (T-323). Cada CPU tem também a
-//! caixa de pedidos de IPI (T-322), a thread atual e o quadro gravado
-//! quando um pânico a congela. O BSP usa a instância estática (as
-//! exceções podem chegar antes do alocador); os APs recebem a sua na
-//! partida (T-318).
+//! caixa de pedidos de IPI (T-322), a thread atual, o quadro gravado
+//! quando um pânico a congela e os caches de frames e de objetos do heap
+//! (T-328). O BSP usa a
+//! instância estática (as exceções podem chegar antes do alocador); os APs
+//! recebem a sua na partida (T-318).
 //!
 //! Regra de uso: nada lido da `PerCpu` pode atravessar uma troca de
 //! contexto, porque a thread pode voltar em outra CPU (ADR 0032). O acesso
@@ -23,6 +24,7 @@ use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use okernel::ipi::Mailbox;
+use okernel::mm::cache::{FrameCache, ObjectCache, object_cache};
 use okernel::sync::HeldLocks;
 
 use super::cpu::{rdmsr, wrmsr};
@@ -71,6 +73,19 @@ pub struct PerCpu {
     panic_dump: [AtomicU64; 6],
     gdt: UnsafeCell<Gdt>,
     tss: UnsafeCell<Tss>,
+    /// Cache de frames de 4 KiB (T-328): só esta CPU o toca, por
+    /// [`with_frame_cache`].
+    frames: UnsafeCell<FrameCache>,
+    /// Frames no cache, para as contas de outras CPUs.
+    frames_cached: AtomicU32,
+    /// O cache está emprestado (pega reentrada).
+    frames_busy: AtomicBool,
+    /// Cache de objetos do heap (T-328), por [`with_object_cache`].
+    objects: UnsafeCell<ObjectCache>,
+    /// Objetos no cache, somadas as classes.
+    objects_cached: AtomicU32,
+    /// O cache de objetos está emprestado.
+    objects_busy: AtomicBool,
 }
 
 // Os deslocamentos que `syscall.S` usa.
@@ -82,10 +97,24 @@ const _: () = assert!(offset_of!(PerCpu, apic_id) == 28);
 
 // SAFETY: os campos compartilháveis são atômicos; GDT e TSS (as células)
 // só são tocadas pela própria CPU, com interrupções desligadas (`load` e
-// `set_kernel_stack`), e a CPU as lê pelo hardware.
+// `set_kernel_stack`), e a CPU as lê pelo hardware; os caches de frames e
+// de objetos, só pela própria CPU em `with_frame_cache` e
+// `with_object_cache`.
 unsafe impl Sync for PerCpu {}
 
 impl PerCpu {
+    /// Frames no cache desta área (lido de qualquer CPU; pode estar
+    /// mudando).
+    pub fn frames_cached(&self) -> usize {
+        self.frames_cached.load(Ordering::Relaxed) as usize
+    }
+
+    /// Objetos do heap no cache desta área (lido de qualquer CPU; pode
+    /// estar mudando).
+    pub fn objects_cached(&self) -> usize {
+        self.objects_cached.load(Ordering::Relaxed) as usize
+    }
+
     /// Área vazia da CPU de id lógico `cpu_id`.
     pub const fn new(cpu_id: u32) -> Self {
         Self {
@@ -107,6 +136,12 @@ impl PerCpu {
             panic_dump: [const { AtomicU64::new(0) }; 6],
             gdt: UnsafeCell::new(gdt::GDT_TEMPLATE),
             tss: UnsafeCell::new(Tss::new()),
+            frames: UnsafeCell::new(FrameCache::new()),
+            frames_cached: AtomicU32::new(0),
+            frames_busy: AtomicBool::new(false),
+            objects: UnsafeCell::new(object_cache()),
+            objects_cached: AtomicU32::new(0),
+            objects_busy: AtomicBool::new(false),
         }
     }
 
@@ -304,6 +339,68 @@ pub fn with<R>(f: impl FnOnce(&PerCpu) -> R) -> R {
     r
 }
 
+/// Roda `f` com o cache de frames desta CPU (T-328; ADR 0031, item 3: sem
+/// trava). `f` não pode trocar de contexto nem alocar ou liberar frames
+/// (o cache não é reentrante); pode tomar a trava do buddy.
+///
+/// # Panics
+///
+/// Se o cache desta CPU já está emprestado (reentrada).
+pub fn with_frame_cache<R>(f: impl FnOnce(&mut FrameCache) -> R) -> R {
+    let p = this();
+    // SAFETY: a célula é desta CPU e só se chega a ela por aqui.
+    unsafe {
+        borrow(&p.frames, &p.frames_busy, |cache| {
+            let r = f(cache);
+            p.frames_cached.store(count(cache.len()), Ordering::Relaxed);
+            r
+        })
+    }
+}
+
+/// Roda `f` com o cache de objetos do heap desta CPU (T-328). `f` não pode
+/// trocar de contexto nem alocar ou liberar no heap; pode tomar a trava do
+/// heap (e, por ela, alocar frames).
+///
+/// # Panics
+///
+/// Se o cache desta CPU já está emprestado (reentrada).
+pub fn with_object_cache<R>(f: impl FnOnce(&mut ObjectCache) -> R) -> R {
+    let p = this();
+    // SAFETY: a célula é desta CPU e só se chega a ela por aqui.
+    unsafe {
+        borrow(&p.objects, &p.objects_busy, |cache| {
+            let r = f(cache);
+            let n = cache.iter().map(okernel::mm::cache::Magazine::len).sum();
+            p.objects_cached.store(count(n), Ordering::Relaxed);
+            r
+        })
+    }
+}
+
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Empresta `cell` a `f`, com `busy` pegando a reentrada.
+///
+/// # Safety
+///
+/// `cell` é um campo da `PerCpu` desta CPU que só se toca por esta função
+/// com o mesmo `busy`.
+unsafe fn borrow<T, R>(cell: &UnsafeCell<T>, busy: &AtomicBool, f: impl FnOnce(&mut T) -> R) -> R {
+    // Só esta CPU toca `busy`, com IF=0: ler e gravar basta, sem a troca
+    // atômica (que custa caro no caminho de toda alocação).
+    assert!(!busy.load(Ordering::Relaxed), "cache por CPU reentrado");
+    busy.store(true, Ordering::Relaxed);
+    // SAFETY: contrato acima; só esta CPU chega à célula, e com IF=0 (todo
+    // o kernel, ADR 0009) nenhuma interrupção roda no meio; `busy` acaba de
+    // garantir que não há outro empréstimo aberto.
+    let r = f(unsafe { &mut *cell.get() });
+    busy.store(false, Ordering::Relaxed);
+    r
+}
+
 /// A pilha de travas desta CPU, para os ganchos de `okernel::sync` (uma
 /// trava nunca atravessa uma troca de contexto, então a CPU não muda
 /// enquanto a pilha é usada).
@@ -339,14 +436,19 @@ pub fn cpu_id() -> u32 {
     id
 }
 
-/// Em debug, acusa pânico se há empréstimo de [`with`] aberto (antes de
-/// trocar de contexto).
+/// Em debug, acusa pânico se há empréstimo de [`with`] ou de um cache por
+/// CPU aberto (antes de trocar de contexto).
 pub fn assert_no_borrows() {
     if cfg!(debug_assertions) {
-        let n = this().borrows.load(Ordering::Relaxed);
+        let p = this();
+        let n = p.borrows.load(Ordering::Relaxed);
         assert!(
             n == 0,
             "{n} empréstimo(s) da PerCpu abertos na troca de contexto"
+        );
+        assert!(
+            !p.frames_busy.load(Ordering::Relaxed) && !p.objects_busy.load(Ordering::Relaxed),
+            "cache por CPU emprestado na troca de contexto"
         );
     }
 }

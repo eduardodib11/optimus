@@ -134,6 +134,33 @@ fn liberacao_invalida_e_recusada() {
     assert_eq!(heap.free(a, l), Err(HeapError::BadFree));
 }
 
+#[test]
+fn objetos_por_classe_para_os_caches_por_cpu() {
+    let mut heap = Heap::new(Fake::default(), MIB);
+    for (i, &size) in CLASSES.iter().enumerate() {
+        let a = heap.alloc_class(i).unwrap();
+        // Serve a qualquer layout da classe: tamanho e alinhamento.
+        assert_eq!(class(layout(size, size)), Some(i));
+        assert!(a.is_multiple_of(size as u64));
+        assert!(plausible(i, a));
+        assert!(!plausible(i, a + 8));
+        assert!(!plausible(i, a & !(FRAME_SIZE - 1)));
+        // O objeto volta pela classe ou pelo layout, indistintamente.
+        heap.free_class(i, a).unwrap();
+        assert_eq!(heap.free_class(i, a), Err(HeapError::BadFree));
+        let b = heap.alloc_class(i).unwrap();
+        heap.free(b, layout(size, 8)).unwrap();
+    }
+    assert_eq!(heap.alloc_class(CLASSES.len()), None);
+    assert_eq!(heap.free_class(CLASSES.len(), 0), Err(HeapError::BadFree));
+    assert!(!plausible(CLASSES.len(), 0x1_0000_0040));
+    assert_eq!(heap.failures(), 0);
+    // Sem páginas, o cache só deixa de encher: não é falha do heap.
+    let mut empty = Heap::new(Fake::default(), 0);
+    assert_eq!(empty.alloc_class(0), None);
+    assert_eq!(empty.failures(), 0);
+}
+
 /// PRNG xorshift64.
 struct XorShift(u64);
 
