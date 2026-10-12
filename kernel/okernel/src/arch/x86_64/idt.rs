@@ -145,12 +145,13 @@ pub fn exception_name(vector: u64) -> (&'static str, &'static str) {
         .unwrap_or(("???", "vetor desconhecido"))
 }
 
-/// Preenche as portas 0 a 255 e carrega a IDT.
+/// Preenche as portas 0 a 255 e carrega a IDT (uma só, imutável depois do
+/// boot).
 ///
 /// # Safety
 ///
 /// Só pode rodar uma vez, no boot, com interrupções desligadas e depois de
-/// [`super::gdt::init`] (as portas usam o seletor e as ISTs dela).
+/// [`super::percpu::init_bsp`] (as portas usam o seletor e as ISTs da GDT).
 pub unsafe fn init() {
     // SAFETY: contrato acima; `isr_table` é só leitura e foi relocada pelo
     // optboot, e ninguém mais acessa `IDT` agora.

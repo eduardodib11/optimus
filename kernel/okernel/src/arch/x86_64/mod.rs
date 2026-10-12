@@ -9,6 +9,7 @@ pub mod fpu;
 pub mod gdt;
 pub mod hpet;
 pub mod idt;
+pub mod percpu;
 pub mod probe;
 pub mod serial;
 pub mod syscall;
@@ -22,17 +23,18 @@ global_asm!(include_str!("probe.S"));
 global_asm!(include_str!("syscall.S"));
 global_asm!(include_str!("user.S"));
 
-/// Carrega GDT, TSS e IDT e liga SYSCALL/SYSRET.
+/// Instala a área por CPU do BSP (GDT, TSS e GS), carrega a IDT e liga
+/// SYSCALL/SYSRET.
 ///
 /// # Safety
 ///
 /// Só pode rodar uma vez, no boot, com interrupções desligadas.
 pub unsafe fn init() {
-    // SAFETY: contrato acima, que é o de `gdt::init`, `idt::init` e
+    // SAFETY: contrato acima, que é o de `percpu::init_bsp`, `idt::init` e
     // `syscall::init`; a GDT vem antes porque a IDT e o STAR usam os
     // seletores e as ISTs dela.
     unsafe {
-        gdt::init();
+        percpu::init_bsp();
         idt::init();
         syscall::init();
     }

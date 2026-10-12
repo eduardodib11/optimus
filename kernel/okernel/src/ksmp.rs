@@ -12,7 +12,7 @@ use kabi::boot::BootInfo;
 use okernel::acpi::madt::{self, Options, Topology};
 use okernel::log::option;
 
-use crate::arch::x86_64::apic;
+use crate::arch::x86_64::{apic, percpu};
 use crate::ktime::DirectRead;
 
 pub mod tests;
@@ -37,6 +37,7 @@ pub fn apic_id(cpu: usize) -> Option<u32> {
 pub fn init(info: &BootInfo, cmdline: &str) {
     let (bsp, _) = apic::id_and_version();
     APIC_IDS[0].store(bsp, Ordering::Relaxed);
+    percpu::with(|p| p.set_apic_id(bsp));
     let limit = option(cmdline, "smp")
         .and_then(|n| n.parse::<usize>().ok())
         .unwrap_or(MAX_CPUS);
