@@ -216,3 +216,22 @@ pub fn flush_tlb() {
     // SAFETY: regravar o mesmo CR3 mantém o espaço de endereçamento.
     unsafe { write_cr3(read_cr3()) };
 }
+
+/// CR4.PGE: páginas globais (sobrevivem à troca de CR3).
+const CR4_PGE: u64 = 1 << 7;
+
+/// Descarta a TLB inteira, globais incluídas (desligar e religar CR4.PGE
+/// esvazia tudo; sem PGE, basta recarregar o CR3).
+pub fn flush_tlb_all() {
+    let cr4 = read_cr4();
+    if cr4 & CR4_PGE == 0 {
+        flush_tlb();
+        return;
+    }
+    // SAFETY: só PGE muda, e volta ao valor de antes; nada mais do modo da
+    // CPU é tocado.
+    unsafe {
+        write_cr4(cr4 & !CR4_PGE);
+        write_cr4(cr4);
+    }
+}

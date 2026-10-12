@@ -25,7 +25,8 @@ pub(crate) struct Fake {
     /// Threads acordadas por objeto de IPC destruído.
     pub(crate) woken: AtomicU64,
     pub(crate) frame_limit: i64,
-    pub(crate) flushes: Mutex<Vec<u64>>,
+    /// Shootdowns pedidos: início, páginas e frames vivos na hora.
+    pub(crate) flushes: Mutex<Vec<(u64, u64, i64)>>,
 }
 
 /// Tabelas falsas de um espaço, num mapa por endereço.
@@ -103,8 +104,9 @@ impl Platform for Leaked {
     fn free_frame(&self, frame: PhysAddr) {
         self.0.free_frame(frame);
     }
-    fn flush(&self, _: PhysAddr, virt: u64) {
-        self.0.flushes.lock().unwrap().push(virt);
+    fn flush(&self, _: PhysAddr, start: u64, pages: u64) {
+        let live = self.0.frames_live.load(Ordering::Relaxed);
+        self.0.flushes.lock().unwrap().push((start, pages, live));
     }
     fn alloc_kernel_stack(&self) -> Option<KernelStack> {
         let slot = self.0.stacks_live.fetch_add(1, Ordering::Relaxed);

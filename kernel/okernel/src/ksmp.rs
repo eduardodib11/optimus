@@ -18,6 +18,7 @@ use crate::ktime::DirectRead;
 pub mod ipi;
 pub mod start;
 pub mod tests;
+pub mod tlb;
 pub mod tsc;
 pub use tests::TESTS;
 

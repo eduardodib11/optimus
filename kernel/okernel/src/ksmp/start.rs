@@ -113,6 +113,7 @@ fn wait_until(ns: u64, done: impl Fn() -> bool) -> bool {
         if done() {
             return true;
         }
+        super::ipi::poll();
         core::hint::spin_loop();
     }
     done()

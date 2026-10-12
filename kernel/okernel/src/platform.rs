@@ -27,9 +27,11 @@ pub trait Platform: Sync {
     fn alloc_frame(&self) -> Option<PhysAddr>;
     /// Devolve um frame de [`alloc_frame`](Self::alloc_frame).
     fn free_frame(&self, frame: PhysAddr);
-    /// Invalida a tradução de `virt` no espaço com PML4 `root`, onde ela
-    /// estiver em cache.
-    fn flush(&self, root: PhysAddr, virt: u64);
+    /// Invalida as traduções de `pages` páginas a partir de `start` no
+    /// espaço com PML4 `root`, em toda CPU que as possa ter em cache (TLB
+    /// shootdown, T-326), e só volta depois. Quem chama libera o que saiu
+    /// do mapeamento só depois disso.
+    fn flush(&self, root: PhysAddr, start: u64, pages: u64);
     /// Pilha de kernel de uma thread nova ([`KERNEL_STACK_BYTES`]), com
     /// página de guarda.
     fn alloc_kernel_stack(&self) -> Option<KernelStack>;

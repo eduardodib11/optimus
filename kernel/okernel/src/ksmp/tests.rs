@@ -227,6 +227,7 @@ fn clock_round() -> u64 {
         }
         CLOCK_LAST.fetch_max(now, Ordering::AcqRel);
         reads += 1;
+        super::ipi::poll();
         if now >= end {
             return reads;
         }
@@ -260,6 +261,7 @@ fn relogio_entre_cpus() -> Outcome {
     let mine = clock_round();
     while CLOCK_DONE.load(Ordering::Acquire) < aps {
         ensure!(ktime::now_ns() < start + (secs + 1) * NS_PER_SEC);
+        super::ipi::poll();
         core::hint::spin_loop();
     }
     let reads = CLOCK_READS.load(Ordering::Relaxed) + mine;
@@ -285,6 +287,9 @@ fn aps_ociosos() -> Outcome {
     let before: [u64; 8] = core::array::from_fn(fires);
     let end = ktime::now_ns() + secs * NS_PER_SEC;
     while ktime::now_ns() < end {
+        // Toda espera ativa atende a caixa (ADR 0031): um shootdown de
+        // outra CPU espera por esta.
+        super::ipi::poll();
         core::hint::spin_loop();
     }
     // Um disparo a cada 10 ms; no TCG, metade disso já basta.

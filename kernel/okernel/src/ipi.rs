@@ -14,6 +14,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
+use crate::tlb;
+
 /// Bit de `pending`: reavaliar quem roda (vetor `0xF0`).
 pub const RESCHED: u32 = 1 << 0;
 /// Bit de `pending`: função remota (vetor `0xF1`).
@@ -40,6 +42,10 @@ pub struct Mailbox {
     need_resched: AtomicBool,
     /// Pedidos atendidos, por bit (estatística dos testes).
     handled: [AtomicU64; 3],
+    /// Pedido de shootdown desta CPU para as outras (T-326).
+    tlb_request: tlb::Request,
+    /// CPUs com pedido de shootdown para esta.
+    tlb_inbox: tlb::Inbox,
 }
 
 impl Default for Mailbox {
@@ -60,7 +66,21 @@ impl Mailbox {
             call_done: AtomicBool::new(false),
             need_resched: AtomicBool::new(false),
             handled: [const { AtomicU64::new(0) }; 3],
+            tlb_request: tlb::Request::new(),
+            tlb_inbox: tlb::Inbox::new(),
         }
+    }
+
+    /// O pedido de shootdown desta CPU (ela o preenche; os alvos o leem).
+    pub const fn tlb_request(&self) -> &tlb::Request {
+        &self.tlb_request
+    }
+
+    /// A caixa de entrada de shootdown desta CPU. Quem pede liga o próprio
+    /// bit nela e depois `TLB` com [`post`](Self::post); o bit `TLB` que
+    /// [`poll`](Self::poll) devolve manda esvaziá-la.
+    pub const fn tlb_inbox(&self) -> &tlb::Inbox {
+        &self.tlb_inbox
     }
 
     /// Liga `bits` (`RESCHED` ou `TLB`); quem chama manda o IPI depois.

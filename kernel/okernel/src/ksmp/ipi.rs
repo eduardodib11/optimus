@@ -10,9 +10,9 @@
 //!   tratador do IPI o consome e reavalia quem roda ([`on_ipi`], T-324).
 //! - `CALL` (`0xF1`): função remota síncrona ([`call_on`]), restrita a
 //!   funções que não tomam trava, não esperam e não mandam IPI.
-//! - `TLB` (`0xF2`): reservado ao shootdown (T-326).
+//! - `TLB` (`0xF2`): shootdown ([`super::tlb`], T-326).
 
-use okernel::ipi::{RESCHED, RemoteFn};
+use okernel::ipi::{RESCHED, RemoteFn, TLB};
 
 use crate::arch::x86_64::{apic, percpu};
 use crate::ktime;
@@ -23,7 +23,9 @@ const CALL_TIMEOUT_NS: u64 = 100_000_000;
 /// Atende a caixa desta CPU. Barato sem pedidos (uma carga); não toma
 /// trava, então serve em qualquer espera.
 pub fn poll() {
-    percpu::mailbox().poll();
+    if percpu::mailbox().poll() & TLB != 0 {
+        super::tlb::serve();
+    }
 }
 
 /// Pede à CPU `cpu` que reavalie quem roda. `false` se ela não está ligada.

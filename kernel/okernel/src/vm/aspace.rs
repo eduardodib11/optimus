@@ -196,9 +196,17 @@ impl AddressSpace {
         Ok(())
     }
 
-    fn unmap_page(&mut self, virt: u64) {
-        if self.tables.unmap(virt, PageSize::Size4K).is_ok() {
-            self.platform.flush(self.root(), virt);
+    /// Desmapeia as páginas de `[start, end)` e invalida as traduções em
+    /// toda CPU de uma vez (um shootdown por chamada, ADR 0031, item 7),
+    /// antes que qualquer objeto que saia do espaço possa morrer.
+    fn unmap_pages(&mut self, start: u64, end: u64) {
+        let mut any = false;
+        for page in pages_of(start, end) {
+            any |= self.tables.unmap(page, PageSize::Size4K).is_ok();
+        }
+        if any {
+            self.platform
+                .flush(self.root(), start, (end - start) / PAGE_SIZE);
         }
     }
 
@@ -264,9 +272,7 @@ impl AddressSpace {
         let used = self.live_tables() - before;
         self.charge.shrink(needed.saturating_sub(used) * PAGE_SIZE);
         if let Some(e) = failed {
-            for page in 0..done {
-                self.unmap_page(start + page * PAGE_SIZE);
-            }
+            self.unmap_pages(start, start + done * PAGE_SIZE);
             self.charge.shrink(Region::BYTES);
             return Err(map_error(e));
         }
@@ -302,9 +308,9 @@ impl AddressSpace {
         if splits {
             self.reserve_regions(1)?;
         }
-        for page in pages_of(start, end) {
-            self.unmap_page(page);
-        }
+        // As regiões (e talvez os objetos, com os frames) só saem depois do
+        // shootdown.
+        self.unmap_pages(start, end);
         let mut i = 0;
         while i < self.regions.len() {
             let r = &self.regions[i];
@@ -391,14 +397,14 @@ impl AddressSpace {
         }
         for page in pages_of(start, end) {
             // Toda página da faixa está mapeada (conferido acima).
-            if self
+            let _ = self
                 .tables
-                .protect(page, PageSize::Size4K, perms.page_flags())
-                .is_ok()
-            {
-                self.platform.flush(self.root(), page);
-            }
+                .protect(page, PageSize::Size4K, perms.page_flags());
         }
+        // Uma rodada para a faixa toda, mesmo quando só amplia: uma tradução
+        // velha mais restrita daria falta espúria.
+        self.platform
+            .flush(self.root(), start, (end - start) / PAGE_SIZE);
         Ok(())
     }
 }

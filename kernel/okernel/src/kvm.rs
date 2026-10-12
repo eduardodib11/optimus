@@ -3,8 +3,9 @@
 //!
 //! A [`Platform`] do kernel entrega aos objetos portáveis de `okernel::vm`
 //! frames zerados do buddy, tabelas pelo mapa direto e invalidação da TLB
-//! (`invlpg` quando o espaço é o do CR3; os outros espaços não têm
-//! traduções em cache, porque a troca de CR3 sem PCID descarta a TLB).
+//! em toda CPU com o espaço no CR3 (shootdown, `ksmp::tlb`, T-326; as
+//! outras não têm traduções em cache, porque a troca de CR3 sem PCID
+//! descarta a TLB).
 //!
 //! As pilhas de kernel das threads (16 KiB) ficam na faixa de pilhas da
 //! seção 6.4, uma por fatia de 32 KiB: os 16 KiB de baixo nunca são
@@ -22,6 +23,8 @@ use okernel::thread::Thread;
 
 use crate::arch::x86_64::{cpu, fpu};
 use crate::kmem::{self, DirectMap};
+use crate::ksmp::tlb;
+use okernel::tlb::Flush;
 
 /// Início das pilhas de kernel das threads, na faixa de pilhas da seção 6.4
 /// (`0xFFFF_E000_0000_0000`); o primeiro MiB dela fica com a pilha
@@ -67,10 +70,8 @@ impl Platform for KernelPlatform {
         kmem::free_frames(frame, 0);
     }
 
-    fn flush(&self, root: PhysAddr, virt: u64) {
-        if cpu::read_cr3() & CR3_ADDR == root.0 {
-            cpu::invlpg(virt);
-        }
+    fn flush(&self, root: PhysAddr, start: u64, pages: u64) {
+        tlb::flush(root.0, Flush::range(start, pages));
     }
 
     fn alloc_kernel_stack(&self) -> Option<KernelStack> {
@@ -103,12 +104,12 @@ impl Platform for KernelPlatform {
     }
 
     fn free_kernel_stack(&self, stack: KernelStack) {
+        // Um shootdown para a pilha toda (a thread pode ter rodado noutra
+        // CPU), e só depois os frames voltam ao buddy.
         let bottom = stack.top - KERNEL_STACK_BYTES;
-        for page in (0..KERNEL_STACK_BYTES / PAGE).map(|i| bottom + i * PAGE) {
-            if let Ok(frame) = kmem::unmap(page, PageSize::Size4K) {
-                kmem::free_frames(frame, 0);
-            }
-        }
+        kmem::unmap_pages(bottom, KERNEL_STACK_BYTES / PAGE, &mut |frame| {
+            kmem::free_frames(frame, 0);
+        });
         let mut slots = STACK_SLOTS.lock();
         // Sem memória para a lista, a fatia só deixa de ser reutilizada.
         if slots.1.try_reserve(1).is_ok() {
@@ -140,7 +141,19 @@ pub fn init() {
 /// alta do kernel) ou o do kernel, e continuar vivo enquanto estiver no CR3.
 pub unsafe fn activate(root: PhysAddr) -> u64 {
     let old = cpu::read_cr3();
-    // SAFETY: contrato acima: o PML4 mapeia o kernel em execução.
-    unsafe { cpu::write_cr3(root.0) };
+    // SAFETY: contrato acima.
+    unsafe { load_root(root.0) };
     old
+}
+
+/// Carrega `root` no CR3, anotando-o antes para o shootdown (ADR 0031,
+/// item 7: a anotação vem antes do `mov cr3`).
+///
+/// # Safety
+///
+/// Como em [`activate`].
+pub unsafe fn load_root(root: u64) {
+    tlb::note_root(root);
+    // SAFETY: contrato acima: o PML4 mapeia o kernel em execução.
+    unsafe { cpu::write_cr3(root) };
 }

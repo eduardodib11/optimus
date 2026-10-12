@@ -16,8 +16,10 @@ use okernel::mm::buddy::{FrameAllocator, FrameMeta};
 use okernel::mm::paging::{Flags, MapError, Mapping, PageSize, PageTables, Table, TableMemory};
 use okernel::mm::{FRAME_SIZE, PhysAddr, frames};
 use okernel::sync::{LockClass, SpinLock};
+use okernel::tlb::{Flush, KERNEL_ROOT};
 
 use crate::arch::x86_64::cpu;
+use crate::ksmp::tlb;
 
 mod tests;
 pub use tests::TESTS;
@@ -128,17 +130,40 @@ pub fn map(virt: u64, phys: PhysAddr, size: PageSize, flags: Flags) -> Result<()
     with_tables(|pt| pt.map(virt, phys, size, flags))
 }
 
-/// Desmapeia uma página do kernel e invalida a TLB; devolve o frame.
+/// Desmapeia uma página do kernel e invalida a TLB em toda CPU
+/// (shootdown, T-326); devolve o frame, que só então pode ser liberado.
 pub fn unmap(virt: u64, size: PageSize) -> Result<PhysAddr, MapError> {
     let phys = with_tables(|pt| pt.unmap(virt, size))?;
-    cpu::invlpg(virt);
+    tlb::flush(KERNEL_ROOT, Flush::range(virt, size.bytes() / 4096));
     Ok(phys)
 }
 
-/// Troca as permissões de uma página do kernel e invalida a TLB.
+/// Desmapeia `pages` páginas de 4 KiB do kernel a partir de `start` (até
+/// [`okernel::tlb::MAX_PAGES`]) com um só shootdown e só depois entrega a
+/// `freed` o frame de cada uma.
+pub fn unmap_pages(start: u64, pages: u64, freed: &mut dyn FnMut(PhysAddr)) {
+    const _: () = assert!(okernel::tlb::MAX_PAGES == 32);
+    let mut frames = [PhysAddr(0); 32];
+    let mut n = 0;
+    if let Some(pt) = KERNEL_PT.lock().as_mut() {
+        for i in 0..pages.min(okernel::tlb::MAX_PAGES) {
+            if let Ok(frame) = pt.unmap(start + i * 4096, PageSize::Size4K) {
+                frames[n] = frame;
+                n += 1;
+            }
+        }
+    }
+    tlb::flush(KERNEL_ROOT, Flush::range(start, pages));
+    for &frame in &frames[..n] {
+        freed(frame);
+    }
+}
+
+/// Troca as permissões de uma página do kernel e invalida a TLB em toda
+/// CPU.
 pub fn protect(virt: u64, size: PageSize, flags: Flags) -> Result<(), MapError> {
     with_tables(|pt| pt.protect(virt, size, flags))?;
-    cpu::invlpg(virt);
+    tlb::flush(KERNEL_ROOT, Flush::range(virt, size.bytes() / 4096));
     Ok(())
 }
 

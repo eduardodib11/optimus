@@ -21,6 +21,7 @@ use crate::{kmem, ktime};
 mod sched;
 mod smp;
 mod sync;
+mod tlb;
 
 /// Testes de kernel de threads de usuário.
 pub const TESTS: &[Test] = &[
@@ -55,6 +56,18 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "smp.dois_processos_alternam_em_cpus_distintas",
         run: smp::alternam_em_cpus_distintas,
+    },
+    Test {
+        name: "smp.vm_unmap_faz_a_outra_cpu_faltar",
+        run: tlb::unmap_faz_faltar,
+    },
+    Test {
+        name: "smp.shootdown_sem_traducao_velha",
+        run: tlb::sem_traducao_velha,
+    },
+    Test {
+        name: "smp.shootdown_do_kernel_sem_traducao_velha",
+        run: tlb::kernel_sem_traducao_velha,
     },
 ];
 

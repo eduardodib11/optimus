@@ -35,7 +35,7 @@ const DEFAULT_ROUNDS: u64 = 10_000;
 const MS: u64 = 1_000_000;
 
 /// Valor de uma opção `nome=N` da linha de comando, ou `default`.
-fn option(name: &str, default: u64) -> u64 {
+pub(super) fn option(name: &str, default: u64) -> u64 {
     crate::bootinfo::get()
         .and_then(|i| i.cmdline())
         .and_then(|c| okernel::log::option(c, name))
@@ -46,7 +46,7 @@ fn option(name: &str, default: u64) -> u64 {
 /// Espera até `done()` ou `limit_ns`, rodando as prontas desta CPU e
 /// dormindo (`hlt`, com o timer armado para 1 ms) entre uma olhada e outra:
 /// o BSP girando tiraria do host a CPU de que os APs do QEMU precisam.
-fn wait_for(limit_ns: u64, done: impl Fn() -> bool) -> bool {
+pub(super) fn wait_for(limit_ns: u64, done: impl Fn() -> bool) -> bool {
     wait_with(limit_ns, true, done)
 }
 
@@ -249,6 +249,6 @@ fn acorda_longe_da_ocupada(home: u32) -> Outcome {
 }
 
 /// Terminou e saiu da CPU.
-fn gone(t: &Thread) -> bool {
+pub(super) fn gone(t: &Thread) -> bool {
     t.state() == RunState::Exited && !t.on_cpu()
 }

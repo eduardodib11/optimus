@@ -116,7 +116,13 @@ fn protect_parte_regioes_e_exige_tudo_mapeado() {
     assert_eq!(space.query(U + P).unwrap().1, RX);
     assert_eq!(space.query(U).unwrap().1, RW);
     assert_eq!(space.query(U + 2 * P).unwrap().1, RW);
-    assert!(fake.flushes.lock().unwrap().contains(&(U + P)));
+    assert!(
+        fake.flushes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(s, n, _)| (s, n) == (U + P, 1))
+    );
     // Buraco na faixa: nada muda.
     assert_eq!(
         space.protect(U, 5 * P, Perms::default()),
@@ -136,14 +142,21 @@ fn unmap_parte_regioes_e_libera_o_objeto() {
     assert_eq!(space.regions(), 2);
     assert_eq!(space.query(U + P), None);
     assert_eq!(space.query(U + 2 * P).unwrap().0, frame2);
-    // Faixa sem nada mapeado também vale.
+    // Faixa sem nada mapeado também vale, sem shootdown.
+    let flushes = fake.flushes.lock().unwrap().len();
     space.unmap(U + 0x10_0000, P).unwrap();
+    assert_eq!(fake.flushes.lock().unwrap().len(), flushes);
     let weak = Arc::downgrade(&mo);
     drop(mo);
     assert!(weak.upgrade().is_some(), "as regiões seguram o objeto");
+    let live = fake.frames_live.load(Ordering::Relaxed);
     space.unmap(U, 4 * P).unwrap();
     assert_eq!(space.regions(), 0);
     assert!(weak.upgrade().is_none());
+    // Um shootdown para a faixa toda, antes de os frames do objeto saírem.
+    let last = *fake.flushes.lock().unwrap().last().unwrap();
+    assert_eq!(last, (U, 4, live));
+    assert!(fake.frames_live.load(Ordering::Relaxed) < live);
     let tables = space.live_tables();
     assert_eq!(
         quota.used(),
