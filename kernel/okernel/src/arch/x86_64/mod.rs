@@ -6,6 +6,7 @@ use core::arch::{asm, global_asm};
 pub mod ap;
 pub mod apic;
 pub mod cpu;
+pub mod cpustate;
 pub mod fpu;
 pub mod gdt;
 pub mod hpet;

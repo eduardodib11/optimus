@@ -596,6 +596,11 @@ impl sys::Env for KernelEnv {
 /// ocioso: reavalia quem roda.
 pub fn on_timer() {
     ktime::timer_fired();
+    // Até os APs rodarem threads (T-324), o escalonador é só do BSP: o
+    // timer de um AP ocioso só o acorda.
+    if percpu::cpu_id() != 0 {
+        return;
+    }
     preempt();
 }
 

@@ -20,7 +20,7 @@ use okernel::mm::{FRAME_SIZE, frames};
 
 use crate::arch::x86_64::ap::Trampoline;
 use crate::arch::x86_64::percpu::{self, PerCpu};
-use crate::arch::x86_64::{apic, cpu, idt, syscall};
+use crate::arch::x86_64::{apic, cpu, cpustate, idt, syscall};
 use crate::{bootinfo, kmem, ktime};
 
 /// Início da janela de áreas e pilhas por CPU (seção 6.4).
@@ -112,6 +112,7 @@ fn wait_until(ns: u64, done: impl Fn() -> bool) -> bool {
 /// Liga os APs da topologia, um por vez.
 pub fn start_aps() {
     mark_online(0, percpu::bsp());
+    cpustate::capture();
     let count = super::count();
     if count < 2 {
         return;
@@ -189,7 +190,8 @@ fn start_one(tramp: &Trampoline, cpu: u32, apic_id: u32) -> bool {
 }
 
 /// Primeira função em Rust de um AP, chamada por `ap_entry64` na pilha de
-/// boot dele, com interrupções desligadas e o CR3 do kernel.
+/// boot dele, com interrupções desligadas e o CR3 do kernel (ADR 0030,
+/// item 4).
 #[unsafe(no_mangle)]
 extern "sysv64" fn ap_main(p: &'static PerCpu) -> ! {
     let cpu = p.cpu_id();
@@ -200,7 +202,6 @@ extern "sysv64" fn ap_main(p: &'static PerCpu) -> ! {
     unsafe {
         p.install(p.apic_id(), tops);
         idt::load();
-        syscall::init();
     }
     let hw = cpu::apic_id();
     if hw != p.apic_id() {
@@ -208,8 +209,39 @@ extern "sysv64" fn ap_main(p: &'static PerCpu) -> ! {
         // tocar em nada.
         crate::arch::x86_64::halt();
     }
+    // SAFETY: AP com IF=0, depois de `cpustate::capture` no BSP (feito
+    // antes de ligar os APs) e antes de qualquer FPU ou memória de usuário.
+    if let Err(what) = unsafe { cpustate::apply(cpu) } {
+        warn!("okernel: cpu{cpu} sem {what}, que o BSP usa; fica fora");
+        crate::arch::x86_64::halt();
+    }
+    // SAFETY: GS já aponta a área desta CPU.
+    unsafe { syscall::init() };
+    if !apic::init_ap() {
+        warn!("okernel: cpu{cpu} sem o modo de APIC do BSP; fica fora");
+        crate::arch::x86_64::halt();
+    }
     info!("okernel: cpu{cpu} online (APIC {hw})");
     p.set_online();
-    // A inicialização completa e o laço ocioso vêm no T-319.
-    crate::arch::x86_64::halt()
+    idle()
+}
+
+/// Intervalo do timer de um AP ocioso.
+pub const IDLE_TICK_NS: u64 = 10 * MS;
+
+/// Laço ocioso de um AP: `sti; hlt` com o timer armado a cada
+/// [`IDLE_TICK_NS`]. Provisório até o escalonador por CPU (T-323 e T-324):
+/// sem IPIs nem fila, o timer é o que acorda a CPU para ela ver pedidos.
+fn idle() -> ! {
+    loop {
+        ktime::arm_by(ktime::now_ns() + IDLE_TICK_NS);
+        cpu::wait_for_interrupt();
+    }
+}
+
+/// A área da CPU `cpu`, se ligada.
+pub fn percpu_of(cpu: usize) -> Option<&'static PerCpu> {
+    let p = PERCPUS.get(cpu)?.load(Ordering::Acquire);
+    // SAFETY: só `mark_online` grava, com áreas que vivem para sempre.
+    unsafe { p.as_ref() }
 }
