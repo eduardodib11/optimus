@@ -5,15 +5,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kabi::fault::PAGE_FAULT;
 use kabi::vm::{PAGE_SIZE, WRITE};
-use kabi::{Handle, ObjectType};
-use okernel::cap::Cap;
 use okernel::fault::Kill;
 use okernel::mm::paging::{Flags, PageSize};
 use okernel::vm::{vm_map, vm_unmap};
 
 use super::super::{UserEntry, start_on};
 use super::smp::{gone, option, wait_for};
-use super::{DATA_VA, Process, cap, delete, process, settled, thread, user_symbol};
+use super::{DATA_VA, Page, delete, process, settled, thread, user_symbol};
 use crate::kcap::root_quota;
 use crate::ktest::Outcome;
 use crate::{kfault, kmem, ksmp, ktime};
@@ -48,46 +46,6 @@ const EXPECT: usize = 2;
 const STALE: usize = 3;
 const READS: usize = 4;
 const STOP: usize = 5;
-
-/// Um `MemoryObject` de uma página de um processo de teste, visto pelo
-/// kernel pelo mapa direto.
-struct Page {
-    handle: Handle,
-    cap: Cap,
-    base: u64,
-}
-
-impl Page {
-    /// Cria a página em `p` (zerada).
-    fn new(p: &Process) -> Result<Self, &'static str> {
-        let handle = p
-            .cspace
-            .lock()
-            .obj_create(p.quota, ObjectType::MemoryObject, PAGE_SIZE)
-            .map_err(|_| "obj_create(MemoryObject)")?;
-        let cap = cap(&p.cspace, handle)?;
-        let frame = cap
-            .object
-            .as_memory_object()
-            .map_err(|_| "tipo")?
-            .frame(0)
-            .ok_or("frame")?;
-        Ok(Self {
-            handle,
-            cap,
-            base: kmem::direct(frame),
-        })
-    }
-
-    /// A palavra `i` da página.
-    fn word(&self, i: usize) -> &AtomicU64 {
-        assert!(i < 512);
-        // SAFETY: o frame é do MemoryObject que `self.cap` mantém vivo; no
-        // mapa direto, alinhado a 4 KiB, e só se acessa como atômicos (o
-        // usuário que o mapeia também é parte do teste).
-        unsafe { &*(self.base as *const AtomicU64).add(i) }
-    }
-}
 
 /// Com uma só CPU não há outra para avisar.
 fn other_cpus() -> Option<usize> {

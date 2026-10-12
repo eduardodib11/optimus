@@ -3,6 +3,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicU64;
 
 use kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use kabi::{Error, Handle, ObjectType};
@@ -183,6 +184,48 @@ fn bare_thread(p: &Process) -> Result<(Handle, Arc<Thread>), &'static str> {
     t.configure(Arc::clone(&p.cspace), aspace)
         .map_err(|_| "configure")?;
     Ok((h, t))
+}
+
+/// Um `MemoryObject` de uma página de um processo de teste, visto pelo
+/// kernel pelo mapa direto.
+pub struct Page {
+    /// Handle do objeto, para o teste apagá-lo no fim.
+    pub handle: Handle,
+    /// Capability do objeto, para mapeá-lo.
+    pub cap: Cap,
+    base: u64,
+}
+
+impl Page {
+    /// Cria a página em `p` (zerada).
+    pub fn new(p: &Process) -> Result<Self, &'static str> {
+        let handle = p
+            .cspace
+            .lock()
+            .obj_create(p.quota, ObjectType::MemoryObject, PAGE_SIZE)
+            .map_err(|_| "obj_create(MemoryObject)")?;
+        let cap = cap(&p.cspace, handle)?;
+        let frame = cap
+            .object
+            .as_memory_object()
+            .map_err(|_| "tipo")?
+            .frame(0)
+            .ok_or("frame")?;
+        Ok(Self {
+            handle,
+            cap,
+            base: kmem::direct(frame),
+        })
+    }
+
+    /// A palavra `i` da página.
+    pub fn word(&self, i: usize) -> &AtomicU64 {
+        assert!(i < 512);
+        // SAFETY: o frame é do MemoryObject que `self.cap` mantém vivo; no
+        // mapa direto, alinhado a 4 KiB, e só se acessa como atômicos (o
+        // usuário que o mapeia também é parte do teste).
+        unsafe { &*(self.base as *const AtomicU64).add(i) }
+    }
 }
 
 /// Prazo de [`run_until_exit`].

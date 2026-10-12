@@ -626,6 +626,21 @@ user_wait_cpu:
     syscall
     ud2
 
+/* user_spin_flag(rdi = página RW)
+ *
+ * Grava 1 em [página + 8] (já roda no anel 3) e gira, sem syscall, até
+ * [página] deixar de ser zero; então termina. Só o timer a tira da CPU. */
+.global user_spin_flag
+user_spin_flag:
+    mov qword ptr [rdi + 8], 1
+1:
+    pause
+    cmp qword ptr [rdi], 0
+    je 1b
+    mov eax, 33
+    syscall
+    ud2
+
 /* user_tlb_spin(rdi = endereço, rsi = página RW)
  *
  * Lê a palavra em `endereço`, grava-a em [página + 8] e conta a leitura em
