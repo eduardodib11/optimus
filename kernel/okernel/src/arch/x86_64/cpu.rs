@@ -55,6 +55,18 @@ pub fn under_tcg() -> bool {
     hypervisor().is_some_and(|sig| &sig == b"TCGTCGTCGTCG")
 }
 
+/// Id do APIC local desta CPU pela CPUID (folha 0xB, com o id de 32 bits
+/// do x2APIC, ou o id inicial de 8 bits da folha 1), sem tocar no APIC.
+pub fn apic_id() -> u32 {
+    if max_leaf(false) >= 0xb {
+        let r = cpuid(0xb, 0);
+        if r.ebx != 0 {
+            return r.edx;
+        }
+    }
+    cpuid(1, 0).ebx >> 24
+}
+
 /// Maior folha básica (`basic`) ou estendida de CPUID que a CPU oferece.
 pub fn max_leaf(extended: bool) -> u32 {
     cpuid(if extended { 0x8000_0000 } else { 0 }, 0).eax

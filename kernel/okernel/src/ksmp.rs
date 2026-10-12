@@ -3,7 +3,7 @@
 //! No boot, depois do APIC e do relógio, o kernel lê a MADT e guarda o id
 //! de APIC de cada CPU pelo id lógico (0 é o BSP). A opção `smp=N` da
 //! linha de comando limita quantas sobem; `smp=1` deixa o kernel como no
-//! M2. A partida dos APs vem no T-318.
+//! M2. A partida dos APs fica em [`start`].
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -15,6 +15,7 @@ use okernel::log::option;
 use crate::arch::x86_64::{apic, percpu};
 use crate::ktime::DirectRead;
 
+pub mod start;
 pub mod tests;
 pub use tests::TESTS;
 

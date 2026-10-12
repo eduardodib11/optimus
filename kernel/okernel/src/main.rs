@@ -87,6 +87,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
             kcap::init();
             ktime::init(info);
             ksmp::init(info, cmdline);
+            ksmp::start::start_aps();
         }
         None => warn!("okernel: mapa de memória ausente ou inválido"),
     }

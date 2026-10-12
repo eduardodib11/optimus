@@ -62,6 +62,29 @@ pub fn plan(map: &[MemRegion]) -> Option<Plan> {
     })
 }
 
+/// Páginas do trampolim de partida dos APs (ADR 0030, item 3): código,
+/// parâmetros e as quatro tabelas de página temporárias.
+pub const TRAMPOLINE_PAGES: u64 = 6;
+
+/// Endereço da primeira sequência de [`TRAMPOLINE_PAGES`] páginas usáveis
+/// abaixo de [`LOW_MEMORY`] e acima de `0x1000` (o vetor do SIPI é o
+/// número da página, e a página 0 guarda a IVT); `None` se não houver.
+#[must_use]
+pub fn trampoline_base(map: &[MemRegion]) -> Option<u64> {
+    let need = TRAMPOLINE_PAGES * FRAME_SIZE;
+    map.iter()
+        .filter(|r| r.kind() == MemKind::Usable)
+        .map(|r| {
+            (
+                r.base.max(FRAME_SIZE).next_multiple_of(FRAME_SIZE),
+                r.end().min(LOW_MEMORY) & !(FRAME_SIZE - 1),
+            )
+        })
+        .filter(|(start, end)| start < end && end - start >= need)
+        .map(|(start, _)| start)
+        .min()
+}
+
 /// Faixas `(base, len)` a entregar ao buddy: as usáveis menos os metadados.
 pub fn free_ranges<'a>(map: &'a [MemRegion], plan: &Plan) -> impl Iterator<Item = (u64, u64)> + 'a {
     let (hole_start, hole_end) = (plan.meta.0, plan.meta.0 + plan.meta_bytes);
@@ -106,6 +129,31 @@ mod tests {
                 (4 * MIB + bytes, 60 * MIB - bytes),
                 (68 * MIB, MIB),
             ]
+        );
+    }
+
+    #[test]
+    fn trampolim_abaixo_de_1_mib() {
+        let map = [
+            region(0, 0x3000, MemKind::Usable),
+            region(0x3000, 0x1000, MemKind::Reserved),
+            region(0x8000, 0x9_7000, MemKind::Usable),
+            region(MIB, 60 * MIB, MemKind::Usable),
+        ];
+        assert_eq!(trampoline_base(&map), Some(0x8000));
+        // A página 0 nunca entra; 0x1000 a 0x7000 cabe.
+        let map = [region(0, 0x7000, MemKind::Usable)];
+        assert_eq!(trampoline_base(&map), Some(0x1000));
+        // Pequeno demais, ou só acima de 1 MiB.
+        assert_eq!(trampoline_base(&[region(0, 0x6000, MemKind::Usable)]), None);
+        assert_eq!(
+            trampoline_base(&[region(MIB - 0x2000, 8 * MIB, MemKind::Usable)]),
+            None
+        );
+        // Faixa que cruza 1 MiB conta só até ele.
+        assert_eq!(
+            trampoline_base(&[region(MIB - 0x6000, MIB, MemKind::Usable)]),
+            Some(MIB - 0x6000)
         );
     }
 

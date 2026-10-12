@@ -3,6 +3,7 @@
 
 use core::arch::{asm, global_asm};
 
+pub mod ap;
 pub mod apic;
 pub mod cpu;
 pub mod fpu;
@@ -22,6 +23,7 @@ global_asm!(include_str!("vectors.S"));
 global_asm!(include_str!("probe.S"));
 global_asm!(include_str!("syscall.S"));
 global_asm!(include_str!("user.S"));
+global_asm!(include_str!("ap.S"));
 
 /// Instala a área por CPU do BSP (GDT, TSS e GS), carrega a IDT e liga
 /// SYSCALL/SYSRET.
