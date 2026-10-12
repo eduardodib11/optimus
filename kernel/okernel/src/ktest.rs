@@ -46,6 +46,7 @@ const SUITES: &[&[Test]] = &[
     crate::bootinfo::TESTS,
     crate::arch::x86_64::TESTS,
     crate::ksync::TESTS,
+    crate::ksmp::TESTS,
     crate::kmem::TESTS,
     crate::kheap::TESTS,
     crate::ktime::TESTS,

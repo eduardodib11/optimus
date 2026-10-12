@@ -1,11 +1,13 @@
 //! Leitura mínima das tabelas ACPI (T-109): RSDP, XSDT/RSDT e HPET.
 //!
-//! Só o necessário para achar o HPET (e, depois, a MADT do SMP). Toda tabela
+//! Só o necessário para achar o HPET e a MADT do SMP ([`madt`]). Toda tabela
 //! tem assinatura, tamanho e checksum conferidos antes do uso; tamanhos e
 //! contagens têm teto, contra firmware corrompido. A memória física é lida
 //! por [`PhysRead`], que o kernel implementa sobre o mapa direto.
 
 #![forbid(unsafe_code)]
+
+pub mod madt;
 
 /// Leitura de memória física.
 pub trait PhysRead {
@@ -154,13 +156,13 @@ pub fn hpet_base(mem: &mut impl PhysRead, rsdp: u64) -> Result<u64, AcpiError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
     /// Memória física falsa: blocos de bytes em endereços.
     #[derive(Default)]
-    struct Fake(BTreeMap<u64, Vec<u8>>);
+    pub(crate) struct Fake(BTreeMap<u64, Vec<u8>>);
 
     impl PhysRead for Fake {
         fn read(&mut self, phys: u64, buf: &mut [u8]) -> bool {
@@ -178,7 +180,7 @@ mod tests {
         }
     }
 
-    fn fix_checksum(bytes: &mut [u8], at: usize, range: usize) {
+    pub(crate) fn fix_checksum(bytes: &mut [u8], at: usize, range: usize) {
         bytes[at] = 0;
         let sum = bytes[..range].iter().fold(0u8, |a, &b| a.wrapping_add(b));
         bytes[at] = sum.wrapping_neg();
@@ -202,8 +204,8 @@ mod tests {
         body
     }
 
-    /// RSDP 2.0 em 0xe0000 -> XSDT em 0x1000 -> [FACP falsa, HPET].
-    fn machine(hpet: Vec<u8>) -> Fake {
+    /// RSDP 2.0 em 0xe0000 -> XSDT em 0x1000 -> [FACP falsa, `table`].
+    pub(crate) fn machine_with(table: Vec<u8>) -> Fake {
         let mut mem = Fake::default();
         let mut rsdp = vec![0u8; 36];
         rsdp[..8].copy_from_slice(b"RSD PTR ");
@@ -218,8 +220,12 @@ mod tests {
         entries.extend_from_slice(&0x3000u64.to_le_bytes());
         mem.0.insert(0x1000, sdt(*b"XSDT", &entries));
         mem.0.insert(0x2000, sdt(*b"FACP", &[0; 8]));
-        mem.0.insert(0x3000, hpet);
+        mem.0.insert(0x3000, table);
         mem
+    }
+
+    fn machine(hpet: Vec<u8>) -> Fake {
+        machine_with(hpet)
     }
 
     #[test]

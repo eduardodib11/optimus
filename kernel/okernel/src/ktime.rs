@@ -33,7 +33,7 @@ static APIC_HZ: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicU64 = AtomicU64::new(0);
 
 /// Memória física lida pelo mapa direto, só onde houver mapeamento.
-struct DirectRead;
+pub struct DirectRead;
 
 impl PhysRead for DirectRead {
     fn read(&mut self, phys: u64, buf: &mut [u8]) -> bool {
