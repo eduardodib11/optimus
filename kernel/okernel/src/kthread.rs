@@ -35,7 +35,7 @@ use okernel::thread::{RunState, Thread};
 use crate::arch::x86_64::gdt::{USER_CODE, USER_DATA};
 use crate::arch::x86_64::idt::TrapFrame;
 use crate::arch::x86_64::syscall::{self, switch_context, thread_trampoline};
-use crate::arch::x86_64::{cpu, fpu, probe};
+use crate::arch::x86_64::{cpu, fpu, percpu, probe};
 use crate::{kcap, kipc, kmem, ktest, ktime};
 
 pub mod tests;
@@ -116,8 +116,6 @@ static SCHED: SpinLock<Sched> = SpinLock::with_key(
         trace: Vec::new(),
     },
 );
-/// rsp salvo do ocioso.
-static IDLE_RSP: AtomicU64 = AtomicU64::new(0);
 /// Trocas diretas do caminho rápido de IPC.
 static FAST_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static DEBUG_LOG: SpinLock<([u8; 256], usize)> =
@@ -427,9 +425,8 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     if same {
         return;
     }
-    let prev_slot = prev
-        .as_ref()
-        .map_or(IDLE_RSP.as_ptr(), |p| p.saved_rsp().as_ptr());
+    let idle_slot = percpu::with(|p| p.idle_rsp().as_ptr());
+    let prev_slot = prev.as_ref().map_or(idle_slot, |p| p.saved_rsp().as_ptr());
     let prev_fpu = prev
         .as_ref()
         .filter(|p| p.state() != RunState::Exited)
@@ -455,11 +452,9 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
             syscall::set_kernel_stack(t.stack().top);
         }
     }
-    let (next_rsp, root) = next
-        .as_ref()
-        .map_or((IDLE_RSP.load(Ordering::Acquire), None), |t| {
-            (t.saved_rsp().load(Ordering::Acquire), t.root())
-        });
+    let (next_rsp, root) = next.as_ref().map_or((idle_rsp(), None), |t| {
+        (t.saved_rsp().load(Ordering::Acquire), t.root())
+    });
     let root = root.or_else(|| kmem::kernel_root().map(|r| r.0));
     if let Some(root) = root
         && cpu::read_cr3() & 0x000f_ffff_ffff_f000 != root
@@ -473,8 +468,14 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     // `dead` ou o ocioso); `next_rsp` foi salvo por esta mesma função ou
     // montado por `start`.
     crate::ksync::assert_none_held("switch_context");
+    percpu::assert_no_borrows();
     unsafe { switch_context(prev_slot, next_rsp) };
     finish_switch();
+}
+
+/// rsp salvo do ocioso desta CPU.
+fn idle_rsp() -> u64 {
+    percpu::with(|p| p.idle_rsp().load(Ordering::Acquire))
 }
 
 /// Solta a thread que terminou, já fora da pilha dela.

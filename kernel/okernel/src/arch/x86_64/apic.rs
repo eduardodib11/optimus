@@ -52,8 +52,6 @@ pub enum Mode {
 static MODE: AtomicU8 = AtomicU8::new(Mode::Off as u8);
 static MMIO: AtomicU64 = AtomicU64::new(0);
 static DEADLINE: AtomicBool = AtomicBool::new(false);
-static TIMER_FIRES: AtomicU64 = AtomicU64::new(0);
-static TIMER_LAST_TSC: AtomicU64 = AtomicU64::new(0);
 static UNEXPECTED: AtomicU64 = AtomicU64::new(0);
 static FROZEN: AtomicBool = AtomicBool::new(false);
 
@@ -149,12 +147,12 @@ pub fn id_and_version() -> (u32, u32) {
     (id, read(REG_VERSION))
 }
 
-/// Disparos do timer e o TSC do último.
+/// Disparos do timer desta CPU e o TSC do último.
 pub fn timer_fires() -> (u64, u64) {
-    (
-        TIMER_FIRES.load(Ordering::Acquire),
-        TIMER_LAST_TSC.load(Ordering::Relaxed),
-    )
+    super::percpu::with(|p| {
+        let [fires, last] = p.timer_stats();
+        (fires.load(Ordering::Acquire), last.load(Ordering::Relaxed))
+    })
 }
 
 /// Interrupções sem dono recebidas.
@@ -245,8 +243,11 @@ pub fn dispatch(vector: u64) -> bool {
     let timer = match u8::try_from(vector) {
         Ok(SPURIOUS_VECTOR) => return false,
         Ok(TIMER_VECTOR) => {
-            TIMER_LAST_TSC.store(cpu::rdtsc(), Ordering::Relaxed);
-            TIMER_FIRES.fetch_add(1, Ordering::Release);
+            super::percpu::with(|p| {
+                let [fires, last] = p.timer_stats();
+                last.store(cpu::rdtsc(), Ordering::Relaxed);
+                fires.fetch_add(1, Ordering::Release);
+            });
             true
         }
         _ => {

@@ -1,9 +1,10 @@
 //! Acessos à memória que sobrevivem a faltas (`probe.S`) e o gancho que os
 //! retoma no tratador de exceções (T-107).
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use super::idt::TrapFrame;
+use super::percpu;
 
 unsafe extern "C" {
     fn probe_write_byte(addr: *mut u8, value: u8) -> u64;
@@ -32,11 +33,10 @@ pub const PF_WRITE: u64 = 1 << 1;
 /// #PF: busca de instrução.
 pub const PF_FETCH: u64 = 1 << 4;
 
-static EXEC_ARMED: AtomicBool = AtomicBool::new(false);
-static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-
+/// A última falta de sonda desta CPU (o registro mora na `PerCpu`).
 fn last_fault() -> Fault {
-    let [vector, error, addr] = [0, 1, 2].map(|i| LAST[i].load(Ordering::Relaxed));
+    let [vector, error, addr] =
+        percpu::with(|p| [0, 1, 2].map(|i| p.probe_last()[i].load(Ordering::Relaxed)));
     Fault {
         vector,
         error,
@@ -77,10 +77,10 @@ pub fn read_byte(addr: u64) -> Result<u8, Fault> {
 ///
 /// Se `addr` for executável, o código lá roda: precisa ser só um `ret`.
 pub unsafe fn exec(addr: u64) -> Result<(), Fault> {
-    EXEC_ARMED.store(true, Ordering::SeqCst);
+    percpu::with(|p| p.probe_exec_armed().store(true, Ordering::SeqCst));
     // SAFETY: contrato do chamador; a falta volta pelo `probe_fault`.
     let result = unsafe { probe_exec(addr as *const u8) };
-    EXEC_ARMED.store(false, Ordering::SeqCst);
+    percpu::with(|p| p.probe_exec_armed().store(false, Ordering::SeqCst));
     match result {
         0 => Ok(()),
         _ => Err(last_fault()),
@@ -123,7 +123,7 @@ pub(super) fn fixup(frame: &mut TrapFrame, cr2: u64) -> bool {
     let exec_fault = frame.vector == 14
         && frame.error & PF_FETCH != 0
         && frame.rip == cr2
-        && EXEC_ARMED.swap(false, Ordering::SeqCst);
+        && percpu::with(|p| p.probe_exec_armed().swap(false, Ordering::SeqCst));
     let resume = if exec_fault {
         (&raw const probe_fault).addr() as u64
     } else if let Some(&[_, fix]) = table.iter().find(|&&[insn, _]| insn == frame.rip) {
@@ -132,9 +132,11 @@ pub(super) fn fixup(frame: &mut TrapFrame, cr2: u64) -> bool {
         return false;
     };
     let addr = if frame.vector == 14 { cr2 } else { 0 };
-    for (slot, value) in LAST.iter().zip([frame.vector, frame.error, addr]) {
-        slot.store(value, Ordering::Relaxed);
-    }
+    percpu::with(|p| {
+        for (slot, value) in p.probe_last().iter().zip([frame.vector, frame.error, addr]) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    });
     if exec_fault {
         // Descarta o retorno empilhado pelo `call` do `probe_exec`.
         frame.rsp += 8;

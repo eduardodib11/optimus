@@ -5,6 +5,7 @@ use core::arch::asm;
 
 use super::gdt::{self, KERNEL_CODE, Pointer};
 use super::idt;
+use super::percpu;
 use crate::ktest::{Outcome, Test};
 
 /// Testes de kernel de x86-64.
@@ -17,7 +18,56 @@ pub const TESTS: &[Test] = &[
         name: "arch.segmento_de_codigo_do_kernel",
         run: segmento_de_codigo,
     },
+    Test {
+        name: "percpu.bsp_e_a_cpu_zero",
+        run: bsp_e_a_cpu_zero,
+    },
+    Test {
+        name: "percpu.tss_e_ists_sao_desta_cpu",
+        run: tss_e_ists_desta_cpu,
+    },
 ];
+
+fn bsp_e_a_cpu_zero() -> Outcome {
+    ensure!(percpu::cpu_id() == 0);
+    let (id, apic_id, online) = percpu::with(|p| (p.cpu_id(), p.apic_id(), p.online()));
+    ensure!(id == 0 && online);
+    ensure!(apic_id == super::apic::id_and_version().0);
+    let gs = gs_base();
+    // SAFETY: `gs:[0]` é o endereço da própria área.
+    let this: u64;
+    unsafe { asm!("mov {}, gs:[0]", out(reg) this, options(nostack, readonly)) };
+    ensure!(gs == this && gs.is_multiple_of(4096));
+    Ok(())
+}
+
+fn tss_e_ists_desta_cpu() -> Outcome {
+    let (gdt, tss) = percpu::with(|p| (p.gdt_addr(), p.tss_addr()));
+    // SAFETY: a GDT desta CPU tem 8 entradas; as 6 e 7 são o descritor da
+    // TSS, e a TSS tem os topos IST nos bytes 36 a 92.
+    let (low, high, ist) = unsafe {
+        let g = gdt as *const u64;
+        let ist = (tss as *const u8)
+            .add(36)
+            .cast::<[u64; 3]>()
+            .read_unaligned();
+        (g.add(6).read(), g.add(7).read(), ist)
+    };
+    let base = ((low >> 16) & 0xff_ffff) | (((low >> 56) & 0xff) << 24) | (high << 32);
+    ensure!(base == tss);
+    for top in ist {
+        ensure!(top % 16 == 0);
+        // SAFETY: `top` é o rsp inicial de uma pilha IST preparada.
+        let owner = unsafe { percpu::from_ist_rsp(top - 64) };
+        ensure!(core::ptr::from_ref(owner).addr() as u64 == gs_base());
+    }
+    Ok(())
+}
+
+fn gs_base() -> u64 {
+    // SAFETY: ler GS_BASE só lê um MSR.
+    unsafe { super::cpu::rdmsr(0xc000_0101) }
+}
 
 fn tabelas_carregadas() -> Outcome {
     let mut gdtr = Pointer { limit: 0, base: 0 };
@@ -35,7 +85,10 @@ fn tabelas_carregadas() -> Outcome {
     }
     let (gdt_base, gdt_limit) = (gdtr.base, gdtr.limit);
     let (idt_base, idt_limit) = (idtr.base, idtr.limit);
-    ensure!(gdt_base == gdt::table_addr() && usize::from(gdt_limit) == gdt::GDT_ENTRIES * 8 - 1);
+    ensure!(
+        gdt_base == percpu::with(percpu::PerCpu::gdt_addr)
+            && usize::from(gdt_limit) == gdt::GDT_ENTRIES * 8 - 1
+    );
     ensure!(idt_base == idt::table_addr() && idt_limit == 256 * 16 - 1);
     ensure!(tr == gdt::TSS_SELECTOR);
     Ok(())
