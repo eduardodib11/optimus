@@ -177,6 +177,7 @@ fn start_one(tramp: &Trampoline, cpu: u32, apic_id: u32) -> bool {
         warn!("okernel: sem memória para a área da cpu{cpu}");
         return false;
     };
+    crate::kthread::init_cpu(cpu);
     for j in 1..STACKS {
         // SAFETY: a pilha acabou de ser mapeada (RW) e só esta CPU a usará.
         unsafe { percpu::prepare_ist(stack_top(cpu, j), p) };

@@ -12,6 +12,13 @@
 //! elas só chegam no anel 3 ou no ocioso. Por isso a fila tem uma trava
 //! simples, nunca segura durante a troca.
 //!
+//! Estado por CPU (ADR 0032, item 1; T-323): cada CPU tem a sua `Sched`
+//! (atual, fila de prontas, sem orçamento, prazos de IPC, morta pendente e
+//! registro), sob a trava `RunQueue` com a chave do id da CPU. A `Thread`
+//! guarda a CPU dona (`Thread::cpu`): a fila, os prazos e o despertar dela
+//! são os dessa CPU. Até o T-324 só o BSP roda threads; os APs têm a
+//! própria `Sched`, vazia.
+//!
 //! Escalonamento (T-207, seção 6.6): prioridade fixa de 256 níveis com
 //! round-robin de [`DEFAULT_SLICE_NS`] dentro do nível; cada thread roda
 //! sobre o orçamento do seu `SchedContext` e, sem orçamento, espera o fim
@@ -23,7 +30,10 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+
+use alloc::boxed::Box;
+use kabi::MAX_CPUS;
 
 use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Syscall};
@@ -100,22 +110,68 @@ struct Sched {
     trace: Vec<Event>,
 }
 
-static SCHED: SpinLock<Sched> = SpinLock::with_key(
-    LockClass::RunQueue,
-    0,
-    Sched {
-        current: None,
-        charged_at: 0,
-        charging: None,
-        started_at: 0,
-        slice_end: 0,
-        ready: RunQueue::new(),
-        throttled: Vec::new(),
-        timeouts: Vec::new(),
-        dead: None,
-        trace: Vec::new(),
-    },
-);
+impl Sched {
+    const fn new() -> Self {
+        Self {
+            current: None,
+            charged_at: 0,
+            charging: None,
+            started_at: 0,
+            slice_end: 0,
+            ready: RunQueue::new(),
+            throttled: Vec::new(),
+            timeouts: Vec::new(),
+            dead: None,
+            trace: Vec::new(),
+        }
+    }
+}
+
+/// Escalonador do BSP (estático: existe antes do heap).
+static BSP_SCHED: SpinLock<Sched> = SpinLock::with_key(LockClass::RunQueue, 0, Sched::new());
+/// Escalonador de cada AP, criado por [`init_cpu`] antes de ele ligar.
+static SCHEDS: [AtomicPtr<SpinLock<Sched>>; MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
+/// O escalonador da CPU `cpu` (`None` se ela não tem um).
+fn sched_of(cpu: u32) -> Option<&'static SpinLock<Sched>> {
+    if cpu == 0 {
+        return Some(&BSP_SCHED);
+    }
+    let p = SCHEDS.get(cpu as usize)?.load(Ordering::Acquire);
+    // SAFETY: só `init_cpu` grava, com escalonadores que nunca são soltos.
+    unsafe { p.as_ref() }
+}
+
+/// O escalonador desta CPU.
+fn this_sched() -> &'static SpinLock<Sched> {
+    sched_of(percpu::cpu_id()).unwrap_or(&BSP_SCHED)
+}
+
+/// Endereço do escalonador da CPU `cpu` e quantas prontas ele tem (para
+/// os testes).
+pub fn sched_info(cpu: u32) -> Option<(usize, usize)> {
+    let s = sched_of(cpu)?;
+    let ready = s.lock().ready.len();
+    Some((core::ptr::from_ref(s).addr(), ready))
+}
+
+/// Cria o escalonador da CPU `cpu` (na partida dela, antes de ligá-la);
+/// a chave da trava é o id, para duas filas só se tomarem em ordem
+/// crescente (ADR 0031, item 3).
+pub fn init_cpu(cpu: u32) {
+    if cpu == 0 || sched_of(cpu).is_some() {
+        return;
+    }
+    let sched = Box::leak(Box::new(SpinLock::with_key(
+        LockClass::RunQueue,
+        cpu,
+        Sched::new(),
+    )));
+    if let Some(slot) = SCHEDS.get(cpu as usize) {
+        slot.store(sched, Ordering::Release);
+    }
+}
 /// Trocas diretas do caminho rápido de IPC.
 static FAST_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static DEBUG_LOG: SpinLock<([u8; 256], usize)> =
@@ -123,7 +179,7 @@ static DEBUG_LOG: SpinLock<([u8; 256], usize)> =
 
 /// A thread na CPU (`None` no ocioso).
 pub fn current() -> Option<Arc<Thread>> {
-    SCHED.lock().current.clone()
+    this_sched().lock().current.clone()
 }
 
 fn user_addr(addr: u64) -> bool {
@@ -164,7 +220,9 @@ pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
     // Abaixo do quadro: rbp, rbx, r12-r15 zerados e o retorno de
     // `switch_context` para o trampolim.
     let switch_at = frame_at - 7 * 8;
-    let mut sched = SCHED.lock();
+    let me = percpu::cpu_id();
+    thread.set_cpu(me);
+    let mut sched = this_sched().lock();
     // Toda thread iniciada tem lugar reservado na espera: o escalonador
     // nunca aloca.
     sched
@@ -339,7 +397,7 @@ fn expire_timeouts() {
     loop {
         let now = ktime::now_ns();
         let expired = {
-            let mut s = SCHED.lock();
+            let mut s = this_sched().lock();
             let i = s.timeouts.iter().position(|(d, _)| *d <= now);
             i.map(|i| s.timeouts.swap_remove(i).1)
         };
@@ -370,7 +428,8 @@ fn pick_next(s: &mut Sched, direct: Option<Arc<Thread>>, now: u64) -> Option<Arc
 fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     expire_timeouts();
     let now = ktime::now_ns();
-    let mut s = SCHED.lock();
+    let me = percpu::cpu_id();
+    let mut s = this_sched().lock();
     charge_current(&mut s, now);
     release_throttled(&mut s, now);
     if why == Why::Preempt
@@ -396,6 +455,7 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     };
     if let Some(n) = &next {
         n.set_state(RunState::Running);
+        n.set_cpu(me);
         if let Some((sc, p)) = sc_of(n) {
             let mut b = sc.budget();
             b.activate(&p, now);
@@ -483,7 +543,7 @@ fn idle_rsp() -> u64 {
 
 /// Solta a thread que terminou, já fora da pilha dela.
 fn finish_switch() {
-    let dead = SCHED.lock().dead.take();
+    let dead = this_sched().lock().dead.take();
     drop(dead);
 }
 
@@ -502,7 +562,12 @@ pub fn yield_now() {
 /// põe na fila; não troca de thread (quem chama decide se preempta).
 pub fn wake(thread: Arc<Thread>, value: u64) {
     thread.set_wake_value(value);
-    let mut s = SCHED.lock();
+    // Na CPU dona: lá estão os prazos dela (ADR 0032, I7). Escolher outra
+    // CPU para acordar vem com o T-324.
+    let Some(sched) = sched_of(thread.cpu()) else {
+        return;
+    };
+    let mut s = sched.lock();
     drop_timeout(&mut s, &thread);
     if thread.state() == RunState::Blocked {
         enqueue(&mut s, thread, ktime::now_ns());
@@ -513,7 +578,7 @@ pub fn wake(thread: Arc<Thread>, value: u64) {
 /// não zero, até o prazo vencer (o IPC a acorda com `TimedOut`).
 pub fn block_until(deadline: u64) {
     if deadline != 0 {
-        let mut s = SCHED.lock();
+        let mut s = this_sched().lock();
         if let Some(t) = s.current.clone()
             && s.timeouts.len() < s.timeouts.capacity()
         {
@@ -528,7 +593,7 @@ pub fn block_until(deadline: u64) {
 /// fila e o escalonador escolhe.
 pub fn handoff(to: Arc<Thread>, deadline: u64) {
     if deadline != 0 {
-        let mut s = SCHED.lock();
+        let mut s = this_sched().lock();
         if let Some(t) = s.current.clone()
             && s.timeouts.len() < s.timeouts.capacity()
         {
@@ -610,14 +675,14 @@ pub fn on_timer() {
 /// Liga o registro de eventos do escalonador com espaço para `capacity`
 /// eventos (testes); `false` sem memória.
 pub fn trace_start(capacity: usize) -> bool {
-    let mut s = SCHED.lock();
+    let mut s = this_sched().lock();
     s.trace = Vec::new();
     s.trace.try_reserve_exact(capacity).is_ok()
 }
 
 /// Desliga o registro e devolve os eventos.
 pub fn trace_take() -> Vec<Event> {
-    core::mem::take(&mut SCHED.lock().trace)
+    core::mem::take(&mut this_sched().lock().trace)
 }
 
 /// `thread_exit`: a thread atual termina. Quem chama solta antes as
