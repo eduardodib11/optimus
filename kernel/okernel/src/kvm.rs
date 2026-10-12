@@ -60,9 +60,7 @@ impl Platform for KernelPlatform {
 
     fn alloc_frame(&self) -> Option<PhysAddr> {
         let frame = kmem::alloc_frames(0)?;
-        // SAFETY: frame recém-saído do buddy, só nosso, no mapa direto
-        // (RW), alinhado a 4 KiB.
-        unsafe { core::ptr::write_bytes(kmem::direct(frame) as *mut u8, 0, 4096) };
+        zero_frame(frame);
         Some(frame)
     }
 
@@ -89,6 +87,7 @@ impl Platform for KernelPlatform {
         let bottom = top - KERNEL_STACK_BYTES;
         for page in (0..KERNEL_STACK_BYTES / PAGE).map(|i| bottom + i * PAGE) {
             let mapped = kmem::alloc_frames(0).is_some_and(|frame| {
+                zero_frame(frame);
                 let ok = kmem::map(page, frame, PageSize::Size4K, Flags::RW).is_ok();
                 if !ok {
                     kmem::free_frames(frame, 0);
@@ -144,6 +143,16 @@ pub unsafe fn activate(root: PhysAddr) -> u64 {
     // SAFETY: contrato acima.
     unsafe { load_root(root.0) };
     old
+}
+
+/// Zera um frame recém-saído do buddy. As pilhas de kernel também saem
+/// zeradas: nada de dado velho na pilha e, no TCG, nenhuma tradução velha
+/// na página (do firmware ou de código de usuário que morou nela), que
+/// deixaria lenta toda escrita nela enquanto durasse.
+fn zero_frame(frame: PhysAddr) {
+    // SAFETY: frame recém-saído do buddy, só de quem chama, no mapa direto
+    // (RW), alinhado a 4 KiB.
+    unsafe { core::ptr::write_bytes(kmem::direct(frame) as *mut u8, 0, 4096) };
 }
 
 /// Carrega `root` no CR3, anotando-o antes para o shootdown (ADR 0031,

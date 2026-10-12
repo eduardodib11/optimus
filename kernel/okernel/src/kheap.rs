@@ -37,7 +37,14 @@ struct DirectPages;
 
 impl PageSource for DirectPages {
     fn alloc_pages(&mut self, order: usize) -> Option<u64> {
-        kmem::alloc_frames(order).map(kmem::direct)
+        let addr = kmem::direct(kmem::alloc_frames(order)?);
+        // Zeradas como as pilhas de kernel (`kvm::zero_frame`): no TCG, uma
+        // tradução velha que sobrasse na página deixaria lenta toda escrita
+        // nos objetos dela.
+        // SAFETY: páginas recém-saídas do buddy, só nossas, no mapa direto
+        // (RW), `4096 << order` bytes.
+        unsafe { core::ptr::write_bytes(addr as *mut u8, 0, 4096 << order) };
+        Some(addr)
     }
 
     fn free_pages(&mut self, addr: u64, order: usize) {
