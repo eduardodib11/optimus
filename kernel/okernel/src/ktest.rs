@@ -58,14 +58,15 @@ const SUITES: &[&[Test]] = &[
     crate::kroot::TESTS,
 ];
 
-/// Roda os testes selecionados e desliga o QEMU com o resultado.
+/// Roda os testes selecionados (`ktest=` com um ou mais prefixos separados
+/// por vírgula, ou todos) e desliga o QEMU com o resultado.
 pub fn run(filter: Option<&str>) -> ! {
     ACTIVE.store(true, Ordering::Relaxed);
     let selected = || {
         SUITES
             .iter()
             .flat_map(|suite| suite.iter())
-            .filter(|t| filter.is_none_or(|prefix| t.name.starts_with(prefix)))
+            .filter(|t| filter.is_none_or(|f| f.split(',').any(|p| t.name.starts_with(p))))
     };
     info!("ktest: início, {} testes", selected().count());
     let (mut passed, mut failed) = (0u32, 0u32);

@@ -146,10 +146,25 @@ pub struct Heap<M> {
     failures: u64,
 }
 
-/// Cache que atende `layout`, ou `None` se for grande demais para slab.
-fn class(layout: Layout) -> Option<usize> {
+/// Classe (índice em [`CLASSES`]) que atende `layout`, ou `None` se for
+/// grande demais para slab. Todo objeto da classe `i` serve a qualquer
+/// `layout` dela: tem `CLASSES[i]` bytes e alinhamento `CLASSES[i]`.
+#[must_use]
+pub fn class(layout: Layout) -> Option<usize> {
     let need = layout.size().max(layout.align());
     CLASSES.iter().position(|&c| c >= need)
+}
+
+/// `addr` tem a posição de um objeto da classe `i` dentro de um slab (só
+/// aritmética, sem ler o slab nem tomar trava).
+#[must_use]
+pub fn plausible(i: usize, addr: u64) -> bool {
+    let Some(&size) = CLASSES.get(i) else {
+        return false;
+    };
+    let cache = Cache::new(size);
+    let offset = addr & (cache.bytes() - 1);
+    offset >= cache.first() && (offset - cache.first()).is_multiple_of(cache.size)
 }
 
 /// Ordem do bloco do buddy para uma alocação grande.
@@ -225,6 +240,28 @@ impl<M: PageSource> Heap<M> {
             self.failures += 1;
         }
         result
+    }
+
+    /// Um objeto da classe `i` para um cache por CPU, ou `None` (o cache só
+    /// tenta encher: a recusa não conta como falha).
+    pub fn alloc_class(&mut self, i: usize) -> Option<u64> {
+        if i >= CLASSES.len() {
+            return None;
+        }
+        self.alloc_small(i).ok()
+    }
+
+    /// Devolve um objeto da classe `i`, vindo de um cache por CPU.
+    ///
+    /// # Errors
+    ///
+    /// [`HeapError::BadFree`] se o endereço não for um objeto alocado de um
+    /// slab da classe; nada muda nesse caso.
+    pub fn free_class(&mut self, i: usize, addr: u64) -> Result<(), HeapError> {
+        if i >= CLASSES.len() {
+            return Err(HeapError::BadFree);
+        }
+        self.free_small(i, addr)
     }
 
     /// Libera um objeto alocado com o mesmo `layout`.

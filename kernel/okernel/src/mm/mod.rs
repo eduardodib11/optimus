@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod buddy;
+pub mod cache;
 pub mod frames;
 pub mod paging;
 pub mod slab;

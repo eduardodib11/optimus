@@ -12,6 +12,8 @@ use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::probe::{self, Fault, PF_FETCH, PF_PRESENT, PF_WRITE};
 use crate::ktest::{Outcome, Test};
 
+mod smp;
+
 /// Testes de kernel da memória.
 pub const TESTS: &[Test] = &[
     Test {
@@ -49,6 +51,14 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "mm.mapear_proteger_desmapear",
         run: mapear_proteger_desmapear,
+    },
+    Test {
+        name: "mm.frames_concorrentes_sem_perda_nem_repeticao",
+        run: smp::frames_concorrentes,
+    },
+    Test {
+        name: "mm.frames_escala_de_1_a_4_cpus",
+        run: smp::escala,
     },
 ];
 
