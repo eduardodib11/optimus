@@ -50,7 +50,7 @@ pub const TESTS: &[Test] = &[
 ];
 
 /// Cada CPU ligada tem a própria `Sched` (T-323), distinta das outras;
-/// os APs ainda não têm prontas.
+/// entre os testes, os APs não têm prontas.
 fn escalonador_por_cpu() -> Outcome {
     let n = super::start::online_count();
     let mut seen = [0usize; 64];
@@ -97,13 +97,15 @@ fn wait_polling(done: impl Fn() -> bool) -> bool {
     true
 }
 
-/// O IPI de reescalonar liga `need_resched` em cada AP (ocioso, IF=1).
+/// O IPI de reescalonar chega a cada AP (ocioso, IF=1): a caixa dele conta
+/// o pedido atendido, e o tratador consome `need_resched` (T-324).
 fn resched_chega() -> Outcome {
     for cpu in 1..super::start::online_count() {
-        super::ipi::resched_pending(cpu, true);
+        let mailbox = super::start::percpu_of(cpu).ok_or("sem área")?.mailbox();
+        let before = mailbox.handled()[0];
         ensure!(super::ipi::resched(cpu));
-        ensure!(wait_polling(|| super::ipi::resched_pending(cpu, false)));
-        ensure!(super::ipi::resched_pending(cpu, true));
+        ensure!(wait_polling(|| mailbox.handled()[0] > before));
+        ensure!(wait_polling(|| !super::ipi::resched_pending(cpu, false)));
     }
     ensure!(!super::ipi::resched(super::count()));
     Ok(())

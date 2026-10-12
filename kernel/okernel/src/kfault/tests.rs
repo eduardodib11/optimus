@@ -17,7 +17,7 @@ use crate::kcap::root_quota;
 use crate::kipc::tests::{create, give, run_until_blocked, spawn, user_words};
 use crate::kmem;
 use crate::ktest::{Outcome, Test};
-use crate::kthread::tests::{DATA_VA, delete, process, run_until_exit};
+use crate::kthread::tests::{DATA_VA, delete, process, run_until_exit, settled};
 
 /// Testes de kernel das faltas de usuário.
 pub const TESTS: &[Test] = &[
@@ -67,7 +67,7 @@ fn acesso_nulo() -> Outcome {
         drop(t);
         delete(&p, &[h])?;
     }
-    ensure!(quota.used() == used0);
+    ensure!(settled(&quota, used0));
     Ok(())
 }
 

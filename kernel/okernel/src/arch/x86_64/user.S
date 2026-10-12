@@ -565,5 +565,66 @@ user_bench_yield:
     syscall
     ud2
 
+/* user_pingpong(rdi = id | cpu << 8, rsi = voltas, rdx = página compartilhada)
+ *
+ * Duas threads de processos diferentes, com a mesma página mapeada,
+ * alternam a vez pela palavra em [0] (u32, o id de quem joga): esperam a
+ * vez em futex_wait, contam a jogada, passam a vez e acordam a outra com
+ * futex_wake. Cada jogada lê a CPU por RDTSCP (TSC_AUX = id lógico).
+ * Grava em [8 + 8 * id] as jogadas e em [24 + 8 * id] as feitas fora da
+ * CPU `cpu`. */
+.global user_pingpong
+user_pingpong:
+    movzx r12d, dil
+    mov r13, rdi
+    shr r13, 8
+    mov r14, rsi
+    mov r15, rdx
+    mov ebx, r12d
+    xor ebx, 1
+1:  /* espera a vez */
+    mov eax, dword ptr [r15]
+    cmp eax, r12d
+    je 2f
+    mov rdi, r15
+    mov esi, ebx
+    mov eax, 29
+    syscall
+    jmp 1b
+2:  /* jogada */
+    rdtscp
+    cmp ecx, r13d
+    je 3f
+    inc qword ptr [r15 + r12 * 8 + 24]
+3:
+    inc qword ptr [r15 + r12 * 8 + 8]
+    mov dword ptr [r15], ebx
+    mov rdi, r15
+    mov esi, 1
+    mov eax, 30
+    syscall
+    dec r14
+    jnz 1b
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_wait_cpu(rdi = Notification, rsi = página RW)
+ *
+ * Espera na notificação e grava: [0] status do ntfy_wait, [8] bits
+ * recebidos, [16] a CPU em que acordou (RDTSCP, TSC_AUX = id lógico). */
+.global user_wait_cpu
+user_wait_cpu:
+    mov r12, rsi
+    mov eax, 23
+    syscall
+    mov qword ptr [r12], rax
+    mov qword ptr [r12 + 8], rdx
+    rdtscp
+    mov qword ptr [r12 + 16], rcx
+    mov eax, 33
+    syscall
+    ud2
+
 .global user_test_end
 user_test_end:

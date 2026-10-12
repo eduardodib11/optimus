@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use kabi::{Error, Handle, ObjectType};
-use okernel::cap::{Cap, SharedCapSpace};
+use okernel::cap::{Cap, MemoryQuota, SharedCapSpace};
 use okernel::sched::Params;
 use okernel::thread::{RunState, Thread};
 use okernel::vm::vm_map;
@@ -14,11 +14,12 @@ use okernel::vm::vm_map;
 use super::{UserEntry, start, take_debug_log, yield_now};
 use crate::arch::x86_64::{apic, cpu, probe};
 use crate::kcap::{root_cap_space, root_quota};
-use crate::kmem;
 use crate::ktest::{Outcome, Test};
 use crate::kvm::activate;
+use crate::{kmem, ktime};
 
 mod sched;
+mod smp;
 mod sync;
 
 /// Testes de kernel de threads de usuário.
@@ -47,6 +48,14 @@ pub const TESTS: &[Test] = &[
         name: "futex.mutex_de_usuario_com_4_threads",
         run: sync::mutex_4_threads,
     },
+    Test {
+        name: "smp.thread_bloqueada_acorda_na_cpu_certa",
+        run: smp::acorda_na_cpu_certa,
+    },
+    Test {
+        name: "smp.dois_processos_alternam_em_cpus_distintas",
+        run: smp::alternam_em_cpus_distintas,
+    },
 ];
 
 unsafe extern "C" {
@@ -72,7 +81,8 @@ pub struct Process {
     pub aspace: Cap,
 }
 
-fn cap(space: &SharedCapSpace, h: Handle) -> Result<Cap, &'static str> {
+/// A capability `h` de `space`, clonada.
+pub fn cap(space: &SharedCapSpace, h: Handle) -> Result<Cap, &'static str> {
     space.lock().get(h).cloned().map_err(|_| "handle")
 }
 
@@ -162,15 +172,40 @@ fn bare_thread(p: &Process) -> Result<(Handle, Arc<Thread>), &'static str> {
     Ok((h, t))
 }
 
-/// Roda as prontas até todas as `threads` saírem (ou um limite de voltas).
+/// Prazo de [`run_until_exit`].
+const RUN_LIMIT_NS: u64 = 20_000_000_000;
+
+/// Roda as prontas desta CPU até todas as `threads` saírem de vez
+/// (terminadas e fora de qualquer CPU; as que acordaram noutra CPU rodam
+/// lá) ou o prazo vencer.
 pub fn run_until_exit(threads: &[Arc<Thread>]) -> Outcome {
-    for _ in 0..100_000 {
-        if threads.iter().all(|t| t.state() == RunState::Exited) {
+    let give_up = ktime::now_ns() + RUN_LIMIT_NS;
+    while ktime::now_ns() < give_up {
+        if threads
+            .iter()
+            .all(|t| t.state() == RunState::Exited && !t.on_cpu())
+        {
             return Ok(());
         }
         yield_now();
+        crate::ksmp::ipi::poll();
     }
     Err("as threads não terminaram")
+}
+
+/// Espera (até 1 s, rodando as prontas) a cota voltar a `used`: a última
+/// referência a uma thread que rodou noutra CPU é solta lá, logo depois da
+/// troca que a tirou da CPU.
+pub fn settled(quota: &MemoryQuota, used: u64) -> bool {
+    let give_up = ktime::now_ns() + 1_000_000_000;
+    while quota.used() != used {
+        if ktime::now_ns() > give_up {
+            return false;
+        }
+        yield_now();
+        crate::ksmp::ipi::poll();
+    }
+    true
 }
 
 /// Apaga as capabilities das threads (quebra o ciclo thread ↔ `CapSpace`).
@@ -219,7 +254,7 @@ fn alternam() -> Outcome {
         ensure!(!strict || log[..len].chunks(2).all(|pair| pair == b"AB"));
         delete(&p, &handles)?;
     }
-    ensure!(quota.used() == used0);
+    ensure!(settled(&quota, used0));
     Ok(())
 }
 

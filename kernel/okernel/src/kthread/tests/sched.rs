@@ -16,7 +16,7 @@ use okernel::sched::Params;
 use okernel::thread::RunState;
 
 use super::super::{Event, UserEntry, start, trace_start, trace_take, yield_now};
-use super::{DATA_VA, delete, process, thread_with, user_symbol};
+use super::{DATA_VA, delete, process, settled, thread_with, user_symbol};
 use crate::arch::x86_64::cpu;
 use crate::kcap::root_quota;
 use crate::ktest::Outcome;
@@ -71,7 +71,7 @@ pub fn sem_orcamento_espera() -> Outcome {
         drop((h, l));
         delete(&p, &[hh, hl])?;
     }
-    ensure!(quota.used() == used0);
+    ensure!(settled(&quota, used0));
     Ok(())
 }
 
