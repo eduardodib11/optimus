@@ -271,13 +271,19 @@ static AP_JOB: SpinLock<Option<fn()>> = SpinLock::with_class(LockClass::Diagnost
 /// Muda a cada [`post_ap_job`].
 static AP_JOB_GEN: AtomicUsize = AtomicUsize::new(0);
 
-/// Pede que cada AP ocioso rode `job` uma vez, no próximo disparo do timer
-/// (até [`IDLE_TICK_NS`]). Para os testes de kernel que precisam de código
-/// em todas as CPUs ao mesmo tempo; provisório até a função remota por IPI
-/// (T-322) e o escalonador por CPU (T-324).
+/// Pede que cada AP ocioso rode `job` uma vez. O IPI de reescalonar acorda
+/// o AP na hora (sem ele, o timer o acordaria em até [`IDLE_TICK_NS`]).
+/// Para os testes de kernel que precisam de código longo em todas as CPUs
+/// ao mesmo tempo (a função remota tem de ser curta); provisório até o
+/// escalonador por CPU (T-324).
 pub fn post_ap_job(job: fn()) {
     *AP_JOB.lock() = Some(job);
     AP_JOB_GEN.fetch_add(1, Ordering::AcqRel);
+    for cpu in 1..super::count() {
+        if is_online(cpu) {
+            super::ipi::resched(cpu);
+        }
+    }
 }
 
 /// Laço ocioso de um AP: `sti; hlt` com o timer armado a cada

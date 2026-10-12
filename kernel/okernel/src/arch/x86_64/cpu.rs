@@ -196,6 +196,9 @@ pub fn interrupts_enabled() -> bool {
 /// Liga as interrupções e espera a próxima; volta com elas desligadas.
 pub fn wait_for_interrupt() {
     crate::ksync::assert_none_held("ocioso");
+    // Pedido que chegou por sondagem antes de dormir (ADR 0031, item 5); o
+    // que chegar depois acorda o `hlt` pelo IPI.
+    crate::ksmp::ipi::poll();
     // SAFETY: STI só vale depois da instrução seguinte, então nenhuma
     // interrupção escapa entre STI e HLT; os tratadores instalados voltam.
     unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };

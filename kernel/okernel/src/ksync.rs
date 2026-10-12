@@ -21,8 +21,9 @@ fn held() -> Option<&'static HeldLocks> {
 
 static HOOKS: Hooks = Hooks {
     held,
-    // A caixa de IPIs vem com o T-322; por ora só há uma CPU.
-    relax: || {},
+    // Toda volta de espera atende a caixa de IPIs (ADR 0031, item 6,
+    // regra 3): quem segura a trava pode estar esperando por esta CPU.
+    relax: crate::ksmp::ipi::poll,
     interrupts_enabled: cpu::interrupts_enabled,
 };
 

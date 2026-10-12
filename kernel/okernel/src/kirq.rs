@@ -13,7 +13,7 @@ use okernel::cap::MemoryQuota;
 use okernel::notify::Interrupt;
 use okernel::sync::{LockClass, SpinLock};
 
-use crate::arch::x86_64::apic::{SPURIOUS_VECTOR, TIMER_VECTOR};
+use crate::arch::x86_64::apic::{KERNEL_VECTORS, SPURIOUS_VECTOR, TIMER_VECTOR};
 use crate::kthread;
 
 /// Primeiro vetor entregue a objetos `Interrupt` (abaixo ficam exceções,
@@ -27,10 +27,15 @@ static LINES: SpinLock<[Option<Weak<Interrupt>>; 256]> =
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] para vetores do kernel; [`Error::Busy`] se
+/// [`Error::InvalidArgument`] para vetores do kernel (exceções, timer,
+/// espúrio e `0xF0..=0xFE`, dos IPIs); [`Error::Busy`] se
 /// o vetor já tem objeto vivo; [`Error::QuotaExceeded`] sem cota.
 pub fn create(quota: &Arc<MemoryQuota>, vector: u8) -> Result<Arc<Interrupt>, Error> {
-    if vector < FIRST_VECTOR || vector == TIMER_VECTOR || vector == SPURIOUS_VECTOR {
+    if vector < FIRST_VECTOR
+        || vector == TIMER_VECTOR
+        || vector == SPURIOUS_VECTOR
+        || KERNEL_VECTORS.contains(&vector)
+    {
         return Err(Error::InvalidArgument);
     }
     let mut lines = LINES.lock();

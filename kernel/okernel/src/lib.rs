@@ -14,6 +14,7 @@ pub mod console;
 pub mod fault;
 pub mod futex;
 pub mod ipc;
+pub mod ipi;
 pub mod log;
 pub mod mm;
 pub mod notify;
