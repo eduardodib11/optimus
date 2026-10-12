@@ -168,6 +168,17 @@ pub fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
+/// Lê o TSC depois de todas as leituras de memória anteriores (`lfence;
+/// rdtsc`): uma leitura que vem depois de ver o valor publicado por outra
+/// CPU não executa antes dele (ADR 0030, item 5).
+pub fn rdtsc_ordered() -> u64 {
+    // SAFETY: LFENCE só ordena; RDTSC só lê o contador (CR4.TSD desligado).
+    unsafe {
+        core::arch::x86_64::_mm_lfence();
+        core::arch::x86_64::_rdtsc()
+    }
+}
+
 /// Desliga as interrupções.
 pub fn disable_interrupts() {
     // SAFETY: CLI só adia interrupções desta CPU.

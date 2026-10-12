@@ -2,18 +2,19 @@
 //! 4, passo 2; T-319).
 //!
 //! O BSP grava, antes de ligar os APs, os valores finais de CR0, CR4, EFER,
-//! XCR0 e PAT ([`capture`]); cada AP confere que tem todos os recursos que
-//! esses valores ligam e os copia ([`apply`]). A CPU que não tiver um
+//! XCR0, PAT e `TSC_ADJUST` ([`capture`]); cada AP confere que tem todos os
+//! recursos que esses valores ligam e os copia ([`apply`]). A CPU que não tiver um
 //! recurso que o BSP ligou, ou que pedir área de XSAVE de outro tamanho,
 //! fica fora em vez de rodar com proteção menor.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::cpu::{self, rdmsr, wrmsr};
 use super::fpu;
 
 const MSR_PAT: u32 = 0x277;
 const MSR_TSC_AUX: u32 = 0xc000_0103;
+const MSR_TSC_ADJUST: u32 = 0x3b;
 
 const EFER_SCE: u64 = 1;
 const CR4_PGE: u64 = 1 << 7;
@@ -22,6 +23,9 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 
 /// CR0, CR4, EFER, XCR0 e PAT do BSP.
 static STATE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// `IA32_TSC_ADJUST` do BSP, se ele o tiver.
+static TSC_ADJUST: AtomicU64 = AtomicU64::new(0);
+static BSP_HAS_TSC_ADJUST: AtomicBool = AtomicBool::new(false);
 
 /// Bits de CR4 que dependem de um recurso anunciado: bit, folha, registrador
 /// (0 = EBX, 1 = ECX, 2 = EDX) e bit do CPUID.
@@ -49,6 +53,31 @@ pub fn capture() {
         .zip([cpu::read_cr0(), cpu::read_cr4(), efer, xcr0, pat])
     {
         slot.store(v, Ordering::Relaxed);
+    }
+    if has_tsc_adjust() {
+        // SAFETY: a CPU anuncia `IA32_TSC_ADJUST`.
+        TSC_ADJUST.store(unsafe { rdmsr(MSR_TSC_ADJUST) }, Ordering::Relaxed);
+        BSP_HAS_TSC_ADJUST.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Esta CPU tem `IA32_TSC_ADJUST` (CPUID 7, `EBX[1]`).
+pub fn has_tsc_adjust() -> bool {
+    has(7, 0, 1)
+}
+
+/// Soma `delta` ao `IA32_TSC_ADJUST` desta CPU, o que soma o mesmo ao TSC
+/// (correção do teste de salto, ADR 0030, item 5).
+///
+/// # Safety
+///
+/// A CPU tem `IA32_TSC_ADJUST` e ninguém nela depende ainda do relógio
+/// (é um AP antes de entrar na máscara de ligadas).
+pub unsafe fn add_tsc_adjust(delta: i64) {
+    // SAFETY: contrato do chamador.
+    unsafe {
+        let now = rdmsr(MSR_TSC_ADJUST);
+        wrmsr(MSR_TSC_ADJUST, now.wrapping_add_signed(delta));
     }
 }
 
@@ -103,6 +132,10 @@ pub unsafe fn apply(cpu_id: u32) -> Result<(), &'static str> {
         wrmsr(MSR_PAT, pat);
         if cr4 & CR4_OSXSAVE != 0 {
             fpu::set_xcr0(xcr0);
+        }
+        // O mesmo `TSC_ADJUST` do BSP antes de qualquer leitura do TSC.
+        if BSP_HAS_TSC_ADJUST.load(Ordering::Relaxed) && has_tsc_adjust() {
+            wrmsr(MSR_TSC_ADJUST, TSC_ADJUST.load(Ordering::Relaxed));
         }
         if cpu::max_leaf(true) >= 0x8000_0001 && cpu::cpuid(0x8000_0001, 0).edx & (1 << 27) != 0 {
             wrmsr(MSR_TSC_AUX, u64::from(cpu_id));

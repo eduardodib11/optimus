@@ -12,12 +12,14 @@
 //! 16 KiB de guarda não mapeada abaixo. A metade alta do PML4 é a mesma em
 //! todos os espaços, então a janela aparece em todos.
 
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use kabi::MAX_CPUS;
 use okernel::mm::paging::{Flags, PageSize};
 use okernel::mm::{FRAME_SIZE, frames};
+use okernel::sync::{LockClass, SpinLock};
 
+use super::tsc;
 use crate::arch::x86_64::ap::Trampoline;
 use crate::arch::x86_64::percpu::{self, PerCpu};
 use crate::arch::x86_64::{apic, cpu, cpustate, idt, syscall};
@@ -73,6 +75,11 @@ fn map_stacks(cpu: u32) -> bool {
             let Some(frame) = kmem::alloc_frames(0) else {
                 return false;
             };
+            // SAFETY: frame recém-saído do buddy, só nosso, no mapa direto
+            // (RW). Zerado como as pilhas do `kvm`: nada de dado velho na
+            // pilha do kernel (e, no TCG, nenhuma tradução velha do
+            // firmware na página, que deixaria toda escrita nela lenta).
+            unsafe { core::ptr::write_bytes(kmem::direct(frame) as *mut u8, 0, 4096) };
             if kmem::map(page, frame, PageSize::Size4K, Flags::RW).is_err() {
                 kmem::free_frames(frame, 0);
                 return false;
@@ -90,8 +97,10 @@ fn new_percpu(cpu: u32, apic_id: u32) -> Option<&'static PerCpu> {
     let p = kmem::direct(frame) as *mut PerCpu;
     // SAFETY: frames recém-saídos do buddy, só nossos, alinhados a 4 KiB
     // (o alinhamento da `PerCpu`) e com espaço para ela; nunca voltam ao
-    // buddy, então a referência vive para sempre.
+    // buddy, então a referência vive para sempre. Zerados antes, como as
+    // pilhas.
     unsafe {
+        core::ptr::write_bytes(p.cast::<u8>(), 0, 4096 << order);
         p.write(PerCpu::new(cpu));
         (*p).set_apic_id(apic_id);
         Some(&*p)
@@ -121,6 +130,7 @@ pub fn start_aps() {
         warn!("okernel: sem relógio para a partida dos APs; só o BSP");
         return;
     }
+    tsc::warn_if_not_invariant();
     let Some(base) = bootinfo::get()
         .and_then(bootinfo::memory_map)
         .and_then(frames::trampoline_base)
@@ -179,13 +189,34 @@ fn start_one(tramp: &Trampoline, cpu: u32, apic_id: u32) -> bool {
     if !wait_until(ktime::now_ns() + MS / 5, || p.online()) {
         apic::send_sipi(apic_id, tramp.vector());
     }
-    if wait_until(ktime::now_ns() + 100 * MS, || p.online()) {
-        mark_online(cpu, p);
-        true
-    } else {
+    if !wait_until(ktime::now_ns() + 100 * MS, || p.online()) {
         // Volta a esperar SIPI: nunca roda com os parâmetros do próximo.
         apic::send_init(apic_id);
-        false
+        return false;
+    }
+    match tsc::bsp_side(cpu as usize) {
+        tsc::Outcome::Accepted { ns, adjusted } => {
+            let how = if adjusted {
+                ", depois de corrigido"
+            } else {
+                ""
+            };
+            info!(
+                "okernel: cpu{cpu}: salto de TSC de até {ns} ns em {} rodadas{how}",
+                tsc::ROUNDS
+            );
+            mark_online(cpu, p);
+            true
+        }
+        tsc::Outcome::Rejected { ns } => {
+            warn!("okernel: cpu{cpu}: salto de TSC de {ns} ns mesmo corrigido; fica fora");
+            apic::send_init(apic_id);
+            false
+        }
+        tsc::Outcome::Silent => {
+            apic::send_init(apic_id);
+            false
+        }
     }
 }
 
@@ -221,19 +252,48 @@ extern "sysv64" fn ap_main(p: &'static PerCpu) -> ! {
         warn!("okernel: cpu{cpu} sem o modo de APIC do BSP; fica fora");
         crate::arch::x86_64::halt();
     }
-    info!("okernel: cpu{cpu} online (APIC {hw})");
+    // Sinal ao BSP e teste de salto do TSC com ele (ADR 0030, item 5).
+    let generation = tsc::generation();
     p.set_online();
+    if !tsc::ap_side(generation) {
+        crate::arch::x86_64::halt();
+    }
+    info!("okernel: cpu{cpu} online (APIC {hw})");
     idle()
 }
 
 /// Intervalo do timer de um AP ocioso.
 pub const IDLE_TICK_NS: u64 = 10 * MS;
 
+/// Trabalho pedido aos APs ociosos ([`post_ap_job`]). Folha (ADR 0031,
+/// item 3).
+static AP_JOB: SpinLock<Option<fn()>> = SpinLock::with_class(LockClass::Diagnostic, None);
+/// Muda a cada [`post_ap_job`].
+static AP_JOB_GEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Pede que cada AP ocioso rode `job` uma vez, no próximo disparo do timer
+/// (até [`IDLE_TICK_NS`]). Para os testes de kernel que precisam de código
+/// em todas as CPUs ao mesmo tempo; provisório até a função remota por IPI
+/// (T-322) e o escalonador por CPU (T-324).
+pub fn post_ap_job(job: fn()) {
+    *AP_JOB.lock() = Some(job);
+    AP_JOB_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
 /// Laço ocioso de um AP: `sti; hlt` com o timer armado a cada
 /// [`IDLE_TICK_NS`]. Provisório até o escalonador por CPU (T-323 e T-324):
 /// sem IPIs nem fila, o timer é o que acorda a CPU para ela ver pedidos.
 fn idle() -> ! {
+    let mut seen = AP_JOB_GEN.load(Ordering::Acquire);
     loop {
+        let generation = AP_JOB_GEN.load(Ordering::Acquire);
+        if generation != seen {
+            seen = generation;
+            let job = *AP_JOB.lock();
+            if let Some(job) = job {
+                job();
+            }
+        }
         ktime::arm_by(ktime::now_ns() + IDLE_TICK_NS);
         cpu::wait_for_interrupt();
     }
