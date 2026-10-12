@@ -25,3 +25,19 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Testes unitários, smoke test de boot e testes de kernel no QEMU
         run: cargo xtask test all
+
+  smp:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [2, 4]
+    name: smp (${{ matrix.cpus }} CPUs)
+    steps:
+      - uses: actions/checkout@v5
+      - name: QEMU e OVMF
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+      - name: Toolchain fixada em rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Testes de kernel no QEMU com ${{ matrix.cpus }} CPUs
+        run: cargo xtask test smp --smp ${{ matrix.cpus }}
