@@ -19,6 +19,10 @@ pub use rights::Rights;
 /// Versão da ABI de syscalls (seção 14.2, "ABI v1").
 pub const ABI_VERSION: u32 = 1;
 
+/// Máximo de CPUs que o kernel liga (RF-03, ADR 0030); ids lógicos vão de
+/// 0 a `MAX_CPUS - 1`.
+pub const MAX_CPUS: usize = 256;
+
 /// Valor bruto recusado por uma conversão vinda de registrador.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UnknownValue(pub u64);

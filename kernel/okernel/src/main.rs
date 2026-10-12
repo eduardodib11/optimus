@@ -28,6 +28,7 @@ mod kirq;
 mod kmem;
 mod kpanic;
 mod kroot;
+mod ksmp;
 mod ksync;
 mod kthread;
 mod ktime;
@@ -85,6 +86,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
             kheap::init(cmdline);
             kcap::init();
             ktime::init(info);
+            ksmp::init(info, cmdline);
         }
         None => warn!("okernel: mapa de memória ausente ou inválido"),
     }
