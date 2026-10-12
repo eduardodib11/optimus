@@ -17,6 +17,7 @@ use crate::ktime::DirectRead;
 
 pub mod start;
 pub mod tests;
+pub mod tsc;
 pub use tests::TESTS;
 
 /// Id de APIC de cada CPU, pelo id lógico.

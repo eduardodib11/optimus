@@ -20,7 +20,7 @@ trava).
 | 7 | `SchedLeaf` | `thread::Thread.sched`, `thread::Thread.donated` | folha do escalonador |
 | 8 | `KernelStacks`, depois `KernelPageTables` | `kvm::STACK_SLOTS`, depois `kmem::KERNEL_PT` | nessa ordem |
 | 9 | `Heap`, depois `Frames` | `kheap::HEAP`, depois `kmem::FRAMES` | nessa ordem |
-| 10 | `Diagnostic` | `kthread::DEBUG_LOG`, `kfault::LAST`, `platform::PLATFORM` | folha |
+| 10 | `Diagnostic` | `kthread::DEBUG_LOG`, `kfault::LAST`, `platform::PLATFORM`, `ksmp::tsc::LAST` (teste de salto do TSC na partida), `ksmp::start::AP_JOB` (trabalho de teste dos APs ociosos) | folha |
 
 Notas:
 

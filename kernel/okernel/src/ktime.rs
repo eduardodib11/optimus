@@ -70,8 +70,18 @@ fn clock() -> Option<Clock> {
 }
 
 /// Nanossegundos desde o reset da CPU (zero sem relógio calibrado).
+///
+/// Todas as CPUs usam o TSC com a escala do BSP; o teste de salto da
+/// partida (`ksmp::tsc`) garante que duas leituras ordenadas por memória
+/// compartilhada não andam para trás entre CPUs, e o `lfence` impede que a
+/// leitura do TSC passe à frente da leitura de memória que a ordena.
 pub fn now_ns() -> u64 {
-    clock().map_or(0, |c| c.ns(cpu::rdtsc()))
+    clock().map_or(0, |c| c.ns(cpu::rdtsc_ordered()))
+}
+
+/// Escala do TSC calibrada no BSP (`None` sem relógio).
+pub fn tsc_scale() -> Option<Scale> {
+    Scale::from_mult(TSC_MULT.load(Ordering::Relaxed))
 }
 
 /// Ns do HPET desde a contagem `start`.

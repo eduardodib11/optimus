@@ -1,7 +1,13 @@
-//! Testes de kernel da topologia (T-316).
+//! Testes de kernel da topologia, da partida e do relógio entre CPUs
+//! (T-316, T-318, T-319 e T-321).
+
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use okernel::time::{MAX_TSC_WARP_NS, NS_PER_SEC};
 
 use crate::arch::x86_64::apic;
 use crate::ktest::{Outcome, Test};
+use crate::ktime;
 
 /// Testes de kernel da topologia de CPUs.
 pub const TESTS: &[Test] = &[
@@ -17,25 +23,119 @@ pub const TESTS: &[Test] = &[
         name: "smp.aps_ociosos_recebem_o_timer",
         run: aps_ociosos,
     },
+    Test {
+        name: "smp.salto_de_tsc_ate_1_us",
+        run: salto_de_tsc,
+    },
+    Test {
+        name: "smp.relogio_monotonico_entre_cpus",
+        run: relogio_entre_cpus,
+    },
 ];
+
+/// Segundos de uma opção `nome=N` da linha de comando, ou `default`.
+fn seconds(name: &str, default: u64) -> u64 {
+    crate::bootinfo::get()
+        .and_then(|i| i.cmdline())
+        .and_then(|c| okernel::log::option(c, name))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Todo AP ligado passou no teste de salto da partida com até 1 µs.
+fn salto_de_tsc() -> Outcome {
+    for cpu in 1..super::count() {
+        let ns = super::tsc::warp_ns(cpu);
+        info!("ktest: · cpu{cpu}: salto de TSC de até {ns} ns na partida");
+        ensure!(super::start::is_online(cpu));
+        ensure!(ns <= MAX_TSC_WARP_NS);
+    }
+    Ok(())
+}
+
+/// Fim da rodada do teste de relógio (ns do relógio).
+static CLOCK_END: AtomicU64 = AtomicU64::new(0);
+/// Maior leitura publicada até agora, por qualquer CPU.
+static CLOCK_LAST: AtomicU64 = AtomicU64::new(0);
+/// Leituras que voltaram atrás e o maior recuo (ns).
+static CLOCK_BACK: AtomicU64 = AtomicU64::new(0);
+static CLOCK_WORST: AtomicU64 = AtomicU64::new(0);
+static CLOCK_READS: AtomicU64 = AtomicU64::new(0);
+/// APs que terminaram a rodada.
+static CLOCK_DONE: AtomicUsize = AtomicUsize::new(0);
+
+/// Até `CLOCK_END`: lê a maior leitura publicada, lê o relógio (que, pelo
+/// `lfence`, vem depois) e exige que não seja menor; depois publica.
+fn clock_round() -> u64 {
+    let end = CLOCK_END.load(Ordering::Acquire);
+    let mut reads = 0;
+    loop {
+        let seen = CLOCK_LAST.load(Ordering::Acquire);
+        let now = ktime::now_ns();
+        if now < seen {
+            CLOCK_BACK.fetch_add(1, Ordering::Relaxed);
+            CLOCK_WORST.fetch_max(seen - now, Ordering::Relaxed);
+        }
+        CLOCK_LAST.fetch_max(now, Ordering::AcqRel);
+        reads += 1;
+        if now >= end {
+            return reads;
+        }
+    }
+}
+
+fn clock_job() {
+    let reads = clock_round();
+    CLOCK_READS.fetch_add(reads, Ordering::Relaxed);
+    CLOCK_DONE.fetch_add(1, Ordering::AcqRel);
+}
+
+/// `clock_get` (`ktime::now_ns`) não volta atrás entre CPUs: todas leem e
+/// publicam ao mesmo tempo por `smp.clock_s` segundos (10 por padrão, o
+/// aceite do T-321).
+fn relogio_entre_cpus() -> Outcome {
+    let aps = super::start::online_count() - 1;
+    if aps == 0 {
+        info!("ktest: · só uma CPU; nada a comparar");
+        return Ok(());
+    }
+    let secs = seconds("smp.clock_s", 10);
+    for a in [&CLOCK_LAST, &CLOCK_BACK, &CLOCK_WORST, &CLOCK_READS] {
+        a.store(0, Ordering::Relaxed);
+    }
+    CLOCK_DONE.store(0, Ordering::Relaxed);
+    // Os APs pegam o trabalho no próximo disparo do timer (até 10 ms).
+    let start = ktime::now_ns();
+    CLOCK_END.store(start + secs * NS_PER_SEC, Ordering::Release);
+    super::start::post_ap_job(clock_job);
+    let mine = clock_round();
+    while CLOCK_DONE.load(Ordering::Acquire) < aps {
+        ensure!(ktime::now_ns() < start + (secs + 1) * NS_PER_SEC);
+        core::hint::spin_loop();
+    }
+    let reads = CLOCK_READS.load(Ordering::Relaxed) + mine;
+    let back = CLOCK_BACK.load(Ordering::Relaxed);
+    info!(
+        "ktest: · {} CPUs, {secs} s, {reads} leituras ({mine} no BSP), {back} recuos (pior {} ns)",
+        aps + 1,
+        CLOCK_WORST.load(Ordering::Relaxed)
+    );
+    ensure!(back == 0);
+    ensure!(reads > mine);
+    Ok(())
+}
 
 /// Os APs ficam ociosos com o timer ligado por `smp.idle_s` segundos (1 por
 /// padrão; o aceite do T-319 pede 60) e seguem ligados, recebendo disparos.
 fn aps_ociosos() -> Outcome {
-    let secs = crate::bootinfo::get()
-        .and_then(|i| i.cmdline())
-        .and_then(|c| okernel::log::option(c, "smp.idle_s"))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1);
+    let secs = seconds("smp.idle_s", 1);
     let n = super::count();
     let fires = |cpu: usize| {
-        super::start::percpu_of(cpu).map_or(0, |p| {
-            p.timer_stats()[0].load(core::sync::atomic::Ordering::Acquire)
-        })
+        super::start::percpu_of(cpu).map_or(0, |p| p.timer_stats()[0].load(Ordering::Acquire))
     };
     let before: [u64; 8] = core::array::from_fn(fires);
-    let end = crate::ktime::now_ns() + secs * okernel::time::NS_PER_SEC;
-    while crate::ktime::now_ns() < end {
+    let end = ktime::now_ns() + secs * NS_PER_SEC;
+    while ktime::now_ns() < end {
         core::hint::spin_loop();
     }
     // Um disparo a cada 10 ms; no TCG, metade disso já basta.

@@ -100,6 +100,59 @@ impl Clock {
     }
 }
 
+/// Maior salto de TSC aceito entre duas CPUs (ADR 0030, item 5; T-321).
+pub const MAX_TSC_WARP_NS: u64 = 1_000;
+
+/// Saltos medidos no teste de TSC entre o BSP e um AP, em contagens: cada
+/// lado lê o próprio TSC sob uma trava e o compara com o último valor que o
+/// outro publicou.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Warp {
+    /// O AP leu menos que o BSP publicara antes: o AP está atrasado.
+    pub ap_behind: u64,
+    /// O BSP leu menos que o AP publicara antes: o AP está adiantado.
+    pub ap_ahead: u64,
+}
+
+/// O que fazer com o AP depois de uma rodada do teste de salto.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarpVerdict {
+    /// Salto dentro de [`MAX_TSC_WARP_NS`]: o AP entra.
+    Accept,
+    /// Corrigir uma vez somando este valor ao `TSC_ADJUST` do AP e medir de
+    /// novo.
+    Adjust(i64),
+    /// O AP fica fora.
+    Reject,
+}
+
+impl Warp {
+    /// O maior dos dois saltos, em ns.
+    #[must_use]
+    pub fn ns(self, scale: Scale) -> u64 {
+        scale.ticks_to_ns(self.ap_behind.max(self.ap_ahead))
+    }
+
+    /// Decide pelo salto medido: aceita até [`MAX_TSC_WARP_NS`]; acima disso
+    /// corrige uma vez (se ainda não corrigiu e o AP tiver `TSC_ADJUST`) e,
+    /// persistindo, recusa.
+    #[must_use]
+    pub fn verdict(self, scale: Scale, adjusted: bool, can_adjust: bool) -> WarpVerdict {
+        if self.ns(scale) <= MAX_TSC_WARP_NS {
+            return WarpVerdict::Accept;
+        }
+        if adjusted || !can_adjust {
+            return WarpVerdict::Reject;
+        }
+        let delta = i128::from(self.ap_behind) - i128::from(self.ap_ahead);
+        WarpVerdict::Adjust(i64::try_from(delta).unwrap_or(if delta > 0 {
+            i64::MAX
+        } else {
+            i64::MIN
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +203,45 @@ mod tests {
             assert!(ns >= last);
             last = ns;
         }
+    }
+
+    #[test]
+    fn veredito_do_salto_de_tsc() {
+        // TSC de 1 GHz: uma contagem por ns.
+        let s = Scale::from_hz(NS_PER_SEC).unwrap();
+        let w = |ap_behind, ap_ahead| Warp {
+            ap_behind,
+            ap_ahead,
+        };
+        assert_eq!(w(0, 0).verdict(s, false, true), WarpVerdict::Accept);
+        assert_eq!(w(1_000, 0).verdict(s, false, true), WarpVerdict::Accept);
+        assert_eq!(w(0, 1_000).ns(s), 1_000);
+        // Atrasado: soma; adiantado: subtrai.
+        assert_eq!(
+            w(5_000, 0).verdict(s, false, true),
+            WarpVerdict::Adjust(5_000)
+        );
+        assert_eq!(
+            w(0, 7_000).verdict(s, false, true),
+            WarpVerdict::Adjust(-7_000)
+        );
+        // Só uma correção, e só com TSC_ADJUST.
+        assert_eq!(w(5_000, 0).verdict(s, true, true), WarpVerdict::Reject);
+        assert_eq!(w(5_000, 0).verdict(s, false, false), WarpVerdict::Reject);
+        assert_eq!(
+            w(u64::MAX, 0).verdict(s, false, true),
+            WarpVerdict::Adjust(i64::MAX)
+        );
+        assert_eq!(
+            w(0, u64::MAX).verdict(s, false, true),
+            WarpVerdict::Adjust(i64::MIN)
+        );
+        // TSC de 3 GHz: 3001 contagens passam de 1 µs.
+        let s = Scale::from_hz(3 * NS_PER_SEC).unwrap();
+        assert_eq!(w(2_999, 0).verdict(s, false, true), WarpVerdict::Accept);
+        assert!(matches!(
+            w(3_301, 0).verdict(s, false, true),
+            WarpVerdict::Adjust(3_301)
+        ));
     }
 }

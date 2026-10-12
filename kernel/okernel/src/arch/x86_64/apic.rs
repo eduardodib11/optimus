@@ -138,6 +138,10 @@ pub fn init(direct_map: u64) -> Mode {
 /// nenhum), com o vetor espúrio e o timer mascarado; o 8259 só o BSP
 /// mascara. `false` se a CPU não tiver o modo do BSP.
 pub fn init_ap() -> bool {
+    // O timer em modo deadline é por CPU: quem não o tiver não acorda.
+    if tsc_deadline() && cpu::cpuid(1, 0).ecx & (1 << 24) == 0 {
+        return false;
+    }
     // SAFETY: `IA32_APIC_BASE` existe em toda CPU x86-64 com APIC.
     let base = unsafe { rdmsr(MSR_APIC_BASE) };
     match mode() {
