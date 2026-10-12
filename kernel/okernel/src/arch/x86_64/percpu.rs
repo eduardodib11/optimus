@@ -228,6 +228,11 @@ pub unsafe fn from_ist_rsp(rsp: u64) -> &'static PerCpu {
     unsafe { &*(((top - 8) as *const u64).read() as *const PerCpu) }
 }
 
+/// Área do BSP.
+pub fn bsp() -> &'static PerCpu {
+    &BSP
+}
+
 /// Instala a área do BSP.
 ///
 /// # Safety

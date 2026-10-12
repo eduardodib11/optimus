@@ -208,6 +208,59 @@ pub fn self_ipi(vector: u8) {
     }
 }
 
+/// ICR: entrega ainda pendente (xAPIC).
+const ICR_PENDING: u32 = 1 << 12;
+/// ICR: nível de asserção.
+const ICR_ASSERT: u32 = 1 << 14;
+/// ICR: entrega INIT.
+const ICR_INIT: u32 = 0b101 << 8;
+/// ICR: entrega Start-up (SIPI).
+const ICR_STARTUP: u32 = 0b110 << 8;
+
+/// Espera o xAPIC terminar a entrega anterior (bit 12 do ICR).
+fn wait_icr_idle() {
+    for _ in 0..1_000_000 {
+        if read(REG_ICR) & ICR_PENDING == 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Escreve o ICR para o APIC de id `dest` (ADR 0030, item 3; ADR 0031,
+/// item 5). Chamar com interrupções desligadas.
+fn send_icr(dest: u32, low: u32) {
+    match mode() {
+        // SAFETY: ICR do x2APIC: destino nos 32 bits altos, uma escrita só.
+        // O WRMSR do x2APIC não serializa: a barreira faz as escritas
+        // anteriores (parâmetros, pedidos na caixa) chegarem antes do IPI.
+        Mode::X2Apic => unsafe {
+            core::sync::atomic::fence(Ordering::SeqCst);
+            wrmsr(
+                0x800 + (REG_ICR >> 4),
+                (u64::from(dest) << 32) | u64::from(low),
+            );
+        },
+        Mode::XApic => {
+            wait_icr_idle();
+            write(REG_ICR_HIGH, dest << 24);
+            write(REG_ICR, low);
+            wait_icr_idle();
+        }
+        Mode::Off => {}
+    }
+}
+
+/// Manda INIT ao APIC `dest` (põe a CPU à espera de SIPI).
+pub fn send_init(dest: u32) {
+    send_icr(dest, ICR_INIT | ICR_ASSERT);
+}
+
+/// Manda SIPI ao APIC `dest`: a CPU começa em modo real em `page << 12`.
+pub fn send_sipi(dest: u32, page: u8) {
+    send_icr(dest, ICR_STARTUP | ICR_ASSERT | u32::from(page));
+}
+
 /// Manda NMI a todas as outras CPUs (para congelá-las no pânico).
 fn nmi_others() {
     // Entrega NMI (100b), nível de asserção, destino "todas menos esta".

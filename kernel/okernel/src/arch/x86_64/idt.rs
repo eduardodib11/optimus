@@ -178,6 +178,22 @@ pub unsafe fn init() {
     }
 }
 
+/// Carrega nesta CPU a IDT já preenchida por [`init`] (a IDT é uma só,
+/// imutável depois do boot; os APs a carregam na partida).
+///
+/// # Safety
+///
+/// Depois de [`init`], com interrupções desligadas e a GDT desta CPU
+/// carregada.
+pub unsafe fn load() {
+    let pointer = Pointer {
+        limit: (size_of::<[Gate; 256]>() - 1) as u16,
+        base: (&raw const IDT).addr() as u64,
+    };
+    // SAFETY: contrato acima; a IDT é estática e não muda mais.
+    unsafe { asm!("lidt [{}]", in(reg) &raw const pointer, options(nostack)) };
+}
+
 /// Endereço virtual da IDT, para conferir o que a CPU carregou.
 pub fn table_addr() -> u64 {
     (&raw const IDT).addr() as u64
