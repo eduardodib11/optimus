@@ -3,6 +3,7 @@
 //! fila certa e avisa com o IPI de reescalonar.
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use kabi::vm::{PAGE_SIZE, WRITE};
 use kabi::{ObjectType, STATUS_OK};
@@ -13,7 +14,9 @@ use okernel::vm::vm_map;
 
 use super::super::{UserEntry, start_on, wake, yield_now};
 use super::sync::read_user;
-use super::{DATA_VA, Process, cap, delete, process, settled, thread, thread_with, user_symbol};
+use super::{
+    DATA_VA, Page, Process, cap, delete, process, settled, thread, thread_with, user_symbol,
+};
 use crate::arch::x86_64::cpu;
 use crate::kcap::root_quota;
 use crate::ksmp;
@@ -23,7 +26,7 @@ use crate::ktime;
 unsafe extern "C" {
     static user_pingpong: u8;
     static user_wait_cpu: u8;
-    static user_spin: u8;
+    static user_spin_flag: u8;
 }
 
 /// Onde os dois processos do pingue-pongue mapeiam a página comum.
@@ -33,9 +36,14 @@ const SHARED_VA: u64 = 0x60_0000;
 /// à parte (de um a cinco minutos sob TCG; na depuração, dez vezes mais).
 const DEFAULT_ROUNDS: u64 = 10_000;
 const MS: u64 = 1_000_000;
+/// Prazo das esperas por outra CPU: folgado, porque sob TCG uma vCPU pode
+/// ficar centenas de milissegundos sem andar.
+const LIMIT: u64 = 10_000 * MS;
+/// Onde a thread que gira mapeia a página com o pedido de parar.
+const SPIN_VA: u64 = 0x70_0000;
 
 /// Valor de uma opção `nome=N` da linha de comando, ou `default`.
-fn option(name: &str, default: u64) -> u64 {
+pub(super) fn option(name: &str, default: u64) -> u64 {
     crate::bootinfo::get()
         .and_then(|i| i.cmdline())
         .and_then(|c| okernel::log::option(c, name))
@@ -46,7 +54,7 @@ fn option(name: &str, default: u64) -> u64 {
 /// Espera até `done()` ou `limit_ns`, rodando as prontas desta CPU e
 /// dormindo (`hlt`, com o timer armado para 1 ms) entre uma olhada e outra:
 /// o BSP girando tiraria do host a CPU de que os APs do QEMU precisam.
-fn wait_for(limit_ns: u64, done: impl Fn() -> bool) -> bool {
+pub(super) fn wait_for(limit_ns: u64, done: impl Fn() -> bool) -> bool {
     wait_with(limit_ns, true, done)
 }
 
@@ -173,7 +181,7 @@ fn park_on(
         args: [u64::from(ntfy.raw()), DATA_VA, 0],
     };
     ensure!(start_on(&t, &e, cpu).is_ok());
-    ensure!(wait_for(1_000 * MS, || parked(&t)));
+    ensure!(wait_for(LIMIT, || parked(&t)));
     ensure!(t.cpu() == cpu);
     Ok((h, t))
 }
@@ -211,7 +219,7 @@ fn acorda_na_ociosa(home: u32) -> Outcome {
     let (ntfy_h, ntfy) = notification(&p)?;
     let (handle, waiter) = park_on(&p, ntfy_h, home)?;
     signal(&ntfy, 0b10)?;
-    ensure!(wait_for(1_000 * MS, || gone(&waiter)));
+    ensure!(wait_for(LIMIT, || gone(&waiter)));
     let [status, bits, cpu] = read_user::<3>(&p, DATA_VA)?;
     info!("ktest: · cpu{home} ociosa: acordou na cpu{cpu}");
     ensure!(status == STATUS_OK && bits == 0b10);
@@ -222,33 +230,40 @@ fn acorda_na_ociosa(home: u32) -> Outcome {
 
 /// Bloqueada na CPU `home`, ocupada por uma de prioridade 200: a de 100
 /// acorda na primeira ociosa depois dela, que é o BSP (o teste roda no
-/// ocioso dele).
+/// ocioso dele). A de 200 gira até o teste mandar parar, não por um prazo
+/// de relógio: sob TCG uma vCPU pode ficar centenas de milissegundos sem
+/// andar (o MMIO do APIC espera a trava global do QEMU), e o prazo venceria
+/// antes do despertar.
 fn acorda_longe_da_ocupada(home: u32) -> Outcome {
-    let p = process(2)?;
+    let p = process(1)?;
     let (ntfy_h, ntfy) = notification(&p)?;
     let (handle, waiter) = park_on(&p, ntfy_h, home)?;
     let busy = Params::new(MS, MS, 200).map_err(|_| "params")?;
     let (spin_h, spinner) = thread_with(&p, busy)?;
+    let stop = Page::new(&p)?;
+    ensure!(vm_map(&p.aspace, &stop.cap, SPIN_VA, 0, PAGE_SIZE, WRITE).is_ok());
     let e = UserEntry {
-        rip: user_symbol(&raw const user_spin),
-        rsp: DATA_VA + 2 * PAGE_SIZE,
-        args: [ktime::now_ns() + 300 * MS, 0, 0],
+        rip: user_symbol(&raw const user_spin_flag),
+        rsp: DATA_VA + PAGE_SIZE,
+        args: [SPIN_VA, 0, 0],
     };
     ensure!(start_on(&spinner, &e, home).is_ok());
-    ensure!(wait_for(1_000 * MS, || spinner.state() == RunState::Running));
-    signal(&ntfy, 0b100)?;
-    ensure!(wait_for(1_000 * MS, || gone(&waiter)));
+    // Já no anel 3: a troca terminou e a CPU publicou a prioridade 200.
+    let running = wait_for(LIMIT, || stop.word(1).load(Ordering::Acquire) == 1);
+    let woke = running && signal(&ntfy, 0b100).is_ok() && wait_for(LIMIT, || gone(&waiter));
+    stop.word(0).store(1, Ordering::Release);
+    ensure!(running && woke);
     let [status, bits, cpu] = read_user::<3>(&p, DATA_VA)?;
     info!("ktest: · cpu{home} ocupada por prioridade 200: a de 100 acordou na cpu{cpu}");
     ensure!(status == STATUS_OK && bits == 0b100);
     ensure!(cpu == 0 && waiter.cpu() == 0);
-    ensure!(wait_for(2_000 * MS, || gone(&spinner)));
+    ensure!(wait_for(LIMIT, || gone(&spinner)));
     ensure!(spinner.cpu() == home);
     drop((waiter, spinner));
-    delete(&p, &[handle, spin_h, ntfy_h])
+    delete(&p, &[handle, spin_h, ntfy_h, stop.handle])
 }
 
 /// Terminou e saiu da CPU.
-fn gone(t: &Thread) -> bool {
+pub(super) fn gone(t: &Thread) -> bool {
     t.state() == RunState::Exited && !t.on_cpu()
 }

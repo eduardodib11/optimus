@@ -3,6 +3,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicU64;
 
 use kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use kabi::{Error, Handle, ObjectType};
@@ -21,6 +22,7 @@ use crate::{kmem, ktime};
 mod sched;
 mod smp;
 mod sync;
+mod tlb;
 
 /// Testes de kernel de threads de usuário.
 pub const TESTS: &[Test] = &[
@@ -55,6 +57,18 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "smp.dois_processos_alternam_em_cpus_distintas",
         run: smp::alternam_em_cpus_distintas,
+    },
+    Test {
+        name: "smp.vm_unmap_faz_a_outra_cpu_faltar",
+        run: tlb::unmap_faz_faltar,
+    },
+    Test {
+        name: "smp.shootdown_sem_traducao_velha",
+        run: tlb::sem_traducao_velha,
+    },
+    Test {
+        name: "smp.shootdown_do_kernel_sem_traducao_velha",
+        run: tlb::kernel_sem_traducao_velha,
     },
 ];
 
@@ -170,6 +184,48 @@ fn bare_thread(p: &Process) -> Result<(Handle, Arc<Thread>), &'static str> {
     t.configure(Arc::clone(&p.cspace), aspace)
         .map_err(|_| "configure")?;
     Ok((h, t))
+}
+
+/// Um `MemoryObject` de uma página de um processo de teste, visto pelo
+/// kernel pelo mapa direto.
+pub struct Page {
+    /// Handle do objeto, para o teste apagá-lo no fim.
+    pub handle: Handle,
+    /// Capability do objeto, para mapeá-lo.
+    pub cap: Cap,
+    base: u64,
+}
+
+impl Page {
+    /// Cria a página em `p` (zerada).
+    pub fn new(p: &Process) -> Result<Self, &'static str> {
+        let handle = p
+            .cspace
+            .lock()
+            .obj_create(p.quota, ObjectType::MemoryObject, PAGE_SIZE)
+            .map_err(|_| "obj_create(MemoryObject)")?;
+        let cap = cap(&p.cspace, handle)?;
+        let frame = cap
+            .object
+            .as_memory_object()
+            .map_err(|_| "tipo")?
+            .frame(0)
+            .ok_or("frame")?;
+        Ok(Self {
+            handle,
+            cap,
+            base: kmem::direct(frame),
+        })
+    }
+
+    /// A palavra `i` da página.
+    pub fn word(&self, i: usize) -> &AtomicU64 {
+        assert!(i < 512);
+        // SAFETY: o frame é do MemoryObject que `self.cap` mantém vivo; no
+        // mapa direto, alinhado a 4 KiB, e só se acessa como atômicos (o
+        // usuário que o mapeia também é parte do teste).
+        unsafe { &*(self.base as *const AtomicU64).add(i) }
+    }
 }
 
 /// Prazo de [`run_until_exit`].

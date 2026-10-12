@@ -42,6 +42,16 @@ Notas:
   Por isso o escalonador solta a thread que saiu da CPU (`switch_prev`,
   talvez a última referência de uma que terminou) só depois de largar a
   fila, em `finish_switch`.
+- O TLB shootdown (T-326, `ksmp::tlb::flush`) não toma trava, mas espera
+  as outras CPUs confirmarem com a trava de quem chamou na mão: a do
+  `AddressSpace` em `unmap`/`protect`/`map` (o frame só volta ao buddy
+  depois). Não trava porque o alvo atende o pedido no IPI (anel 3 ou
+  ocioso) ou em `ipi::poll`, que toda espera do kernel chama, inclusive o
+  giro de `SpinLock::lock`: uma CPU parada esperando aquela mesma trava
+  atende o shootdown enquanto gira. O atendimento só invalida a TLB e
+  confirma; não toma trava, não espera e não manda IPI. `kmem::unmap` e
+  `kmem::unmap_pages` largam `KernelPageTables` antes do shootdown e só
+  depois liberam os frames.
 
 ## Pontos sem nenhuma trava
 

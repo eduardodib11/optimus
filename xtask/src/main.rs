@@ -543,6 +543,16 @@ const ALTERNATE_SCENARIO: Scenario = Scenario {
     ..KERNEL_SCENARIO
 };
 
+/// Aceite do T-326 (em `cargo xtask test smp`, release): 10⁵ trocas de
+/// mapeamento lidas por outra CPU sem nenhuma leitura pela tradução velha.
+/// Sob TCG, cerca de meio minuto com 4 e 8 CPUs; com 2, uns três.
+const SHOOTDOWN_SCENARIO: Scenario = Scenario {
+    name: "10⁵ shootdowns sem tradução velha",
+    cmdline: "test=kernel ktest=smp.shootdown_sem smp.shootdown=100000",
+    timeout: Duration::from_mins(15),
+    ..KERNEL_SCENARIO
+};
+
 /// Aceite do T-212 (`cargo xtask test hello`): o boot normal com 10⁶ idas
 /// e voltas entre o `hello` e o `root`. Fica fora do `test all` pelo tempo.
 const HELLO_SCENARIO: Scenario = Scenario {
@@ -928,6 +938,15 @@ fn smp(opts: &Options) -> Result {
             &ALTERNATE_SCENARIO,
         )?;
         println!("xtask: -smp {n}: dois processos alternaram 10⁶ vezes em CPUs distintas");
+        bases.extend(direct_map_base(&serial));
+        let serial = boot_scenario(
+            &Options {
+                smp: n,
+                ..release.clone()
+            },
+            &SHOOTDOWN_SCENARIO,
+        )?;
+        println!("xtask: -smp {n}: 10⁵ shootdowns sem leitura pela tradução velha");
         bases.extend(direct_map_base(&serial));
     }
     check_direct_map_bases(&bases)

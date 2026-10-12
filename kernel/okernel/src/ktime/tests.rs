@@ -94,6 +94,7 @@ fn desvio() -> Outcome {
         .clamp(1, 60);
     let (h0, n0) = paired();
     while hpet_ns_since(h0) < seconds * NS_PER_SEC {
+        crate::ksmp::ipi::poll();
         core::hint::spin_loop();
     }
     let (h1, n1) = paired();

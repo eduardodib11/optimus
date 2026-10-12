@@ -626,5 +626,73 @@ user_wait_cpu:
     syscall
     ud2
 
+/* user_spin_flag(rdi = página RW)
+ *
+ * Grava 1 em [página + 8] (já roda no anel 3) e gira, sem syscall, até
+ * [página] deixar de ser zero; então termina. Só o timer a tira da CPU. */
+.global user_spin_flag
+user_spin_flag:
+    mov qword ptr [rdi + 8], 1
+1:
+    pause
+    cmp qword ptr [rdi], 0
+    je 1b
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_tlb_spin(rdi = endereço, rsi = página RW)
+ *
+ * Lê a palavra em `endereço`, grava-a em [página + 8] e conta a leitura em
+ * [página], sem parar e sem syscall: só a falta depois do `vm_unmap` de
+ * outra CPU (T-326) a encerra. */
+.global user_tlb_spin
+user_tlb_spin:
+1:
+    mov rax, qword ptr [rdi]
+    mov qword ptr [rsi + 8], rax
+    inc qword ptr [rsi]
+    jmp 1b
+
+/* user_tlb_reader(rdi = endereço, rsi = página RW)
+ *
+ * Leitora do teste de traduções velhas (T-326). A página RW tem [0] a
+ * rodada liberada, [8] a última rodada lida, [16] o valor esperado em
+ * `endereço`, [24] as leituras com outro valor, [32] as leituras e [40]
+ * o pedido de parar. A cada rodada nova, lê `endereço` 64 vezes, conta as
+ * leituras que não dão o esperado e grava a rodada em [8]; entre uma
+ * rodada e outra, só gira na página RW (a tradução de `endereço` fica na
+ * TLB enquanto o kernel troca o mapeamento). */
+.global user_tlb_reader
+user_tlb_reader:
+    xor r12d, r12d
+1:  /* espera a próxima rodada ou o pedido de parar */
+    cmp qword ptr [rsi + 40], 0
+    jne 9f
+    mov rax, qword ptr [rsi]
+    cmp rax, r12
+    jne 2f
+    pause
+    jmp 1b
+2:
+    mov r12, rax
+    mov r13, qword ptr [rsi + 16]
+    mov ecx, 64
+3:
+    mov rax, qword ptr [rdi]
+    cmp rax, r13
+    je 4f
+    inc qword ptr [rsi + 24]
+4:
+    inc qword ptr [rsi + 32]
+    dec ecx
+    jnz 3b
+    mov qword ptr [rsi + 8], r12
+    jmp 1b
+9:
+    mov eax, 33
+    syscall
+    ud2
+
 .global user_test_end
 user_test_end:

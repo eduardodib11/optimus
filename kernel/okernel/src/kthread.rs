@@ -634,7 +634,7 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     {
         // SAFETY: o espaço da thread que vai rodar (vivo enquanto ela
         // estiver em `current`) ou o do kernel; ambos mapeiam o kernel.
-        unsafe { cpu::write_cr3(root) };
+        unsafe { crate::kvm::load_root(root) };
     }
     drop(next);
     // SAFETY: `prev_slot` é o rsp salvo da anterior, viva (em
