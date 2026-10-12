@@ -28,6 +28,7 @@ mod kirq;
 mod kmem;
 mod kpanic;
 mod kroot;
+mod ksync;
 mod kthread;
 mod ktime;
 mod kvm;
@@ -50,6 +51,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
     // SAFETY: primeira e única chamada, no boot, com interrupções desligadas
     // (o optboot entrega assim e nada as ligou).
     unsafe { arch::x86_64::init() };
+    ksync::init();
     info!("okernel: GDT, TSS e IDT carregadas");
     if !info.is_valid() {
         error!("okernel: BootInfo inválida (magic {:#x})", info.magic);

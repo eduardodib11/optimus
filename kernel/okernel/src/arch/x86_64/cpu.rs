@@ -162,6 +162,14 @@ pub fn disable_interrupts() {
     unsafe { asm!("cli", options(nomem, nostack)) };
 }
 
+/// As interrupções desta CPU estão ligadas (RFLAGS.IF)?
+pub fn interrupts_enabled() -> bool {
+    let rflags: u64;
+    // SAFETY: PUSHFQ/POP só leem RFLAGS para um registrador.
+    unsafe { asm!("pushfq", "pop {}", out(reg) rflags, options(nomem, preserves_flags)) };
+    rflags & (1 << 9) != 0
+}
+
 /// Liga as interrupções e espera a próxima; volta com elas desligadas.
 pub fn wait_for_interrupt() {
     // SAFETY: STI só vale depois da instrução seguinte, então nenhuma
