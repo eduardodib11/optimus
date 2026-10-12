@@ -17,6 +17,15 @@ use super::outb;
 pub const TIMER_VECTOR: u8 = 0x20;
 /// Vetor de interrupções espúrias.
 pub const SPURIOUS_VECTOR: u8 = 0xff;
+/// IPI de reescalonar (ADR 0031, item 5).
+pub const RESCHED_VECTOR: u8 = 0xf0;
+/// IPI de função remota.
+pub const CALL_VECTOR: u8 = 0xf1;
+/// IPI de TLB shootdown (T-326).
+pub const TLB_VECTOR: u8 = 0xf2;
+/// Vetores reservados ao kernel no topo da tabela (IPIs e futuros), que
+/// nenhum objeto `Interrupt` pode usar.
+pub const KERNEL_VECTORS: core::ops::RangeInclusive<u8> = 0xf0..=0xfe;
 
 const MSR_APIC_BASE: u32 = 0x1b;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
@@ -284,6 +293,11 @@ fn send_icr(dest: u32, low: u32) {
 /// Manda INIT ao APIC `dest` (põe a CPU à espera de SIPI).
 pub fn send_init(dest: u32) {
     send_icr(dest, ICR_INIT | ICR_ASSERT);
+}
+
+/// Manda ao APIC `dest` uma interrupção fixa no vetor `vector` (IPI).
+pub fn send_ipi(dest: u32, vector: u8) {
+    send_icr(dest, ICR_ASSERT | u32::from(vector));
 }
 
 /// Manda SIPI ao APIC `dest`: a CPU começa em modo real em `page << 12`.

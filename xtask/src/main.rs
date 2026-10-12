@@ -500,19 +500,22 @@ const SCENARIOS: &[Scenario] = &[
         hello: false,
         timeout: SMOKE_TIMEOUT,
     },
-    Scenario {
-        name: "pânico proposital",
-        cmdline: "test=panic",
-        markers: PANIC_MARKERS,
-        forbidden: &["okernel: desligando", "okernel: FALTA"],
-        exit: Some(KERNEL_EXIT_FAILURE),
-        ktest: false,
-        screen: true,
-        rounds: None,
-        hello: false,
-        timeout: SMOKE_TIMEOUT,
-    },
+    PANIC_SCENARIO,
 ];
+
+/// Pânico proposital (T-110); com `smp.panic_cpu`, vindo de um AP (T-322).
+const PANIC_SCENARIO: Scenario = Scenario {
+    name: "pânico proposital",
+    cmdline: "test=panic",
+    markers: PANIC_MARKERS,
+    forbidden: &["okernel: desligando", "okernel: FALTA"],
+    exit: Some(KERNEL_EXIT_FAILURE),
+    ktest: false,
+    screen: true,
+    rounds: None,
+    hello: false,
+    timeout: SMOKE_TIMEOUT,
+};
 
 /// Testes de kernel (T-111): o kernel roda os testes registrados e sai com 33
 /// se todos passarem.
@@ -882,8 +885,53 @@ fn smp(opts: &Options) -> Result {
         check_cpus_online(&serial, n)?;
         println!("xtask: -smp {n}: {n} CPUs ligadas, suíte de kernel ok");
         bases.extend(direct_map_base(&serial));
+        // Pânico na última CPU: as outras congelam e o dump sai legível.
+        let cpu = n - 1;
+        let cmdline: &'static str =
+            Box::leak(format!("test=panic smp.panic_cpu={cpu}").into_boxed_str());
+        let serial = boot_scenario(
+            &Options {
+                smp: n,
+                ..opts.clone()
+            },
+            &Scenario {
+                name: "pânico numa CPU secundária",
+                cmdline,
+                ..PANIC_SCENARIO
+            },
+        )?;
+        check_smp_panic(&serial, n, cpu)?;
+        println!("xtask: -smp {n}: pânico na cpu{cpu} congelou as outras {cpu} CPUs");
+        bases.extend(direct_map_base(&serial));
     }
     check_direct_map_bases(&bases)
+}
+
+/// Pânico SMP (ADR 0031, item 8): a dona é `cpu` e cada uma das outras
+/// `n - 1` CPUs deixou o quadro na serial.
+fn check_smp_panic(serial: &str, n: u32, cpu: u32) -> Result {
+    if n < 2 {
+        return Ok(());
+    }
+    let owner = format!("(cpu{cpu}): pânico de teste proposital");
+    if !serial
+        .lines()
+        .any(|l| l.contains("okernel: PÂNICO em") && l.contains(&owner))
+    {
+        return Err(format!("o pânico não veio da cpu{cpu}"));
+    }
+    let others = n - 1;
+    let summary = format!("okernel: {others} de {others} outras CPUs congeladas");
+    if !serial.contains(&summary) {
+        return Err(format!("faltou \"{summary}\""));
+    }
+    for other in (0..n).filter(|&c| c != cpu) {
+        let line = format!("okernel: cpu{other} congelada: rip 0x");
+        if !serial.contains(&line) {
+            return Err(format!("faltou o quadro da cpu{other}"));
+        }
+    }
+    Ok(())
 }
 
 /// Exige que o kernel tenha ligado todas as `n` CPUs da máquina.
@@ -1244,6 +1292,25 @@ mod tests {
         assert!(check_cpus_online(serial, 8).is_err());
         assert!(check_cpus_online(&serial.replace("4 de 4", "3 de 4"), 4).is_err());
         assert_eq!(check_cpus_online("", 1), Ok(()));
+    }
+
+    #[test]
+    fn panico_smp_exige_dona_e_quadros() {
+        let serial = "okernel: PÂNICO em kernel/okernel/src/main.rs:1:2 (cpu1): pânico de teste proposital (test=panic)\n\
+                      okernel: 1 de 1 outras CPUs congeladas\n\
+                      okernel: cpu0 congelada: rip 0xffff rsp 0x1\n";
+        assert_eq!(check_smp_panic(serial, 2, 1), Ok(()));
+        assert!(check_smp_panic(serial, 2, 0).is_err());
+        assert!(
+            check_smp_panic(
+                &serial.replace("cpu0 congelada", "cpu0 não respondeu"),
+                2,
+                1
+            )
+            .is_err()
+        );
+        assert!(check_smp_panic(&serial.replace("1 de 1", "0 de 1"), 2, 1).is_err());
+        assert_eq!(check_smp_panic("", 1, 0), Ok(()));
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! global: GDT e TSS, rsp salvo do ocioso, timer armado e disparos dele,
 //! pilha de travas e o registro das sondas de memória. Continuam globais só
 //! a configuração comum a todas as CPUs (modo do APIC, calibragem do TSC,
-//! XSAVE), o estado do pânico (vira por CPU no T-322) e o escalonador
-//! (T-323). O BSP usa a instância estática (as
+//! XSAVE), o dono do pânico e o escalonador (T-323). Cada CPU tem também a
+//! caixa de pedidos de IPI (T-322), a thread atual e o quadro gravado
+//! quando um pânico a congela. O BSP usa a instância estática (as
 //! exceções podem chegar antes do alocador); os APs recebem a sua na
 //! partida (T-318).
 //!
@@ -21,9 +22,10 @@ use core::cell::UnsafeCell;
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use okernel::ipi::Mailbox;
 use okernel::sync::HeldLocks;
 
-use super::cpu::wrmsr;
+use super::cpu::{rdmsr, wrmsr};
 use super::gdt::{self, Gdt, IST_STACK_SIZE, Tss};
 
 const MSR_GS_BASE: u32 = 0xc000_0101;
@@ -59,6 +61,14 @@ pub struct PerCpu {
     probe_last: [AtomicU64; 3],
     /// Travas na mão (ADR 0031, item 4).
     held: HeldLocks,
+    /// Pedidos de outras CPUs (ADR 0031, item 5).
+    mailbox: Mailbox,
+    /// Endereço da `Thread` que roda (zero: o ocioso), para o dump do
+    /// pânico.
+    thread: AtomicU64,
+    /// Quadro gravado pelo NMI do pânico: rip, rsp, rflags, cr3, cs e
+    /// thread (ADR 0031, item 8).
+    panic_dump: [AtomicU64; 6],
     gdt: UnsafeCell<Gdt>,
     tss: UnsafeCell<Tss>,
 }
@@ -92,6 +102,9 @@ impl PerCpu {
             probe_exec_armed: AtomicBool::new(false),
             probe_last: [const { AtomicU64::new(0) }; 3],
             held: HeldLocks::new(),
+            mailbox: Mailbox::new(),
+            thread: AtomicU64::new(0),
+            panic_dump: [const { AtomicU64::new(0) }; 6],
             gdt: UnsafeCell::new(gdt::GDT_TEMPLATE),
             tss: UnsafeCell::new(Tss::new()),
         }
@@ -145,6 +158,21 @@ impl PerCpu {
     /// Registro da última falta de sonda nesta CPU.
     pub fn probe_last(&self) -> &[AtomicU64; 3] {
         &self.probe_last
+    }
+
+    /// Caixa de pedidos de IPI desta CPU.
+    pub fn mailbox(&self) -> &Mailbox {
+        &self.mailbox
+    }
+
+    /// Endereço da `Thread` que roda nesta CPU (zero: o ocioso).
+    pub fn thread(&self) -> &AtomicU64 {
+        &self.thread
+    }
+
+    /// Quadro gravado quando o pânico congelou esta CPU.
+    pub fn panic_dump(&self) -> &[AtomicU64; 6] {
+        &self.panic_dump
     }
 
     /// Endereço da GDT desta CPU.
@@ -281,6 +309,23 @@ pub fn with<R>(f: impl FnOnce(&PerCpu) -> R) -> R {
 /// enquanto a pilha é usada).
 pub fn held_locks() -> &'static HeldLocks {
     &this().held
+}
+
+/// A caixa de pedidos de IPI desta CPU (vive para sempre; só esta CPU a
+/// atende).
+pub fn mailbox() -> &'static Mailbox {
+    &this().mailbox
+}
+
+/// Id lógico desta CPU, ou zero se o GS do kernel ainda não foi instalado
+/// (pânico no começo do boot).
+pub fn cpu_id_or_zero() -> u32 {
+    // SAFETY: `IA32_GS_BASE` existe em toda CPU x86-64; ler não muda nada.
+    if unsafe { rdmsr(MSR_GS_BASE) } == 0 {
+        0
+    } else {
+        cpu_id()
+    }
 }
 
 /// Id lógico desta CPU (`gs:[24]`). Vale para o instante da leitura: a

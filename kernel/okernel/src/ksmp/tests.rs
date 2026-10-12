@@ -1,5 +1,5 @@
-//! Testes de kernel da topologia, da partida e do relógio entre CPUs
-//! (T-316, T-318, T-319 e T-321).
+//! Testes de kernel da topologia, da partida, do relógio e dos IPIs entre
+//! CPUs (T-316, T-318, T-319, T-321 e T-322).
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -31,7 +31,131 @@ pub const TESTS: &[Test] = &[
         name: "smp.relogio_monotonico_entre_cpus",
         run: relogio_entre_cpus,
     },
+    Test {
+        name: "smp.funcao_remota_local_e_cpu_desligada",
+        run: funcao_remota_local,
+    },
+    Test {
+        name: "smp.resched_chega_a_todas_as_cpus",
+        run: resched_chega,
+    },
+    Test {
+        name: "smp.ipi_ida_e_volta_entre_todos_os_pares",
+        run: ipi_todos_os_pares,
+    },
 ];
+
+static LOCAL: AtomicU64 = AtomicU64::new(0);
+
+/// Na própria CPU, `call_on` chama direto; CPU fora da topologia, `false`.
+fn funcao_remota_local() -> Outcome {
+    let me = crate::arch::x86_64::percpu::cpu_id() as usize;
+    ensure!(super::ipi::call_on(
+        me,
+        |v| LOCAL.store(v, Ordering::Relaxed),
+        7
+    ));
+    ensure!(LOCAL.load(Ordering::Relaxed) == 7);
+    ensure!(!super::ipi::call_on(super::count(), |_| {}, 0));
+    ensure!(!super::ipi::call_on(kabi::MAX_CPUS, |_| {}, 0));
+    Ok(())
+}
+
+/// Espera `done()` por até 100 ms, atendendo a própria caixa.
+fn wait_polling(done: impl Fn() -> bool) -> bool {
+    let end = ktime::now_ns() + 100_000_000;
+    while !done() {
+        if ktime::now_ns() > end {
+            return false;
+        }
+        super::ipi::poll();
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// O IPI de reescalonar liga `need_resched` em cada AP (ocioso, IF=1).
+fn resched_chega() -> Outcome {
+    for cpu in 1..super::start::online_count() {
+        super::ipi::resched_pending(cpu, true);
+        ensure!(super::ipi::resched(cpu));
+        ensure!(wait_polling(|| super::ipi::resched_pending(cpu, false)));
+        ensure!(super::ipi::resched_pending(cpu, true));
+    }
+    ensure!(!super::ipi::resched(super::count()));
+    Ok(())
+}
+
+/// Linha `from` da matriz: bit `to` ligado quando `to` atendeu `from`.
+static PAIRS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+/// APs que terminaram de chamar todas as outras.
+static PAIRS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+fn ping(from: u64) {
+    let to = crate::arch::x86_64::percpu::cpu_id();
+    if let Some(row) = usize::try_from(from).ok().and_then(|f| PAIRS.get(f)) {
+        row.fetch_or(1 << to, Ordering::Relaxed);
+    }
+}
+
+/// Esta CPU chama `ping` em todas as outras.
+fn ping_all() -> bool {
+    let me = crate::arch::x86_64::percpu::cpu_id();
+    let n = super::start::online_count().min(64);
+    (0..n)
+        .filter(|&to| to != me as usize)
+        .all(|to| super::ipi::call_on(to, ping, u64::from(me)))
+}
+
+fn ping_job() {
+    if ping_all() {
+        PAIRS_DONE.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Toda CPU manda função remota a toda outra, todas ao mesmo tempo (o BSP
+/// pelo teste, os APs pelo trabalho do ocioso), e cada uma atende a sua
+/// caixa enquanto espera: a matriz de pares fecha sem travar.
+fn ipi_todos_os_pares() -> Outcome {
+    let n = super::start::online_count().min(64);
+    if n < 2 {
+        info!("ktest: · só uma CPU; nada a comparar");
+        return Ok(());
+    }
+    for row in &PAIRS {
+        row.store(0, Ordering::Relaxed);
+    }
+    PAIRS_DONE.store(0, Ordering::Relaxed);
+    // Ida e volta medida do BSP a cada AP, antes do teste cruzado.
+    let mut worst = 0;
+    let mut total = 0;
+    for to in 1..n {
+        let t0 = ktime::now_ns();
+        ensure!(super::ipi::call_on(to, |_| {}, 0));
+        let dt = ktime::now_ns() - t0;
+        worst = worst.max(dt);
+        total += dt;
+    }
+    super::start::post_ap_job(ping_job);
+    ensure!(ping_all());
+    let end = ktime::now_ns() + 2 * NS_PER_SEC;
+    while PAIRS_DONE.load(Ordering::Acquire) < n - 1 {
+        ensure!(ktime::now_ns() < end);
+        super::ipi::poll();
+        core::hint::spin_loop();
+    }
+    let all = (1u64 << n) - 1;
+    for (from, row) in PAIRS.iter().enumerate().take(n) {
+        let got = row.load(Ordering::Relaxed);
+        ensure!(got == all & !(1 << from));
+    }
+    info!(
+        "ktest: · {} pares; ida e volta BSP→AP média {} ns, pior {worst} ns",
+        n * (n - 1),
+        total / (n as u64 - 1)
+    );
+    Ok(())
+}
 
 /// Segundos de uma opção `nome=N` da linha de comando, ou `default`.
 fn seconds(name: &str, default: u64) -> u64 {

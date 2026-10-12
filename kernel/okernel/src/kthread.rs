@@ -456,6 +456,9 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         (t.saved_rsp().load(Ordering::Acquire), t.root())
     });
     let root = root.or_else(|| kmem::kernel_root().map(|r| r.0));
+    // Para o dump do pânico (ADR 0031, item 8): quem roda nesta CPU.
+    let thread = next.as_ref().map_or(0, |t| Arc::as_ptr(t).addr() as u64);
+    percpu::with(|p| p.thread().store(thread, Ordering::Relaxed));
     if let Some(root) = root
         && cpu::read_cr3() & 0x000f_ffff_ffff_f000 != root
     {

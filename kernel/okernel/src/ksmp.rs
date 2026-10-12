@@ -15,6 +15,7 @@ use okernel::log::option;
 use crate::arch::x86_64::{apic, percpu};
 use crate::ktime::DirectRead;
 
+pub mod ipi;
 pub mod start;
 pub mod tests;
 pub mod tsc;

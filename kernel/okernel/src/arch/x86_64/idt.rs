@@ -17,6 +17,7 @@
 use core::arch::asm;
 use core::fmt::Write;
 use core::mem::size_of;
+use core::sync::atomic::Ordering;
 
 use super::gdt::{IST_DOUBLE_FAULT, IST_MACHINE_CHECK, IST_NMI, KERNEL_CODE, Pointer};
 use super::halt;
@@ -218,7 +219,13 @@ fn control_registers() -> [u64; 4] {
 #[unsafe(no_mangle)]
 extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
     if frame.vector >= 32 {
-        if crate::kirq::fire(frame.vector) {
+        if (u64::from(super::apic::RESCHED_VECTOR)..=u64::from(super::apic::TLB_VECTOR))
+            .contains(&frame.vector)
+        {
+            // IPI (ADR 0031, item 5): EOI e atendimento da caixa.
+            super::apic::eoi();
+            crate::ksmp::ipi::on_ipi();
+        } else if crate::kirq::fire(frame.vector) {
             // Linha de um objeto `Interrupt` (T-209): a notificação ligada
             // pode ter acordado alguém mais prioritário.
             super::apic::eoi();
@@ -230,9 +237,31 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
         return;
     }
     if frame.vector == 2 && super::apic::frozen() {
-        // NMI do pânico de outra CPU: para sem despejar nada.
+        // NMI do pânico de outra CPU: grava o quadro interrompido na
+        // própria área (achada pelo topo da pilha IST, sem confiar no GS),
+        // avisa e para sem `iret` (ADR 0031, item 8).
+        // SAFETY: o NMI roda na pilha IST desta CPU, preparada com a dona
+        // no topo.
+        let me = unsafe { super::percpu::from_ist_rsp((&raw const *frame).addr() as u64) };
+        let dump = me.panic_dump();
+        let cr3 = control_registers()[2];
+        let thread = me.thread().load(Ordering::Relaxed);
+        for (slot, value) in
+            dump.iter()
+                .zip([frame.rip, frame.rsp, frame.rflags, cr3, frame.cs, thread])
+        {
+            slot.store(value, Ordering::Relaxed);
+        }
+        crate::kpanic::frozen_here();
         halt();
     }
+    // Verificação de máquina no kernel: vira pânico, que escolhe uma dona
+    // se chegar a várias CPUs juntas (ADR 0031, item 8).
+    assert!(
+        !(frame.vector == 18 && frame.cs & 3 != 3),
+        "verificação de máquina (#MC) em rip {:#x}",
+        frame.rip
+    );
     if frame.cs & 3 == 3 && kabi::fault::user_vector(frame.vector) {
         crate::kfault::user_exception(frame, control_registers()[1]);
         crate::ksync::assert_none_held("volta ao usuário");

@@ -98,7 +98,18 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         }
         Some("kernel") => ktest::run(option(cmdline, "ktest")),
         Some("bench") => kbench::run(),
-        Some("panic") => panic!("pânico de teste proposital (test=panic)"),
+        Some("panic") => {
+            // Com `smp.panic_cpu=N`, o pânico vem da CPU N (função remota),
+            // e as outras, inclusive o BSP que espera, congelam pelo NMI.
+            if let Some(cpu) = option(cmdline, "smp.panic_cpu").and_then(|c| c.parse().ok()) {
+                ksmp::ipi::call_on(
+                    cpu,
+                    |_| panic!("pânico de teste proposital (test=panic)"),
+                    0,
+                );
+            }
+            panic!("pânico de teste proposital (test=panic)")
+        }
         Some("fuzz") => kfuzz::run(cmdline),
         _ => kroot::run(),
     }
