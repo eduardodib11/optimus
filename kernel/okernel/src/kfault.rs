@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use okernel::fault::{self, Fault, Kill};
-use okernel::sync::SpinLock;
+use okernel::sync::{LockClass, SpinLock};
 
 use crate::arch::x86_64::idt::{TrapFrame, exception_name};
 use crate::kthread::{self, KernelEnv};
@@ -32,7 +32,7 @@ pub struct Report {
 /// Threads encerradas por falta desde o boot.
 static KILLED: AtomicU64 = AtomicU64::new(0);
 /// O último encerramento (para os testes).
-static LAST: SpinLock<Option<Report>> = SpinLock::new(None);
+static LAST: SpinLock<Option<Report>> = SpinLock::with_class(LockClass::Diagnostic, None);
 
 /// Threads encerradas por falta desde o boot.
 pub fn killed() -> u64 {

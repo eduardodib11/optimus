@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 
 use crate::mm::PhysAddr;
 use crate::mm::paging::TableMemory;
-use crate::sync::SpinLock;
+use crate::sync::{LockClass, SpinLock};
 use crate::thread::Thread;
 
 /// Serviços da máquina para os objetos do kernel.
@@ -56,7 +56,8 @@ pub struct KernelStack {
     pub slot: u32,
 }
 
-static PLATFORM: SpinLock<Option<&'static dyn Platform>> = SpinLock::new(None);
+static PLATFORM: SpinLock<Option<&'static dyn Platform>> =
+    SpinLock::with_class(LockClass::Diagnostic, None);
 
 /// Instala a plataforma do kernel (uma vez, no boot).
 pub fn install(platform: &'static dyn Platform) {

@@ -11,7 +11,7 @@ use alloc::sync::{Arc, Weak};
 use kabi::Error;
 use okernel::cap::MemoryQuota;
 use okernel::notify::Interrupt;
-use okernel::sync::SpinLock;
+use okernel::sync::{LockClass, SpinLock};
 
 use crate::arch::x86_64::apic::{SPURIOUS_VECTOR, TIMER_VECTOR};
 use crate::kthread;
@@ -20,7 +20,8 @@ use crate::kthread;
 /// o timer e reservas do kernel).
 pub const FIRST_VECTOR: u8 = 0x30;
 
-static LINES: SpinLock<[Option<Weak<Interrupt>>; 256]> = SpinLock::new([const { None }; 256]);
+static LINES: SpinLock<[Option<Weak<Interrupt>>; 256]> =
+    SpinLock::with_class(LockClass::Object, [const { None }; 256]);
 
 /// Cria o `Interrupt` do vetor `vector`, cobrado de `quota`.
 ///

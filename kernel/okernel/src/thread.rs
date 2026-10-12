@@ -25,7 +25,7 @@ use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
 use crate::ipc::IpcSlot;
 use crate::platform::{KERNEL_STACK_BYTES, KernelStack, Platform};
 use crate::sched::SchedContext;
-use crate::sync::SpinLock;
+use crate::sync::{LockClass, SpinLock};
 use crate::vm::SharedAddressSpace;
 
 /// Estado de execução.
@@ -148,10 +148,10 @@ impl Thread {
             wake_value: AtomicU64::new(0),
             fpu,
             fpu_addr,
-            binding: SpinLock::new(Binding::default()),
-            sched: SpinLock::new(None),
-            donated: SpinLock::new(None),
-            ipc: SpinLock::new(IpcSlot::default()),
+            binding: SpinLock::with_class(LockClass::Object, Binding::default()),
+            sched: SpinLock::with_class(LockClass::SchedLeaf, None),
+            donated: SpinLock::with_class(LockClass::SchedLeaf, None),
+            ipc: SpinLock::with_class(LockClass::IpcSlot, IpcSlot::default()),
             ipc_buffer: AtomicU64::new(0),
             exception: AtomicU32::new(0),
         })

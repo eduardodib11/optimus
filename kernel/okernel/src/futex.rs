@@ -23,7 +23,7 @@ use alloc::sync::Arc;
 
 use kabi::Error;
 
-use crate::sync::SpinLock;
+use crate::sync::{LockClass, SpinLock};
 use crate::thread::{RunState, Thread};
 
 /// Estatísticas da tabela (para os testes).
@@ -58,14 +58,17 @@ impl FutexTable {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            inner: SpinLock::new(Table {
-                waiters: VecDeque::new(),
-                stats: Stats {
-                    blocked: 0,
-                    stale: 0,
-                    woken: 0,
+            inner: SpinLock::with_class(
+                LockClass::Object,
+                Table {
+                    waiters: VecDeque::new(),
+                    stats: Stats {
+                        blocked: 0,
+                        stale: 0,
+                        woken: 0,
+                    },
                 },
-            }),
+            ),
         }
     }
 

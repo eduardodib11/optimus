@@ -21,10 +21,10 @@ use kabi::{Badge, Error, Handle, Rights};
 
 use super::space::{MAX_DERIVATION_DEPTH, Revoke, Walk, XRef};
 use super::{Cap, SharedCapSpace};
-use crate::sync::SpinLock;
+use crate::sync::{LockClass, SpinLock};
 
 /// Trava global da árvore de derivação.
-pub static CDT: SpinLock<()> = SpinLock::new(());
+pub static CDT: SpinLock<()> = SpinLock::with_class(LockClass::Cdt, ());
 
 /// Um nó da árvore: o slot `index` de `space`.
 #[derive(Clone)]

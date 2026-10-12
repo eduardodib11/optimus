@@ -39,3 +39,14 @@ pub fn init() {
 pub fn held_locks() -> &'static HeldLocks {
     &BSP_HELD
 }
+
+/// Em debug, acusa pânico se esta CPU tem alguma trava na mão num ponto
+/// em que não pode ter: troca de contexto, volta ao usuário e ocioso (ADR
+/// 0031, item 4, regra 5).
+#[track_caller]
+pub fn assert_none_held(point: &str) {
+    if cfg!(debug_assertions) {
+        let n = BSP_HELD.depth();
+        assert!(n == 0, "{n} trava(s) na mão em {point}");
+    }
+}

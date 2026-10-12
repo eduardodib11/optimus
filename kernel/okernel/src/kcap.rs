@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 
 use kabi::{Error, Handle, ObjectType};
 use okernel::cap::{Cap, MemoryQuota, Object, SharedCapSpace, default_rights, obj_create};
-use okernel::sync::SpinLock;
+use okernel::sync::{LockClass, SpinLock};
 
 use crate::kheap;
 
@@ -26,7 +26,7 @@ pub const REVOKE_SLICE_BUDGET: u32 = 64;
 /// Fração do heap reservada ao próprio kernel, fora da cota raiz (1/8).
 const KERNEL_RESERVE_SHIFT: u32 = 3;
 
-static ROOT: SpinLock<Option<Arc<MemoryQuota>>> = SpinLock::new(None);
+static ROOT: SpinLock<Option<Arc<MemoryQuota>>> = SpinLock::with_class(LockClass::Object, None);
 
 /// Cria a cota raiz com o heap livre menos a reserva do kernel. Chamar
 /// depois de `kheap::init`.

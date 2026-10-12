@@ -209,6 +209,7 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
         } else if super::apic::dispatch(frame.vector) {
             crate::kthread::on_timer();
         }
+        crate::ksync::assert_none_held("fim de interrupção");
         return;
     }
     if frame.vector == 2 && super::apic::frozen() {
@@ -217,6 +218,7 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
     }
     if frame.cs & 3 == 3 && kabi::fault::user_vector(frame.vector) {
         crate::kfault::user_exception(frame, control_registers()[1]);
+        crate::ksync::assert_none_held("volta ao usuário");
         return;
     }
     if super::probe::fixup(frame, control_registers()[1]) {
