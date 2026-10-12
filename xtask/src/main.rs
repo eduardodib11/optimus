@@ -1005,6 +1005,10 @@ const FUZZ_BAD: &[&str] = &[
     "okernel: okfuzz não terminou no prazo",
     "não voltou",
 ];
+/// Endereço de ligação do kernel (`kabi::boot::KERNEL_LINK_BASE`).
+const KERNEL_LINK_BASE: u64 = 0xffff_ffff_8000_0000;
+/// Faixa depois da base onde procurar endereços do kernel numa pilha.
+const KERNEL_SPAN: u64 = 0x100_0000;
 /// Duração da rodada curta de fuzz dentro do `test all` (segundos).
 const FUZZ_SHORT_SECONDS: u64 = 60;
 /// Semente fixa da rodada curta, para o `test all` ser reprodutível.
@@ -1035,7 +1039,11 @@ fn run_fuzz(opts: &Options, seconds: u64, seed: u64) -> Result {
     let cmdline = format!("test=fuzz fuzz.seed=0x{seed:x} fuzz.secs={seconds}");
     println!("xtask: fuzz semente 0x{seed:x}, {seconds} s (repita com --seed 0x{seed:x})");
     let esp = image(opts, &cmdline, None)?;
+    let monitor = root().join("target/qemu-fuzz-monitor.sock");
+    let _ = fs::remove_file(&monitor);
     let mut child = qemu(opts, &esp)?
+        .arg("-monitor")
+        .arg(format!("unix:{},server=on,wait=off", monitor.display()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
@@ -1063,6 +1071,10 @@ fn run_fuzz(opts: &Options, seconds: u64, seed: u64) -> Result {
             break Ok(st.code());
         }
         if start.elapsed() > limit {
+            // Antes de matar: onde a vCPU está presa.
+            raw.extend(rx.try_iter().flatten());
+            let kernel = root().join(format!("target/{KERNEL_TARGET}/{}/okernel", mode(opts)));
+            hang_report(&monitor, &kernel, &String::from_utf8_lossy(&raw));
             let _ = child.kill();
             let _ = child.wait();
             break Err(());
@@ -1073,6 +1085,124 @@ fn run_fuzz(opts: &Options, seconds: u64, seed: u64) -> Result {
     raw.extend(rx.try_iter().flatten());
     let serial = String::from_utf8_lossy(&raw);
     check_fuzz(&serial, end, seed)
+}
+
+/// Kernel travado: imprime, pelo monitor do QEMU, os registradores de toda
+/// CPU (três vezes, para ver se o RIP anda), a pilha da CPU 0 e os
+/// endereços do kernel nela com função e linha (`addr2line`, se houver).
+fn hang_report(monitor: &Path, kernel: &Path, serial: &str) {
+    let Ok(mut sock) = UnixStream::connect(monitor) else {
+        println!("xtask: travou, e o monitor do QEMU não respondeu");
+        return;
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+    let _ = monitor_command(&mut sock, "");
+    let mut regs = String::new();
+    for _ in 0..3 {
+        regs += &monitor_command(&mut sock, "info registers -a");
+        thread::sleep(Duration::from_millis(500));
+    }
+    let field = |name: &str| {
+        regs.lines()
+            .rev()
+            .find_map(|l| l.split_once(name).map(|(_, r)| r))
+            .and_then(|r| r.get(..16))
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+    };
+    let stack = field("RSP=").map_or_else(String::new, |rsp| {
+        monitor_command(&mut sock, &format!("x/96gx {rsp:#x}"))
+    });
+    println!("xtask: travou; estado das CPUs pelo monitor do QEMU:\n{regs}\npilha:\n{stack}");
+    let slide = serial
+        .lines()
+        .find_map(|l| l.split_once("kaslr_slide 0x").map(|(_, r)| r))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|h| u64::from_str_radix(h.trim_end_matches(','), 16).ok());
+    let Some(slide) = slide else {
+        return;
+    };
+    let base = KERNEL_LINK_BASE.wrapping_add(slide);
+    // Os RIPs e as palavras da pilha (a coluna do endereço vem antes de
+    // `:`) que caem na imagem do kernel.
+    let rips = regs
+        .lines()
+        .filter_map(|l| l.split_once("RIP=").map(|(_, r)| r.get(..16).unwrap_or(r)));
+    let words = stack
+        .lines()
+        .filter_map(|l| l.split_once(':').map(|(_, r)| r))
+        .flat_map(str::split_whitespace);
+    let mut addrs: Vec<u64> = Vec::new();
+    for w in rips.chain(words) {
+        if let Ok(a) = u64::from_str_radix(w.trim_start_matches("0x"), 16)
+            && (base..base + KERNEL_SPAN).contains(&a)
+            && !addrs.contains(&(a - slide))
+        {
+            addrs.push(a - slide);
+        }
+    }
+    if addrs.is_empty() {
+        return;
+    }
+    let out = Command::new("addr2line")
+        .arg("-f")
+        .arg("-C")
+        .arg("-e")
+        .arg(kernel)
+        .args(addrs.iter().map(|a| format!("{a:#x}")))
+        .output();
+    let Ok(out) = out else {
+        return;
+    };
+    let lines = String::from_utf8_lossy(&out.stdout);
+    let mut lines = lines.lines();
+    println!("xtask: endereços do kernel acima (sem o deslocamento de KASLR):");
+    for a in addrs {
+        let (Some(func), Some(place)) = (lines.next(), lines.next()) else {
+            break;
+        };
+        println!("  {a:#x} {func} ({place})");
+    }
+}
+
+/// Manda `cmd` ao monitor do QEMU e devolve a resposta (até o prompt
+/// seguinte ou 3 s), sem as sequências de controle do terminal.
+fn monitor_command(sock: &mut UnixStream, cmd: &str) -> String {
+    if writeln!(sock, "{cmd}").is_err() {
+        return String::new();
+    }
+    let mut raw = Vec::new();
+    let start = Instant::now();
+    let mut chunk = [0u8; 4096];
+    while start.elapsed() < Duration::from_secs(3) {
+        match sock.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(_) if raw.ends_with(b"(qemu) ") => break,
+            Err(_) => {}
+        }
+    }
+    // A primeira linha é o eco do comando, letra a letra.
+    let text = strip_escapes(&String::from_utf8_lossy(&raw));
+    text.split_once('\n')
+        .map_or(text.clone(), |(_, rest)| rest.to_string())
+}
+
+/// Tira as sequências ESC [ ... letra que o readline do monitor manda.
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Decide a rodada de fuzz: nenhum texto de kernel quebrado, o marcador de
