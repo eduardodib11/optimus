@@ -134,6 +134,32 @@ pub fn init(direct_map: u64) -> Mode {
     mode
 }
 
+/// Liga o APIC local de um AP no mesmo modo do BSP (x2APIC em todos ou em
+/// nenhum), com o vetor espúrio e o timer mascarado; o 8259 só o BSP
+/// mascara. `false` se a CPU não tiver o modo do BSP.
+pub fn init_ap() -> bool {
+    // SAFETY: `IA32_APIC_BASE` existe em toda CPU x86-64 com APIC.
+    let base = unsafe { rdmsr(MSR_APIC_BASE) };
+    match mode() {
+        Mode::X2Apic => {
+            if cpu::cpuid(1, 0).ecx & (1 << 21) == 0 {
+                return false;
+            }
+            // SAFETY: a CPU anuncia x2APIC; EN e depois EXTD, como no BSP.
+            unsafe {
+                wrmsr(MSR_APIC_BASE, base | APIC_BASE_ENABLE);
+                wrmsr(MSR_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_X2);
+            }
+        }
+        // SAFETY: liga o APIC global sem mudar o endereço (o mesmo do BSP).
+        Mode::XApic => unsafe { wrmsr(MSR_APIC_BASE, base | APIC_BASE_ENABLE) },
+        Mode::Off => return false,
+    }
+    write(REG_SVR, 0x100 | u32::from(SPURIOUS_VECTOR));
+    write(REG_LVT_TIMER, LVT_MASKED | u32::from(TIMER_VECTOR));
+    true
+}
+
 /// Endereço físico dos registradores do xAPIC (`IA32_APIC_BASE`).
 pub fn xapic_phys() -> u64 {
     // SAFETY: `IA32_APIC_BASE` existe em toda CPU x86-64 com APIC.

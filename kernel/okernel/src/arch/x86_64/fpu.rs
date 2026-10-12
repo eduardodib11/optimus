@@ -66,6 +66,26 @@ pub fn area_bytes() -> usize {
     AREA_BYTES.load(Ordering::Relaxed)
 }
 
+/// XCR0 desta CPU (só com CR4.OSXSAVE ligado).
+pub fn xcr0() -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: quem chama confere CR4.OSXSAVE; XGETBV só lê.
+    unsafe {
+        asm!("xgetbv", in("ecx") 0, out("eax") low, out("edx") high, options(nomem, nostack));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Grava o XCR0 desta CPU (os APs copiam o do BSP).
+///
+/// # Safety
+///
+/// CR4.OSXSAVE ligado e `value` válido para a CPU.
+pub unsafe fn set_xcr0(value: u64) {
+    // SAFETY: contrato do chamador.
+    unsafe { xsetbv(value) };
+}
+
 /// Grava XCR0.
 ///
 /// # Safety

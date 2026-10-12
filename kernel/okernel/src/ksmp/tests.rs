@@ -13,7 +13,41 @@ pub const TESTS: &[Test] = &[
         name: "smp.todas_as_cpus_ligadas",
         run: todas_ligadas,
     },
+    Test {
+        name: "smp.aps_ociosos_recebem_o_timer",
+        run: aps_ociosos,
+    },
 ];
+
+/// Os APs ficam ociosos com o timer ligado por `smp.idle_s` segundos (1 por
+/// padrão; o aceite do T-319 pede 60) e seguem ligados, recebendo disparos.
+fn aps_ociosos() -> Outcome {
+    let secs = crate::bootinfo::get()
+        .and_then(|i| i.cmdline())
+        .and_then(|c| okernel::log::option(c, "smp.idle_s"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1);
+    let n = super::count();
+    let fires = |cpu: usize| {
+        super::start::percpu_of(cpu).map_or(0, |p| {
+            p.timer_stats()[0].load(core::sync::atomic::Ordering::Acquire)
+        })
+    };
+    let before: [u64; 8] = core::array::from_fn(fires);
+    let end = crate::ktime::now_ns() + secs * okernel::time::NS_PER_SEC;
+    while crate::ktime::now_ns() < end {
+        core::hint::spin_loop();
+    }
+    // Um disparo a cada 10 ms; no TCG, metade disso já basta.
+    let want = secs * 1000 / 10 / 2;
+    for (cpu, before) in before.iter().enumerate().take(n).skip(1) {
+        let got = fires(cpu) - before;
+        info!("ktest: · cpu{cpu}: {got} disparos do timer em {secs} s");
+        ensure!(super::start::is_online(cpu));
+        ensure!(got >= want);
+    }
+    Ok(())
+}
 
 fn todas_ligadas() -> Outcome {
     let n = super::count();
