@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum LockClass {
-    /// Ainda não classificada: fora da verificação (só até o T-315).
+    /// Sem classe: fora da verificação. Só as travas dos testes de host.
     Unchecked = 0,
     /// Nível 1: a trava global da árvore de derivação (ADR 0028).
     Cdt = 10,
@@ -334,7 +334,9 @@ pub struct SpinLock<T> {
 unsafe impl<T: Send> Sync for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
-    /// Trava livre com `value`, ainda sem classe (fora da verificação).
+    /// Trava livre com `value`, sem classe (fora da verificação). Só nos
+    /// testes de host: toda trava do kernel tem classe (T-315).
+    #[cfg(test)]
     pub const fn new(value: T) -> Self {
         Self::with_class(LockClass::Unchecked, value)
     }

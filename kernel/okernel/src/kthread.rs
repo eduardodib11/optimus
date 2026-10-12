@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Syscall};
 use okernel::sched::{DEFAULT_SLICE_NS, Params, RunQueue, SchedContext};
-use okernel::sync::SpinLock;
+use okernel::sync::{LockClass, SpinLock};
 use okernel::sys::{self, Values};
 use okernel::thread::{RunState, Thread};
 
@@ -100,23 +100,28 @@ struct Sched {
     trace: Vec<Event>,
 }
 
-static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
-    current: None,
-    charged_at: 0,
-    charging: None,
-    started_at: 0,
-    slice_end: 0,
-    ready: RunQueue::new(),
-    throttled: Vec::new(),
-    timeouts: Vec::new(),
-    dead: None,
-    trace: Vec::new(),
-});
+static SCHED: SpinLock<Sched> = SpinLock::with_key(
+    LockClass::RunQueue,
+    0,
+    Sched {
+        current: None,
+        charged_at: 0,
+        charging: None,
+        started_at: 0,
+        slice_end: 0,
+        ready: RunQueue::new(),
+        throttled: Vec::new(),
+        timeouts: Vec::new(),
+        dead: None,
+        trace: Vec::new(),
+    },
+);
 /// rsp salvo do ocioso.
 static IDLE_RSP: AtomicU64 = AtomicU64::new(0);
 /// Trocas diretas do caminho rápido de IPC.
 static FAST_SWITCHES: AtomicU64 = AtomicU64::new(0);
-static DEBUG_LOG: SpinLock<([u8; 256], usize)> = SpinLock::new(([0; 256], 0));
+static DEBUG_LOG: SpinLock<([u8; 256], usize)> =
+    SpinLock::with_class(LockClass::Diagnostic, ([0; 256], 0));
 
 /// A thread na CPU (`None` no ocioso).
 pub fn current() -> Option<Arc<Thread>> {
@@ -467,6 +472,7 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     // SAFETY: `prev_slot` é o rsp salvo da anterior, viva (na fila, em
     // `dead` ou o ocioso); `next_rsp` foi salvo por esta mesma função ou
     // montado por `start`.
+    crate::ksync::assert_none_held("switch_context");
     unsafe { switch_context(prev_slot, next_rsp) };
     finish_switch();
 }
@@ -622,6 +628,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
     {
         kipc::syscall(frame, call);
         frame.rflags = syscall::user_rflags(frame.rflags);
+        crate::ksync::assert_none_held("volta ao usuário");
         return u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss));
     }
     let args = [
@@ -637,6 +644,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
         Err(e) => frame.rax = e.to_raw(),
     }
     frame.rflags = syscall::user_rflags(frame.rflags);
+    crate::ksync::assert_none_held("volta ao usuário");
     u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss))
 }
 

@@ -15,7 +15,7 @@ use kabi::boot::{DIRECT_MAP_START, MemRegion};
 use okernel::mm::buddy::{FrameAllocator, FrameMeta};
 use okernel::mm::paging::{Flags, MapError, Mapping, PageSize, PageTables, Table, TableMemory};
 use okernel::mm::{FRAME_SIZE, PhysAddr, frames};
-use okernel::sync::SpinLock;
+use okernel::sync::{LockClass, SpinLock};
 
 use crate::arch::x86_64::cpu;
 
@@ -24,8 +24,10 @@ pub use tests::TESTS;
 
 /// Base do mapa direto, lida da `BootInfo` no boot (ADR 0026).
 static DIRECT_BASE: AtomicU64 = AtomicU64::new(DIRECT_MAP_START);
-static FRAMES: SpinLock<Option<FrameAllocator<'static>>> = SpinLock::new(None);
-static KERNEL_PT: SpinLock<Option<PageTables<DirectMap>>> = SpinLock::new(None);
+static FRAMES: SpinLock<Option<FrameAllocator<'static>>> =
+    SpinLock::with_class(LockClass::Frames, None);
+static KERNEL_PT: SpinLock<Option<PageTables<DirectMap>>> =
+    SpinLock::with_class(LockClass::KernelPageTables, None);
 
 unsafe extern "C" {
     static __kernel_text_start: u8;

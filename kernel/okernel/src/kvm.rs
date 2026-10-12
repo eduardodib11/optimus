@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use okernel::mm::PhysAddr;
 use okernel::mm::paging::{Flags, PageSize, TableMemory};
 use okernel::platform::{self, KERNEL_STACK_BYTES, KernelStack, Platform};
-use okernel::sync::SpinLock;
+use okernel::sync::{LockClass, SpinLock};
 use okernel::thread::Thread;
 
 use crate::arch::x86_64::{cpu, fpu};
@@ -32,7 +32,8 @@ const STACK_SLOT: u64 = 2 * KERNEL_STACK_BYTES;
 const PAGE: u64 = 4096;
 
 /// Fatias de pilha: a próxima nunca usada e as devolvidas.
-static STACK_SLOTS: SpinLock<(u32, Vec<u32>)> = SpinLock::new((0, Vec::new()));
+static STACK_SLOTS: SpinLock<(u32, Vec<u32>)> =
+    SpinLock::with_class(LockClass::KernelStacks, (0, Vec::new()));
 
 mod tests;
 pub use tests::TESTS;

@@ -33,7 +33,7 @@ use kabi::{Badge, Error, Handle, MSG_MAX_CAPS, MSG_REG_WORDS};
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
 use crate::sched::SchedContext;
-use crate::sync::SpinLock;
+use crate::sync::{LockClass, SpinLock};
 use crate::thread::Thread;
 
 pub mod ops;
@@ -167,7 +167,7 @@ impl Endpoint {
     pub fn new(quota: &Arc<MemoryQuota>) -> Result<Self, Error> {
         Ok(Self {
             _charge: quota.charge(object_bytes::<Self>())?,
-            queues: SpinLock::new(Queues::default()),
+            queues: SpinLock::with_class(LockClass::Object, Queues::default()),
         })
     }
 
@@ -251,8 +251,8 @@ impl Reply {
     pub fn new(quota: &Arc<MemoryQuota>) -> Result<Self, Error> {
         Ok(Self {
             _charge: quota.charge(object_bytes::<Self>())?,
-            caller: SpinLock::new(None),
-            donation: SpinLock::new(None),
+            caller: SpinLock::with_class(LockClass::Object, None),
+            donation: SpinLock::with_class(LockClass::Object, None),
         })
     }
 

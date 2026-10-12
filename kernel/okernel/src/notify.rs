@@ -32,7 +32,7 @@ use kabi::Error;
 
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota};
-use crate::sync::SpinLock;
+use crate::sync::{LockClass, SpinLock};
 use crate::thread::{RunState, Thread};
 
 /// Resultado de [`Notification::wait`].
@@ -70,10 +70,13 @@ impl Notification {
     pub fn new(quota: &Arc<MemoryQuota>) -> Result<Self, Error> {
         Ok(Self {
             _charge: quota.charge(object_bytes::<Self>())?,
-            state: SpinLock::new(State {
-                pending: 0,
-                waiters: VecDeque::new(),
-            }),
+            state: SpinLock::with_class(
+                LockClass::Object,
+                State {
+                    pending: 0,
+                    waiters: VecDeque::new(),
+                },
+            ),
         })
     }
 
@@ -158,7 +161,7 @@ impl Interrupt {
         Ok(Self {
             _charge: quota.charge(object_bytes::<Self>())?,
             vector,
-            line: SpinLock::new(Line::default()),
+            line: SpinLock::with_class(LockClass::Object, Line::default()),
         })
     }
 

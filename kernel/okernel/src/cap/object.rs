@@ -22,7 +22,7 @@ use crate::ipc::{Endpoint, Reply};
 use crate::notify::{Interrupt, Notification};
 use crate::platform;
 use crate::sched::SchedContext;
-use crate::sync::SpinLock;
+use crate::sync::{LockClass, SpinLock};
 use crate::thread::Thread;
 use crate::vm::{AddressSpace, MemoryObject, SharedAddressSpace};
 
@@ -308,13 +308,17 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
         {
             Err(Error::InvalidArgument)
         }
-        ObjectType::CapSpace => Ok(Object::CapSpace(Arc::new(SpinLock::new(CapSpace::new(
-            quota,
-        )?)))),
+        ObjectType::CapSpace => Ok(Object::CapSpace(Arc::new(SpinLock::with_class(
+            LockClass::CapSpace,
+            CapSpace::new(quota)?,
+        )))),
         ObjectType::AddressSpace => {
             let platform = platform::get().ok_or(Error::NotSupported)?;
             let space = AddressSpace::new(quota, platform)?;
-            Ok(Object::AddressSpace(Arc::new(SpinLock::new(space))))
+            Ok(Object::AddressSpace(Arc::new(SpinLock::with_class(
+                LockClass::AddressSpace,
+                space,
+            ))))
         }
         ObjectType::MemoryObject => {
             let platform = platform::get().ok_or(Error::NotSupported)?;

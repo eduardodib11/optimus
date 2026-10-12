@@ -12,7 +12,7 @@ use core::ptr::NonNull;
 
 use okernel::mm::PhysAddr;
 use okernel::mm::slab::{CLASSES, Heap, HeapError, PageSource};
-use okernel::sync::SpinLock;
+use okernel::sync::{LockClass, SpinLock};
 
 use crate::kmem;
 
@@ -46,7 +46,8 @@ impl PageSource for DirectPages {
     }
 }
 
-static HEAP: SpinLock<Heap<DirectPages>> = SpinLock::new(Heap::new(DirectPages, 0));
+static HEAP: SpinLock<Heap<DirectPages>> =
+    SpinLock::with_class(LockClass::Heap, Heap::new(DirectPages, 0));
 
 /// Alocador global do kernel.
 struct KernelAllocator;
