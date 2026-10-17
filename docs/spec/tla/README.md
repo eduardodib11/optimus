@@ -43,12 +43,58 @@ coerente com o estado), `NoMissedRendezvous`, `CallerBlocked` (chamador
 bloqueado até a resposta), `ReplyOnce` e `GrantRequired`. Vivacidade:
 `CallAnswered`. `CHECK_DEADLOCK TRUE`: o sistema nunca trava por inteiro.
 
+## SMP (T-313, ADR 0031 e 0032)
+
+Com `CPUs` (`CapRevoke*.cfg`, `Ipc*.cfg`) os modelos ganham várias CPUs.
+Os arquivos sem sufixo rodam com uma CPU e reproduzem o modelo anterior.
+O `Ipc3.cfg` usa dois clientes: com três clientes e três CPUs passou de 40 milhões
+de estados sem terminar.
+
+**Ipc.tla.** Cada thread tem `cpu[t]`. Um wake na mesma CPU deixa a thread
+em `Run`; um wake em outra CPU a deixa em `Ready` (IPI pendente) até `Pick`
+(a CPU a escolhe). `Migrate` move uma thread que não está executando.
+Vivacidade: `ReadyRuns` (nenhum IPI se perde) e `CallAnswered`, com justiça
+fraca em `Pick`. Fora do escopo desta rodada: destruição de Endpoint com
+threads em outra CPU (fica coberta pela destruição concorrente do CapRevoke).
+
+**CapRevoke.tla.** Cada CPU tem um cache de handles resolvidos (`cache`). Uso
+do cache não revalida. Liberar um slot (`Free`) põe as cópias em cache na
+fila de invalidação (`pend`, o shootdown); a CPU confirma com `Ack`.
+`RevokeEnd` só termina com `pend` vazio. Fantasmas: `rf` (liberados desde o
+último cap_revoke concluído), `rdone` (liberados antes de um concluído) e
+`stale` (uso de cópia de handle de `rdone` que não resolve). Invariante
+`NoStaleUse`: depois de um cap_revoke concluído, nenhuma CPU usa cópia
+do handle revogado. Uso entre `Free` e `Ack`, com a revogação em curso, é legal.
+
+**Resultados (TLC, TLA+ tools 1.8.0):**
+
+| Config | Estados distintos | Resultado |
+|---|---|---|
+| Ipc.cfg (1 CPU) | 5.024 | sem erro |
+| Ipc2.cfg (2 CPUs) | 903.680 | sem erro (≈ 6 min) |
+| Ipc3.cfg (3 CPUs, 2 clientes) | 135.432 | sem erro (≈ 38 s) |
+| CapRevoke.cfg (1 CPU, N = 3) | 24.959 | sem erro |
+| CapRevoke2.cfg (2 CPUs, N = 3) | 189.245 | sem erro (≈ 1 min) |
+| CapRevoke3.cfg (3 CPUs, N = 3) | 1.473.785 | sem erro (≈ 14 min) |
+
+**Mutações (TLC acusa a invariante ou propriedade):**
+
+- Fim da revogação sem esperar `pend` (`RevokeEnd` sem `pend = {}`): `NoStaleUse` violada.
+- Liberar sem enviar shootdown (`Free` sem `pend'`): `NoStaleUse` violada.
+- `Ack` sem remover a cópia do cache: `NoStaleUse` violada.
+- Sem justiça fraca em `Pick` (IPI que nunca é atendido): `CallAnswered` e `ReadyRuns` violadas.
+
+N = 4 foi descartado nas configs de CPUs: com cache por CPU, `CapRevoke` com
+1 CPU passou de 6,7 milhões de estados sem terminar. N = 3 cobre os mesmos
+casos de revogação concorrente.
+
 ## Fora do escopo
 
 Badges, tipos de objeto, contagem de referências e cota (ADR 0006), vários
 endpoints e processos, prazos/`TimedOut`, cancelamento, `PeerClosed`,
 revogação concorrente com IPC em andamento, conteúdo das mensagens, doação
-de SchedContext, caminho rápido, notificações e anéis SPSC, SMP.
+de SchedContext, caminho rápido, notificações e anéis SPSC. Afinidade e
+NUMA (T-325) não entram: dependem da decisão de Eduardo.
 
 ## Como rodar
 
@@ -62,3 +108,4 @@ mutação (mint que amplia direitos, delete sem avançar geração, revoke que
 termina cedo, revoke que ignora elos remotos (`RevokeComplete`), Reply não consumido, transferência sem GRANT, remoção da
 justiça) fazem o TLC acusar a invariante ou propriedade correspondente.
 Apague `states/` e `*_TTrace_*` gerados antes de versionar.
+Para as configs de CPUs, use `-config CapRevoke2.cfg` (ou `Ipc2.cfg`, etc.).
