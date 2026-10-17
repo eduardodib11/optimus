@@ -11,14 +11,14 @@
 Um host ou runner com:
 
 1. `/dev/kvm` acessível pelo usuário que roda o `cargo xtask`. Em Linux, o usuário precisa estar no grupo `kvm`.
-2. QEMU com aceleração KVM. O `xtask` deve passar `-accel kvm` (hoje roda com TCG).
-3. Um comando de medição com KVM, que gere o relatório neste diretório:
+2. QEMU capaz de KVM. Com `/dev/kvm` acessível, o `xtask` escolhe KVM sozinho e grava `Acelerador: KVM` no relatório. Não há flag para isso.
+3. Um comando de medição, que gera o relatório neste diretório:
 
 ```
-cargo xtask bench --accel kvm
+cargo xtask bench
 ```
 
-Se o `xtask` ainda não aceita `--accel`, ele precisa ganhar essa opção antes de a medição valer. Esse ajuste fica para a próxima tarefa, junto com o runner.
+Sem `/dev/kvm`, o mesmo comando roda com TCG e o relatório avisa que os números não valem para as metas.
 
 ## Campos que o relatório deve trazer
 
