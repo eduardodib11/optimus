@@ -99,7 +99,7 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     IpcCall = 20 => "`ipc_call`.",
     IpcReplyRecv = 21 => "`ipc_reply_recv`.",
     NtfySignal = 22 => "`ntfy_signal`.",
-    NtfyWait = 23 => "`ntfy_wait`.",
+    NtfyWait = 23 => "`ntfy_wait`; `PeerClosed` se a notificação morre durante a espera.",
     NtfyPoll = 24 => "`ntfy_poll`.",
     ObjBindNotify = 25 => "`obj_bind_notify`.",
     IrqAck = 26 => "`irq_ack`.",

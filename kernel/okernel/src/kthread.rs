@@ -26,8 +26,9 @@
 //! escolhe a CPU pelo resumo atômico de cada uma (prioridade da atual e
 //! prontas) e manda o IPI de reescalonar quando o destino está ocioso ou
 //! roda algo menos prioritário. A troca direta do IPC só acontece com a
-//! outra thread já nesta CPU; entre CPUs, o despertar comum (a migração do
-//! servidor que segue quem chama vem com o T-327).
+//! outra thread nesta CPU: na chamada, o servidor que esperava noutra CPU
+//! segue quem chama e vem para cá ([`follow`], T-327); na resposta, quem
+//! chamou e está noutra CPU acorda pelo despertar comum.
 //!
 //! Escalonamento (T-207, seção 6.6): prioridade fixa de 256 níveis com
 //! round-robin de [`DEFAULT_SLICE_NS`] dentro do nível; cada thread roda
@@ -247,6 +248,8 @@ fn choose_cpu(t: &Thread, p: u32) -> u32 {
 
 /// Trocas diretas do caminho rápido de IPC.
 static FAST_SWITCHES: AtomicU64 = AtomicU64::new(0);
+/// Servidores trazidos de outra CPU por quem os chamou ([`follow`]).
+static FOLLOWS: AtomicU64 = AtomicU64::new(0);
 static DEBUG_LOG: SpinLock<([u8; 256], usize)> =
     SpinLock::with_class(LockClass::Diagnostic, ([0; 256], 0));
 
@@ -762,9 +765,50 @@ pub fn handoff(to: Arc<Thread>, deadline: u64) {
     }
 }
 
+/// Caminho rápido de `ipc_call` que achou o servidor `to` esperando (ADR
+/// 0032, item 6): ele segue quem chama e roda nesta CPU. A atual já está
+/// bloqueada esperando a resposta, com prazo `deadline`.
+///
+/// Com `to` noutra CPU, a atual ganha o despertar dele e, sem trava
+/// nenhuma na mão (ADR 0031, regra 4), espera a pilha dele sair de uso
+/// (`on_cpu`), atendendo os IPIs; então tira o prazo dele da lista da CPU
+/// antiga (I7), grava esta CPU como a dele e faz a troca direta. A espera
+/// termina: entre entrar na fila do endpoint e trocar de contexto, o
+/// servidor só toma travas, que quem espera não segura, e acorda threads,
+/// o que nunca espera.
+pub fn follow(to: Arc<Thread>, deadline: u64) {
+    let me = percpu::cpu_id();
+    if to.cpu() == me {
+        handoff(to, deadline);
+        return;
+    }
+    push_timeout(deadline);
+    if !to.claim_wake() {
+        // Alguém já o acordou (e o pôs numa fila).
+        schedule(Why::Block);
+        return;
+    }
+    crate::ksync::assert_none_held("follow");
+    while to.on_cpu() {
+        ksmp::ipi::poll();
+        core::hint::spin_loop();
+    }
+    if let Some(old) = sched_of(to.cpu()) {
+        drop_timeout(&mut old.lock(), &to);
+    }
+    to.set_cpu(me);
+    FOLLOWS.fetch_add(1, Ordering::Relaxed);
+    schedule_to(Why::Block, Some(to));
+}
+
 /// Trocas diretas do caminho rápido de IPC desde o boot.
 pub fn fast_switches() -> u64 {
     FAST_SWITCHES.load(Ordering::Relaxed)
+}
+
+/// Servidores que seguiram quem os chamou para outra CPU desde o boot.
+pub fn follows() -> u64 {
+    FOLLOWS.load(Ordering::Relaxed)
 }
 
 /// Ponto de preempção: a atual segue, a menos que haja alguém mais
@@ -808,6 +852,10 @@ impl sys::Env for KernelEnv {
 
     fn handoff(&mut self, to: Arc<Thread>, deadline: u64) {
         handoff(to, deadline);
+    }
+
+    fn follow(&mut self, to: Arc<Thread>, deadline: u64) {
+        follow(to, deadline);
     }
 
     fn read_buffer(&mut self, thread: &Thread, at: usize, out: &mut [u64]) -> bool {

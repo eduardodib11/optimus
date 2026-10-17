@@ -37,7 +37,9 @@
 //! Caminho rápido (seção 6.7): `ipc_call` que encontra o servidor esperando
 //! e `ipc_reply_recv` que não encontra outro remetente, ambos só com
 //! registradores, pedem a [`Env::handoff`] a troca direta para a outra
-//! thread, sem passar pela fila de prontas.
+//! thread, sem passar pela fila de prontas. Na chamada, o servidor segue
+//! quem chama ([`Env::follow`], ADR 0032, item 6): passa a rodar na CPU
+//! dele, mesmo que esperasse noutra.
 //!
 //! Cada syscall se divide em [`begin`], que pode deixar a thread bloqueada
 //! ([`Step::Block`]), e [`finish`], que lê o resultado depois que alguém a
@@ -95,6 +97,9 @@ pub enum Step {
         deadline: u64,
         /// Thread para a troca direta do caminho rápido.
         handoff: Option<Arc<Thread>>,
+        /// `handoff` é o receptor de uma chamada, que segue quem chama
+        /// para a CPU dele ([`Env::follow`]).
+        follow: bool,
     },
 }
 
@@ -314,6 +319,7 @@ fn send_out(
         return Ok(Step::Block {
             deadline: wait.deadline,
             handoff: None,
+            follow: false,
         });
     };
     let recv = core::mem::take(&mut r.ipc().lock().blocked);
@@ -341,6 +347,7 @@ fn send_out(
     Ok(Step::Block {
         deadline: wait.deadline,
         handoff,
+        follow: true,
     })
 }
 
@@ -486,6 +493,7 @@ pub fn begin(
                     Ok(Step::Block {
                         deadline: wait.deadline,
                         handoff,
+                        follow: false,
                     })
                 }
                 Err(e) => {
@@ -542,8 +550,13 @@ pub fn invoke(
 fn wait_for(me: &Thread, step: Step, env: &mut dyn Env) -> Result<Out, Error> {
     match step {
         Step::Done(out) => Ok(out),
-        Step::Block { deadline, handoff } => {
+        Step::Block {
+            deadline,
+            handoff,
+            follow,
+        } => {
             match handoff {
+                Some(to) if follow => env.follow(to, deadline),
                 Some(to) => env.handoff(to, deadline),
                 None => env.block_until(deadline),
             }

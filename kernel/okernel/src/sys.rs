@@ -56,6 +56,13 @@ pub trait Env {
     /// `to` (bloqueada, já atendida), sem passar pela fila; se `to` não
     /// puder rodar agora, vale como acordá-la e [`block_until`](Self::block_until).
     fn handoff(&mut self, to: Arc<Thread>, deadline: u64);
+    /// Como [`handoff`](Self::handoff), para o receptor `to` de uma
+    /// chamada: ele segue quem chama e passa a rodar na CPU da atual, mesmo
+    /// que esperasse noutra (ADR 0032, item 6). Sem várias CPUs, é o
+    /// próprio `handoff`.
+    fn follow(&mut self, to: Arc<Thread>, deadline: u64) {
+        self.handoff(to, deadline);
+    }
     /// Lê palavras do buffer de IPC de `thread`, a partir da palavra `at`;
     /// falso se não houver buffer ou a página não estiver mapeada.
     fn read_buffer(&mut self, thread: &Thread, at: usize, out: &mut [u64]) -> bool;
@@ -275,6 +282,9 @@ fn invoke_sync(
                 Wait::Blocked => {
                     drop(cap);
                     env.block();
+                    if let Some(e) = me.take_wake_error() {
+                        return Err(e);
+                    }
                     Ok([me.wake_value(), 0, 0])
                 }
             }

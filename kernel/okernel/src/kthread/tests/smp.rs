@@ -35,10 +35,10 @@ const SHARED_VA: u64 = 0x60_0000;
 /// do T-324 pede 10⁶, que `cargo xtask test smp` roda num boot de release
 /// à parte (de um a cinco minutos sob TCG; na depuração, dez vezes mais).
 const DEFAULT_ROUNDS: u64 = 10_000;
-const MS: u64 = 1_000_000;
+pub(super) const MS: u64 = 1_000_000;
 /// Prazo das esperas por outra CPU: folgado, porque sob TCG uma vCPU pode
 /// ficar centenas de milissegundos sem andar.
-const LIMIT: u64 = 10_000 * MS;
+pub(super) const LIMIT: u64 = 10_000 * MS;
 /// Onde a thread que gira mapeia a página com o pedido de parar.
 const SPIN_VA: u64 = 0x70_0000;
 
@@ -60,7 +60,7 @@ pub(super) fn wait_for(limit_ns: u64, done: impl Fn() -> bool) -> bool {
 
 /// Como [`wait_for`]; sem `sleep`, gira cedendo a vez (quando o próprio
 /// BSP joga, o `hlt` atrasaria cada despertar dele).
-fn wait_with(limit_ns: u64, sleep: bool, done: impl Fn() -> bool) -> bool {
+pub(super) fn wait_with(limit_ns: u64, sleep: bool, done: impl Fn() -> bool) -> bool {
     let give_up = ktime::now_ns() + limit_ns;
     while !done() {
         let now = ktime::now_ns();
@@ -79,7 +79,7 @@ fn wait_with(limit_ns: u64, sleep: bool, done: impl Fn() -> bool) -> bool {
 }
 
 /// Bloqueada e fora da CPU (a troca que a tirou terminou).
-fn parked(t: &Thread) -> bool {
+pub(super) fn parked(t: &Thread) -> bool {
     t.state() == RunState::Blocked && !t.on_cpu()
 }
 
@@ -150,7 +150,7 @@ pub fn alternam_em_cpus_distintas() -> Outcome {
 }
 
 /// Cria uma notificação em `p` e devolve o handle e o objeto.
-fn notification(
+pub(super) fn notification(
     p: &Process,
 ) -> Result<(kabi::Handle, Arc<okernel::notify::Notification>), &'static str> {
     let h = p
@@ -169,7 +169,7 @@ fn notification(
 
 /// Põe uma thread de `p` esperando na notificação `ntfy` na CPU `cpu` e
 /// espera ela bloquear e sair da CPU.
-fn park_on(
+pub(super) fn park_on(
     p: &Process,
     ntfy: kabi::Handle,
     cpu: u32,

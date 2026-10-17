@@ -176,10 +176,14 @@ fn call_encontra_o_servidor_e_a_resposta_volta_pelo_caminho_rapido() {
     let r = regs(w.s_target, 0, &[]);
     assert!(blocked(&w.server.begin(&mut env, Syscall::IpcRecv, &r)));
     let call = regs(w.c_ep, 0xAB, &[1, 2, 3, 4, 5, 6]);
-    let Ok(Step::Block { handoff, .. }) = w.client.begin(&mut env, Syscall::IpcCall, &call) else {
+    let Ok(Step::Block {
+        handoff, follow, ..
+    }) = w.client.begin(&mut env, Syscall::IpcCall, &call)
+    else {
         panic!("a chamada bloqueia esperando a resposta");
     };
     assert!(Arc::ptr_eq(&handoff.unwrap(), &w.server.thread));
+    assert!(follow, "o servidor segue quem chama para a CPU dele");
     let got = finish(&w.server.thread).unwrap();
     assert_eq!(
         got,
@@ -194,11 +198,14 @@ fn call_encontra_o_servidor_e_a_resposta_volta_pelo_caminho_rapido() {
     // Resposta com reply_recv: o servidor volta a esperar e cede a CPU
     // direto ao cliente.
     let answer = regs(w.s_target, 0xCD, &[9]);
-    let Ok(Step::Block { handoff, .. }) = w.server.begin(&mut env, Syscall::IpcReplyRecv, &answer)
+    let Ok(Step::Block {
+        handoff, follow, ..
+    }) = w.server.begin(&mut env, Syscall::IpcReplyRecv, &answer)
     else {
         panic!("sem outro remetente, o servidor espera");
     };
     assert!(Arc::ptr_eq(&handoff.unwrap(), &w.client.thread));
+    assert!(!follow, "a resposta não move quem chamou");
     let back = finish(&w.client.thread).unwrap();
     assert_eq!((back.badge, back.label, back.words[0]), (0, 0xCD, 9));
     assert_eq!(back.words[1..], [0; 5], "palavras não declaradas zeradas");

@@ -98,6 +98,9 @@ pub struct Thread {
     /// Valor entregue a quem acorda a thread bloqueada (os bits da
     /// notificação, T-209).
     wake_value: AtomicU64,
+    /// Erro do despertar (cru; zero sem erro): o objeto em que a thread
+    /// esperava morreu (`PeerClosed` da notificação, ADR 0032, item 6).
+    wake_error: AtomicU64,
     /// Área de FPU; só o código de troca de contexto a acessa, pelo
     /// endereço exposto em `fpu_addr`.
     fpu: Vec<Block>,
@@ -155,6 +158,7 @@ impl Thread {
             cpu: AtomicU32::new(0),
             on_cpu: AtomicBool::new(false),
             wake_value: AtomicU64::new(0),
+            wake_error: AtomicU64::new(0),
             fpu,
             fpu_addr,
             binding: SpinLock::with_class(LockClass::Object, Binding::default()),
@@ -266,6 +270,17 @@ impl Thread {
     #[must_use]
     pub fn wake_value(&self) -> u64 {
         self.wake_value.load(Ordering::Acquire)
+    }
+
+    /// O próximo despertar devolve `e` em vez do valor (antes de acordar
+    /// a thread, por quem tirou a thread da fila do objeto).
+    pub fn set_wake_error(&self, e: Error) {
+        self.wake_error.store(e.to_raw(), Ordering::Release);
+    }
+
+    /// Tira o erro do último despertar, se houver.
+    pub fn take_wake_error(&self) -> Option<Error> {
+        Error::try_from(self.wake_error.swap(0, Ordering::AcqRel)).ok()
     }
 
     /// `thread_configure`: liga a thread a um `CapSpace` e a um
