@@ -39,7 +39,7 @@ const MUTEX_ROUNDS: u64 = 2_000;
 const PEER_ROUNDS: u64 = 100;
 
 /// Como `kipc::tests::spawn`, na fila da CPU `cpu`.
-fn spawn_on(
+pub(super) fn spawn_on(
     p: &Process,
     sym: *const u8,
     args: [u64; 3],
@@ -266,7 +266,14 @@ pub fn destruicao_concorrente_acorda_com_peer_closed() -> Outcome {
     endpoint_de_longe(far)?;
     reply_de_longe(far)?;
     notificacao_de_longe(far)?;
-    em_corrida(far, option("smp.peer", PEER_ROUNDS))?;
+    let rounds = option("smp.peer", PEER_ROUNDS);
+    let (closed, invalid) = em_corrida(far, rounds)?;
+    info!(
+        "ktest: · {rounds} endpoints apagados em corrida com ipc_recv na cpu{far}: \
+         {closed} PeerClosed, {invalid} InvalidHandle"
+    );
+    // Os atrasos longos pegam a thread já esperando.
+    ensure!(closed > 0);
     ensure!(settled(&quota, used0));
     Ok(())
 }
@@ -342,8 +349,9 @@ fn notificacao_de_longe(far: u32) -> Outcome {
 /// `rounds` vezes: inicia na CPU `far` uma thread que entra em `ipc_recv`
 /// e apaga o endpoint depois de um atraso que varre de 0 a 1,9 ms, para
 /// cair antes da syscall, na janela de entrada na espera ou já com a
-/// thread parada.
-fn em_corrida(far: u32, rounds: u64) -> Outcome {
+/// thread parada. Devolve quantas voltas deram `PeerClosed` e quantas
+/// `InvalidHandle`.
+pub(super) fn em_corrida(far: u32, rounds: u64) -> Result<(u64, u64), &'static str> {
     let p = process(2)?;
     let (mut closed, mut invalid) = (0u64, 0u64);
     for round in 0..rounds {
@@ -372,11 +380,5 @@ fn em_corrida(far: u32, rounds: u64) -> Outcome {
         drop(t);
         delete(&p, &[h, reply])?;
     }
-    info!(
-        "ktest: · {rounds} endpoints apagados em corrida com ipc_recv na cpu{far}: \
-         {closed} PeerClosed, {invalid} InvalidHandle"
-    );
-    // Os atrasos longos pegam a thread já esperando.
-    ensure!(closed > 0);
-    Ok(())
+    Ok((closed, invalid))
 }

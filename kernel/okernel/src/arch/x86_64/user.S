@@ -5,7 +5,8 @@
  * RX no anel 3. Todo salto é relativo, então o código roda em qualquer
  * endereço. Usa só registradores e a página RW cujo endereço recebe.
  *
- * Syscalls: 6 = vm_map, 0x80000000 = depuração dos testes (kabi::DEBUG_PRINT),
+ * Syscalls: 1 = cap_mint, 2 = cap_delete, 3 = cap_revoke, 6 = vm_map,
+ * 0x80000000 = depuração dos testes (kabi::DEBUG_PRINT),
  * 18 = ipc_send, 19 = ipc_recv, 20 = ipc_call, 21 = ipc_reply_recv,
  * 23 = ntfy_wait, 25 = obj_bind_notify, 26 = irq_ack, 27 = clock_get,
  * 28 = yield, 29 = futex_wait, 30 = futex_wake, 33 = thread_exit.
@@ -690,6 +691,105 @@ user_tlb_reader:
     mov qword ptr [rsi + 8], r12
     jmp 1b
 9:
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_cap_churn(rdi = raiz, rsi = voltas, rdx = página RW)
+ *
+ * Estresse do CDT (T-329). Em cada volta copia a capability `raiz` (h1),
+ * copia h1 (h2) e, se [página + 16] tiver o handle de um CapSpace alheio
+ * com MANAGE, copia h2 para lá (filha remota, ADR 0028); depois revoga h1
+ * (de oito em oito voltas, a própria `raiz`, que leva junto o que as
+ * outras threads copiaram) e apaga h1. Quem corre com outra revogação
+ * recebe InvalidHandle, Busy ou Revoked: são contados em [página + 24] e
+ * seguem; qualquer outro erro encerra a thread com ele em [página].
+ * Os valores das syscalls voltam em rdx, r10 e r8 (o handle, em rdx).
+ * Página: [0] status final, [8] voltas, [16] CapSpace alheio, [24] erros
+ * esperados, [32] cópias remotas, [40] revogações concluídas. */
+.global user_cap_churn
+user_cap_churn:
+    mov rbx, rdi
+    mov rbp, rsi
+    mov r12, rdx
+    xor r14d, r14d
+1:  /* h1 = cap_mint(raiz) */
+    mov rdi, rbx
+    mov esi, 0x1fffff
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 1
+    syscall
+    test rax, rax
+    jz 2f
+    call 8f
+    jmp 6f
+2:  mov r13, rdx
+    /* h2 = cap_mint(h1) */
+    mov rdi, r13
+    mov esi, 0x1fffff
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 1
+    syscall
+    test rax, rax
+    jz 3f
+    call 8f
+    jmp 4f
+3:  mov r15, rdx
+    cmp qword ptr [r12 + 16], 0
+    je 4f
+    /* cópia de h2 no CapSpace alheio */
+    mov rdi, r15
+    mov esi, 0x1fffff
+    xor edx, edx
+    mov r10, qword ptr [r12 + 16]
+    mov eax, 1
+    syscall
+    test rax, rax
+    jz 31f
+    call 8f
+    jmp 4f
+31: inc qword ptr [r12 + 32]
+4:  /* cap_revoke(h1), ou da raiz a cada oito voltas */
+    mov rdi, r13
+    mov eax, r14d
+    and eax, 7
+    cmp eax, 7
+    jne 41f
+    mov rdi, rbx
+41: mov eax, 3
+    syscall
+    test rax, rax
+    jz 42f
+    call 8f
+    jmp 5f
+42: inc qword ptr [r12 + 40]
+5:  /* cap_delete(h1) */
+    mov rdi, r13
+    mov eax, 2
+    syscall
+    test rax, rax
+    jz 6f
+    call 8f
+6:  inc qword ptr [r12 + 8]
+    inc r14
+    dec rbp
+    jnz 1b
+    xor eax, eax
+    jmp 9f
+8:  /* erro em rax: esperado (conta e volta) ou fatal (encerra) */
+    cmp rax, -1
+    je 81f
+    cmp rax, -11
+    je 81f
+    cmp rax, -12
+    je 81f
+    add rsp, 8
+    jmp 9f
+81: inc qword ptr [r12 + 24]
+    ret
+9:  mov qword ptr [r12], rax
     mov eax, 33
     syscall
     ud2

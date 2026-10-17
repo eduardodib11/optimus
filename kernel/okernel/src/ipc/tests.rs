@@ -53,6 +53,30 @@ fn filas_fifo_e_remocao() {
     assert_eq!(ep.queued(), (0, 0));
 }
 
+/// Tirar o par ou entrar na fila é um passo só: nunca sobram um remetente
+/// e um receptor ambos esperando (`NoMissedRendezvous`).
+#[test]
+fn encontro_ou_fila_num_passo() {
+    let quota = MemoryQuota::root(1 << 22);
+    let ep = Endpoint::new(&quota).unwrap();
+    let (a, b, c) = (thread(&quota), thread(&quota), thread(&quota));
+    // Sem par: o remetente entra na fila (ou, sem `queue`, só volta).
+    assert!(ep.pop_receiver_or_push_sender(&a, false).unwrap().is_none());
+    assert_eq!(ep.queued(), (0, 0));
+    assert!(ep.pop_receiver_or_push_sender(&a, true).unwrap().is_none());
+    assert_eq!(ep.queued(), (1, 0));
+    // O receptor que chega acha o remetente e não entra.
+    let found = ep.pop_sender_or_push_receiver(&b, true).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&found, &a));
+    assert_eq!(ep.queued(), (0, 0));
+    // Sem remetente, o receptor entra; o remetente seguinte o acha.
+    assert!(ep.pop_sender_or_push_receiver(&b, true).unwrap().is_none());
+    assert_eq!(ep.queued(), (0, 1));
+    let found = ep.pop_receiver_or_push_sender(&c, true).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&found, &b));
+    assert_eq!(ep.queued(), (0, 0));
+}
+
 #[test]
 fn reply_de_uso_unico() {
     let quota = MemoryQuota::root(1 << 22);

@@ -22,6 +22,7 @@ use crate::{kmem, ktime};
 mod sched;
 mod smp;
 mod smp_ipc;
+mod smp_stress;
 mod sync;
 mod tlb;
 
@@ -74,6 +75,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "smp.destruicao_concorrente_acorda_com_peer_closed",
         run: smp_ipc::destruicao_concorrente_acorda_com_peer_closed,
+    },
+    Test {
+        name: "smp.estresse",
+        run: smp_stress::estresse,
     },
     Test {
         name: "smp.vm_unmap_faz_a_outra_cpu_faltar",
