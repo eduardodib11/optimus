@@ -161,6 +161,15 @@ impl Inbox {
         }
     }
 
+    /// O pedido de `from` ainda está na caixa, sem atender (para o
+    /// diagnóstico de um shootdown que não fechou).
+    #[must_use]
+    pub fn signaled(&self, from: usize) -> bool {
+        self.bits
+            .get(from / 64)
+            .is_some_and(|w| w.load(Ordering::Acquire) & (1 << (from % 64)) != 0)
+    }
+
     /// Esvazia a caixa e chama `serve` com cada CPU que tinha pedido.
     pub fn drain(&self, serve: &mut dyn FnMut(usize)) {
         for (i, word) in self.bits.iter().enumerate() {

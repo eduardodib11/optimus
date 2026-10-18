@@ -112,12 +112,28 @@ pub fn flush(root: u64, flush: Flush) {
     while !request.done() {
         super::ipi::poll();
         core::hint::spin_loop();
-        assert!(
-            ktime::now_ns() < deadline,
-            "{} CPU(s) não confirmaram o shootdown em {} ms",
-            request.pending(),
-            limit / 1_000_000
-        );
+        if ktime::now_ns() >= deadline {
+            laggards(me, &targets, n);
+            panic!(
+                "{} CPU(s) não confirmaram o shootdown em {} ms",
+                request.pending(),
+                limit / 1_000_000
+            );
+        }
+    }
+}
+
+/// Diagnóstico do pânico por prazo: para cada alvo, se o pedido ainda está
+/// na caixa dele (nunca atendido) e a raiz que ele tem carregada.
+fn laggards(me: usize, targets: &[u64; MAX_CPUS / 64], n: usize) {
+    for c in (0..n).filter(|&c| targets[c / 64] & (1 << (c % 64)) != 0) {
+        if let Some(p) = super::start::percpu_of(c) {
+            error!(
+                "okernel: shootdown de cpu{me}: cpu{c} pedido na caixa {}, raiz carregada {:#x}",
+                p.mailbox().tlb_inbox().signaled(me),
+                LOADED[c].load(Ordering::Relaxed)
+            );
+        }
     }
 }
 
