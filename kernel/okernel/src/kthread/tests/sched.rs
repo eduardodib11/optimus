@@ -16,7 +16,7 @@ use okernel::sched::Params;
 use okernel::thread::RunState;
 
 use super::super::{Event, UserEntry, start, trace_start, trace_take, yield_now};
-use super::{DATA_VA, delete, process, settled, thread_with, user_symbol};
+use super::{DATA_VA, delete, pin, process, settled, thread_with, user_symbol};
 use crate::arch::x86_64::cpu;
 use crate::kcap::root_quota;
 use crate::ktest::Outcome;
@@ -55,6 +55,8 @@ pub fn sem_orcamento_espera() -> Outcome {
                 rsp: DATA_VA + PAGE_SIZE,
                 args: [deadline, 0, 0],
             };
+            // O registro é desta CPU: presas a ela, sem roubo dos APs.
+            pin(t, crate::arch::x86_64::percpu::cpu_id())?;
             ensure!(start(t, &e).is_ok());
         }
         // O ocioso roda as prontas e dorme até o próximo timer.

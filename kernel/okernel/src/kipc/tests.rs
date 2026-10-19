@@ -17,7 +17,7 @@ use crate::arch::x86_64::{cpu, probe};
 use crate::kcap::root_quota;
 use crate::ktest::{Outcome, Test};
 use crate::kthread::tests::{
-    DATA_VA, Process, delete, process, run_until_exit, settled, thread, user_symbol,
+    DATA_VA, Process, delete, pin, process, run_until_exit, settled, thread, user_symbol,
 };
 use crate::kthread::{KernelEnv, UserEntry, fast_switches, start, yield_now};
 use crate::ktime;
@@ -124,7 +124,10 @@ pub(crate) fn create(p: &Process, ty: ObjectType) -> Result<(Handle, Object), &'
 }
 
 /// Inicia em `p` uma thread em `sym` com a pilha no topo da página
-/// `stack_page` de dados e o buffer de IPC na página 0.
+/// `stack_page` de dados e o buffer de IPC na página 0, presa a esta CPU:
+/// estes testes medem o IPC numa CPU só (o de várias CPUs está em
+/// `kthread::tests::smp_ipc`), e sem a máscara os APs ociosos roubariam
+/// as threads (T-325).
 pub(crate) fn spawn(
     p: &Process,
     sym: *const u8,
@@ -132,6 +135,7 @@ pub(crate) fn spawn(
     stack_page: u64,
 ) -> Result<(Handle, Arc<Thread>), &'static str> {
     let (h, t) = thread(p)?;
+    pin(&t, crate::arch::x86_64::percpu::cpu_id())?;
     t.set_ipc_buffer(DATA_VA).map_err(|_| "buffer")?;
     let e = UserEntry {
         rip: user_symbol(sym),

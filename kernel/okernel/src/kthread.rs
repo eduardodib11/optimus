@@ -30,6 +30,14 @@
 //! segue quem chama e vem para cá ([`follow`], T-327); na resposta, quem
 //! chamou e está noutra CPU acorda pelo despertar comum.
 //!
+//! Afinidade e balanceamento (ADR 0032, itens 4 e 7; T-325): uma thread só
+//! começa a rodar numa CPU da máscara do `SchedContext` em que roda (o
+//! doado, se houver). O despertar escolhe entre as CPUs da máscara; a
+//! decisão que acha a atual ou uma pronta fora dela a põe em `outbox`, de
+//! onde ela vai para uma CPU permitida depois da troca. O ocioso rouba uma
+//! pronta da CPU de maior carga ([`idle_steal`]) e, no timer, a CPU puxa
+//! uma da que tem duas a mais que ela, no máximo a cada [`BALANCE_NS`].
+//!
 //! Escalonamento (T-207, seção 6.6): prioridade fixa de 256 níveis com
 //! round-robin de [`DEFAULT_SLICE_NS`] dentro do nível; cada thread roda
 //! sobre o orçamento do seu `SchedContext` e, sem orçamento, espera o fim
@@ -45,6 +53,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 use kabi::MAX_CPUS;
+use kabi::sched::CpuMask;
 
 use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Syscall};
@@ -119,6 +128,11 @@ struct Sched {
     /// em uso até a troca terminar); a próxima a rodar a libera em
     /// [`finish_switch`] e solta a referência (a última, se ela terminou).
     switch_prev: Option<Arc<Thread>>,
+    /// Prontas que esta CPU não pode rodar (a máscara do `SchedContext`
+    /// delas mudou ou elas o receberam por doação): saem da fila e vão
+    /// para uma CPU permitida em [`drain_outbox`], sem esta trava na mão e
+    /// depois da troca (ADR 0032, item 3, passos 4, 5 e 8).
+    outbox: Vec<Arc<Thread>>,
     /// Registro de eventos dos testes (capacidade reservada antes; nunca
     /// aloca aqui).
     trace: Vec<Event>,
@@ -137,6 +151,7 @@ impl Sched {
             throttled: Vec::new(),
             timeouts: Vec::new(),
             switch_prev: None,
+            outbox: Vec::new(),
             trace: Vec::new(),
         }
     }
@@ -220,30 +235,212 @@ fn usable(cpu: usize) -> bool {
         || (ksmp::start::is_online(cpu) && u32::try_from(cpu).is_ok_and(|c| sched_of(c).is_some()))
 }
 
-/// Onde acordar `t` (ADR 0032, item 5; sem máscara de afinidade até o
-/// T-325), com `p` o [`rank`] de `t`: a CPU dela, se ociosa ou rodando algo menos prioritário (cache
-/// quente); senão uma ociosa sem prontas, procurada a partir dela; senão a
-/// que roda a atual menos prioritária, se menos que `t`; senão a dela.
+/// CPUs em que `t` pode começar a rodar: a máscara do `SchedContext` em
+/// que ela roda (o doado, se houver; todas, sem nenhum).
+fn mask_of(t: &Thread) -> CpuMask {
+    t.sched_context().map_or(CpuMask::ALL, |sc| sc.mask())
+}
+
+/// `t` pode começar a rodar na CPU `cpu` (ADR 0032, I4).
+fn allowed(t: &Thread, cpu: u32) -> bool {
+    t.sched_context().is_none_or(|sc| sc.allows(cpu as usize))
+}
+
+/// Onde acordar `t` (ADR 0032, item 5), com `p` o [`rank`] de `t` e só
+/// entre as CPUs da máscara dela: a CPU dela, se ociosa ou rodando algo
+/// menos prioritário (cache quente); senão uma ociosa sem prontas,
+/// procurada a partir dela; senão a que roda a atual menos prioritária, se
+/// menos que `t`; senão a dela, ou a primeira permitida depois dela.
 fn choose_cpu(t: &Thread, p: u32) -> u32 {
     let n = ksmp::count().clamp(1, MAX_CPUS);
+    let mask = mask_of(t);
+    let ok = |c: usize| usable(c) && mask.contains(c);
     let cur = |c: usize| CUR_PRIO[c].load(Ordering::Relaxed);
-    let home = t.cpu() as usize;
-    let home = if home < n && usable(home) { home } else { 0 };
     let idle = |c: usize| cur(c) == 0 && NR_READY[c].load(Ordering::Relaxed) == 0;
-    let chosen = if cur(home) < p {
-        home
-    } else if let Some(c) = (1..n)
-        .map(|i| (home + i) % n)
-        .find(|&c| usable(c) && idle(c))
+    let from = t.cpu() as usize % n;
+    let home = Some(from).filter(|&h| ok(h));
+    let around = || (0..n).map(|i| (from + i) % n);
+    let chosen = if let Some(h) = home.filter(|&h| cur(h) < p) {
+        h
+    } else if let Some(c) = around().find(|&c| ok(c) && idle(c)) {
+        c
+    } else if let Some(c) = (0..n)
+        .filter(|&c| ok(c) && cur(c) < p)
+        .min_by_key(|&c| cur(c))
     {
         c
     } else {
-        (0..n)
-            .filter(|&c| usable(c) && cur(c) < p)
-            .min_by_key(|&c| cur(c))
-            .unwrap_or(home)
+        // Máscara sem CPU usável (só antes de as CPUs dela ligarem): a 0.
+        home.or_else(|| around().find(|&c| ok(c))).unwrap_or(0)
     };
     u32::try_from(chosen).unwrap_or(0)
+}
+
+/// Põe `thread` (pronta, fora de toda fila, sem `on_cpu`) na fila da CPU
+/// `dest`, com a trava só dela, e avisa o destino se ele está ocioso ou
+/// roda algo menos prioritário que `p` (o [`rank`] de `thread`).
+fn push_to(dest: u32, thread: Arc<Thread>, p: u32) {
+    let sched = sched_of(dest).unwrap_or(&BSP_SCHED);
+    let mut s = sched.lock();
+    drop_timeout(&mut s, &thread);
+    let id = s.id;
+    thread.set_cpu(id);
+    let ready = enqueue(&mut s, thread, ktime::now_ns());
+    publish(&s, None);
+    // O resumo da atual do destino é exato com a trava dele na mão. Sem
+    // orçamento, o destino precisa rearmar o timer para o reabastecimento:
+    // também é motivo de aviso.
+    let kick =
+        id != percpu::cpu_id() && (CUR_PRIO[id as usize].load(Ordering::Relaxed) < p || !ready);
+    drop(s);
+    if kick {
+        ksmp::ipi::resched(id as usize);
+    }
+}
+
+/// Manda para outra CPU, pela escolha de [`choose_cpu`], as prontas que
+/// esta não pode rodar (`Sched::outbox`). Sem trava na mão; a anterior
+/// já saiu da CPU (`on_cpu` falso).
+fn drain_outbox() {
+    loop {
+        let t = this_sched().lock().outbox.pop();
+        let Some(t) = t else { return };
+        let p = rank(&t);
+        push_to(choose_cpu(&t, p), t, p);
+    }
+}
+
+/// Tira `t` (pronta) da CPU: vai para `outbox`. Sem memória para isso,
+/// devolve `t` para quem chama rodá-la aqui mesmo (só nesse caso uma CPU
+/// fora da máscara começa a rodar uma thread).
+fn to_outbox(s: &mut Sched, t: Arc<Thread>) -> Option<Arc<Thread>> {
+    if s.outbox.try_reserve(1).is_err() {
+        AFFINITY_MISSES.fetch_add(1, Ordering::Relaxed);
+        return Some(t);
+    }
+    t.set_state(RunState::Ready);
+    s.outbox.push(t);
+    None
+}
+
+/// Intervalo mínimo entre dois balanços periódicos de uma CPU (ADR 0032,
+/// item 7).
+const BALANCE_NS: u64 = 10_000_000;
+/// Último balanço periódico de cada CPU.
+static LAST_BALANCE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Threads puxadas de outra CPU pelo balanceamento desde o boot.
+static PULLS: AtomicU64 = AtomicU64::new(0);
+
+/// Threads puxadas de outra CPU (roubo do ocioso e balanço periódico)
+/// desde o boot.
+pub fn pulls() -> u64 {
+    PULLS.load(Ordering::Relaxed)
+}
+
+/// Puxa da fila da CPU `victim` para a desta a pronta mais prioritária que
+/// pode rodar aqui e não tem `on_cpu` (ADR 0032, I3 e I4); com `local`, só
+/// uma de prioridade não menor que a da melhor pronta daqui. Toma as duas
+/// filas em ordem de id (ADR 0031, item 3). `true` se trouxe alguém.
+fn pull_from(victim: u32, local: bool) -> bool {
+    let me = percpu::cpu_id();
+    let Some(theirs) = sched_of(victim).filter(|_| victim != me) else {
+        return false;
+    };
+    let mine = this_sched();
+    let (mut v, mut m) = if victim < me {
+        let v = theirs.lock();
+        (v, mine.lock())
+    } else {
+        let m = mine.lock();
+        (theirs.lock(), m)
+    };
+    let min = if local {
+        m.ready.highest().unwrap_or(0)
+    } else {
+        0
+    };
+    let Some((_, t)) = v
+        .ready
+        .take_where(min, |_, t| !t.on_cpu() && allowed(t, me))
+    else {
+        return false;
+    };
+    publish(&v, None);
+    drop(v);
+    t.set_cpu(me);
+    enqueue(&mut m, t, ktime::now_ns());
+    publish(&m, None);
+    PULLS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Carga da CPU `c` pelo resumo atômico: as prontas e a atual. Uma CPU
+/// ociosa com uma pronta tem carga 1: já foi avisada e vai rodá-la.
+fn load(c: usize) -> u32 {
+    NR_READY[c]
+        .load(Ordering::Relaxed)
+        .saturating_add(u32::from(CUR_PRIO[c].load(Ordering::Relaxed) != 0))
+}
+
+/// A CPU, fora esta, de maior [`load`], se for pelo menos `at_least`.
+fn busiest(at_least: u32) -> Option<u32> {
+    let me = percpu::cpu_id() as usize;
+    let n = ksmp::count().clamp(1, MAX_CPUS);
+    (0..n)
+        .filter(|&c| c != me && usable(c))
+        .max_by_key(|&c| load(c))
+        .filter(|&c| load(c) >= at_least)
+        .and_then(|c| u32::try_from(c).ok())
+}
+
+/// Roubo do ocioso (ADR 0032, item 7): sem prontas aqui, puxa uma da CPU
+/// de maior carga que tenha alguma pronta além da que roda (carga 2 ou
+/// mais). `true` se trouxe alguém: quem chama cede a vez de novo antes de
+/// dormir.
+pub fn idle_steal() -> bool {
+    let me = percpu::cpu_id() as usize;
+    if NR_READY[me].load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    busiest(2).is_some_and(|c| pull_from(c, false))
+}
+
+/// Balanço periódico, de carona no timer (ADR 0032, item 7): a cada
+/// [`BALANCE_NS`] no máximo, puxa uma thread da CPU de maior carga se ela
+/// tem pelo menos duas a mais que esta.
+fn periodic_balance(now: u64) {
+    let me = percpu::cpu_id() as usize;
+    let last = &LAST_BALANCE[me];
+    if now.saturating_sub(last.load(Ordering::Relaxed)) < BALANCE_NS {
+        return;
+    }
+    last.store(now, Ordering::Relaxed);
+    if let Some(c) = busiest(load(me).saturating_add(2)) {
+        pull_from(c, true);
+    }
+}
+
+/// `sc` passa a permitir só `mask`, como `sched_configure` com `r8` (para
+/// os testes): as CPUs fora dela reavaliam quem roda.
+pub fn set_affinity(sc: &SchedContext, mask: CpuMask) {
+    sc.set_mask(mask);
+    sys::Env::affinity_changed(&mut KernelEnv, mask);
+}
+
+/// CPUs ligadas.
+fn online_mask() -> CpuMask {
+    (0..ksmp::count().min(MAX_CPUS))
+        .filter(|&c| usable(c))
+        .fold(CpuMask::NONE, CpuMask::with)
+}
+
+/// Vezes em que uma CPU rodou uma thread fora da máscara por falta de
+/// memória para `outbox` ([`to_outbox`]).
+static AFFINITY_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Threads rodadas fora da máscara desde o boot (zero, salvo sem memória).
+pub fn affinity_misses() -> u64 {
+    AFFINITY_MISSES.load(Ordering::Relaxed)
 }
 
 /// Trocas diretas do caminho rápido de IPC.
@@ -271,16 +468,22 @@ fn user_addr(addr: u64) -> bool {
 /// `thread_configure` ou com `rip`/`rsp` fora da metade de usuário;
 /// [`Error::QuotaExceeded`] sem memória para a fila.
 pub fn start(thread: &Arc<Thread>, entry: &UserEntry) -> Result<(), Error> {
-    start_on(thread, entry, percpu::cpu_id())
+    let me = percpu::cpu_id();
+    let cpu = if allowed(thread, me) {
+        me
+    } else {
+        choose_cpu(thread, rank(thread))
+    };
+    start_on(thread, entry, cpu)
 }
 
 /// Como [`start`], na fila da CPU `cpu` (os testes põem threads em CPUs
-/// escolhidas; sem afinidade, uma thread fica onde começou até bloquear).
+/// escolhidas; o balanceamento pode levá-las para outra da máscara).
 ///
 /// # Errors
 ///
 /// Os de [`start`]; [`Error::InvalidArgument`] também se `cpu` não pode
-/// receber threads.
+/// receber threads ou está fora da máscara do `SchedContext`.
 pub fn start_on(thread: &Arc<Thread>, entry: &UserEntry, cpu: u32) -> Result<(), Error> {
     if thread.state() != RunState::Inactive {
         return Err(Error::Busy);
@@ -308,7 +511,7 @@ pub fn start_on(thread: &Arc<Thread>, entry: &UserEntry, cpu: u32) -> Result<(),
     // `switch_context` para o trampolim.
     let switch_at = frame_at - 7 * 8;
     let target = sched_of(cpu)
-        .filter(|_| usable(cpu as usize))
+        .filter(|_| usable(cpu as usize) && allowed(thread, cpu))
         .ok_or(Error::InvalidArgument)?;
     thread.set_cpu(cpu);
     let mut sched = target.lock();
@@ -509,17 +712,31 @@ fn expire_timeouts() {
     }
 }
 
-/// A próxima a rodar: `direct`, se puder rodar já, ou a primeira da fila.
-fn pick_next(s: &mut Sched, direct: Option<Arc<Thread>>, now: u64) -> Option<Arc<Thread>> {
+/// A próxima a rodar na CPU `me`: `direct`, se puder rodar já, ou a
+/// primeira da fila. As que `me` não pode rodar (I4) vão para `outbox`.
+fn pick_next(s: &mut Sched, direct: Option<Arc<Thread>>, me: u32, now: u64) -> Option<Arc<Thread>> {
     if let Some(t) = direct {
         drop_timeout(s, &t);
-        if runs_directly(s, &t, now) {
+        if !allowed(&t, me) {
+            if let Some(t) = to_outbox(s, t) {
+                return Some(t);
+            }
+        } else if runs_directly(s, &t, now) {
             FAST_SWITCHES.fetch_add(1, Ordering::Relaxed);
             return Some(t);
+        } else {
+            enqueue(s, t, now);
         }
-        enqueue(s, t, now);
     }
-    s.ready.pop().map(|(_, t)| t)
+    while let Some((_, t)) = s.ready.pop() {
+        if allowed(&t, me) {
+            return Some(t);
+        }
+        if let Some(t) = to_outbox(s, t) {
+            return Some(t);
+        }
+    }
+    None
 }
 
 /// `n` passa a ser a atual desta CPU (`me`): estado, CPU dona, `on_cpu`
@@ -555,6 +772,7 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     if why == Why::Preempt
         && let Some(cur) = s.current.clone()
         && keeps_running(&s, &cur, now)
+        && allowed(&cur, me)
     {
         publish(&s, None);
         program_timer(&s, now);
@@ -565,12 +783,20 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         match why {
             Why::Exit => p.set_state(RunState::Exited),
             Why::Block => {}
+            // Fora da máscara (mudou ou veio com uma doação): sai para
+            // uma CPU permitida depois da troca, quando já não tiver
+            // `on_cpu`.
+            Why::Yield | Why::Preempt if !allowed(p, me) => {
+                if let Some(p) = to_outbox(&mut s, Arc::clone(p)) {
+                    enqueue(&mut s, p, now);
+                }
+            }
             Why::Yield | Why::Preempt => {
                 enqueue(&mut s, Arc::clone(p), now);
             }
         }
     }
-    let next = pick_next(&mut s, direct, now);
+    let next = pick_next(&mut s, direct, me, now);
     let same = match (&prev, &next) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
@@ -599,6 +825,8 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     publish(&s, Some(cur_rank));
     program_timer(&s, now);
     if same {
+        drop(s);
+        drain_outbox();
         return;
     }
     let idle_slot = percpu::with(|p| p.idle_rsp().as_ptr());
@@ -655,14 +883,16 @@ fn idle_rsp() -> u64 {
 }
 
 /// Já na próxima: libera a pilha da anterior (`on_cpu` falso, ADR 0032,
-/// item 3, passo 8), que outra CPU pode passar a rodar, e solta a
-/// referência a ela (a última, se ela terminou).
+/// item 3, passo 8), que outra CPU pode passar a rodar, solta a
+/// referência a ela (a última, se ela terminou) e manda as prontas que
+/// esta CPU não pode rodar para outra.
 fn finish_switch() {
     let prev = this_sched().lock().switch_prev.take();
     if let Some(p) = prev {
         p.set_on_cpu(false);
         drop(p);
     }
+    drain_outbox();
 }
 
 /// Primeira execução de uma thread, chamada por `thread_trampoline`.
@@ -682,9 +912,10 @@ pub fn yield_now() {
 /// Pode ser chamada de qualquer CPU, com trava de objeto na mão, e nunca
 /// espera (ADR 0032, item 5): só quem passa a thread de `Blocked` a
 /// `Ready` a enfileira. Ainda saindo da CPU dela (`on_cpu`), volta à fila
-/// dessa CPU, a única que pode pegá-la; senão, vai para a CPU de
-/// [`choose_cpu`]. Destino em outra CPU ociosa ou rodando algo menos
-/// prioritário recebe o IPI de reescalonar.
+/// dessa CPU, a única que pode pegá-la, mesmo fora da máscara (quem a
+/// tirar da fila a manda para uma permitida); senão, vai para a CPU de
+/// [`choose_cpu`], entre as da máscara. Destino em outra CPU ociosa ou
+/// rodando algo menos prioritário recebe o IPI de reescalonar.
 pub fn wake(thread: Arc<Thread>, value: u64) {
     if !thread.claim_wake() {
         return;
@@ -704,22 +935,7 @@ pub fn wake(thread: Arc<Thread>, value: u64) {
     {
         drop_timeout(&mut old.lock(), &thread);
     }
-    let sched = sched_of(dest).unwrap_or(&BSP_SCHED);
-    let mut s = sched.lock();
-    drop_timeout(&mut s, &thread);
-    let id = s.id;
-    thread.set_cpu(id);
-    let ready = enqueue(&mut s, thread, ktime::now_ns());
-    publish(&s, None);
-    // O resumo da atual do destino é exato com a trava dele na mão. Sem
-    // orçamento, o destino precisa rearmar o timer para o reabastecimento:
-    // também é motivo de aviso.
-    let kick =
-        id != percpu::cpu_id() && (CUR_PRIO[id as usize].load(Ordering::Relaxed) < p || !ready);
-    drop(s);
-    if kick {
-        ksmp::ipi::resched(id as usize);
-    }
+    push_to(dest, thread, p);
 }
 
 /// Bloqueia a atual (já marcada) até alguém a acordar ou, com `deadline`
@@ -865,12 +1081,30 @@ impl sys::Env for KernelEnv {
     fn write_buffer(&mut self, thread: &Thread, at: usize, data: &[u64]) -> bool {
         kipc::write_buffer(thread, at, data)
     }
+
+    fn read_bytes(&mut self, addr: u64, out: &mut [u8]) -> bool {
+        probe::copy_from_user(out, addr)
+    }
+
+    fn online_cpus(&self) -> CpuMask {
+        online_mask()
+    }
+
+    fn affinity_changed(&mut self, mask: CpuMask) {
+        let me = percpu::cpu_id() as usize;
+        for c in 0..ksmp::count().min(MAX_CPUS) {
+            if c != me && !mask.contains(c) && usable(c) {
+                ksmp::ipi::resched(c);
+            }
+        }
+    }
 }
 
 /// Disparo do timer do APIC (com o EOI já feito), vindo do anel 3 ou do
 /// ocioso: reavalia quem roda.
 pub fn on_timer() {
     ktime::timer_fired();
+    periodic_balance(ktime::now_ns());
     preempt();
 }
 
@@ -936,6 +1170,7 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
         }
         Syscall::ThreadExit => exit_current(),
         Syscall::ClockGet => Ok([ktime::now_ns(), 0, 0]),
+        Syscall::SysInfo => sys_info(a[0]),
         Syscall::ThreadStart => thread_start(a).map(|()| [0; 3]),
         _ => {
             let space = current()
@@ -943,6 +1178,19 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
                 .ok_or(Error::NotSupported)?;
             sys::invoke(&space, call, a, kcap::REVOKE_SLICE_BUDGET, &mut KernelEnv)
         }
+    }
+}
+
+/// `sys_info(seletor)` (ADR 0032, item 4): com [`kabi::sched::SYS_INFO_CPUS`],
+/// as CPUs ligadas e o total de ids lógicos da topologia.
+fn sys_info(selector: u64) -> Result<Values, Error> {
+    match selector {
+        kabi::sched::SYS_INFO_CPUS => Ok([
+            ksmp::start::online_count().max(1) as u64,
+            ksmp::count().max(1) as u64,
+            0,
+        ]),
+        _ => Err(Error::NotSupported),
     }
 }
 

@@ -18,7 +18,7 @@ use okernel::thread::{RunState, Thread};
 use super::{BADGE, create, give, run_until_blocked, user_words};
 use crate::arch::x86_64::cpu;
 use crate::ktest::Outcome;
-use crate::kthread::tests::{DATA_VA, Process, delete, process, thread_with, user_symbol};
+use crate::kthread::tests::{DATA_VA, Process, delete, pin, process, thread_with, user_symbol};
 use crate::kthread::{Event, UserEntry, start, trace_start, trace_take, yield_now};
 use crate::ktime;
 
@@ -31,7 +31,8 @@ unsafe extern "C" {
 const MS: u64 = 1_000_000;
 
 /// Inicia em `p` uma thread de prioridade `priority` (sem limite de
-/// orçamento) em `sym`, com a pilha na página 1 e o buffer de IPC na página 0.
+/// orçamento) em `sym`, com a pilha na página 1 e o buffer de IPC na página 0,
+/// presa a esta CPU: a inversão e o registro são de uma CPU só.
 fn spawn_at(
     p: &Process,
     priority: u64,
@@ -40,6 +41,7 @@ fn spawn_at(
 ) -> Result<(kabi::Handle, Arc<Thread>), &'static str> {
     let params = Params::new(MS, MS, priority).map_err(|_| "params")?;
     let (h, t) = thread_with(p, params)?;
+    pin(&t, crate::arch::x86_64::percpu::cpu_id())?;
     t.set_ipc_buffer(DATA_VA).map_err(|_| "buffer")?;
     let e = UserEntry {
         rip: user_symbol(sym),

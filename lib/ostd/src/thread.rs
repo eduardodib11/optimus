@@ -1,5 +1,6 @@
 //! Threads e escalonamento (SDD v1.0, seções 6.1, 6.6 e 14.2; ADR 0029).
 
+use kabi::sched::{CpuMask, SYS_INFO_CPUS};
 use kabi::thread::{CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER};
 use kabi::{Error, Handle, Syscall};
 
@@ -80,6 +81,36 @@ pub fn sched_configure(
 ) -> Result<(), Error> {
     let args = [raw(sc), budget_ns, period_ns, u64::from(priority), 0, 0];
     syscall(Syscall::SchedConfigure, args).map(drop)
+}
+
+/// Como [`sched_configure`], e o `SchedContext` passa a permitir só as CPUs
+/// de `mask` (ADR 0032, item 4): as threads que rodam sobre ele, inclusive
+/// por doação, só começam a rodar nelas.
+///
+/// # Errors
+///
+/// Os do kernel (`InvalidArgument` se `mask` não tem CPU ligada).
+pub fn sched_configure_on(
+    sc: Handle,
+    budget_ns: u64,
+    period_ns: u64,
+    priority: u8,
+    mask: &CpuMask,
+) -> Result<(), Error> {
+    let addr = core::ptr::from_ref(mask).addr() as u64;
+    let args = [raw(sc), budget_ns, period_ns, u64::from(priority), addr, 0];
+    syscall(Syscall::SchedConfigure, args).map(drop)
+}
+
+/// CPUs ligadas e total de ids lógicos da topologia (`sys_info` com
+/// `SYS_INFO_CPUS`).
+///
+/// # Errors
+///
+/// Os do kernel.
+pub fn cpus() -> Result<(u64, u64), Error> {
+    syscall(Syscall::SysInfo, [SYS_INFO_CPUS, 0, 0, 0, 0, 0])
+        .map(|[online, total, _]| (online, total))
 }
 
 /// `sched_bind`: a thread passa a rodar sobre o `SchedContext` `sc`.

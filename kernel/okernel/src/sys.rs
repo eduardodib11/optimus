@@ -19,6 +19,7 @@
 
 use alloc::sync::Arc;
 
+use kabi::sched::{CPU_MASK_BYTES, CpuMask};
 use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Handle, ObjectType, Rights, Syscall};
 
@@ -69,6 +70,19 @@ pub trait Env {
     /// Grava palavras no buffer de IPC de `thread`, a partir da palavra
     /// `at`; falso se não houver buffer ou ele não for gravável.
     fn write_buffer(&mut self, thread: &Thread, at: usize, data: &[u64]) -> bool;
+    /// Lê `out.len()` bytes do usuário em `addr` (no espaço ativo); falso
+    /// se alguma página não puder ser lida.
+    fn read_bytes(&mut self, _addr: u64, _out: &mut [u8]) -> bool {
+        false
+    }
+    /// CPUs ligadas (uma só, sem SMP).
+    fn online_cpus(&self) -> CpuMask {
+        CpuMask::only(0)
+    }
+    /// Um `SchedContext` passou a permitir só `mask` (ADR 0032, item 4):
+    /// as CPUs fora dela que rodam ou têm na fila uma thread sobre ele
+    /// reavaliam quem roda. Volta sem esperar.
+    fn affinity_changed(&mut self, _mask: CpuMask) {}
 }
 
 fn handle(raw: u64) -> Result<Handle, Error> {
@@ -167,7 +181,21 @@ pub fn invoke(
             if !cap.rights.contains(Rights::CONFIGURE) {
                 return Err(Error::AccessDenied);
             }
-            sc.configure(Params::new(a[1], a[2], a[3])?);
+            if a[5] != 0 {
+                return Err(Error::InvalidArgument);
+            }
+            let params = Params::new(a[1], a[2], a[3])?;
+            let mask = match a[4] {
+                0 => None,
+                addr => Some(cpu_mask(addr, env)?),
+            };
+            sc.configure(params);
+            if let Some(mask) = mask {
+                sc.set_mask(mask);
+                env.affinity_changed(mask);
+                // Esta CPU pode ter saído da máscara da própria thread.
+                env.preempt();
+            }
             Ok([0; 3])
         }
         Syscall::SchedBind => {
@@ -185,6 +213,24 @@ pub fn invoke(
         Syscall::ThreadConfigure => thread_configure(space, a).map(|()| [0; 3]),
         _ => invoke_sync(space, call, a, env),
     }
+}
+
+/// Máscara de afinidade de `sched_configure` (`r8`, ADR 0032, item 4): uma
+/// [`CpuMask`] alinhada a 8 na memória do usuário, com alguma CPU ligada.
+fn cpu_mask(addr: u64, env: &mut dyn Env) -> Result<CpuMask, Error> {
+    let end = USER_END - CPU_MASK_BYTES as u64;
+    if !addr.is_multiple_of(8) || !(USER_START..=end).contains(&addr) {
+        return Err(Error::InvalidArgument);
+    }
+    let mut bytes = [0u8; CPU_MASK_BYTES];
+    if !env.read_bytes(addr, &mut bytes) {
+        return Err(Error::InvalidArgument);
+    }
+    let mask = CpuMask::from_bytes(&bytes);
+    if mask.and(&env.online_cpus()).is_empty() {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(mask)
 }
 
 /// `cap_mint(origem, máscara, badge, destino)`: com `destino` (um

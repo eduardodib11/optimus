@@ -566,14 +566,14 @@ user_bench_yield:
     syscall
     ud2
 
-/* user_pingpong(rdi = id | cpu << 8, rsi = voltas, rdx = página compartilhada)
+/* user_pingpong(rdi = id | máscara << 8, rsi = voltas, rdx = página compartilhada)
  *
  * Duas threads de processos diferentes, com a mesma página mapeada,
  * alternam a vez pela palavra em [0] (u32, o id de quem joga): esperam a
  * vez em futex_wait, contam a jogada, passam a vez e acordam a outra com
  * futex_wake. Cada jogada lê a CPU por RDTSCP (TSC_AUX = id lógico).
- * Grava em [8 + 8 * id] as jogadas e em [24 + 8 * id] as feitas fora da
- * CPU `cpu`. */
+ * Grava em [8 + 8 * id] as jogadas e em [24 + 8 * id] as feitas fora das
+ * CPUs da `máscara` (bit i = CPU i, até a CPU 55). */
 .global user_pingpong
 user_pingpong:
     movzx r12d, dil
@@ -594,8 +594,8 @@ user_pingpong:
     jmp 1b
 2:  /* jogada */
     rdtscp
-    cmp ecx, r13d
-    je 3f
+    bt r13, rcx
+    jc 3f
     inc qword ptr [r15 + r12 * 8 + 24]
 3:
     inc qword ptr [r15 + r12 * 8 + 8]
@@ -790,6 +790,38 @@ user_cap_churn:
 81: inc qword ptr [r12 + 24]
     ret
 9:  mov qword ptr [r12], rax
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_where(rdi = página RW)
+ *
+ * Gira contando voltas em [0] e gravando em [8] a CPU de cada volta
+ * (RDTSCP, TSC_AUX = id lógico) até [16] deixar de ser zero; então
+ * termina. Com [24] não zero (o endereço de uma CpuMask), chama
+ * sched_configure([32], [40], [48], [56], [24], 0), grava o status em [64]
+ * e zera [24]. */
+.global user_where
+user_where:
+    mov r12, rdi
+1:  rdtscp
+    mov qword ptr [r12 + 8], rcx
+    inc qword ptr [r12]
+    mov r8, qword ptr [r12 + 24]
+    test r8, r8
+    jz 2f
+    mov rdi, qword ptr [r12 + 32]
+    mov rsi, qword ptr [r12 + 40]
+    mov rdx, qword ptr [r12 + 48]
+    mov r10, qword ptr [r12 + 56]
+    xor r9d, r9d
+    mov eax, 16
+    syscall
+    mov qword ptr [r12 + 64], rax
+    mov qword ptr [r12 + 24], 0
+2:  pause
+    cmp qword ptr [r12 + 16], 0
+    je 1b
     mov eax, 33
     syscall
     ud2

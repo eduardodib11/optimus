@@ -3,6 +3,7 @@
 //! cada syscall.
 
 use ostd::kabi::ipc::{FLAG_NONBLOCK, MsgInfo, recv_target};
+use ostd::kabi::sched::{CpuMask, SYS_INFO_CPUS};
 use ostd::kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use ostd::kabi::{Error, ObjectType, Rights, Syscall};
 
@@ -350,13 +351,37 @@ impl Fuzzer {
 
     fn sched(&mut self) {
         let (a, b) = (self.some_handle(), self.some_handle());
-        if self.rng.chance(1, 2) {
-            let budget = self.small_len();
-            let period = self.small_len();
-            let priority = self.rng.below(300);
-            let _ = syscall(Syscall::SchedConfigure, [a, budget, period, priority, 0, 0]);
-        } else {
-            let _ = syscall(Syscall::SchedBind, [a, b, 0, 0, 0, 0]);
+        match self.rng.below(5) {
+            0 | 1 => {
+                let budget = self.small_len();
+                let period = self.small_len();
+                let priority = self.rng.below(300);
+                // Máscara de afinidade (T-325): às vezes nenhuma, às vezes
+                // uma de verdade na pilha, às vezes um endereço qualquer; e
+                // às vezes o `r9` reservado ligado.
+                let mask = CpuMask([self.rng.next(), self.rng.next(), 0, self.rng.next()]);
+                let r8 = match self.rng.below(4) {
+                    0 => 0,
+                    1 | 2 => core::ptr::from_ref(&mask).addr() as u64,
+                    _ if self.rng.chance(1, 2) => self.scratch_addr(),
+                    _ => wild(&mut self.rng),
+                };
+                let r9 = u64::from(self.rng.chance(1, 16));
+                let args = [a, budget, period, priority, r8, r9];
+                let _ = syscall(Syscall::SchedConfigure, args);
+                core::hint::black_box(&mask);
+            }
+            2 | 3 => {
+                let _ = syscall(Syscall::SchedBind, [a, b, 0, 0, 0, 0]);
+            }
+            _ => {
+                let selector = if self.rng.chance(1, 2) {
+                    SYS_INFO_CPUS
+                } else {
+                    wild(&mut self.rng)
+                };
+                let _ = syscall(Syscall::SysInfo, [selector, 0, 0, 0, 0, 0]);
+            }
         }
     }
 
