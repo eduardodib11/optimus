@@ -10,6 +10,8 @@
 #   PERFIL_SKIP    entradas dessa syscall a ignorar antes (aquecimento)
 #   PERFIL_TITLE   título da seção do relatório
 #   PERFIL_OUT     arquivo em que a seção é acrescentada
+#   PERFIL_DUMP    (opcional) arquivo em que vai a volta inteira, uma
+#                  instrução por linha, para estudar um trecho
 #
 # Para no `syscall_entry` com `rax` = PERFIL_NR, depois de PERFIL_SKIP
 # entradas, e segue com `stepi` até a segunda volta ao anel 3: a primeira
@@ -178,6 +180,14 @@ def main():
             asm = arch.disassemble(addr)[0]["asm"]
             loc = where(addr) if addr >= KERNEL_HALF else ("(anel 3)", "(anel 3)", "user.S", "user.S")
             info[addr] = (classify(asm), loc, entry(addr) if addr >= KERNEL_HALF else None)
+
+    dump = os.environ.get("PERFIL_DUMP")
+    if dump:
+        with open(dump, "a", encoding="utf-8") as f:
+            f.write(f"# {title}\n")
+            for p, a in trace:
+                asm = arch.disassemble(a)[0]["asm"]
+                f.write(f"{p}\t{a:#x}\t{info[a][1][0]}\t{info[a][1][1]}\t{info[a][1][3]}\t{asm}\n")
 
     total = len(trace)
     kernel_n = sum(1 for p, _ in trace if p >= 0)
