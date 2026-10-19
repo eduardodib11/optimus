@@ -70,10 +70,16 @@ pub fn bench(opts: &Options) -> Result {
     build(&opts)?;
     let serial = boot_scenario(&opts, &BENCH_SCENARIO)?;
     let meta = meta();
-    let report = report(&serial, &meta)?;
+    let report = report(&serial, &meta, opts.smp)?;
     let dir = root().join("docs/bench");
     fs::create_dir_all(&dir).map_err(|e| format!("criando {}: {e}", dir.display()))?;
-    let file = dir.join(format!("{}-{}.md", meta.date, meta.commit));
+    // Com mais de uma CPU, o relatório não sobrescreve o de uma.
+    let smp = if opts.smp > 1 {
+        format!("-smp{}", opts.smp)
+    } else {
+        String::new()
+    };
+    let file = dir.join(format!("{}-{}{smp}.md", meta.date, meta.commit));
     fs::write(&file, &report).map_err(|e| format!("gravando {}: {e}", file.display()))?;
     println!("{report}");
     println!("xtask: relatório em {}", file.display());
@@ -167,8 +173,8 @@ pub fn line<'a>(serial: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-/// O relatório em markdown.
-pub fn report(serial: &str, meta: &Meta) -> Result<String> {
+/// O relatório em markdown, de uma rodada com `smp` CPUs.
+pub fn report(serial: &str, meta: &Meta, smp: u32) -> Result<String> {
     let env = line(serial, "ambiente").ok_or("sem a linha bench: ambiente")?;
     let env = fields(env);
     let get = |k: &str| {
@@ -180,7 +186,8 @@ pub fn report(serial: &str, meta: &Meta) -> Result<String> {
     let mut md = format!(
         "# Benchmarks de IPC e troca de contexto ({})\n\n\
          - Commit: `{}`\n\
-         - Comando: `cargo xtask bench` (kernel e serviços em release)\n\
+         - Comando: `cargo xtask bench{}` (kernel e serviços em release; \
+         `-smp {smp}`, o par de cada benchmark preso a uma CPU)\n\
          - Acelerador: {accel}\n\
          - CPU do convidado: {}\n\
          - TSC: {} kHz; APIC {}; timer {}\n\
@@ -189,6 +196,11 @@ pub fn report(serial: &str, meta: &Meta) -> Result<String> {
          - QEMU: {}\n\n",
         meta.date,
         meta.commit,
+        if smp > 1 {
+            format!(" --smp {smp}")
+        } else {
+            String::new()
+        },
         get("cpu"),
         get("tsc_khz"),
         get("apic"),
@@ -274,7 +286,7 @@ mod tests {
 
     #[test]
     fn relatorio_com_mediana_p99_e_aviso_do_tcg() {
-        let md = report(SERIAL, &meta()).unwrap();
+        let md = report(SERIAL, &meta(), 1).unwrap();
         assert!(md.contains("Commit: `abc1234`"));
         assert!(md.contains("CPU do convidado: QEMU TCG CPU version 2.5+"));
         assert!(md.contains(
@@ -283,9 +295,9 @@ mod tests {
         assert!(md.contains("| 707 ns |"));
         assert!(md.contains("**Sem KVM:**"));
         let kvm = SERIAL.replace("acelerador=TCG", "acelerador=KVM");
-        assert!(!report(&kvm, &meta()).unwrap().contains("Sem KVM"));
+        assert!(!report(&kvm, &meta(), 1).unwrap().contains("Sem KVM"));
         let missing = SERIAL.replace("bench: troca_de_contexto_mesmo_processo", "x");
-        assert!(report(&missing, &meta()).is_err());
+        assert!(report(&missing, &meta(), 1).is_err());
     }
 
     #[test]

@@ -25,10 +25,11 @@ use kabi::vm::PAGE_SIZE;
 use kabi::{Handle, ObjectType, Rights};
 use okernel::thread::Thread;
 
-use crate::arch::x86_64::{QemuExit, apic, cpu, qemu_exit};
+use crate::arch::x86_64::{QemuExit, apic, cpu, percpu, qemu_exit};
 use crate::kipc::tests::{create, give};
 use crate::kthread::tests::{
-    DATA_VA, Process, RUN_LIMIT_NS, delete, process, run_until_exit_within, thread, user_symbol,
+    DATA_VA, Process, RUN_LIMIT_NS, delete, pin, process, run_until_exit_within, thread,
+    user_symbol,
 };
 use crate::kthread::{UserEntry, fast_switches, start};
 use crate::{kmem, ktime};
@@ -88,7 +89,9 @@ const BENCHES: &[Bench] = &[
 ];
 
 /// Inicia em `p` uma thread em `sym` com `args` e a pilha na página
-/// `stack_page`.
+/// `stack_page`, presa à CPU que roda o benchmark: em SMP as duas threads de
+/// cada par ficam na mesma CPU (a meta é a do par fixado; T-331), sem o
+/// balanceamento separá-las.
 fn spawn(
     p: &Process,
     sym: *const u8,
@@ -96,6 +99,7 @@ fn spawn(
     stack_page: u64,
 ) -> Result<(Handle, Arc<Thread>), &'static str> {
     let (h, t) = thread(p)?;
+    pin(&t, percpu::cpu_id())?;
     let e = UserEntry {
         rip: user_symbol(sym),
         rsp: DATA_VA + (stack_page + 1) * PAGE_SIZE,
