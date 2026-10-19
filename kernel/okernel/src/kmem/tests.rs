@@ -45,6 +45,10 @@ pub const TESTS: &[Test] = &[
         run: endurecimento,
     },
     Test {
+        name: "mm.folhas_do_kernel_globais",
+        run: kernel_global,
+    },
+    Test {
         name: "mm.buddy_aloca_e_libera",
         run: buddy,
     },
@@ -155,6 +159,27 @@ fn endurecimento() -> Outcome {
     // SAFETY: EFER existe em toda CPU x86-64.
     ensure!(unsafe { cpu::rdmsr(cpu::MSR_EFER) } & cpu::EFER_NXE != 0);
     ensure!(cpu::read_cr0() & cpu::CR0_WP != 0);
+    Ok(())
+}
+
+/// Toda folha do kernel é global e o CR4.PGE está ligado (ADR 0031, item
+/// 7), inclusive a mapeada depois do boot.
+fn kernel_global() -> Outcome {
+    ensure!(cpu::read_cr4() & (1 << 7) != 0);
+    let (mut leaves, mut local) = (0, 0);
+    for_each_leaf(&mut |_, m| {
+        leaves += 1;
+        local += usize::from(!m.flags.global);
+    });
+    ensure!(leaves > 0 && local == 0);
+    let frame = alloc_frames(0).ok_or("sem frames")?;
+    ensure!(map(TEST_VA, frame, PageSize::Size4K, Flags::RW).is_ok());
+    let global = translate(TEST_VA).is_some_and(|m| m.flags.global);
+    ensure!(protect(TEST_VA, PageSize::Size4K, Flags::READ).is_ok());
+    let still = translate(TEST_VA).is_some_and(|m| m.flags.global);
+    ensure!(unmap(TEST_VA, PageSize::Size4K) == Ok(frame));
+    free_frames(frame, 0);
+    ensure!(global && still);
     Ok(())
 }
 

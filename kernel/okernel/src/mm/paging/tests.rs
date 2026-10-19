@@ -248,3 +248,29 @@ fn conta_tabelas_e_devolve_a_metade_baixa() {
     assert_eq!(pt.translate(u), None);
     assert!(pt.translate(K).is_some());
 }
+
+#[test]
+fn so_a_metade_do_kernel_vira_global() {
+    let mut pt = Fake::new(16);
+    let user = Flags {
+        user: true,
+        ..Flags::RW
+    };
+    pt.map(0x40_0000, PhysAddr(0x9000), PageSize::Size4K, user)
+        .unwrap();
+    pt.map(K, PhysAddr(0x8000), PageSize::Size4K, Flags::RX)
+        .unwrap();
+    pt.map(K + MIB2, PhysAddr(0), PageSize::Size2M, Flags::RW)
+        .unwrap();
+    assert_eq!(pt.globalize_kernel_half(), 2);
+    let global = |f: Flags| Flags { global: true, ..f };
+    assert_eq!(pt.translate(K).unwrap().flags, global(Flags::RX));
+    assert_eq!(pt.translate(K + MIB2).unwrap().flags, global(Flags::RW));
+    assert_eq!(pt.translate(0x40_0000).unwrap().flags, user);
+    // A divisão da página grande mantém o bit nas folhas pequenas.
+    pt.protect(K + MIB2, PageSize::Size4K, global(Flags::READ))
+        .unwrap();
+    let m = pt.translate(K + MIB2 + 0x1000).unwrap();
+    assert_eq!((m.size, m.flags), (PageSize::Size4K, global(Flags::RW)));
+    assert_eq!(pt.globalize_kernel_half(), 513);
+}
