@@ -92,9 +92,11 @@ fn fila_por_prioridade_e_round_robin() {
     for prio in 0..=255u8 {
         q.push(prio, prio).unwrap();
     }
+    assert_eq!(q.len(), 256);
     for expected in (0..=255u8).rev() {
         assert_eq!(q.pop(), Some((expected, expected)));
     }
+    assert_eq!(q.len(), 0);
 }
 
 #[test]
@@ -143,6 +145,7 @@ fn roubo_tira_o_primeiro_que_serve_do_nivel_mais_alto() {
     }
     // O 90 não serve: sai o 91, e a ordem do nível segue.
     assert_eq!(q.take_where(0, |_, t| *t != 90), Some((9, 91)));
+    assert_eq!(q.len(), 4);
     // A partir do nível 6, nada abaixo de 90 serve (o 5 fica de fora).
     assert_eq!(q.take_where(6, |_, t| *t < 90), None);
     assert_eq!(q.take_where(0, |p, _| p < 9), Some((5, 50)));
@@ -151,5 +154,6 @@ fn roubo_tira_o_primeiro_que_serve_do_nivel_mais_alto() {
     assert_eq!(q.pop(), Some((9, 92)));
     assert_eq!(q.take_where(0, |_, _| true), Some((1, 10)));
     assert!(q.is_empty());
+    assert_eq!(q.len(), 0);
     assert_eq!(q.highest(), None);
 }

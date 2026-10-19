@@ -111,10 +111,11 @@ struct Wait {
 }
 
 impl Wait {
-    fn new(info: MsgInfo, deadline: u64, now: u64) -> Self {
+    /// O relógio só é lido com prazo (T-331: o caminho rápido não tem).
+    fn new(info: MsgInfo, deadline: u64, env: &dyn Env) -> Self {
         let refuse = if info.flags & FLAG_NONBLOCK != 0 {
             Some(Error::WouldBlock)
-        } else if deadline != 0 && deadline <= now {
+        } else if deadline != 0 && deadline <= env.now() {
             Some(Error::TimedOut)
         } else {
             None
@@ -257,7 +258,8 @@ fn deliver(from: &Thread, out: Outgoing, to: &Thread, env: &mut dyn Env) {
     slot.result = Ok(());
 }
 
-/// Bloqueia `me` como `blocked`; a fila é posta por quem chama.
+/// Bloqueia `me` como `blocked`; a fila é posta por quem chama (sob a
+/// trava dela, logo antes de entrar).
 fn block(me: &Thread, blocked: Blocked, out: Option<Outgoing>) {
     let mut slot = me.ipc().lock();
     slot.blocked = blocked;
@@ -265,18 +267,6 @@ fn block(me: &Thread, blocked: Blocked, out: Option<Outgoing>) {
     slot.result = Err(Error::Cancelled);
     drop(slot);
     me.set_state(RunState::Blocked);
-}
-
-/// Desfaz [`block`] quando a fila recusa a thread ou ela encontrou par
-/// antes de entrar; devolve a mensagem de saída que ficou no slot.
-fn unblock(me: &Thread) -> Option<Outgoing> {
-    let mut slot = me.ipc().lock();
-    slot.blocked = Blocked::None;
-    slot.result = Ok(());
-    let out = slot.out.take();
-    drop(slot);
-    me.set_state(RunState::Running);
-    out
 }
 
 /// Envio ou chamada num endpoint.
@@ -293,7 +283,7 @@ fn send(
         return Err(Error::AccessDenied);
     }
     let info = MsgInfo::try_from(regs.info).map_err(|_| Error::InvalidArgument)?;
-    let wait = Wait::new(info, regs.deadline, env.now());
+    let wait = Wait::new(info, regs.deadline, env);
     let mut out = outgoing(space, me, regs, ep_cap.rights.contains(Rights::GRANT), env)?;
     out.badge = ep_cap.badge;
     out.call = call;
@@ -310,21 +300,15 @@ fn send_out(
 ) -> Result<Step, Error> {
     let call = out.call;
     let fast = out.msg.info.registers_only();
-    // A thread já fica marcada como bloqueada na fila de envio antes de
-    // entrar nela: com várias CPUs, assim que entra, outra pode tirá-la e
-    // lê o slot. Se achar receptor, a marca é desfeita e a mensagem volta.
+    // A thread fica marcada como bloqueada na fila de envio, com a
+    // mensagem no slot, antes de entrar nela (sob a trava das filas): com
+    // várias CPUs, assim que entra, outra pode tirá-la e ler o slot. Quem
+    // acha receptor não é marcado e fica com a mensagem.
     let queue = wait.refuse.is_none();
     let mut out = Some(out);
-    if queue {
+    let popped = ep.pop_receiver_or_push_sender(me, queue, || {
         block(me, Blocked::Send(Arc::downgrade(ep)), out.take());
-    }
-    let popped = match ep.pop_receiver_or_push_sender(me, queue) {
-        Ok(popped) => popped,
-        Err(e) => {
-            unblock(me);
-            return Err(e);
-        }
-    };
+    })?;
     let Some(r) = popped else {
         if let Some(e) = wait.refuse {
             return Err(e);
@@ -335,9 +319,6 @@ fn send_out(
             follow: false,
         });
     };
-    if queue {
-        out = unblock(me);
-    }
     let out = out.unwrap_or_default();
     let recv = core::mem::take(&mut r.ipc().lock().blocked);
     deliver(me, out, &r, env);
@@ -392,32 +373,21 @@ fn receive(
     grant: bool,
     wait: Wait,
 ) -> Result<Option<Arc<Thread>>, Error> {
-    // Como em `send_out`: marcada antes de entrar na fila, desfeita se
-    // achar remetente.
+    // Como em `send_out`: marcada logo antes de entrar na fila.
     let queue = wait.refuse.is_none();
-    if queue {
+    let popped = ep.pop_sender_or_push_receiver(me, queue, || {
         block(
             me,
             Blocked::Recv(Arc::downgrade(ep), Arc::clone(reply), grant),
             None,
         );
-    }
-    let popped = match ep.pop_sender_or_push_receiver(me, queue) {
-        Ok(popped) => popped,
-        Err(e) => {
-            unblock(me);
-            return Err(e);
-        }
-    };
+    })?;
     let Some(s) = popped else {
         if let Some(e) = wait.refuse {
             return Err(e);
         }
         return Ok(None);
     };
-    if queue {
-        unblock(me);
-    }
     Ok(Some(s))
 }
 
@@ -467,6 +437,17 @@ pub fn begin(
     env: &mut dyn Env,
 ) -> Result<Step, Error> {
     let me = env.current().ok_or(Error::NotSupported)?;
+    begin_as(space, &me, call, regs, env)
+}
+
+/// [`begin`] da thread atual `me`, já em mãos.
+fn begin_as(
+    space: &Arc<SharedCapSpace>,
+    me: &Arc<Thread>,
+    call: Syscall,
+    regs: &Regs,
+    env: &mut dyn Env,
+) -> Result<Step, Error> {
     match call {
         Syscall::IpcSend | Syscall::IpcCall => {
             let target = cap(space, handle(regs.target)?, Rights::NONE)?;
@@ -475,12 +456,12 @@ pub fn begin(
                     if !target.rights.contains(Rights::SEND) {
                         return Err(Error::AccessDenied);
                     }
-                    let (caller, _) = reply_to(space, &me, reply, regs, env)?;
+                    let (caller, _) = reply_to(space, me, reply, regs, env)?;
                     env.wake(caller, 0);
                     env.preempt();
                     Ok(Step::Done(Out::default()))
                 }
-                _ => send(space, &me, &target, regs, call == Syscall::IpcCall, env),
+                _ => send(space, me, &target, regs, call == Syscall::IpcCall, env),
             }
         }
         Syscall::IpcRecv | Syscall::IpcReplyRecv => {
@@ -488,17 +469,17 @@ pub fn begin(
             let ep = ep_cap.object.as_endpoint()?;
             let grant = ep_cap.rights.contains(Rights::GRANT);
             let info = MsgInfo::try_from(regs.info).map_err(|_| Error::InvalidArgument)?;
-            let wait = Wait::new(info, regs.deadline, env.now());
+            let wait = Wait::new(info, regs.deadline, env);
             let replied = if call == Syscall::IpcReplyRecv && reply.pending() {
-                Some(reply_to(space, &me, &reply, regs, env)?)
+                Some(reply_to(space, me, &reply, regs, env)?)
             } else if reply.pending() {
                 return Err(Error::Busy);
             } else {
                 None
             };
-            match receive(&me, ep, &reply, grant, wait) {
+            match receive(me, ep, &reply, grant, wait) {
                 Ok(Some(s)) => {
-                    let donated = take_from(&me, s, &reply, grant, env);
+                    let donated = take_from(me, s, &reply, grant, env);
                     if let Some((caller, _)) = &replied {
                         env.wake(Arc::clone(caller), 0);
                     }
@@ -507,7 +488,7 @@ pub fn begin(
                     if donated || replied.is_some() {
                         env.preempt();
                     }
-                    Ok(Step::Done(finish(&me)?))
+                    Ok(Step::Done(finish(me)?))
                 }
                 Ok(None) => {
                     let handoff = match replied {
@@ -563,9 +544,25 @@ pub fn invoke(
     regs: &Regs,
     env: &mut dyn Env,
 ) -> Result<Out, Error> {
-    let step = begin(space, call, regs, env)?;
     let me = env.current().ok_or(Error::NotSupported)?;
-    let out = wait_for(&me, step, env)?;
+    invoke_as(space, &me, call, regs, env)
+}
+
+/// [`invoke`] da thread atual `me`, que quem chama já tem (o caminho da
+/// syscall, T-331).
+///
+/// # Errors
+///
+/// Os da syscall (ver o módulo).
+pub fn invoke_as(
+    space: &Arc<SharedCapSpace>,
+    me: &Arc<Thread>,
+    call: Syscall,
+    regs: &Regs,
+    env: &mut dyn Env,
+) -> Result<Out, Error> {
+    let step = begin_as(space, me, call, regs, env)?;
+    let out = wait_for(me, step, env)?;
     Ok(if call == Syscall::IpcSend {
         Out::default()
     } else {

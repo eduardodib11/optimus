@@ -45,8 +45,8 @@ pub enum LockClass {
     AddressSpace = 50,
     /// Nível 6: fila de prontas de uma CPU; duas só em ordem de id.
     RunQueue = 60,
-    /// Nível 7: folha do escalonador (`Thread.sched`, `Thread.donated`,
-    /// orçamento do `SchedContext`).
+    /// Nível 7: folha do escalonador (`Thread.sched`, com o
+    /// `SchedContext` dela e o doado; orçamento do `SchedContext`).
     SchedLeaf = 70,
     /// Nível 8, primeira: as faixas de pilhas de kernel (`kvm`).
     KernelStacks = 80,
@@ -308,6 +308,7 @@ pub fn install(hooks: &'static Hooks) {
     HOOKS.store(ptr::from_ref(hooks).cast_mut(), Ordering::Release);
 }
 
+#[inline]
 fn hooks() -> Option<&'static Hooks> {
     // SAFETY: só `install` grava o ponteiro, sempre com um `&'static Hooks`.
     unsafe { HOOKS.load(Ordering::Acquire).as_ref() }

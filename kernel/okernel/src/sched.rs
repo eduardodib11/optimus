@@ -191,6 +191,7 @@ impl SchedContext {
 
     /// Parâmetros, se configurado.
     #[must_use]
+    #[inline]
     pub fn params(&self) -> Option<Params> {
         let priority = self.priority.load(Ordering::Acquire).checked_sub(1)?;
         Some(Params {
@@ -202,6 +203,7 @@ impl SchedContext {
 
     /// Estado do orçamento.
     #[must_use]
+    #[inline]
     pub fn budget(&self) -> Budget {
         Budget {
             remaining: self.remaining.load(Ordering::Relaxed),
@@ -211,6 +213,7 @@ impl SchedContext {
     }
 
     /// Grava o estado do orçamento (pelo escalonador).
+    #[inline]
     pub fn set_budget(&self, b: Budget) {
         self.remaining.store(b.remaining, Ordering::Relaxed);
         self.replenish_at.store(b.replenish_at, Ordering::Relaxed);
@@ -220,6 +223,7 @@ impl SchedContext {
     /// CPUs em que as threads que rodam sobre este `SchedContext` podem
     /// começar a rodar.
     #[must_use]
+    #[inline]
     pub fn mask(&self) -> CpuMask {
         CpuMask(core::array::from_fn(|i| {
             self.mask[i].load(Ordering::Relaxed)
@@ -237,6 +241,7 @@ impl SchedContext {
 
     /// A CPU `cpu` está na máscara (uma leitura atômica).
     #[must_use]
+    #[inline]
     pub fn allows(&self, cpu: usize) -> bool {
         self.mask
             .get(cpu / 64)
@@ -252,10 +257,12 @@ impl SchedContext {
 }
 
 /// Fila de prontas: um bitmap de 256 bits diz quais níveis têm alguém, e
-/// cada nível é uma fila FIFO (round-robin).
+/// cada nível é uma fila FIFO (round-robin). O total fica contado à parte:
+/// o escalonador o publica a cada troca (T-331).
 pub struct RunQueue<T> {
     bitmap: [u64; PRIORITIES / 64],
     levels: [VecDeque<T>; PRIORITIES],
+    len: usize,
 }
 
 impl<T> Default for RunQueue<T> {
@@ -271,6 +278,7 @@ impl<T> RunQueue<T> {
         Self {
             bitmap: [0; PRIORITIES / 64],
             levels: [const { VecDeque::new() }; PRIORITIES],
+            len: 0,
         }
     }
 
@@ -284,6 +292,7 @@ impl<T> RunQueue<T> {
         level.try_reserve(1).map_err(|_| Error::QuotaExceeded)?;
         level.push_back(item);
         self.bitmap[usize::from(priority / 64)] |= 1 << (priority % 64);
+        self.len += 1;
         Ok(())
     }
 
@@ -307,6 +316,7 @@ impl<T> RunQueue<T> {
         if level.is_empty() {
             self.bitmap[usize::from(priority / 64)] &= !(1 << (priority % 64));
         }
+        self.len -= 1;
         Some((priority, item))
     }
 
@@ -326,6 +336,7 @@ impl<T> RunQueue<T> {
             if level.is_empty() {
                 self.bitmap[usize::from(priority / 64)] &= !(1 << (priority % 64));
             }
+            self.len -= 1;
             return Some((priority, item));
         }
         None
@@ -333,8 +344,8 @@ impl<T> RunQueue<T> {
 
     /// Itens na fila.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.levels.iter().map(VecDeque::len).sum()
+    pub const fn len(&self) -> usize {
+        self.len
     }
 
     /// Fila vazia.

@@ -17,7 +17,7 @@ trava).
 | 4 | `IpcSlot` | `thread::Thread.ipc` | depois do objeto |
 | 5 | `AddressSpace` | `SharedAddressSpace` (`cap::object`, `obj_create`) | uma por vez |
 | 6 | `RunQueue` | escalonador de cada CPU (`kthread::BSP_SCHED` e `kthread::SCHEDS`, chave = id da CPU, T-323) | duas só em ordem crescente de id; o despertar entre CPUs (T-324) toma a da CPU antiga e depois a do destino, nunca as duas juntas |
-| 7 | `SchedLeaf` | `thread::Thread.sched`, `thread::Thread.donated` | folha do escalonador |
+| 7 | `SchedLeaf` | `thread::Thread.sched` (o `SchedContext` dela e o doado) | folha do escalonador |
 | 8 | `KernelStacks`, depois `KernelPageTables` | `kvm::STACK_SLOTS`, depois `kmem::KERNEL_PT` | nessa ordem |
 | 9 | `Heap`, depois `Frames` | `kheap::HEAP`, depois `kmem::FRAMES` | nessa ordem |
 | 10 | `Diagnostic` | `kthread::DEBUG_LOG`, `kfault::LAST`, `platform::PLATFORM`, `ksmp::tsc::LAST` (teste de salto do TSC na partida), `ksmp::start::AP_JOB` (trabalho de teste dos APs ociosos) | folha |

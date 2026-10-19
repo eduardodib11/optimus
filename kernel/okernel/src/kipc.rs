@@ -32,9 +32,9 @@ pub fn syscall(frame: &mut TrapFrame, call: Syscall) {
         ],
     };
     let result = current()
-        .and_then(|t| t.cspace())
+        .and_then(|me| Some((me.cspace()?, me)))
         .ok_or(Error::NotSupported)
-        .and_then(|space| ops::invoke(&space, call, &regs, &mut KernelEnv));
+        .and_then(|(space, me)| ops::invoke_as(&space, &me, call, &regs, &mut KernelEnv));
     match result {
         Ok(out) => {
             frame.rax = kabi::STATUS_OK;
