@@ -88,3 +88,14 @@ fn leitura_e_enfileiramento_sao_atomicos_quanto_ao_wake() {
     assert_eq!(res.is_ok(), woke);
     assert_eq!(table.waiting(0x1000), 0);
 }
+
+/// Palavras vizinhas (o caso de mutexes num mesmo vetor) se espalham pelos
+/// baldes, e a mesma chave cai sempre no mesmo.
+#[test]
+fn chaves_vizinhas_se_espalham_pelos_baldes() {
+    let used: std::collections::BTreeSet<usize> =
+        (0..64u64).map(|i| bucket_of(0x1000 + 4 * i)).collect();
+    assert!(used.len() >= BUCKETS / 2, "{} baldes", used.len());
+    assert!(used.iter().all(|&b| b < BUCKETS));
+    assert_eq!(bucket_of(0x1234_5678), bucket_of(0x1234_5678));
+}

@@ -543,6 +543,16 @@ const ALTERNATE_SCENARIO: Scenario = Scenario {
     ..KERNEL_SCENARIO
 };
 
+/// Aceite do T-327 (em `cargo xtask test smp`, release): 10⁶ idas e voltas
+/// de IPC com o servidor começando noutra CPU; ele segue quem chama e o
+/// resto é troca direta na CPU do cliente.
+const IPC_SCENARIO: Scenario = Scenario {
+    name: "10⁶ idas e voltas de IPC com o servidor seguindo quem chama",
+    cmdline: "test=kernel ktest=smp.ipc_servidor smp.ipc=1000000",
+    timeout: Duration::from_mins(15),
+    ..KERNEL_SCENARIO
+};
+
 /// Aceite do T-326 (em `cargo xtask test smp`, release): 10⁵ trocas de
 /// mapeamento lidas por outra CPU sem nenhuma leitura pela tradução velha.
 /// Sob TCG, cerca de meio minuto com 4 e 8 CPUs; com 2, uns três.
@@ -886,7 +896,8 @@ const SMP_COUNTS: &[u32] = &[2, 4, 8];
 /// `cargo xtask test smp [--smp N]`: a suíte de kernel inteira com N CPUs
 /// (só N com `--smp` maior que 1; senão 2, 4 e 8), exigindo que todas
 /// tenham ligado, o pânico numa CPU secundária e, em release, a alternância
-/// de 10⁶ vezes entre duas CPUs.
+/// de 10⁶ vezes entre duas CPUs, os 10⁵ shootdowns e as 10⁶ idas e voltas
+/// de IPC com o servidor seguindo quem chama.
 fn smp(opts: &Options) -> Result {
     build(opts)?;
     let release = Options {
@@ -947,6 +958,15 @@ fn smp(opts: &Options) -> Result {
             &SHOOTDOWN_SCENARIO,
         )?;
         println!("xtask: -smp {n}: 10⁵ shootdowns sem leitura pela tradução velha");
+        bases.extend(direct_map_base(&serial));
+        let serial = boot_scenario(
+            &Options {
+                smp: n,
+                ..release.clone()
+            },
+            &IPC_SCENARIO,
+        )?;
+        println!("xtask: -smp {n}: 10⁶ idas e voltas de IPC, servidor seguindo quem chama");
         bases.extend(direct_map_base(&serial));
     }
     check_direct_map_bases(&bases)

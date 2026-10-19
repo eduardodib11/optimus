@@ -121,9 +121,22 @@ impl Notification {
             return Ok(Wait::Ready(core::mem::take(&mut s.pending)));
         }
         s.waiters.try_reserve(1).map_err(|_| Error::QuotaExceeded)?;
+        let _ = thread.take_wake_error();
         thread.set_state(RunState::Blocked);
         s.waiters.push_back(Arc::clone(thread));
         Ok(Wait::Blocked)
+    }
+}
+
+impl Drop for Notification {
+    /// Ninguém mais pode sinalizar: quem espera acorda com `PeerClosed`
+    /// (ADR 0032, item 6), de qualquer CPU, em vez de esperar para sempre.
+    fn drop(&mut self) {
+        let waiters = core::mem::take(&mut self.state.lock().waiters);
+        for t in waiters {
+            t.set_wake_error(Error::PeerClosed);
+            t.platform().wake(t);
+        }
     }
 }
 

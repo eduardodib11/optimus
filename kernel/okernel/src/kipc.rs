@@ -75,9 +75,9 @@ pub fn read_buffer(t: &Thread, at: usize, out: &mut [u64]) -> bool {
     };
     // SAFETY: `src` aponta, pelo mapa direto, para dentro da página física
     // mapeada no buffer de `t` (a faixa cabe nela); o frame é RAM de um
-    // `MemoryObject` vivo enquanto mapeado, alinhado a 8. O usuário pode
-    // mudá-lo ao mesmo tempo só em outra CPU (ainda não há SMP), e o valor
-    // lido é só dado.
+    // `MemoryObject` vivo enquanto mapeado, alinhado a 8. Uma thread do
+    // dono em outra CPU pode gravá-lo ao mesmo tempo; o que se lê é só
+    // dado, conferido depois como qualquer entrada do usuário.
     unsafe { core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out.len()) };
     true
 }

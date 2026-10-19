@@ -21,6 +21,7 @@ use crate::{kmem, ktime};
 
 mod sched;
 mod smp;
+mod smp_ipc;
 mod sync;
 mod tlb;
 
@@ -57,6 +58,22 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "smp.dois_processos_alternam_em_cpus_distintas",
         run: smp::alternam_em_cpus_distintas,
+    },
+    Test {
+        name: "smp.ipc_servidor_segue_quem_chama",
+        run: smp_ipc::servidor_segue_quem_chama,
+    },
+    Test {
+        name: "smp.ipc_dois_clientes_em_cpus_distintas",
+        run: smp_ipc::dois_clientes_em_cpus_distintas,
+    },
+    Test {
+        name: "smp.mutex_de_usuario_em_4_cpus",
+        run: smp_ipc::mutex_de_usuario_em_4_cpus,
+    },
+    Test {
+        name: "smp.destruicao_concorrente_acorda_com_peer_closed",
+        run: smp_ipc::destruicao_concorrente_acorda_com_peer_closed,
     },
     Test {
         name: "smp.vm_unmap_faz_a_outra_cpu_faltar",

@@ -65,3 +65,20 @@ fn interrupcao_mascara_ate_o_ack() {
     assert!(irq.fire().is_some());
     assert_eq!(irq.vector(), 0x40);
 }
+
+/// Quem espera numa notificação que morre acorda com `PeerClosed` (ADR
+/// 0032, item 6), e o erro vale só para esse despertar.
+#[test]
+fn notificacao_destruida_acorda_com_peer_closed() {
+    use core::sync::atomic::Ordering;
+    let quota = MemoryQuota::root(1 << 20);
+    let (fake, leaked) = platform(100);
+    let n = Notification::new(&quota).unwrap();
+    let t = Arc::new(Thread::new(&quota, leaked).unwrap());
+    assert_eq!(n.wait(&t), Ok(Wait::Blocked));
+    let before = fake.woken.load(Ordering::Relaxed);
+    drop(n);
+    assert_eq!(fake.woken.load(Ordering::Relaxed) - before, 1);
+    assert_eq!(t.take_wake_error(), Some(Error::PeerClosed));
+    assert_eq!(t.take_wake_error(), None);
+}

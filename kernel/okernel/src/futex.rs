@@ -7,11 +7,16 @@
 //! processos que compartilham a página (o mesmo `MemoryObject` mapeado em
 //! espaços diferentes) usam a mesma fila.
 //!
-//! Atomicidade: quem chama lê a palavra do usuário com a trava da tabela na
+//! A tabela tem [`BUCKETS`] baldes, cada um com a sua trava, escolhidos por
+//! hash da chave (ADR 0032, item 6): CPUs que esperam em palavras
+//! diferentes quase nunca disputam a mesma trava.
+//!
+//! Atomicidade: quem chama lê a palavra do usuário com a trava do balde na
 //! mão ([`FutexTable::wait`] recebe a leitura como função), e `wake` toma a
-//! mesma trava. Um `futex_wake` que vem depois de o usuário mudar a palavra
-//! ou acha a thread já na fila ou faz a leitura devolver outro valor:
-//! nenhum despertar se perde.
+//! mesma trava (a mesma chave cai no mesmo balde). Um `futex_wake` que vem
+//! depois de o usuário mudar a palavra, de qualquer CPU, ou acha a thread
+//! já na fila ou faz a leitura devolver outro valor: nenhum despertar se
+//! perde. Nada segura dois baldes ao mesmo tempo.
 //!
 //! Como na [`Notification`](crate::notify::Notification), a fila cresce no
 //! heap do kernel, no máximo uma entrada por thread viva.
@@ -42,9 +47,20 @@ struct Table {
     stats: Stats,
 }
 
+/// Baldes da tabela.
+pub const BUCKETS: usize = 64;
+
 /// Tabela de esperas por endereço físico.
 pub struct FutexTable {
-    inner: SpinLock<Table>,
+    buckets: [SpinLock<Table>; BUCKETS],
+}
+
+/// O balde de `key`: o endereço é múltiplo de 4, então os dois bits de
+/// baixo ficam de fora antes da mistura (Fibonacci).
+fn bucket_of(key: u64) -> usize {
+    #[allow(clippy::cast_possible_truncation, reason = "seis bits")]
+    let i = ((key >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize;
+    i
 }
 
 impl Default for FutexTable {
@@ -58,21 +74,27 @@ impl FutexTable {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            inner: SpinLock::with_class(
-                LockClass::Object,
-                Table {
-                    waiters: VecDeque::new(),
-                    stats: Stats {
-                        blocked: 0,
-                        stale: 0,
-                        woken: 0,
+            buckets: [const {
+                SpinLock::with_class(
+                    LockClass::Object,
+                    Table {
+                        waiters: VecDeque::new(),
+                        stats: Stats {
+                            blocked: 0,
+                            stale: 0,
+                            woken: 0,
+                        },
                     },
-                },
-            ),
+                )
+            }; BUCKETS],
         }
     }
 
-    /// `futex_wait`: com a trava da tabela, lê a palavra por `read` e, se
+    fn bucket(&self, key: u64) -> &SpinLock<Table> {
+        &self.buckets[bucket_of(key)]
+    }
+
+    /// `futex_wait`: com a trava do balde de `key`, lê a palavra por `read` e, se
     /// ela vale `expected`, põe `thread` na fila de `key` como
     /// [`RunState::Blocked`].
     ///
@@ -88,7 +110,7 @@ impl FutexTable {
         expected: u32,
         read: impl FnOnce() -> Option<u32>,
     ) -> Result<(), Error> {
-        let mut t = self.inner.lock();
+        let mut t = self.bucket(key).lock();
         let value = read().ok_or(Error::InvalidArgument)?;
         if value != expected {
             t.stats.stale += 1;
@@ -105,7 +127,7 @@ impl FutexTable {
     /// que chegaram, e as entrega a `wake` (com a trava na mão: `wake` não
     /// pode voltar à tabela). Devolve quantas acordou.
     pub fn wake(&self, key: u64, max: u64, wake: &mut dyn FnMut(Arc<Thread>)) -> u64 {
-        let mut t = self.inner.lock();
+        let mut t = self.bucket(key).lock();
         let mut woken = 0;
         let mut i = 0;
         while woken < max && i < t.waiters.len() {
@@ -125,7 +147,7 @@ impl FutexTable {
     /// Threads esperando em `key`.
     #[must_use]
     pub fn waiting(&self, key: u64) -> usize {
-        self.inner
+        self.bucket(key)
             .lock()
             .waiters
             .iter()
@@ -133,10 +155,18 @@ impl FutexTable {
             .count()
     }
 
-    /// Estatísticas acumuladas.
+    /// Estatísticas acumuladas, somadas de todos os baldes (um de cada
+    /// vez: a soma pode juntar momentos diferentes de cada balde).
     #[must_use]
     pub fn stats(&self) -> Stats {
-        self.inner.lock().stats
+        self.buckets.iter().fold(Stats::default(), |acc, b| {
+            let s = b.lock().stats;
+            Stats {
+                blocked: acc.blocked + s.blocked,
+                stale: acc.stale + s.stale,
+                woken: acc.woken + s.woken,
+            }
+        })
     }
 }
 
