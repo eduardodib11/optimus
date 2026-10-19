@@ -105,12 +105,18 @@ pub enum Step {
 
 /// Como esperar: pode bloquear e o erro de quando não pode.
 #[derive(Clone, Copy)]
-struct Wait {
+pub(super) struct Wait {
     deadline: u64,
     refuse: Option<Error>,
 }
 
 impl Wait {
+    /// Sem prazo e sem `FLAG_NONBLOCK`: sempre pode esperar.
+    pub(super) const FOREVER: Self = Self {
+        deadline: 0,
+        refuse: None,
+    };
+
     /// O relógio só é lido com prazo (T-331: o caminho rápido não tem).
     fn new(info: MsgInfo, deadline: u64, env: &dyn Env) -> Self {
         let refuse = if info.flags & FLAG_NONBLOCK != 0 {
@@ -260,7 +266,7 @@ fn deliver(from: &Thread, out: Outgoing, to: &Thread, env: &mut dyn Env) {
 
 /// Bloqueia `me` como `blocked`; a fila é posta por quem chama (sob a
 /// trava dela, logo antes de entrar).
-fn block(me: &Thread, blocked: Blocked, out: Option<Outgoing>) {
+pub(super) fn block(me: &Thread, blocked: Blocked, out: Option<Outgoing>) {
     let mut slot = me.ipc().lock();
     slot.blocked = blocked;
     slot.out = out;
@@ -366,7 +372,7 @@ fn reply_to(
 }
 
 /// Parte de recepção de `ipc_recv`/`ipc_reply_recv` (`RecvPart` da spec).
-fn receive(
+pub(super) fn receive(
     me: &Arc<Thread>,
     ep: &Arc<Endpoint>,
     reply: &Arc<Reply>,
@@ -393,7 +399,7 @@ fn receive(
 
 /// Entrega a mensagem do remetente `s`, já fora da fila, a `me`; devolve
 /// se era uma chamada (e `me` passou a rodar com o tempo de `s`).
-fn take_from(
+pub(super) fn take_from(
     me: &Arc<Thread>,
     s: Arc<Thread>,
     reply: &Arc<Reply>,
@@ -617,11 +623,7 @@ pub fn kernel_call(
         call: true,
         ..Outgoing::default()
     };
-    let wait = Wait {
-        deadline: 0,
-        refuse: None,
-    };
-    let step = send_out(me, ep, out, wait, env)?;
+    let step = send_out(me, ep, out, Wait::FOREVER, env)?;
     drop(ep_cap);
     wait_for(me, step, env)
 }

@@ -4,17 +4,25 @@
 //! gravado pelo mapa direto, a partir da tradução no espaço dela (as duas
 //! pontas de uma mensagem estão em espaços diferentes).
 //!
-//! O bloqueio, o prazo e a troca direta do caminho rápido ficam no
-//! escalonador (`kthread`).
+//! `ipc_call` e `ipc_reply_recv` tentam antes o caminho rápido
+//! (`okernel::ipc::fast`, T-331), que recusa sem mudar nada ou deixa a
+//! outra thread pronta para a troca direta; o bloqueio, o prazo e essa
+//! troca ficam no escalonador (`kthread`).
+
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use kabi::vm::PAGE_SIZE;
-use kabi::{Error, IPC_BUFFER_BYTES, Syscall};
-use okernel::ipc::ops::{self, Regs};
+use kabi::{Error, IPC_BUFFER_BYTES, MAX_CPUS, Syscall};
+use okernel::cap::SharedCapSpace;
+use okernel::ipc::fast::{self, Fast};
+use okernel::ipc::ops::{self, Out, Regs};
 use okernel::thread::Thread;
 
 use crate::arch::x86_64::idt::TrapFrame;
+use crate::arch::x86_64::percpu;
 use crate::kmem;
-use crate::kthread::{KernelEnv, current};
+use crate::kthread::{self, KernelEnv, current};
 
 pub(crate) mod tests;
 pub use tests::TESTS;
@@ -34,7 +42,7 @@ pub fn syscall(frame: &mut TrapFrame, call: Syscall) {
     let result = current()
         .and_then(|me| Some((me.cspace()?, me)))
         .ok_or(Error::NotSupported)
-        .and_then(|(space, me)| ops::invoke_as(&space, &me, call, &regs, &mut KernelEnv));
+        .and_then(|(space, me)| invoke(&space, &me, call, &regs));
     match result {
         Ok(out) => {
             frame.rax = kabi::STATUS_OK;
@@ -46,6 +54,42 @@ pub fn syscall(frame: &mut TrapFrame, call: Syscall) {
             ] = out.words;
         }
         Err(e) => frame.rax = e.to_raw(),
+    }
+}
+
+/// Idas pelo caminho rápido, por CPU: só a própria CPU grava a dela, sem
+/// RMW atômico.
+static FAST_PATHS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Syscalls de IPC que foram pelo caminho rápido desde o boot.
+pub fn fast_paths() -> u64 {
+    FAST_PATHS.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+}
+
+/// A syscall `call` de `me`: pelo caminho rápido, se as condições dele
+/// valem, ou pelo comum.
+fn invoke(
+    space: &Arc<SharedCapSpace>,
+    me: &Arc<Thread>,
+    call: Syscall,
+    regs: &Regs,
+) -> Result<Out, Error> {
+    let cpu = percpu::cpu_id();
+    let fast = match call {
+        Syscall::IpcCall => fast::call(space, me, regs, cpu),
+        Syscall::IpcReplyRecv => fast::reply_recv(space, me, regs, cpu, &mut KernelEnv),
+        _ => Fast::Slow,
+    };
+    match fast {
+        Fast::Slow => ops::invoke_as(space, me, call, regs, &mut KernelEnv),
+        Fast::Switch(to) => {
+            if let Some(c) = FAST_PATHS.get(cpu as usize) {
+                c.store(c.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+            }
+            kthread::switch_direct(to);
+            ops::finish(me)
+        }
+        Fast::Done(result) => result,
     }
 }
 

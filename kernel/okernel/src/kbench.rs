@@ -136,7 +136,7 @@ fn ipc() -> Result<Vec<u64>, &'static str> {
     let (ep_h, ep) = create(&server, ObjectType::Endpoint)?;
     let (reply, _) = create(&server, ObjectType::Reply)?;
     let c_ep = give(&client, &ep, Rights::SEND, 1)?;
-    let fast0 = fast_switches();
+    let (fast0, paths0) = (fast_switches(), crate::kipc::fast_paths());
     let rounds = ROUNDS as u64;
     let target = recv_target(ep_h, reply);
     let server_sym = &raw const user_bench_ipc_server;
@@ -146,8 +146,11 @@ fn ipc() -> Result<Vec<u64>, &'static str> {
     let (hc, tc) = spawn(&client, client_sym, args, STACK_PAGE)?;
     run_until_exit(&[Arc::clone(&ts), Arc::clone(&tc)])?;
     let fast = fast_switches() - fast0;
-    // Só a primeira chamada e a última resposta podem não ser diretas.
+    let paths = crate::kipc::fast_paths() - paths0;
+    // Só a primeira chamada e a última resposta podem não ser diretas, nem
+    // ir pelo caminho rápido (`okernel::ipc::fast`).
     ensure!(fast + 2 >= 2 * rounds);
+    ensure!(paths + 2 >= 2 * rounds);
     let out = samples(&client, 1)?;
     drop((ts, tc));
     delete(&client, &[hc])?;

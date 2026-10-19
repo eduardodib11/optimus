@@ -162,7 +162,7 @@ fn ping_pong() -> Outcome {
         let s_ep = give(&server, &ep, Rights::RECV, 0)?;
         let (s_reply, _) = create(&server, ObjectType::Reply)?;
         user_words(&server, DATA_VA + 16, Some([BADGE]))?;
-        let fast0 = fast_switches();
+        let (fast0, paths0) = (fast_switches(), crate::kipc::fast_paths());
         let t0 = ktime::now_ns();
         let target = recv_target(s_ep, s_reply);
         let (hs, ts) = spawn(
@@ -180,10 +180,11 @@ fn ping_pong() -> Outcome {
         run_until_exit(&[Arc::clone(&ts), Arc::clone(&tc)])?;
         let ns = ktime::now_ns() - t0;
         let fast = fast_switches() - fast0;
+        let paths = crate::kipc::fast_paths() - paths0;
         let [c_status, c_count] = user_words::<2>(&client, DATA_VA, None)?;
         let [s_status, s_count] = user_words::<2>(&server, DATA_VA, None)?;
         info!(
-            "ktest: · {c_count} idas e voltas em {} µs ({} ns cada), {fast} trocas diretas",
+            "ktest: · {c_count} idas e voltas em {} µs ({} ns cada), {fast} trocas diretas, {paths} pelo caminho rápido",
             ns / 1000,
             ns / VOLTAS
         );

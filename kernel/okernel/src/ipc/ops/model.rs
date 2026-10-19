@@ -15,6 +15,12 @@ use kabi::{Error, Handle, ObjectType, Rights, Syscall};
 
 use super::tests::{Fake, Proc, regs};
 use super::{Regs, Step, finish};
+use crate::ipc::fast::{self, Fast};
+
+std::thread_local! {
+    /// Vezes que o caminho rápido fez a troca direta.
+    static FAST: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
 use crate::cap::{MemoryQuota, Object, obj_create};
 use crate::thread::Thread;
 
@@ -194,7 +200,27 @@ fn step(i: usize, actors: &mut [Actor], env: &mut Fake, rng: &mut Rng, calls: bo
             _ => (Syscall::IpcReplyRecv, regs(a.target, 0, &[])),
         }
     };
-    let result = a.proc.begin(env, call, &regs);
+    // Metade das vezes tenta antes o caminho rápido (T-331), que recusa
+    // sem mudar nada ou faz o mesmo que o comum.
+    let fast = match call {
+        Syscall::IpcCall if rng.pick(2) == 0 => fast::call(&a.proc.space, &a.proc.thread, &regs, 0),
+        Syscall::IpcReplyRecv if rng.pick(2) == 0 => {
+            fast::reply_recv(&a.proc.space, &a.proc.thread, &regs, 0, env)
+        }
+        _ => Fast::Slow,
+    };
+    let result = match fast {
+        Fast::Slow => a.proc.begin(env, call, &regs),
+        Fast::Switch(to) => {
+            FAST.with(|n| n.set(n.get() + 1));
+            Ok(Step::Block {
+                deadline: 0,
+                handoff: Some(to),
+                follow: call == Syscall::IpcCall,
+            })
+        }
+        Fast::Done(r) => r.map(Step::Done),
+    };
     let wants_cap = MsgInfo::try_from(regs.info).unwrap().caps > 0;
     match (call, result) {
         (Syscall::IpcRecv, Err(e)) => assert_eq!(e, Error::Busy),
@@ -271,6 +297,10 @@ fn invariantes_da_spec_ipc() {
     for seed in 1..=300u64 {
         run(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), 400);
     }
+    assert!(
+        FAST.with(core::cell::Cell::get) > 1000,
+        "o caminho rápido quase não rodou"
+    );
 }
 
 #[test]

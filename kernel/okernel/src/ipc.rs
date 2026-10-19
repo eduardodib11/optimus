@@ -36,6 +36,7 @@ use crate::sched::SchedContext;
 use crate::sync::{LockClass, SpinLock};
 use crate::thread::Thread;
 
+pub mod fast;
 pub mod ops;
 
 /// Rótulo, `info` e palavras em registradores.
@@ -282,6 +283,27 @@ impl Endpoint {
         Ok(None)
     }
 
+    /// Há remetente na fila (o caminho rápido de `ipc_reply_recv` só vale
+    /// sem ninguém para receber).
+    #[must_use]
+    pub fn has_senders(&self) -> bool {
+        !self.queues.lock().senders.is_empty()
+    }
+
+    /// Caminho rápido de `ipc_call` (`Deliver` da spec): com a trava das
+    /// filas na mão, passa o primeiro receptor a `take`, que confere se ele
+    /// serve e o atende (com a trava do slot dele, que vem depois); só então
+    /// ele sai da fila. Nada muda se a fila está vazia ou `take` recusa.
+    pub fn take_receiver<T>(
+        &self,
+        take: impl FnOnce(&Arc<Thread>) -> Option<T>,
+    ) -> Option<(Arc<Thread>, T)> {
+        let mut q = self.queues.lock();
+        let got = take(q.receivers.front()?)?;
+        let r = q.receivers.pop_front()?;
+        Some((r, got))
+    }
+
     /// Tira `t` de qualquer das filas; falso se não estava em nenhuma.
     pub fn remove(&self, t: &Thread) -> bool {
         let mut q = self.queues.lock();
@@ -332,6 +354,16 @@ impl Reply {
     #[must_use]
     pub fn grant(&self) -> Option<bool> {
         self.caller.lock().as_ref().map(|c| c.1)
+    }
+
+    /// Quem espera está na CPU `cpu`, fora dela (a pilha livre), para a
+    /// troca direta do caminho rápido.
+    #[must_use]
+    pub fn caller_on(&self, cpu: u32) -> bool {
+        self.caller
+            .lock()
+            .as_ref()
+            .is_some_and(|c| c.0.cpu() == cpu && !c.0.on_cpu())
     }
 
     /// Verdadeiro se `t` é quem espera.

@@ -444,8 +444,9 @@ pub fn affinity_misses() -> u64 {
     AFFINITY_MISSES.load(Ordering::Relaxed)
 }
 
-/// Trocas diretas do caminho rápido de IPC.
-static FAST_SWITCHES: AtomicU64 = AtomicU64::new(0);
+/// Trocas diretas do caminho rápido de IPC, por CPU: só a própria CPU
+/// grava a dela, sem RMW atômico (T-331).
+static FAST_SWITCHES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Servidores trazidos de outra CPU por quem os chamou ([`follow`]).
 static FOLLOWS: AtomicU64 = AtomicU64::new(0);
 static DEBUG_LOG: SpinLock<([u8; 256], usize)> =
@@ -794,7 +795,9 @@ fn pick_next(s: &mut Sched, direct: Option<Arc<Thread>>, me: u32, now: u64) -> O
         drop_timeout(s, &t);
         match direct_verdict(s, &t, me, now) {
             Direct::Run => {
-                FAST_SWITCHES.fetch_add(1, Ordering::Relaxed);
+                if let Some(c) = FAST_SWITCHES.get(me as usize) {
+                    c.store(c.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                }
                 return Some(t);
             }
             Direct::Queue => {
@@ -1125,6 +1128,19 @@ pub fn handoff(to: Arc<Thread>, deadline: u64) {
     }
 }
 
+/// Troca direta do caminho rápido de IPC (`okernel::ipc::fast`, T-331):
+/// como [`handoff`] sem prazo, sem as conferências que ele já fez. `to` é
+/// desta CPU, com a pilha livre, e foi atendida pelo IPC; segue bloqueada
+/// até aqui, e ninguém mais a pode acordar (saiu da fila e do `Reply`).
+pub fn switch_direct(to: Arc<Thread>) {
+    debug_assert_eq!(to.cpu(), percpu::cpu_id(), "troca direta de outra CPU");
+    if to.claim_wake() {
+        schedule_to(Why::Block, Some(to));
+    } else {
+        schedule(Why::Block);
+    }
+}
+
 /// Caminho rápido de `ipc_call` que achou o servidor `to` esperando (ADR
 /// 0032, item 6): ele segue quem chama e roda nesta CPU. A atual já está
 /// bloqueada esperando a resposta, com prazo `deadline`.
@@ -1163,7 +1179,10 @@ pub fn follow(to: Arc<Thread>, deadline: u64) {
 
 /// Trocas diretas do caminho rápido de IPC desde o boot.
 pub fn fast_switches() -> u64 {
-    FAST_SWITCHES.load(Ordering::Relaxed)
+    FAST_SWITCHES
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum()
 }
 
 /// Servidores que seguiram quem os chamou para outra CPU desde o boot.
