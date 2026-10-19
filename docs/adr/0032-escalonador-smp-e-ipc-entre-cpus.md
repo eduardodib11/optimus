@@ -326,8 +326,11 @@ preferir CPUs do mesmo nó depois, sem mudar a ABI.
 ### Lacunas do SDD
 
 - A 6.6 fala em afinidade e NUMA, mas nenhuma syscall da 14.2 os recebe e
-  `sys_info` não tem formato. **Eduardo precisa decidir** se a afinidade
-  fica no `SchedContext` (esta ADR) ou na thread.
+  `sys_info` não tem formato. **Decidido por Eduardo em 2026-10-19:** a
+  afinidade fica no `SchedContext` (item 4), não na thread; a máscara anda
+  com a doação e uma thread roda nas CPUs que o `SchedContext` efetivo
+  permite (I4). Uma thread presa a hardware usa a função remota do kernel
+  (ADR 0031), não máscara de thread.
 - A 6.7 diz "mesma CPU" sem dizer o que acontece entre CPUs nem em que CPU
   roda o servidor que recebe a doação. **Eduardo precisa decidir** se o
   servidor segue quem chama (esta ADR) ou fica na CPU dele.
