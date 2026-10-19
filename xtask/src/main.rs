@@ -131,6 +131,8 @@ struct Options {
     seconds: u64,
     /// Semente de `fuzz` (`None`: sorteada do relógio).
     seed: Option<u64>,
+    /// Duração do `stress`, em minutos.
+    minutes: u64,
 }
 
 impl Default for Options {
@@ -147,6 +149,7 @@ impl Default for Options {
             rounds: None,
             seconds: 60,
             seed: None,
+            minutes: STRESS_MINUTES,
         }
     }
 }
@@ -177,6 +180,11 @@ fn parse(args: &[String]) -> Result<Options> {
                     .parse()
                     .map_err(|_| "--seconds espera um número")?;
             }
+            "--minutes" => {
+                opts.minutes = value("--minutes")?
+                    .parse()
+                    .map_err(|_| "--minutes espera um número")?;
+            }
             "--seed" => {
                 let v = value("--seed")?;
                 let seed = v
@@ -192,7 +200,7 @@ fn parse(args: &[String]) -> Result<Options> {
                         .map_err(|_| "--rounds espera um número")?,
                 );
             }
-            "unit" | "boot" | "kernel" | "smp" | "hello" | "fuzz" | "all" => {
+            "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "fuzz" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -563,6 +571,12 @@ const SHOOTDOWN_SCENARIO: Scenario = Scenario {
     ..KERNEL_SCENARIO
 };
 
+/// Minutos do `cargo xtask test stress` sem `--minutes` (aceite do T-329).
+const STRESS_MINUTES: u64 = 30;
+
+/// CPUs do `cargo xtask test stress` sem `--smp`.
+const STRESS_CPUS: u32 = 4;
+
 /// Aceite do T-212 (`cargo xtask test hello`): o boot normal com 10⁶ idas
 /// e voltas entre o `hello` e o `root`. Fica fora do `test all` pelo tempo.
 const HELLO_SCENARIO: Scenario = Scenario {
@@ -873,6 +887,9 @@ fn test(opts: &Options) -> Result {
     if opts.suite == "smp" {
         smp(opts)?;
     }
+    if opts.suite == "stress" {
+        stress(opts)?;
+    }
     if opts.suite == "hello" {
         // 10⁶ idas e voltas no build de depuração levariam horas sob TCG.
         let release = Options {
@@ -970,6 +987,44 @@ fn smp(opts: &Options) -> Result {
         bases.extend(direct_map_base(&serial));
     }
     check_direct_map_bases(&bases)
+}
+
+/// `cargo xtask test stress [--smp N] [--minutes M]` (aceite do T-329):
+/// o estresse SMP (IPC cruzado, mutex de futex, revogação concorrente no
+/// CDT, criação e destruição de processos, shootdown e destruição de longe)
+/// por `M` minutos (30) em `N` CPUs (4), no build de depuração, que liga a
+/// verificação de ordem de travas. Não roda no CI: a suíte de kernel de
+/// `test smp` já traz uma rodada curta dele.
+fn stress(opts: &Options) -> Result {
+    let smp = if opts.smp > 1 { opts.smp } else { STRESS_CPUS };
+    let seconds = opts.minutes * 60;
+    let cmdline: &'static str = Box::leak(
+        format!("test=kernel ktest=smp.estresse smp.estresse_s={seconds}").into_boxed_str(),
+    );
+    println!("xtask: estresse SMP: {} min em -smp {smp}", opts.minutes);
+    build(opts)?;
+    let serial = boot_scenario(
+        &Options {
+            smp,
+            ..opts.clone()
+        },
+        &Scenario {
+            name: "estresse SMP",
+            cmdline,
+            // Poucas épocas por minuto na depuração, com folga de um quarto.
+            timeout: Duration::from_secs(seconds + seconds / 4 + 600),
+            ..KERNEL_SCENARIO
+        },
+    )?;
+    check_cpus_online(&serial, smp)?;
+    if !serial.contains("ktest: · ") || !serial.lines().any(|l| l.contains("épocas em")) {
+        return Err("o estresse não imprimiu o resumo das épocas".into());
+    }
+    println!(
+        "xtask: estresse SMP: {} min em -smp {smp} sem pânico nem trava",
+        opts.minutes
+    );
+    Ok(())
 }
 
 /// Pânico SMP (ADR 0031, item 8): a dona é `cpu` e cada uma das outras
@@ -1349,6 +1404,13 @@ mod tests {
 
     #[test]
     fn suite_smp_exige_todas_as_cpus() {
+        let opts = parse(&args(&["stress", "--smp", "4", "--minutes", "2"])).unwrap();
+        assert_eq!(
+            (opts.suite.as_str(), opts.smp, opts.minutes),
+            ("stress", 4, 2)
+        );
+        assert_eq!(parse(&args(&["stress"])).unwrap().minutes, STRESS_MINUTES);
+        assert!(parse(&args(&["--minutes", "x"])).is_err());
         let opts = parse(&args(&["smp", "--smp", "4"])).unwrap();
         assert_eq!((opts.suite.as_str(), opts.smp), ("smp", 4));
         let serial = "info  okernel: cpu3 online (APIC 3)\r\n\

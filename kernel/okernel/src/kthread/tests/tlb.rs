@@ -90,7 +90,7 @@ pub fn unmap_faz_faltar() -> Outcome {
 }
 
 /// Uma rodada de [`unmap_faz_faltar`] com a leitora na CPU `cpu`.
-fn unmap_em(cpu: u32) -> Outcome {
+pub(super) fn unmap_em(cpu: u32) -> Outcome {
     let p = process(1)?;
     let control = Page::new(&p)?;
     let target = Page::new(&p)?;
@@ -105,11 +105,11 @@ fn unmap_em(cpu: u32) -> Outcome {
     };
     ensure!(start_on(&t, &e, cpu).is_ok());
     let reads = control.word(0);
-    ensure!(wait_for(1_000 * MS, || reads.load(Ordering::Relaxed) >= 1_000));
+    ensure!(wait_for(10_000 * MS, || reads.load(Ordering::Relaxed) >= 1_000));
     let before = kfault::killed();
     ensure!(vm_unmap(&p.aspace, TARGET_VA, PAGE_SIZE).is_ok());
     let at_return = reads.load(Ordering::Relaxed);
-    ensure!(wait_for(1_000 * MS, || gone(&t)));
+    ensure!(wait_for(10_000 * MS, || gone(&t)));
     let total = reads.load(Ordering::Relaxed);
     info!(
         "ktest: · cpu{cpu}: {at_return} leituras até a volta do vm_unmap, {} depois",

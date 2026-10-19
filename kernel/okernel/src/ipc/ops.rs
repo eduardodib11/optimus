@@ -267,13 +267,16 @@ fn block(me: &Thread, blocked: Blocked, out: Option<Outgoing>) {
     me.set_state(RunState::Blocked);
 }
 
-/// Desfaz [`block`] quando a fila recusa a thread.
-fn unblock(me: &Thread) {
+/// Desfaz [`block`] quando a fila recusa a thread ou ela encontrou par
+/// antes de entrar; devolve a mensagem de saída que ficou no slot.
+fn unblock(me: &Thread) -> Option<Outgoing> {
     let mut slot = me.ipc().lock();
     slot.blocked = Blocked::None;
-    slot.out = None;
+    slot.result = Ok(());
+    let out = slot.out.take();
     drop(slot);
     me.set_state(RunState::Running);
+    out
 }
 
 /// Envio ou chamada num endpoint.
@@ -307,13 +310,23 @@ fn send_out(
 ) -> Result<Step, Error> {
     let call = out.call;
     let fast = out.msg.info.registers_only();
-    let Some(r) = ep.pop_receiver() else {
-        if let Some(e) = wait.refuse {
+    // A thread já fica marcada como bloqueada na fila de envio antes de
+    // entrar nela: com várias CPUs, assim que entra, outra pode tirá-la e
+    // lê o slot. Se achar receptor, a marca é desfeita e a mensagem volta.
+    let queue = wait.refuse.is_none();
+    let mut out = Some(out);
+    if queue {
+        block(me, Blocked::Send(Arc::downgrade(ep)), out.take());
+    }
+    let popped = match ep.pop_receiver_or_push_sender(me, queue) {
+        Ok(popped) => popped,
+        Err(e) => {
+            unblock(me);
             return Err(e);
         }
-        block(me, Blocked::Send(Arc::downgrade(ep)), Some(out));
-        if let Err(e) = ep.push_sender(me) {
-            unblock(me);
+    };
+    let Some(r) = popped else {
+        if let Some(e) = wait.refuse {
             return Err(e);
         }
         return Ok(Step::Block {
@@ -322,6 +335,10 @@ fn send_out(
             follow: false,
         });
     };
+    if queue {
+        out = unblock(me);
+    }
+    let out = out.unwrap_or_default();
     let recv = core::mem::take(&mut r.ipc().lock().blocked);
     deliver(me, out, &r, env);
     if !call {
@@ -375,21 +392,32 @@ fn receive(
     grant: bool,
     wait: Wait,
 ) -> Result<Option<Arc<Thread>>, Error> {
-    let Some(s) = ep.pop_sender() else {
-        if let Some(e) = wait.refuse {
-            return Err(e);
-        }
+    // Como em `send_out`: marcada antes de entrar na fila, desfeita se
+    // achar remetente.
+    let queue = wait.refuse.is_none();
+    if queue {
         block(
             me,
             Blocked::Recv(Arc::downgrade(ep), Arc::clone(reply), grant),
             None,
         );
-        if let Err(e) = ep.push_receiver(me) {
+    }
+    let popped = match ep.pop_sender_or_push_receiver(me, queue) {
+        Ok(popped) => popped,
+        Err(e) => {
             unblock(me);
+            return Err(e);
+        }
+    };
+    let Some(s) = popped else {
+        if let Some(e) = wait.refuse {
             return Err(e);
         }
         return Ok(None);
     };
+    if queue {
+        unblock(me);
+    }
     Ok(Some(s))
 }
 

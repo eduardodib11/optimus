@@ -216,6 +216,52 @@ impl Endpoint {
         push(&mut self.queues.lock().receivers, t)
     }
 
+    /// `Deliver` da spec `Ipc.tla`, num passo só sob a trava das filas:
+    /// tira o primeiro receptor ou, se não houver (e `queue`), põe `t` no
+    /// fim da fila de envio. Dois passos separados deixariam, com duas
+    /// CPUs, um remetente e um receptor ambos na fila, esperando um pelo
+    /// outro (`NoMissedRendezvous`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QuotaExceeded`] sem memória para a fila.
+    pub fn pop_receiver_or_push_sender(
+        &self,
+        t: &Arc<Thread>,
+        queue: bool,
+    ) -> Result<Option<Arc<Thread>>, Error> {
+        let mut q = self.queues.lock();
+        if let Some(r) = q.receivers.pop_front() {
+            return Ok(Some(r));
+        }
+        if queue {
+            push(&mut q.senders, t)?;
+        }
+        Ok(None)
+    }
+
+    /// `RecvPart` da spec `Ipc.tla`, num passo só: tira o primeiro
+    /// remetente ou, se não houver (e `queue`), põe `t` no fim da fila de
+    /// receptores. Ver [`Endpoint::pop_receiver_or_push_sender`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QuotaExceeded`] sem memória para a fila.
+    pub fn pop_sender_or_push_receiver(
+        &self,
+        t: &Arc<Thread>,
+        queue: bool,
+    ) -> Result<Option<Arc<Thread>>, Error> {
+        let mut q = self.queues.lock();
+        if let Some(s) = q.senders.pop_front() {
+            return Ok(Some(s));
+        }
+        if queue {
+            push(&mut q.receivers, t)?;
+        }
+        Ok(None)
+    }
+
     /// Tira `t` de qualquer das filas; falso se não estava em nenhuma.
     pub fn remove(&self, t: &Thread) -> bool {
         let mut q = self.queues.lock();
