@@ -86,6 +86,8 @@ pub fn irq_acorda() -> Outcome {
         rsp: DATA_VA + PAGE_SIZE,
         args: [u64::from(irq.raw()), u64::from(ntfy.raw()), DATA_VA],
     };
+    // A IRQ chega a esta CPU, e a espera abaixo dorme nela: a thread fica.
+    super::pin(&t, crate::arch::x86_64::percpu::cpu_id())?;
     ensure!(start(&t, &e).is_ok());
     for _ in 0..100 {
         if t.state() == RunState::Blocked {

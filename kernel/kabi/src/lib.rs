@@ -72,6 +72,7 @@ pub mod boot;
 pub mod fault;
 pub mod fuzz;
 pub mod ipc;
+pub mod sched;
 
 abi_enum! {
 /// Números das syscalls da ABI v1 (seção 14.2), passados em `rax`.

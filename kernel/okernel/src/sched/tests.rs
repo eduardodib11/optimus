@@ -118,3 +118,38 @@ fn sched_context_configura_e_liga_uma_vez() {
     drop(sc);
     assert_eq!(quota.used(), 0);
 }
+
+#[test]
+fn sched_context_comeca_com_todas_as_cpus() {
+    use kabi::sched::CpuMask;
+    let quota = MemoryQuota::root(1 << 10);
+    let sc = SchedContext::new(quota.charge(64).unwrap());
+    assert_eq!(sc.mask(), CpuMask::ALL);
+    assert!(sc.allows(0) && sc.allows(255));
+    sc.set_mask(CpuMask::only(2).with(130));
+    assert_eq!(sc.mask(), CpuMask::only(2).with(130));
+    assert!(sc.allows(2) && sc.allows(130));
+    assert!(!sc.allows(0) && !sc.allows(3) && !sc.allows(256));
+    // Reconfigurar o orçamento não mexe na máscara.
+    sc.configure(Params::new(MS, MS, 3).unwrap());
+    assert_eq!(sc.mask(), CpuMask::only(2).with(130));
+}
+
+#[test]
+fn roubo_tira_o_primeiro_que_serve_do_nivel_mais_alto() {
+    let mut q = RunQueue::new();
+    for (prio, item) in [(5, 50), (9, 90), (9, 91), (9, 92), (1, 10)] {
+        q.push(prio, item).unwrap();
+    }
+    // O 90 não serve: sai o 91, e a ordem do nível segue.
+    assert_eq!(q.take_where(0, |_, t| *t != 90), Some((9, 91)));
+    // A partir do nível 6, nada abaixo de 90 serve (o 5 fica de fora).
+    assert_eq!(q.take_where(6, |_, t| *t < 90), None);
+    assert_eq!(q.take_where(0, |p, _| p < 9), Some((5, 50)));
+    assert_eq!(q.highest(), Some(9));
+    assert_eq!(q.pop(), Some((9, 90)));
+    assert_eq!(q.pop(), Some((9, 92)));
+    assert_eq!(q.take_where(0, |_, _| true), Some((1, 10)));
+    assert!(q.is_empty());
+    assert_eq!(q.highest(), None);
+}

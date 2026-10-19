@@ -26,12 +26,16 @@ fn setup() -> (Arc<MemoryQuota>, Arc<SharedCapSpace>, u64) {
     (root, space, u64::from(q.raw()))
 }
 
-/// Ambiente falso: conta preempções e guarda quem foi acordado.
+/// Ambiente falso: conta preempções e guarda quem foi acordado; `user` é
+/// a memória de usuário legível (endereço e bytes) e `changed`, as
+/// máscaras avisadas por `affinity_changed`.
 #[derive(Default)]
 struct Fake {
     preempts: u32,
     woken: Vec<(Arc<Thread>, u64)>,
     current: Option<Arc<Thread>>,
+    user: Vec<(u64, Vec<u8>)>,
+    changed: Vec<CpuMask>,
 }
 
 impl Env for Fake {
@@ -60,6 +64,19 @@ impl Env for Fake {
     }
     fn write_buffer(&mut self, _thread: &Thread, _at: usize, _data: &[u64]) -> bool {
         false
+    }
+    fn read_bytes(&mut self, addr: u64, out: &mut [u8]) -> bool {
+        let Some((_, bytes)) = self.user.iter().find(|(at, _)| *at == addr) else {
+            return false;
+        };
+        out.copy_from_slice(&bytes[..out.len()]);
+        true
+    }
+    fn online_cpus(&self) -> CpuMask {
+        CpuMask([0b1111, 0, 0, 0])
+    }
+    fn affinity_changed(&mut self, mask: CpuMask) {
+        self.changed.push(mask);
     }
 }
 
@@ -213,6 +230,63 @@ fn sched_configure_e_bind_conferem_direitos() {
         .clone();
     let bound = thread.object.as_thread().unwrap().sched_context().unwrap();
     assert_eq!(bound.params().map(|p| p.priority), Some(120));
+}
+
+#[test]
+fn sched_configure_com_mascara_de_afinidade() {
+    platform::install(fake_platform(1000).1);
+    let (_root, space, q) = setup();
+    let [sc, ..] = call(
+        &space,
+        Syscall::ObjCreate,
+        [q, ObjectType::SchedContext.to_raw(), 0, 0, 0, 0],
+    )
+    .unwrap();
+    let ms = 1_000_000;
+    let mask_bytes = |m: CpuMask| m.0.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+    let mut env = Fake {
+        user: alloc::vec![
+            (0x10_000, mask_bytes(CpuMask::only(2).with(9))),
+            (0x10_100, mask_bytes(CpuMask::only(5))),
+            (0x10_200, mask_bytes(CpuMask::NONE)),
+        ],
+        ..Fake::default()
+    };
+    let mut conf = |r8, r9| {
+        invoke(
+            &space,
+            Syscall::SchedConfigure,
+            [sc, ms, 10 * ms, 7, r8, r9],
+            4,
+            &mut env,
+        )
+    };
+    // r9 reservado; máscara sem CPU ligada (5 e nenhuma), desalinhada,
+    // ilegível ou fora da metade de usuário.
+    for (r8, r9) in [
+        (0x10_000, 1),
+        (0x10_100, 0),
+        (0x10_200, 0),
+        (0x10_004, 0),
+        (0x20_000, 0),
+        (USER_END - 8, 0),
+        (8, 0),
+    ] {
+        assert_eq!(conf(r8, r9), Err(Error::InvalidArgument), "r8 {r8:#x}");
+    }
+    assert_eq!(conf(0x10_000, 0), Ok([0; 3]));
+    // Sem máscara (r8 = 0), fica a que estava.
+    assert_eq!(conf(0, 0), Ok([0; 3]));
+    let obj = space
+        .lock()
+        .get(Handle::from_raw(u32::try_from(sc).unwrap()))
+        .unwrap()
+        .clone();
+    let obj = obj.object.as_sched_context().unwrap();
+    assert_eq!(obj.mask(), CpuMask::only(2).with(9));
+    assert_eq!(obj.params().map(|p| p.priority), Some(7));
+    assert_eq!(env.changed, [CpuMask::only(2).with(9)]);
+    assert_eq!(env.preempts, 1);
 }
 
 #[test]

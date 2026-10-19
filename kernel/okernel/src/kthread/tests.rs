@@ -19,6 +19,7 @@ use crate::ktest::{Outcome, Test};
 use crate::kvm::activate;
 use crate::{kmem, ktime};
 
+mod affinity;
 mod sched;
 mod smp;
 mod smp_ipc;
@@ -75,6 +76,18 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "smp.destruicao_concorrente_acorda_com_peer_closed",
         run: smp_ipc::destruicao_concorrente_acorda_com_peer_closed,
+    },
+    Test {
+        name: "smp.threads_presas_a_mascara",
+        run: affinity::presas_a_mascara,
+    },
+    Test {
+        name: "smp.mascara_nova_leva_a_thread",
+        run: affinity::mascara_nova_leva_a_thread,
+    },
+    Test {
+        name: "smp.carga_desigual_converge",
+        run: affinity::carga_desigual_converge,
     },
     Test {
         name: "smp.estresse",
@@ -194,6 +207,15 @@ pub fn thread_with(p: &Process, params: Params) -> Result<(Handle, Arc<Thread>),
     Ok((h, t))
 }
 
+/// Prende `t` à CPU `cpu` pela máscara do `SchedContext` dela (T-325),
+/// para o balanceamento não a levar a outra: os testes que medem algo numa
+/// CPU escolhida.
+pub fn pin(t: &Thread, cpu: u32) -> Outcome {
+    let sc = t.sched_context().ok_or("sem SchedContext")?;
+    sc.set_mask(kabi::sched::CpuMask::only(cpu as usize));
+    Ok(())
+}
+
 /// Thread configurada, sem `SchedContext`.
 fn bare_thread(p: &Process) -> Result<(Handle, Arc<Thread>), &'static str> {
     let h = p
@@ -311,6 +333,8 @@ fn alternam() -> Outcome {
                 rsp: page + PAGE_SIZE,
                 args: [u64::from(letter), VOLTAS, page],
             };
+            // A alternância por `yield` é a de uma CPU: presas a esta.
+            pin(&t, crate::arch::x86_64::percpu::cpu_id())?;
             ensure!(start(&t, &e).is_ok());
             ensure!(start(&t, &e) == Err(Error::Busy));
             handles.push(h);

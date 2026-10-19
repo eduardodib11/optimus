@@ -288,7 +288,8 @@ pub fn post_ap_job(job: fn()) {
 }
 
 /// Laço ocioso de um AP (ADR 0032, item 8, sem `mwait`): roda as prontas
-/// da própria fila e dorme em `sti; hlt` até um IPI (despertar vindo de
+/// da própria fila, tenta roubar uma de outra CPU (item 7) e dorme em
+/// `sti; hlt` até um IPI (despertar vindo de
 /// outra CPU, função remota) ou o timer, armado a cada [`IDLE_TICK_NS`] no
 /// mínimo. O IPI que chega entre olhar a fila e o `hlt` fica pendente e
 /// acorda o `hlt` (a sombra do `sti`).
@@ -304,6 +305,9 @@ fn idle() -> ! {
             }
         }
         crate::kthread::yield_now();
+        if crate::kthread::idle_steal() {
+            continue;
+        }
         ktime::arm_by(ktime::now_ns() + IDLE_TICK_NS);
         cpu::wait_for_interrupt();
     }

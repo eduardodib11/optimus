@@ -11,7 +11,7 @@ use okernel::vm::{vm_map, vm_unmap};
 
 use super::super::{UserEntry, start_on};
 use super::smp::{gone, option, wait_for};
-use super::{DATA_VA, Page, delete, process, settled, thread, user_symbol};
+use super::{DATA_VA, Page, delete, pin, process, settled, thread, user_symbol};
 use crate::kcap::root_quota;
 use crate::ktest::Outcome;
 use crate::{kfault, kmem, ksmp, ktime};
@@ -103,6 +103,7 @@ pub(super) fn unmap_em(cpu: u32) -> Outcome {
         rsp: DATA_VA + PAGE_SIZE,
         args: [TARGET_VA, SHARED_VA, 0],
     };
+    pin(&t, cpu)?;
     ensure!(start_on(&t, &e, cpu).is_ok());
     let reads = control.word(0);
     ensure!(wait_for(10_000 * MS, || reads.load(Ordering::Relaxed) >= 1_000));
@@ -159,6 +160,7 @@ pub fn sem_traducao_velha() -> Outcome {
             args: [TARGET_VA, SHARED_VA, 0],
         };
         let t0 = ktime::now_ns();
+        pin(&t, cpu)?;
         ensure!(start_on(&t, &entry, cpu).is_ok());
         for round in 1..=rounds {
             let ack = control.word(ACK);

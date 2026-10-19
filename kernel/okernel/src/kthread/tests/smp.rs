@@ -15,7 +15,7 @@ use okernel::vm::vm_map;
 use super::super::{UserEntry, start_on, wake, yield_now};
 use super::sync::read_user;
 use super::{
-    DATA_VA, Page, Process, cap, delete, process, settled, thread, thread_with, user_symbol,
+    DATA_VA, Page, Process, cap, delete, pin, process, settled, thread, thread_with, user_symbol,
 };
 use crate::arch::x86_64::cpu;
 use crate::kcap::root_quota;
@@ -83,9 +83,10 @@ pub(super) fn parked(t: &Thread) -> bool {
     t.state() == RunState::Blocked && !t.on_cpu()
 }
 
-/// Aceite do T-324: dois processos, cada um começando numa CPU, alternam a
-/// vez por futex numa página comum `smp.alternate` vezes cada. Cada passagem de vez acorda a outra thread na CPU dela, a
-/// partir da outra CPU; toda jogada tem de acontecer na CPU de partida.
+/// Aceite do T-324: dois processos, cada um preso a uma CPU (T-325),
+/// alternam a vez por futex numa página comum `smp.alternate` vezes cada.
+/// Cada passagem de vez acorda a outra thread na CPU dela, a partir da
+/// outra CPU; toda jogada tem de acontecer na CPU de partida.
 pub fn alternam_em_cpus_distintas() -> Outcome {
     let n = ksmp::start::online_count();
     if n < 2 {
@@ -119,8 +120,9 @@ pub fn alternam_em_cpus_distintas() -> Outcome {
             let e = UserEntry {
                 rip: entry,
                 rsp: DATA_VA + PAGE_SIZE,
-                args: [id as u64 | u64::from(cpu) << 8, rounds, SHARED_VA],
+                args: [id as u64 | 1 << (cpu + 8), rounds, SHARED_VA],
             };
+            pin(t, cpu)?;
             ensure!(start_on(t, &e, cpu).is_ok());
         }
         // 10⁶ jogadas levam de um a cinco minutos em release sob TCG; a

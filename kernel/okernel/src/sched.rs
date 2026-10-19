@@ -19,6 +19,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kabi::Error;
+use kabi::sched::{CPU_MASK_WORDS, CpuMask};
 
 use crate::cap::Charge;
 
@@ -127,11 +128,14 @@ impl Budget {
     }
 }
 
-/// Orçamento de CPU e prioridade de uma thread (objeto `SchedContext`).
+/// Orçamento de CPU, prioridade e afinidade de uma thread (objeto
+/// `SchedContext`).
 ///
 /// Os campos são atômicos para o escalonador lê-los sem tomar trava de
 /// objeto com a da fila na mão (ordem da seção 6.9); só ele muda o
-/// orçamento, e com a trava da fila.
+/// orçamento, e com a trava da fila. A máscara de afinidade (ADR 0032,
+/// item 4) anda com a doação: a thread roda nas CPUs que o `SchedContext`
+/// em que roda permite.
 pub struct SchedContext {
     charge: Charge,
     budget_ns: AtomicU64,
@@ -142,6 +146,8 @@ pub struct SchedContext {
     replenish_at: AtomicU64,
     active: AtomicBool,
     bound: AtomicBool,
+    /// CPUs permitidas (todas, num novo).
+    mask: [AtomicU64; CPU_MASK_WORDS],
 }
 
 impl fmt::Debug for SchedContext {
@@ -163,6 +169,7 @@ impl SchedContext {
             replenish_at: AtomicU64::new(0),
             active: AtomicBool::new(false),
             bound: AtomicBool::new(false),
+            mask: [const { AtomicU64::new(u64::MAX) }; CPU_MASK_WORDS],
         }
     }
 
@@ -208,6 +215,32 @@ impl SchedContext {
         self.remaining.store(b.remaining, Ordering::Relaxed);
         self.replenish_at.store(b.replenish_at, Ordering::Relaxed);
         self.active.store(b.active, Ordering::Relaxed);
+    }
+
+    /// CPUs em que as threads que rodam sobre este `SchedContext` podem
+    /// começar a rodar.
+    #[must_use]
+    pub fn mask(&self) -> CpuMask {
+        CpuMask(core::array::from_fn(|i| {
+            self.mask[i].load(Ordering::Relaxed)
+        }))
+    }
+
+    /// Troca a máscara de afinidade (`sched_configure` com `r8`). Quem lê
+    /// durante a troca pode ver palavras velhas e novas misturadas, o que só
+    /// adia a migração até a próxima decisão.
+    pub fn set_mask(&self, mask: CpuMask) {
+        for (w, m) in self.mask.iter().zip(mask.0) {
+            w.store(m, Ordering::Relaxed);
+        }
+    }
+
+    /// A CPU `cpu` está na máscara (uma leitura atômica).
+    #[must_use]
+    pub fn allows(&self, cpu: usize) -> bool {
+        self.mask
+            .get(cpu / 64)
+            .is_some_and(|w| w.load(Ordering::Relaxed) & (1 << (cpu % 64)) != 0)
     }
 
     /// Marca como ligado a uma thread; `false` se já estava.
@@ -275,6 +308,27 @@ impl<T> RunQueue<T> {
             self.bitmap[usize::from(priority / 64)] &= !(1 << (priority % 64));
         }
         Some((priority, item))
+    }
+
+    /// Tira o primeiro item, do nível mais alto para o mais baixo e na
+    /// ordem de cada nível, para o qual `want(prioridade, item)` vale,
+    /// olhando só os níveis de `min` para cima (roubo do balanceamento).
+    pub fn take_where(&mut self, min: u8, mut want: impl FnMut(u8, &T) -> bool) -> Option<(u8, T)> {
+        for priority in (min..=u8::MAX).rev() {
+            if self.bitmap[usize::from(priority / 64)] & (1 << (priority % 64)) == 0 {
+                continue;
+            }
+            let level = &mut self.levels[usize::from(priority)];
+            let Some(i) = level.iter().position(|t| want(priority, t)) else {
+                continue;
+            };
+            let item = level.remove(i)?;
+            if level.is_empty() {
+                self.bitmap[usize::from(priority / 64)] &= !(1 << (priority % 64));
+            }
+            return Some((priority, item));
+        }
+        None
     }
 
     /// Itens na fila.

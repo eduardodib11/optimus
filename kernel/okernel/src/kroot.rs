@@ -311,7 +311,7 @@ pub fn run_until_exit(thread: &Thread, limit_ns: u64) -> bool {
     let give_up = ktime::now_ns().saturating_add(limit_ns);
     while thread.state() != RunState::Exited && ktime::now_ns() < give_up {
         kthread::yield_now();
-        if thread.state() != RunState::Exited {
+        if thread.state() != RunState::Exited && !kthread::idle_steal() {
             // Sem nada pronto: dorme até o próximo timer (armado aqui
             // também, para nunca dormir sem prazo).
             ktime::set_timer_at(ktime::now_ns() + 10_000_000);
