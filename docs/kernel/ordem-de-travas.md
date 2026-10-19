@@ -48,6 +48,12 @@ Notas:
   Por isso o escalonador solta a thread que saiu da CPU (`switch_prev`,
   talvez a última referência de uma que terminou) só depois de largar a
   fila, em `finish_switch`.
+- O caminho rápido de IPC (T-331, `ipc::fast`) lê as capabilities
+  emprestadas, com a trava do `CapSpace` (2) na mão, e por baixo dela toma
+  uma trava de objeto (3) de cada vez e o `IpcSlot` (4) da outra thread.
+  Nenhuma referência é solta com a trava do `CapSpace` na mão: quando é
+  preciso entregar de um remetente que chegou de outra CPU, ele clona o
+  `Reply` e larga o `CapSpace` antes, como o caminho comum.
 - O TLB shootdown (T-326, `ksmp::tlb::flush`) não toma trava, mas espera
   as outras CPUs confirmarem com a trava de quem chamou na mão: a do
   `AddressSpace` em `unmap`/`protect`/`map` (o frame só volta ao buddy
