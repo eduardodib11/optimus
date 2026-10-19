@@ -87,7 +87,7 @@ fn output(cmd: &mut Command) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn meta() -> Meta {
+pub fn meta() -> Meta {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -142,7 +142,7 @@ fn human(ns: u64) -> String {
 }
 
 /// Campos `chave=valor` de uma linha `bench:` (valores com aspas inteiros).
-fn fields(line: &str) -> Vec<(&str, &str)> {
+pub fn fields(line: &str) -> Vec<(&str, &str)> {
     let mut out = Vec::new();
     let mut rest = line;
     while let Some((key, tail)) = rest.trim_start().split_once('=') {
@@ -159,7 +159,7 @@ fn fields(line: &str) -> Vec<(&str, &str)> {
 }
 
 /// A linha `bench: <nome> ...` da serial, sem o prefixo.
-fn line<'a>(serial: &'a str, name: &str) -> Option<&'a str> {
+pub fn line<'a>(serial: &'a str, name: &str) -> Option<&'a str> {
     let prefix = format!("bench: {name} ");
     serial.lines().find_map(|l| {
         l.split_once(prefix.as_str())

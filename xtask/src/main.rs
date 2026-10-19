@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use std::{env, fs, sync::mpsc, thread};
 
 mod bench;
+mod perfil;
 
 /// Alvo do kernel no lugar de `x86_64-optimus-kernel`: alvos próprios em JSON
 /// exigem `-Zbuild-std`, que não existe no Rust estável (ADR 0025).
@@ -225,7 +226,7 @@ fn parse(args: &[String]) -> Result<Options> {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some((cmd, rest)) = args.split_first() else {
-        eprintln!("uso: cargo xtask <build|image|run|test|fuzz|check|kani|bench> [opções]");
+        eprintln!("uso: cargo xtask <build|image|run|test|fuzz|check|kani|bench|perfil> [opções]");
         return ExitCode::FAILURE;
     };
     let result = parse(rest).and_then(|opts| match cmd.as_str() {
@@ -237,6 +238,7 @@ fn main() -> ExitCode {
         "check" => check(),
         "kani" => kani(),
         "bench" => bench::bench(&opts),
+        "perfil" => perfil::perfil(&opts),
         other => Err(format!("subcomando desconhecido: {other}")),
     });
     match result {
@@ -277,6 +279,11 @@ fn mode(opts: &Options) -> &'static str {
 }
 
 fn build(opts: &Options) -> Result {
+    build_with(opts, &[])
+}
+
+/// [`build`] com variáveis de ambiente a mais para o `cargo`.
+fn build_with(opts: &Options, env: &[(&str, &str)]) -> Result {
     println!(
         "xtask: build {} perfil {} ({})",
         opts.arch,
@@ -286,6 +293,7 @@ fn build(opts: &Options) -> Result {
     for (package, _, target) in CRATES {
         let mut cmd = cargo();
         cmd.args(["build", "--package", package, "--target", target]);
+        cmd.envs(env.iter().copied());
         if opts.release {
             cmd.arg("--release");
         }

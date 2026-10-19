@@ -5,7 +5,8 @@
 //! troca de pilha e chama [`kernel_main`] (T-104), que carrega GDT, TSS e IDT
 //! (T-105). Com `test=fault` na linha de comando, provoca um #UD de propósito;
 //! com `test=kernel`, roda os testes de kernel ([`ktest`], T-111); com
-//! `test=bench`, os benchmarks ([`kbench`], T-213).
+//! `test=bench`, os benchmarks ([`kbench`], T-213); com `test=perfil`, os
+//! de IPC e de troca em laço, para o `cargo xtask perfil` (T-331).
 
 #![no_std]
 #![no_main]
@@ -98,6 +99,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         }
         Some("kernel") => ktest::run(option(cmdline, "ktest")),
         Some("bench") => kbench::run(),
+        Some("perfil") => kbench::profile(),
         Some("panic") => {
             // Com `smp.panic_cpu=N`, o pânico vem da CPU N (função remota),
             // e as outras, inclusive o BSP que espera, congelam pelo NMI.

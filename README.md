@@ -20,6 +20,8 @@ cargo xtask test kernel  # só os testes de kernel (harness com isa-debug-exit)
 cargo xtask test smp     # testes de kernel, pânico SMP, 10⁶ alternâncias entre CPUs, 10⁵ shootdowns (release) e okfuzz de 20 s com -smp 2, 4 e 8 (--smp N: só N)
 cargo xtask fuzz       # okfuzz (um processo por CPU ligada; --smp N, --seconds S, --seed S)
 cargo xtask test stress  # estresse SMP no build de depuração, 30 min com -smp 4 (--smp N, --minutes M)
+cargo xtask bench    # IPC e troca de contexto em release; relatório em docs/bench (metas só valem em KVM)
+cargo xtask perfil   # uma volta de IPC e uma de troca, instrução a instrução (gdb com Python); relatório em docs/bench
 cargo xtask check    # fmt, clippy e allowlist de unsafe
 cargo xtask kani     # provas Kani das capabilities (exige o Kani no host)
 ```

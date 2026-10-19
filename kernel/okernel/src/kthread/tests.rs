@@ -273,13 +273,18 @@ impl Page {
 }
 
 /// Prazo de [`run_until_exit`].
-const RUN_LIMIT_NS: u64 = 20_000_000_000;
+pub const RUN_LIMIT_NS: u64 = 20_000_000_000;
 
 /// Roda as prontas desta CPU até todas as `threads` saírem de vez
 /// (terminadas e fora de qualquer CPU; as que acordaram noutra CPU rodam
 /// lá) ou o prazo vencer.
 pub fn run_until_exit(threads: &[Arc<Thread>]) -> Outcome {
-    let give_up = ktime::now_ns() + RUN_LIMIT_NS;
+    run_until_exit_within(threads, RUN_LIMIT_NS)
+}
+
+/// Como [`run_until_exit`], com `limit_ns` de limite (`u64::MAX`: sem).
+pub fn run_until_exit_within(threads: &[Arc<Thread>], limit_ns: u64) -> Outcome {
+    let give_up = ktime::now_ns().saturating_add(limit_ns);
     while ktime::now_ns() < give_up {
         if threads
             .iter()
