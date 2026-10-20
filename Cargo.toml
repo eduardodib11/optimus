@@ -22,5 +22,10 @@ pedantic = { level = "warn", priority = -1 }
 [profile.dev]
 panic = "abort"
 
+# O bootfs guarda o `utest` no heap do kernel e come a cota dos testes de
+# usuário; sem informação de depuração ele fica pequeno (T-336).
+[profile.dev.package.utest]
+debug = 0
+
 [profile.release]
 panic = "abort"

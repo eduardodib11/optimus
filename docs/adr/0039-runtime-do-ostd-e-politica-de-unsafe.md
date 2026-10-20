@@ -417,6 +417,7 @@ desenho:
   thread alvo (`WRITE_STATE`) e `cspace = aspace = 0`, o alvo inativo passa a
   rodar no `CapSpace` e no `AddressSpace` de quem chama. Quem chama já tem
   poder sobre os dois, então nada novo é concedido.
+  Aceita por Eduardo em 2026-10-20 como exceção ao item 3 (PR #68).
 - **`thread_local!`.** O índice do slot vem de um contador global, atribuído no
   primeiro acesso, e não da posição de um descritor em `.ostd_tls_desc`; o
   `user.ld` não mudou. Contrato igual (tabela de slots no bloco, valor criado
@@ -432,3 +433,13 @@ desenho:
 - **Fim de thread.** Sem notificação de morte (T-348), `join` espera uma flag
   do bloco que a thread grava num bloco de assembly sem pilha; thread que morre
   por falta ou pânico não é juntável até a T-348.
+
+## Notas da implementação (T-336, 2026-10-20)
+
+- **Sem envenenamento.** `panic = abort` (item 5) torna o envenenamento
+  inalcançável; `Mutex::lock`, `RwLock::read`/`write` devolvem a guarda
+  direta, sem `Result`. Se um dia houver desenrolamento, a API muda junto.
+- **Escolhas.** `Mutex` com os estados 0/1/2; `Condvar` por contador de
+  sequência (sem perda de sinal; despertar espúrio permitido); `RwLock` que
+  prefere escritores; `Once` e `OnceLock`. Esperas sem prazo até a T-338.
+- **`unsafe`.** `lib/ostd/src/sync` = 28 (usa 18).
