@@ -390,8 +390,10 @@ fn gather(
     info.acpi_rsdp = firmware::acpi_rsdp(st).unwrap_or(0);
     let _ = write!(out, "optboot: RSDP {:#x}\r\n", info.acpi_rsdp);
     let source = firmware::entropy(bs, &mut info.rng_seed);
-    if matches!(source, Entropy::TscOnly) {
-        let _ = out.write_str("optboot: AVISO: sem RNG do firmware nem da CPU\r\n");
+    if matches!(source, Entropy::None) {
+        let _ = out.write_str(
+            "optboot: AVISO: sem RNG do firmware nem da CPU; semente zero, sem DRBG no kernel\r\n",
+        );
     }
     let _ = write!(out, "optboot: semente de 64 bytes via {source}\r\n");
     Ok(info)
