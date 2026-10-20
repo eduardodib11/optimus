@@ -32,10 +32,29 @@ jobs:
       - name: Bench com 1 CPU
         run: cargo xtask bench
       - name: Bench com 4 CPUs
+        env:
+          # Falta tripla com -no-reboot fecha o QEMU: o log guarda o estado.
+          OPTIMUS_QEMU_ARGS: -d cpu_reset,guest_errors -D target/qemu-smp4.log
         run: cargo xtask bench --smp 4
+      - name: Estado das CPUs no reset (só em falha)
+        if: failure()
+        run: tail -n 200 target/qemu-smp4.log || true
       - name: Testes de kernel em KVM
         if: always()
-        run: cargo xtask test kernel
+        run: |
+          set -o pipefail
+          cargo xtask test kernel 2>&1 | tee target/ktest.log
+      - name: Onde as CPUs pararam (só em falha)
+        if: failure()
+        run: |
+          # Endereços de kernel do estado das CPUs (o xtask o mostra quando o
+          # tempo esgota), menos o deslocamento de KASLR da serial.
+          slide=$(grep -om1 'kaslr_slide 0x[0-9a-f]*' target/ktest.log | cut -d' ' -f2) || exit 0
+          grep -oE 'ffffffff[89a-f][0-9a-f]{7}\b' target/ktest.log | sort -u | while read -r a; do
+            printf '%s ' "$a"
+            addr2line -f -i -C -e target/x86_64-unknown-none/debug/okernel \
+              "$(printf '%x' $((0x$a - slide)))" | paste -sd' '
+          done
       - name: Relatórios no resumo
         if: always()
         run: |

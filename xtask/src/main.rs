@@ -442,6 +442,11 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     if opts.gdb {
         cmd.args(["-s", "-S"]);
     }
+    // Opções a mais para depurar (`-s`, `-d cpu_reset`...), separadas por
+    // espaço.
+    if let Ok(extra) = env::var("OPTIMUS_QEMU_ARGS") {
+        cmd.args(extra.split_whitespace());
+    }
     Ok(cmd)
 }
 
@@ -649,11 +654,11 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let esp = image(opts, sc.cmdline, sc.rounds)?;
     let monitor = root().join("target/qemu-monitor.sock");
     let mut cmd = qemu(opts, &esp)?;
-    if sc.screen {
-        let _ = fs::remove_file(&monitor);
-        cmd.arg("-monitor")
-            .arg(format!("unix:{},server=on,wait=off", monitor.display()));
-    }
+    // O monitor também serve para ver onde as CPUs pararam se o boot
+    // travar.
+    let _ = fs::remove_file(&monitor);
+    cmd.arg("-monitor")
+        .arg(format!("unix:{},server=on,wait=off", monitor.display()));
     let stdin = if sc.screen {
         Stdio::piped()
     } else {
@@ -698,6 +703,10 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
         }
         let frozen = sc.exit.is_none() && seen_all(&raw);
         if frozen || start.elapsed() > sc.timeout {
+            if !frozen {
+                println!("xtask: tempo esgotado em {}; estado das CPUs:", sc.name);
+                println!("{}", monitor_dump(&monitor));
+            }
             let _ = child.kill();
             let _ = child.wait();
             break Err(frozen);
@@ -791,6 +800,29 @@ fn check_panic_screen(monitor: &Path) -> Result {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Registradores de todas as CPUs e o APIC local da primeira, pelo monitor
+/// do QEMU: onde um boot travado parou.
+fn monitor_dump(monitor: &Path) -> String {
+    let run = || -> std::io::Result<String> {
+        let mut sock = UnixStream::connect(monitor)?;
+        sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+        writeln!(sock, "info registers -a")?;
+        writeln!(sock, "info lapic")?;
+        let (mut out, mut chunk) = (Vec::new(), [0u8; 4096]);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            match sock.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(_) if !out.is_empty() => break,
+                Err(_) => {}
+            }
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    };
+    run().unwrap_or_else(|e| format!("monitor do QEMU: {e}"))
 }
 
 /// Imagem PPM binária (P6, 8 bits) completa: largura, altura e pixels RGB.
