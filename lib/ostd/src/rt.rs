@@ -88,6 +88,8 @@ macro_rules! entry {
 
 /// Chamada por `_start` com os valores de entrada.
 pub(crate) extern "sysv64" fn start(a0: u64, a1: u64, a2: u64) -> ! {
+    // O bloco da thread principal e o `FS_BASE` antes de qualquer alocação.
+    crate::tls::init_main();
     let main = crate::arch::entry();
     (main.0)(Start { args: [a0, a1, a2] })
 }
@@ -102,5 +104,5 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // O pânico encerra o processo (ADR 0039, item 5); enquanto o kernel não
     // tem `EXIT_GROUP` (T-348), encerra só a thread, com o mesmo código.
     let _ = crate::thread::exit_group(kabi::exit::PANIC_CODE);
-    crate::thread::exit_with(kabi::exit::PANIC_CODE)
+    crate::thread::exit_raw(kabi::exit::PANIC_CODE)
 }

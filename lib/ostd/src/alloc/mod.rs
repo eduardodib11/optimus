@@ -9,16 +9,14 @@
 //! - [`Allocator`] implementa `GlobalAlloc` e é o `#[global_allocator]` de
 //!   todo binário que usa o `ostd`.
 //!
-//! Por ora existe **um heap só** do processo, atrás de um spinlock simples:
-//! o heap por thread precisa do `FS_BASE` por thread (T-333) e das threads do
-//! `ostd` (T-335), que o ligam ao bloco da thread. O núcleo já é por thread
-//! (listas locais, `thread_free` para liberação entre threads, adoção de
-//! segmentos de quem sai); a T-335 troca o `HEAP` global por um `Heap` por
-//! thread e o spinlock desaparece do caminho comum. Enquanto isso, o spinlock
-//! só protege contra threads do mesmo processo criadas com as syscalls cruas
-//! (hoje só o `root` e o `hello`, que não alocam em paralelo), e uma thread
-//! de prioridade maior que gira esperando uma menor que segura a trava não
-//! avança: por isso o alocador não deve ser usado em paralelo antes da T-335.
+//! Cada thread tem o seu [`Heap`] do `oalloc`, guardado no bloco da thread
+//! ([`crate::tls`], T-335): o caminho comum não toma trava. Ele nasce na
+//! primeira alocação da thread e é devolvido (`Drop`) na saída dela, quando os
+//! segmentos com blocos vivos viram "abandonados" e outro heap os adota;
+//! liberar um bloco de outra thread já funcionava (`thread_free`). A única
+//! trava que sobra é a da [`KernelSource`], que reparte endereços da janela
+//! de segmentos entre todas as threads (só ao mapear ou desmapear um
+//! segmento de 2 MiB, não por alocação).
 //!
 //! Alocar antes de [`crate::rt::init`] é erro de programação e aborta o
 //! processo (hoje, encerra a thread, com uma linha no registro de depuração;
@@ -40,8 +38,8 @@
 //! - `unsafe impl GlobalAlloc` e a chamada de `Heap::free` em `dealloc`: o
 //!   contrato de `GlobalAlloc::dealloc` é o de `Heap::free` (o ponteiro veio
 //!   de `alloc` e é liberado uma vez).
-//! - `unsafe impl Sync` e o acesso ao `UnsafeCell` do [`Locked`]: o valor só
-//!   é tocado com a trava tomada.
+//! - `unsafe impl Sync` e o acesso ao `UnsafeCell` do [`Locked`] (a lista de
+//!   endereços da janela): o valor só é tocado com a trava tomada.
 
 #![allow(unsafe_code)]
 
@@ -264,13 +262,13 @@ unsafe impl PageSource for KernelSource {
     }
 
     fn fault(&self, fault: Fault) -> ! {
-        // A thread morre possivelmente com a trava do heap tomada. Sem isto,
+        // A thread morre possivelmente com a trava da janela tomada. Sem isto,
         // as outras girariam para sempre nela: `Locked::with` encerra quem
         // achar o alocador envenenado. O `abort` do processo todo vem com o
         // `EXIT_GROUP` (T-333, ADR 0039 item 5).
         POISONED.store(true, Ordering::Release);
         crate::debug::print_fmt(format_args!("ostd: alocador: {fault}"));
-        crate::thread::exit()
+        crate::thread::exit_raw(kabi::exit::PANIC_CODE)
     }
 }
 
@@ -298,7 +296,7 @@ impl<T> Locked<T> {
 
     fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         if POISONED.load(Ordering::Acquire) {
-            crate::thread::exit();
+            crate::thread::exit_raw(kabi::exit::PANIC_CODE);
         }
         while self
             .locked
@@ -306,7 +304,7 @@ impl<T> Locked<T> {
             .is_err()
         {
             if POISONED.load(Ordering::Acquire) {
-                crate::thread::exit();
+                crate::thread::exit_raw(kabi::exit::PANIC_CODE);
             }
             core::hint::spin_loop();
         }
@@ -318,17 +316,26 @@ impl<T> Locked<T> {
 }
 
 static GLOBAL: Global<KernelSource> = Global::new(KernelSource::new());
-/// O heap do processo (T-335: um por thread). Nasce na primeira alocação.
-static HEAP: Locked<Option<Heap<'static, KernelSource>>> = Locked::new(None);
 
-fn with_heap<R>(f: impl FnOnce(&mut Heap<'static, KernelSource>) -> R) -> R {
-    HEAP.with(|slot| f(slot.get_or_insert_with(|| Heap::new(&GLOBAL))))
+/// O heap de uma thread (guardado no bloco dela).
+pub(crate) type LocalHeap = Heap<'static, KernelSource>;
+
+/// Heap novo para uma thread.
+pub(crate) fn new_heap() -> LocalHeap {
+    Heap::new(&GLOBAL)
 }
 
-/// Contagens do heap do processo (blocos e bytes vivos, segmentos).
+/// Contagens do heap da thread que chama (blocos e bytes vivos, segmentos).
 #[must_use]
 pub fn stats() -> Stats {
-    with_heap(|heap| heap.stats())
+    crate::tls::current().with_heap(|heap| heap.stats())
+}
+
+/// Segmentos de 2 MiB mapeados pelo processo todo (de todas as threads,
+/// inclusive os abandonados por quem saiu e ainda não adotados).
+#[must_use]
+pub fn mapped_segments() -> usize {
+    GLOBAL.mapped_segments()
 }
 
 /// O alocador global.
@@ -340,14 +347,14 @@ unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if rt::env().is_none() {
             crate::debug::print("ostd: alocação antes de rt::init");
-            crate::thread::exit();
+            crate::thread::exit_raw(kabi::exit::PANIC_CODE);
         }
-        with_heap(|heap| heap.alloc(layout.size(), layout.align()))
+        crate::tls::current().with_heap(|heap| heap.alloc(layout.size(), layout.align()))
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         // SAFETY: o contrato de `GlobalAlloc::dealloc` é o de `Heap::free`.
-        with_heap(|heap| unsafe { heap.free(ptr) });
+        crate::tls::current().with_heap(|heap| unsafe { heap.free(ptr) });
     }
 }
 

@@ -406,3 +406,29 @@ desenho:
 - **`ostd`.** `rt::Env` ficou só com a cota. Há `thread::set_tls`,
   `thread::exit_with`, `thread::exit_group`, `thread::SELF` e `vm::SELF`;
   ler o TLS e o bloco da thread ficam para a T-335, com o módulo `tls`.
+
+## Notas da implementação (T-335, 2026-10-20)
+
+- **`CONFIGURE_BIND_SELF`.** O item 3 diz que ligar `CapSpace`/`AddressSpace`
+  continua exigindo a capability, mas nenhum serviço guarda capability do
+  próprio `CapSpace` ou `AddressSpace` (ciclo de referências), então
+  `thread::spawn` não teria como ligar a thread nova. `thread_configure` ganhou
+  a flag `kabi::thread::CONFIGURE_BIND_SELF` (`1 << 3`): com a capability da
+  thread alvo (`WRITE_STATE`) e `cspace = aspace = 0`, o alvo inativo passa a
+  rodar no `CapSpace` e no `AddressSpace` de quem chama. Quem chama já tem
+  poder sobre os dois, então nada novo é concedido.
+- **`thread_local!`.** O índice do slot vem de um contador global, atribuído no
+  primeiro acesso, e não da posição de um descritor em `.ostd_tls_desc`; o
+  `user.ld` não mudou. Contrato igual (tabela de slots no bloco, valor criado
+  no primeiro acesso e destruído na saída da thread), com limite de 32 chaves.
+- **Bloco e pilha.** O bloco ocupa páginas inteiras e tem o buffer de IPC como
+  última página; o de `spawn` fica no mesmo `MemoryObject` da pilha, acima
+  dela, e a página de guarda abaixo da pilha nunca é mapeada.
+- **Heap por thread.** Sem o spinlock global; a `KernelSource` mantém uma
+  trava só para os endereços da janela. A thread que sai roda os destrutores do
+  `thread_local!` e devolve o heap; cada thread que aloca toma pelo menos um
+  segmento de 2 MiB da cota.
+- **`unsafe`.** `lib/ostd/src/tls` = 23 (a ADR previa 10) e `arch` = 9.
+- **Fim de thread.** Sem notificação de morte (T-348), `join` espera uma flag
+  do bloco que a thread grava num bloco de assembly sem pilha; thread que morre
+  por falta ou pânico não é juntável até a T-348.

@@ -217,8 +217,18 @@ pub mod thread {
     /// própria thread vale ao voltar da syscall; numa thread que roda em
     /// outra CPU, na próxima vez que ela entrar numa CPU.
     pub const CONFIGURE_TLS: u64 = 1 << 2;
+    /// Liga a thread alvo (por capability, com `WRITE_STATE`) ao `CapSpace` e
+    /// ao `AddressSpace` de **quem chama**, sem exigir as capabilities deles
+    /// (T-335): é o que `ostd::thread::spawn` precisa, porque nenhum serviço
+    /// guarda capability do próprio `CapSpace` nem do próprio `AddressSpace`
+    /// (ADR 0039, itens 2 e 3). Os argumentos `cspace` e `aspace` têm de ser
+    /// 0 (senão `InvalidArgument`); a thread alvo só pode estar inativa
+    /// (`Busy` depois da partida), e `thread = `[`SELF`] também dá
+    /// `InvalidArgument`.
+    pub const CONFIGURE_BIND_SELF: u64 = 1 << 3;
     /// Flags definidas; as demais são recusadas com `InvalidArgument`.
-    pub const CONFIGURE_ALL: u64 = CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION | CONFIGURE_TLS;
+    pub const CONFIGURE_ALL: u64 =
+        CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION | CONFIGURE_TLS | CONFIGURE_BIND_SELF;
 }
 
 /// `thread_exit(código, flags)` (`rdi`, `rsi`; ADR 0035, item 2, e ADR
@@ -330,7 +340,7 @@ mod tests {
             ),
             (1, 2, 4)
         );
-        assert_eq!(thread::CONFIGURE_ALL, 0b111);
+        assert_eq!(thread::CONFIGURE_ALL, 0b1111);
         assert_eq!((thread::SELF, vm::SELF), (0, 0));
         assert_eq!(
             (exit::GROUP, exit::ALL_FLAGS, exit::PANIC_CODE),
