@@ -888,18 +888,22 @@ fn fragmentacao_medida() {
         assert!(m.stats.mapped_bytes >= m.stats.live_bytes);
     }
     // Até 8 KiB a perda de arredondamento é de no máximo ~20% do bloco e o
-    // mapeado fica abaixo do dobro do pedido.
+    // mapeado fica abaixo do dobro do pedido. Sob Miri a carga cai para
+    // menos de 1 MiB vivo, e a granularidade do segmento (2 MiB) domina o
+    // mapeado: a segunda conta só vale na escala real.
     for m in &runs[..2] {
         assert!(
             m.stats.live_bytes as f64 <= m.requested as f64 * 1.30,
             "{}",
             m.name
         );
-        assert!(
-            (m.stats.mapped_bytes as f64) < m.requested as f64 * 2.0,
-            "{}",
-            m.name
-        );
+        if !cfg!(miri) {
+            assert!(
+                (m.stats.mapped_bytes as f64) < m.requested as f64 * 2.0,
+                "{}",
+                m.name
+            );
+        }
     }
 
     println!();

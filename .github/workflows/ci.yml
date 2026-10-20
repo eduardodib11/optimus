@@ -69,11 +69,11 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "lib/oalloc não mudou: Miri não roda."
           fi
-      - name: Nightly com Miri (único uso de nightly no CI)
+      - name: Nightly com Miri (único uso de nightly no CI; data fixada)
         if: steps.changed.outputs.run == 'true'
         run: |
-          rustup toolchain install nightly --profile minimal --component miri
-          cargo +nightly miri setup
+          rustup toolchain install nightly-2026-08-21 --profile minimal --component miri
+          cargo +nightly-2026-08-21 miri setup
       - name: Testes do oalloc sob Miri
         if: steps.changed.outputs.run == 'true'
-        run: cargo +nightly miri test -p oalloc
+        run: cargo +nightly-2026-08-21 miri test -p oalloc
