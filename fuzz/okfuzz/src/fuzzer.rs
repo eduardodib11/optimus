@@ -3,7 +3,7 @@
 //! cada syscall.
 
 use ostd::kabi::ipc::{FLAG_NONBLOCK, MsgInfo, recv_target};
-use ostd::kabi::sched::{CpuMask, SYS_INFO_CPUS};
+use ostd::kabi::sched::{CpuMask, SYS_INFO_CPUS, SYS_INFO_ENTROPY};
 use ostd::kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use ostd::kabi::{Error, ObjectType, Rights, Syscall};
 
@@ -380,12 +380,17 @@ impl Fuzzer {
                 let _ = syscall(Syscall::SchedBind, [a, b, 0, 0, 0, 0]);
             }
             _ => {
-                let selector = if self.rng.chance(1, 2) {
-                    SYS_INFO_CPUS
-                } else {
-                    wild(&mut self.rng)
+                let selector = match self.rng.below(3) {
+                    0 => SYS_INFO_CPUS,
+                    1 => SYS_INFO_ENTROPY,
+                    _ => wild(&mut self.rng),
                 };
-                let _ = syscall(Syscall::SysInfo, [selector, 0, 0, 0, 0, 0]);
+                let arg = if self.rng.chance(1, 4) {
+                    wild(&mut self.rng)
+                } else {
+                    0
+                };
+                let _ = syscall(Syscall::SysInfo, [selector, arg, 0, 0, 0, 0]);
             }
         }
     }

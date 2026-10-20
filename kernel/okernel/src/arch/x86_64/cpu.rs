@@ -195,6 +195,44 @@ pub fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
+/// A CPU tem RDRAND (CPUID.01H:ECX\[30\]).
+pub fn has_rdrand() -> bool {
+    cpuid(1, 0).ecx & (1 << 30) != 0
+}
+
+/// A CPU tem RDSEED (CPUID.07H.0:EBX\[18\]).
+pub fn has_rdseed() -> bool {
+    max_leaf(false) >= 7 && cpuid(7, 0).ebx & (1 << 18) != 0
+}
+
+/// Uma palavra de RDRAND; `None` se a CPU não entregou (CF=0). Só depois
+/// de [`has_rdrand`].
+pub fn rdrand() -> Option<u64> {
+    let value: u64;
+    let ok: u8;
+    // SAFETY: quem chama conferiu `has_rdrand` (sem ela, #UD); RDRAND só
+    // escreve o registrador e as flags.
+    unsafe {
+        asm!("rdrand {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok,
+             options(nomem, nostack));
+    }
+    (ok != 0).then_some(value)
+}
+
+/// Uma palavra de RDSEED; `None` se a CPU não entregou (CF=0). Só depois
+/// de [`has_rdseed`].
+pub fn rdseed() -> Option<u64> {
+    let value: u64;
+    let ok: u8;
+    // SAFETY: quem chama conferiu `has_rdseed` (sem ela, #UD); RDSEED só
+    // escreve o registrador e as flags.
+    unsafe {
+        asm!("rdseed {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok,
+             options(nomem, nostack));
+    }
+    (ok != 0).then_some(value)
+}
+
 /// Lê o TSC depois de todas as leituras de memória anteriores (`lfence;
 /// rdtsc`): uma leitura que vem depois de ver o valor publicado por outra
 /// CPU não executa antes dele (ADR 0030, item 5).

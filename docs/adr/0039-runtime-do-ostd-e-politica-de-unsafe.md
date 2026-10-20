@@ -443,3 +443,37 @@ desenho:
   sequência (sem perda de sinal; despertar espúrio permitido); `RwLock` que
   prefere escritores; `Once` e `OnceLock`. Esperas sem prazo até a T-338.
 - **`unsafe`.** `lib/ostd/src/sync` = 28 (usa 18).
+
+## Notas da implementação (T-337, kernel, 2026-10-20)
+
+O que a parte do kernel da T-337 fez diferente do texto acima ou
+acrescentou, sem mudar o desenho do item 4:
+
+- **Construção.** Cada passo do DRBG é o XOF do BLAKE3 chaveado com a chave
+  atual sobre `domínio ‖ tamanho ‖ mistura` (domínio 0 para saída, 1 para
+  filho, com o id da CPU); os 32 primeiros bytes viram a chave nova e o
+  resto sai, até 64 bytes por passo. A mistura de cada pedido é o TSC e uma
+  palavra de `RDSEED` (uma tentativa) ou, se faltar, de `RDRAND` (até 10).
+- **Um por CPU sem trava.** O principal só existe no boot, no BSP: dá o
+  filho 0 ao BSP e um filho a cada AP na partida, antes de o AP rodar, e é
+  apagado depois de ligados os APs. Cada filho fica na `PerCpu` da sua CPU,
+  tocado só por ela com IF=0, como os caches por CPU (ADR 0031, item 3);
+  nenhuma trava nova nem classe nova.
+- **Semente apagada.** O kernel zera `BootInfo.rng_seed` logo depois de
+  semear o principal, antes de publicar a `BootInfo` (o item 4 não o
+  pedia; a `BootInfo` fica na memória para sempre). Cópias temporárias na
+  pilha e o estado interno do `Hasher` só são sobrescritos no melhor esforço.
+- **Argumento.** `sys_info(5, arg)` exige `arg = 0` (ADR 0035, item 2:
+  `rsi` é zero nas classes sem argumento); senão `InvalidArgument`.
+- **`ostd`.** `ostd::rand::secure_fill(buf) -> Result<(), Error>` chama a
+  classe 5 em pedaços de 24 bytes; o `NotSupported` sobe a quem chama até a
+  parte do `ostd` da T-337 acrescentar a mistura de reserva,
+  `is_degraded()` e `fast()`.
+- **Lacuna (para Eduardo).** O item 4 diz que a semente é toda zero quando o
+  `optboot` não acha RNG, mas o `optboot` de hoje, sem `EFI_RNG_PROTOCOL` nem
+  `RDSEED`/`RDRAND`, mistura bits do TSC numa semente zerada (`TSC
+  (fraca)`), que não é zero; o kernel não distingue essa semente de uma boa
+  e entrega entropia fraca em vez de `NotSupported`. Opções: o `optboot`
+  deixa a semente zero nesse caso (o kernel já devolve `NotSupported`), ou a
+  `BootInfo` ganha um campo com a fonte. Sob QEMU (`virtio-rng-pci`) e em
+  hardware com `RDSEED`/`RDRAND` o caso não acontece.

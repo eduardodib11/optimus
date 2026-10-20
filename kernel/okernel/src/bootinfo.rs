@@ -21,7 +21,8 @@ pub fn set(info: &'static BootInfo) {
 pub fn get() -> Option<&'static BootInfo> {
     let ptr = BOOT_INFO.load(Ordering::Acquire);
     // SAFETY: `set` só guarda referências `'static`, e nada escreve na
-    // `BootInfo` depois da entrega (o kernel só a lê).
+    // `BootInfo` depois dela (o kernel só apaga a semente, antes de `set`,
+    // e depois só a lê).
     unsafe { ptr.as_ref() }
 }
 

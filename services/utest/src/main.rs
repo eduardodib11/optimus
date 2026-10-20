@@ -138,6 +138,10 @@ const TESTS: &[Test] = &[
         name: "sync.rwlock",
         run: sync_rwlock,
     },
+    Test {
+        name: "rand.entropia_do_kernel",
+        run: rand_entropia,
+    },
     #[cfg(utest_falha)]
     Test {
         name: "proposital",
@@ -889,6 +893,36 @@ fn threads_guarda(ctx: &Ctx) -> Outcome {
     drop(h);
     let _ = (delete(exc), delete(ep), delete(reply), delete(q));
     verdict
+}
+
+/// T-337: a entropia do kernel (`sys_info` classe 5) muda a cada pedido,
+/// enche pedidos de qualquer tamanho e recusa argumento diferente de zero.
+/// A amostra vai ao registro para comparar entre boots (a semente do
+/// `optboot` muda a cada boot).
+fn rand_entropia(_: &Ctx) -> Outcome {
+    use ostd::kabi::Syscall;
+    use ostd::kabi::sched::SYS_INFO_ENTROPY;
+    let mut a = [0u8; 24];
+    let mut b = [0u8; 24];
+    ostd::rand::secure_fill(&mut a).map_err(|_| "secure_fill falhou")?;
+    ostd::rand::secure_fill(&mut b).map_err(|_| "secure_fill falhou")?;
+    if a == b || a == [0; 24] {
+        return Err("duas leituras de entropia iguais (ou zeradas)");
+    }
+    let mut big = [0u8; 100];
+    ostd::rand::secure_fill(&mut big).map_err(|_| "secure_fill(100) falhou")?;
+    if big.chunks(8).any(|c| c.iter().all(|&x| x == 0)) {
+        return Err("pedido de 100 bytes não foi preenchido");
+    }
+    let raw = ostd::sys::syscall(Syscall::SysInfo, [SYS_INFO_ENTROPY, 1, 0, 0, 0, 0]);
+    if raw != Err(Error::InvalidArgument) {
+        return Err("argumento diferente de zero devia dar InvalidArgument");
+    }
+    ostd::debug::print_fmt(format_args!(
+        "utest: amostra de entropia {:016x}",
+        u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]])
+    ));
+    Ok(())
 }
 
 /// Falha de propósito (só com `UTEST_FALHA=1`): prova que o `xtask`

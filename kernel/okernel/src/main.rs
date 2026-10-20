@@ -28,6 +28,7 @@ mod kipc;
 mod kirq;
 mod kmem;
 mod kpanic;
+mod krand;
 mod kroot;
 mod ksmp;
 mod ksync;
@@ -46,9 +47,11 @@ const _: () = assert!(SYSCALL_COUNT == Syscall::ThreadExit as usize + 1);
 
 /// Primeira função em Rust, chamada por `kernel_entry` já na pilha do kernel.
 #[unsafe(no_mangle)]
-extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
-    let cmdline = info.cmdline().unwrap_or("");
-    klog::init(level_from_cmdline(cmdline, Level::Info));
+extern "sysv64" fn kernel_main(info: &'static mut BootInfo) -> ! {
+    klog::init(level_from_cmdline(
+        info.cmdline().unwrap_or(""),
+        Level::Info,
+    ));
     info!("okernel: hello");
     // SAFETY: primeira e única chamada, no boot, com interrupções desligadas
     // (o optboot entrega assim e nada as ligou).
@@ -59,6 +62,11 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         error!("okernel: BootInfo inválida (magic {:#x})", info.magic);
         qemu_exit(QemuExit::Failure);
     }
+    // A semente vira o DRBG e é apagada (T-337); daqui em diante a
+    // `BootInfo` só é lida.
+    krand::init(&mut info.rng_seed);
+    let info: &'static BootInfo = info;
+    let cmdline = info.cmdline().unwrap_or("");
     info!(
         "okernel: kaslr_slide {:#x}, kernel_main em {:p}",
         info.kaslr_slide, kernel_main as *const ()
@@ -92,6 +100,7 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
         }
         None => warn!("okernel: mapa de memória ausente ou inválido"),
     }
+    krand::seal();
     match option(cmdline, "test") {
         Some("fault") => {
             warn!("okernel: test=fault, provocando #UD");

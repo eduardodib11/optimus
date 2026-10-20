@@ -1459,7 +1459,7 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
         }
         Syscall::ThreadExit => thread_exit(a[0], a[1]),
         Syscall::ClockGet => Ok([ktime::now_ns(), 0, 0]),
-        Syscall::SysInfo => sys_info(a[0]),
+        Syscall::SysInfo => sys_info(a[0], a[1]),
         Syscall::ThreadStart => thread_start(a).map(|()| [0; 3]),
         _ => {
             let space = current()
@@ -1489,15 +1489,31 @@ fn thread_exit(code: u64, flags: u64) -> Result<Values, Error> {
     exit_current()
 }
 
-/// `sys_info(seletor)` (ADR 0032, item 4): com [`kabi::sched::SYS_INFO_CPUS`],
-/// as CPUs ligadas e o total de ids lógicos da topologia.
-fn sys_info(selector: u64) -> Result<Values, Error> {
+/// `sys_info(seletor, arg)` (ADR 0032, item 4): com
+/// [`kabi::sched::SYS_INFO_CPUS`], as CPUs ligadas e o total de ids lógicos
+/// da topologia; com [`kabi::sched::SYS_INFO_ENTROPY`] (ADR 0039, item 4),
+/// 24 bytes do DRBG desta CPU, sem capability, com `arg` zero.
+pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
     match selector {
         kabi::sched::SYS_INFO_CPUS => Ok([
             ksmp::start::online_count().max(1) as u64,
             ksmp::count().max(1) as u64,
             0,
         ]),
+        kabi::sched::SYS_INFO_ENTROPY => {
+            if arg != 0 {
+                return Err(Error::InvalidArgument);
+            }
+            let mut bytes = [0u8; kabi::sched::SYS_INFO_ENTROPY_BYTES];
+            crate::krand::fill(&mut bytes)?;
+            let mut words = [0u64; 3];
+            for (w, chunk) in words.iter_mut().zip(bytes.chunks_exact(8)) {
+                let mut word = [0; 8];
+                word.copy_from_slice(chunk);
+                *w = u64::from_le_bytes(word);
+            }
+            Ok(words)
+        }
         _ => Err(Error::NotSupported),
     }
 }

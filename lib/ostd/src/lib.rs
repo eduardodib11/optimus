@@ -7,7 +7,7 @@
 //! ([`cap`]), memória ([`vm`]), threads ([`thread`]) e o IPC síncrono com
 //! o buffer de IPC ([`ipc`], T-208), o bloco da thread com `thread_local!` ([`tls`], T-335), e o carregador de executáveis do
 //! bootfs ([`process`], ADR 0029) e o alocador global ([`alloc`], T-334).
-//! `Mutex`/`Condvar`/`Once`/`RwLock` sobre futex ([`sync`], T-336); clientes OIDL ficam para depois.
+//! `Mutex`/`Condvar`/`Once`/`RwLock` sobre futex ([`sync`], T-336); a entropia do kernel ([`rand`], T-337); clientes OIDL ficam para depois.
 //!
 //! Só [`arch`] (a instrução `syscall`, o `_start` e o acesso à memória que o
 //! processo mapeou), [`alloc`] (a cola do `GlobalAlloc`), [`tls`] (o bloco da
@@ -28,6 +28,7 @@ pub mod arch;
 pub mod cap;
 pub mod ipc;
 pub mod process;
+pub mod rand;
 pub mod rt;
 pub mod sync;
 pub mod sys;
