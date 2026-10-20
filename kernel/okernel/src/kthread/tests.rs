@@ -46,6 +46,10 @@ pub const TESTS: &[Test] = &[
         run: sched::sem_orcamento_espera,
     },
     Test {
+        name: "sched.fatia_sem_par_se_renova",
+        run: sched::fatia_sem_par,
+    },
+    Test {
         name: "ntfy.irq_acorda_thread_esperando",
         run: sync::irq_acorda,
     },

@@ -55,6 +55,9 @@ jobs:
             addr2line -f -i -C -e target/x86_64-unknown-none/debug/okernel \
               "$(printf '%x' $((0x$a - slide)))" | paste -sd' '
           done
+      - name: Suíte de SMP com 4 CPUs em KVM
+        if: always()
+        run: cargo xtask test smp --smp 4
       - name: Relatórios no resumo
         if: always()
         run: |

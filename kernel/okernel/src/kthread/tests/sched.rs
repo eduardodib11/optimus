@@ -6,6 +6,9 @@
 //! em que esgotou o orçamento, as janelas dela se alinham ao período, ela
 //! não passa (muito) do orçamento em janela alguma e L roda enquanto H
 //! espera.
+//!
+//! E uma thread sem limite sozinha no nível dela passa de várias fatias sem
+//! o timer disparar sem parar no fim da que venceu.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -17,7 +20,7 @@ use okernel::thread::RunState;
 
 use super::super::{Event, UserEntry, start, trace_start, trace_take, yield_now};
 use super::{DATA_VA, delete, pin, process, settled, thread_with, user_symbol};
-use crate::arch::x86_64::cpu;
+use crate::arch::x86_64::{apic, cpu, percpu};
 use crate::kcap::root_quota;
 use crate::ktest::Outcome;
 use crate::ktime;
@@ -72,6 +75,45 @@ pub fn sem_orcamento_espera() -> Outcome {
         check(&trace, h_id, l_id)?;
         drop((h, l));
         delete(&p, &[hh, hl])?;
+    }
+    ensure!(settled(&quota, used0));
+    Ok(())
+}
+
+/// Quanto a thread sozinha gira: várias fatias.
+const SOLO_FOR: u64 = 30 * MS;
+
+pub fn fatia_sem_par() -> Outcome {
+    let quota = root_quota().ok_or("sem cota raiz")?;
+    let used0 = quota.used();
+    {
+        let p = process(1)?;
+        let params = Params::new(MS, MS, 100).map_err(|_| "params")?;
+        let (h, t) = thread_with(&p, params)?;
+        pin(&t, percpu::cpu_id())?;
+        let deadline = ktime::now_ns() + SOLO_FOR;
+        let e = UserEntry {
+            rip: user_symbol(&raw const user_spin),
+            rsp: DATA_VA + PAGE_SIZE,
+            args: [deadline, 0, 0],
+        };
+        let (before, _) = apic::timer_fires();
+        ensure!(start(&t, &e).is_ok());
+        let give_up = deadline + 2_000 * MS;
+        while t.state() != RunState::Exited {
+            ensure!(ktime::now_ns() < give_up);
+            yield_now();
+            ktime::arm_by(ktime::now_ns() + MS);
+            cpu::wait_for_interrupt();
+        }
+        let fires = apic::timer_fires().0 - before;
+        let slices = SOLO_FOR / okernel::sched::DEFAULT_SLICE_NS;
+        info!("ktest: · {fires} disparos do timer em {slices} fatias de uma thread sozinha");
+        // Um por fatia e os do ocioso; sem renovar, o timer dispara sem
+        // parar no fim da primeira (no KVM, a thread nem volta a rodar).
+        ensure!(fires <= 4 * slices + 10);
+        drop(t);
+        delete(&p, &[h])?;
     }
     ensure!(settled(&quota, used0));
     Ok(())
