@@ -1,6 +1,6 @@
 # ADR 0038: `memd`, paginação em espaço de usuário e memória comprimida
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.1, 6.3, 6.4, 7.3 e 14.2; backlog do M3, T-311
 - Relaciona-se com: ADR 0006 (alocação cobrada de cota), ADR 0007, ADR 0029,
@@ -39,7 +39,9 @@ A solução precisa caber nas 34 syscalls da ABI v1.
   e **Present** (com frame, visível em todos os mapeamentos).
   Objetos sem `LAZY` são sempre Present.
 - Novo direito `Rights::EVICT` (bit 22): comprometer/ocultar/liberar
-  páginas e ler o bit de acesso. `Rights::ALL` passa a `(1 << 23) - 1`.
+  páginas e ler o bit de acesso. `Rights::ALL` passa a `(1 << 23) - 1`
+  (o bit 21 é o `DESTROY` da ADR 0035; se este PR vier antes, ele reserva
+  o bit 21 mesmo assim).
   Um objeto `LAZY` nasce com `EVICT` entre os direitos do criador, que
   pode derivar cópias sem ele (`cap_mint`).
 - `vm_map` ganha o bit de flag `RAW` (`kabi::vm::RAW = 1 << 2`): a região
@@ -90,8 +92,9 @@ fatiadas e preemptíveis (ADR 0009): o progresso fica no objeto e a syscall
   região de objeto `LAZY` em página não Present usa o mesmo caminho.
 - O `memd` é o tratador padrão: `svcmgr` configura o endpoint de exceções
   do processo com uma capability do `memd` de **badge = id do processo**
-  (ADR 0034 ganha o parâmetro `exception` em `Root.spawn`). O badge diz
-  de qual processo é a falta; a mensagem tem o endereço.
+  (método `Root.set_exception` da ADR 0034, chamado antes de `start`;
+  `Root.spawn` não ganha parâmetro novo). O badge diz de qual processo é
+  a falta; a mensagem tem o endereço.
 - Fluxo demand-zero: `memd` acha a região pelo endereço, calcula o
   deslocamento no objeto e faz `COMMIT(obj, off, 4096, PUBLISH)`,
   depois responde com `REPLY_RESUME`. Uma resposta com outro rótulo
@@ -138,11 +141,17 @@ interface Mem {
   **baixa** (quadros livres < 1/8 do total) e **crítica** (< 1/32). Como
   qualquer `Interrupt`, ligam-se a uma `Notification` com
   `obj_bind_notify` e ficam mascarados até `irq_ack`; um novo `ack` com a
-  condição ainda verdadeira dispara de novo. Histerese: rearmam ao passar
-  de livres > total/8 + total/16.
-- `sys_info(classe 2)` devolve `[quadros_totais, quadros_livres,
+  condição ainda verdadeira dispara de novo. Histerese: a baixa rearma ao
+  passar de livres > total/8 + total/16, e a crítica ao passar de
+  livres > total/32 + total/64.
+- Contagem de "livres": desde a T-328 os frames também ficam nos caches
+  por CPU. Os limiares e o `sys_info` contam como livres os frames do
+  buddy **e** os dos caches por CPU, porque ambos atendem uma alocação
+  sem trabalho do `memd`. A leitura dos caches é aproximada (sem travar
+  as outras CPUs), o que basta para limiares de 1/8 e 1/32.
+- `sys_info(classe 3)` devolve `[quadros_totais, quadros_livres,
   quadros_comprometidos_de_objetos_lazy]`, sem capability (dados sem
-  segredo).
+  segredo). A classe 1 é a de CPUs (ADR 0032) e a 2 é a morte (ADR 0035).
 - Os limiares (1/8, 1/32) são constantes do kernel no M3; ajustáveis
   depois por uma classe de `sys_info` ou `sched_configure`.
 
@@ -155,7 +164,10 @@ interface Mem {
 - **LRU aproximado (relógio):** sob pressão **baixa**, varre objetos
   gerenciados em ordem crescente de prioridade do processo (fundo
   primeiro), usa `AGE` em lotes de 64 páginas, e escolhe as páginas
-  sem acesso desde a última volta.
+  sem acesso desde a última volta. Limpar o bit de acesso com
+  invalidação de TLB a cada lote de 64 páginas é caro em SMP. Uma variante
+  sem invalidação, que aceita alguma imprecisão como o Linux faz, pode
+  entrar depois se a T-367 mostrar o custo do `AGE`.
 - **Despejo de uma página:** `HIDE` → copia da visão `RAW` e comprime
   (`olz4`, formato de blocos do LZ4 de referência, T-362) → se o resultado
   ≤ 3072 bytes, guarda no repositório e faz `DECOMMIT`; senão
@@ -176,7 +188,14 @@ interface Mem {
   o usam. O repositório guarda páginas sem criptografia no M3 (decisão de
   Eduardo abaixo). Após restaurar, o `memd` zera o espaço.
 - Prioridade do `memd`: 190 (serviço de sistema alto), para atender faltas
-  antes das aplicações; seu orçamento de CPU limita o despejo.
+  antes das aplicações; seu orçamento de CPU limita o despejo. **Premissa
+  não conferida no código:** a falta vira um `ipc_call` em nome da thread
+  (`fault.rs`), e a prioridade só vale para as faltas se esse `ipc_call`
+  doar o `SchedContext` ao tratador, como o `ipc_call` comum. Com a
+  doação, o `memd` atende cada falta na prioridade de quem faltou e os
+  190 valem só para o despejo. Sem a doação, um serviço entre 191 e 199
+  que gire pode atrasar as faltas de todos. Conferir isso é o primeiro
+  teste da T-360.
 
 ### 7. Fora do escopo do M3
 
@@ -209,7 +228,7 @@ T-367 mostrar custo alto de falta), `CACHE` real, `dma_map` com objetos
 ## Consequências
 
 - `kabi`: `Rights::EVICT`, `vm::RAW`, `mem::{COMMIT, ZERO, CACHE,
-  PUBLISH, HIDE, DECOMMIT, AGE, PUBLISH_FLAG}`, flag `LAZY` e classe 2 de
+  PUBLISH, HIDE, DECOMMIT, AGE, PUBLISH_FLAG}`, flag `LAZY` e classe 3 de
   `sys_info`. A 14.2 e a 6.1 do SDD recebem os registradores.
 - O objeto `MemoryObject` fica mais complexo (estado por página, lista de
   regiões) e o `vm_unmap`/destruição de espaço precisam tirar a região da
@@ -229,17 +248,37 @@ T-367 mostrar custo alto de falta), `CACHE` real, `dma_map` com objetos
 1. **Resolvidas aqui:** semântica de `mem_op`, comprometimento sob
    demanda, retirada de mapeamento por objeto, sinal de pressão, protocolo
    de falta e de restauração.
-2. **Decisão de Eduardo:** `EVICT` (bit 22), `vm_map` com `RAW` e objeto
-   `LAZY` — três acréscimos de ABI; e a semântica "o dono do objeto paga".
-3. **Decisão de Eduardo:** pressão por dois `Interrupt` sintéticos e os
-   limiares 1/8 e 1/32.
-4. **Decisão de Eduardo:** repositório comprimido **sem** criptografia no
-   M3 (o `memd` vê conteúdo em claro); alternativa: ChaCha20-Poly1305 com
-   chave de boot, que custa CPU por página.
-5. **Decisão de Eduardo:** política de OOM (`Control.kill` de serviço
-   reiniciável de menor prioridade) e a prioridade 190 do `memd`.
+2. **Decidido (2026-10-20):** `EVICT` (bit 22), `vm_map` com `RAW` e
+   objeto `LAZY` (três acréscimos de ABI), e a semântica "o dono do
+   objeto paga". Sem ela, o `memd` gastaria a própria cota com a memória
+   dos outros.
+3. **Decidido (2026-10-20):** pressão por dois `Interrupt` sintéticos e
+   os limiares 1/8 e 1/32, com a histerese do nível crítico definida.
+4. **Decidido (2026-10-20):** repositório comprimido **sem** criptografia
+   no M3. O `memd` guardaria a chave e veria o conteúdo de qualquer jeito,
+   então cifrar custaria CPU por página sem proteger de quem lê.
+5. **Decidido (2026-10-20):** política de OOM (`Control.kill` de serviço
+   reiniciável de menor prioridade) e a prioridade 190 do `memd`, esta
+   sujeita à premissa de doação de fatia registrada no item 6.
 6. **Pendente:** mapeamento de arquivos permanece sem desenho até o
    `storaged`/OptFS.
 7. **Dependência:** ADR 0031 precisa garantir "ack antes de liberar frame"
-   (invariante 1); ADR 0034 ganha `exception` em `Root.spawn` e
-   `Control.kill`; ADR 0035 define `DESTROY`.
+   (invariante 1; pronto desde a T-326); a ADR 0034 já define
+   `Root.set_exception` e `Control.kill`; ADR 0035 define `DESTROY`.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- O texto cita `Root.set_exception` da ADR 0034 em vez de um parâmetro
+  `exception` em `Root.spawn`.
+- A histerese do nível crítico é definida (livres > total/32 + total/64).
+- A contagem de quadros livres passa a dizer que inclui os caches por CPU
+  (T-328).
+- O custo do `AGE` em SMP é registrado, com uma variante sem invalidação
+  para depois da T-367.
+- A pressão e a memória passam para a classe 3 de `sys_info`.
+- Registrado que a prioridade 190 do `memd` supõe doação de fatia na falta
+  de página, a conferir como primeiro teste da T-360.
+- As decisões da seção final foram registradas como decididas.

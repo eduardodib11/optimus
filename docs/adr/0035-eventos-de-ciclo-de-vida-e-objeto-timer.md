@@ -1,6 +1,6 @@
 # ADR 0035: Eventos de ciclo de vida (morte de thread e processo) e objeto Timer
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.1, 6.4, 6.7, 6.8, 7.2, 14.2 e 14.4; backlog do
   M3, T-308
@@ -51,12 +51,13 @@ fault`); `Killed`: `code` zero. O `CapSpace` guarda o mesmo registro do
 processo: a **primeira** morte anormal (`Faulted` ou `Killed`), ou, se
 todas foram normais, a da última thread.
 
-Leitura: `sys_info(classe = 1 /*EXIT*/, handle)` devolve `[cause, code,
+Leitura: `sys_info(classe = 2 /*EXIT*/, handle)` devolve `[cause, code,
 aux]`; `cause = 0` significa "ainda vivo". Exige `READ_STATE` na `Thread`
 ou `MANAGE` no `CapSpace`. As classes de `sys_info` ficam reservadas
-assim: 1 = morte (esta ADR), 2 = memória (ADR 0038), 3 = hora de boot
-(ADR 0037), 4 = aleatoriedade (ADR 0039); a classe 0 é reservada à versão
-da ABI.
+assim: 0 = versão da ABI (reservada), 1 = CPUs (já existe, ADR 0032,
+`kabi::sched::SYS_INFO_CPUS = 1`), 2 = morte (esta ADR), 3 = memória e
+pressão (ADR 0038), 4 = hora de parede do boot (ADR 0037), 5 =
+aleatoriedade (ADR 0039).
 
 ### 3. `obj_bind_notify` estendido
 
@@ -179,9 +180,15 @@ caminho lento. Isso exige decisão de Eduardo (ver abaixo).
 ### 8. Mudanças em `kabi` (resumo)
 
 `ObjectType::Timer = 14`; `Rights::DESTROY` (bit 21); `cap_delete::DESTROY`;
-`event`/`exit` com `cause` e a classe 1 de `sys_info`; `kabi::timer::{
+`event`/`exit` com `cause` e a classe 2 de `sys_info`; `kabi::timer::{
 RELATIVE, MIN_PERIOD_NS}`; descrição de `obj_bind_notify` por tipo. O
-teste `numeros_estaveis` passa a contar 15 tipos de objeto. A tabela 6.1 e
+teste `numeros_estaveis` passa a contar 15 tipos de objeto. Os bits de
+direito (`DESTROY` = 21 aqui, `EVICT` = 22 na ADR 0038) e os tipos de
+objeto (`Timer` = 14 aqui, `DebugLog` = 15 na ADR 0036) não colidem. A
+ordem de implementação segue a numeração; o PR que trouxer o `EVICT`
+antes do `DESTROY` reserva o bit 21 mesmo assim, e o teste de `kabi` que
+trava `Rights::ALL` e o número de tipos é atualizado em cada PR. A tabela
+6.1 e
 a 14.2 do SDD recebem a linha de `Timer` e o texto dos registradores.
 
 ## Alternativas
@@ -234,14 +241,32 @@ lê direto do objeto); alertas (viram log, ADR 0036).
 
 1. **Resolvidas aqui:** morte de processo, evento ligável, Timer no
    kernel, `max_threads`.
-2. **Decisão de Eduardo:** direito e flag `DESTROY` em `cap_delete`
-   (mudança de ABI sensível; alternativa: syscall dedicada numa versão
-   maior da kabi).
-3. **Decisão de Eduardo:** Timer como objeto do kernel e `ObjectType` 14
-   (altera a tabela 6.1).
-4. **Decisão de Eduardo:** `ipc_rate` informativo no M3 e a proposta de
-   cobrança futura.
-5. **Decisão de Eduardo:** período mínimo do Timer (100 µs).
-6. **Atenção ao SMP:** a ADR 0031 (locks, IPI) precisa aceitar a regra de
-   que o disparo de timer e a morte de thread sinalizam com IF=0 e a
-   ordem de locks do item 3.4.
+2. **Decidido (2026-10-20):** direito e flag `DESTROY` em `cap_delete`.
+   A flag não abre a ABI v1, e só quem cria o processo recebe o direito;
+   uma syscall dedicada ficaria para uma versão maior da kabi.
+3. **Decidido (2026-10-20):** Timer como objeto do kernel e `ObjectType`
+   14 (altera a tabela 6.1). Como serviço, cada prazo custaria um IPC e
+   criaria um ciclo `timed` e `svcmgr`.
+4. **Decidido (2026-10-20):** `ipc_rate` informativo no M3 e a proposta
+   de cobrança futura. Contar no caminho rápido custaria parte do ganho
+   já medido.
+5. **Decidido (2026-10-20):** período mínimo do Timer de 100 µs, o mesmo
+   `MIN_PERIOD_NS` dos `SchedContext`s.
+6. **Decidido (2026-10-20), SMP:** sinalizar com IF=0, na ordem objeto,
+   notificação, fila (item 3.4). Com as ADRs 0031 e 0032 já
+   implementadas, a regra entra em `docs/kernel/ordem-de-travas.md`
+   quando a T-348 e a T-349 chegarem.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- Classes de `sys_info` renumeradas: 0 versão, 1 CPUs (ADR 0032), 2 morte
+  de processo, 3 memória e pressão, 4 hora de parede, 5 aleatoriedade.
+- A leitura da causa da morte usa a classe 2 (antes "classe 1 /*EXIT*/"),
+  e o resumo do `kabi` também.
+- Registrado que os bits de direito e os tipos de objeto das ADRs 0035,
+  0036 e 0038 não colidem, com a ordem de implementação e o teste de
+  `kabi` atualizado em cada PR.
+- As decisões da seção final foram registradas como decididas.

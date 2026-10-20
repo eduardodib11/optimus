@@ -1,6 +1,6 @@
 # ADR 0033: Gramática e formato de fio do OIDL
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 4.3, 6.7, 14.3 e 17.3; backlog do M3, T-306
 - Relaciona-se com: ADR 0007 (IPC), ADR 0012 (OIDL e `oidlc`), ADR 0027
@@ -55,7 +55,9 @@ tipo        = "u8".."u64" | "i8".."i64" | "bool" | id
   declarado e bit de `flags` não declarado são `BadMessage` na decodificação.
 - `Timestamp` é um apelido predefinido no pacote `optimus.core`:
   `i64`, nanossegundos desde 1970-01-01 UTC (hora de parede do `timed`).
-  O SDD usa o nome sem defini-lo.
+  O SDD usa o nome sem defini-lo. O pacote `optimus.core` é o arquivo
+  `idl/optimus.core.oidl`, versionado e visível, e não um texto embutido
+  no `oidlc`.
 - `oneway` marca um método sem resposta (vira `ipc_send`) e não tem `->`.
   Todo outro método DEVE declarar `-> result<T, E>`.
 - `@tool` é obrigatório em todo método exposto à IA e não afeta o fio.
@@ -81,7 +83,10 @@ tipo        = "u8".."u64" | "i8".."i64" | "bool" | id
   `interface_id = 0xA17C_D8BB`. O `oidlc` calcula e grava a constante no
   código gerado; dois ids iguais no conjunto de interfaces compiladas são
   erro de compilação. A versão **maior** entra no hash, então `@1` e `@2`
-  convivem no mesmo endpoint.
+  convivem no mesmo endpoint. A checagem do `oidlc` só enxerga as
+  interfaces compiladas juntas, e um serviço de terceiros pode colidir
+  com outro. Por isso o `svcmgr` recusa, no registro (ADR 0034), dois
+  serviços com o mesmo `interface_id` e nomes de interface diferentes.
 - `método`: ordinal da declaração dentro da interface, a partir de 0.
   Método novo só entra no fim da interface (a regra "métodos novos só em
   versão menor" da 14.3 fica verificável). Remover ou reordenar é mudança
@@ -154,7 +159,10 @@ Seja L o tamanho do corpo em bytes (múltiplo de 8).
 
 `handle<T>` não ocupa bytes no corpo. As capabilities vão no cabeçalho do
 buffer de IPC (`info.caps`, no máximo 4) na ordem em que os `handle`
-aparecem na declaração. Quem recebe confere por `cap_info` que o objeto é
+aparecem na declaração. O `oidlc` recusa, em tempo de compilação, o
+método que declare mais de 4 `handle` (somando os do pedido ou os do
+resultado), que é o limite de `info.caps`. Quem recebe confere por
+`cap_info` que o objeto é
 um `Endpoint` (ou o tipo do kernel declarado); senão `BadMessage`. O kernel
 exige `GRANT` no endpoint por onde passam.
 
@@ -275,6 +283,10 @@ caminho de códigos gerados cujos limites são estáticos (os tipos usam
   cauda canônica, UTF-8, enums.
 - O decodificador é um alvo de fuzzing natural (17.3), com a propriedade
   `encode(decode(x)) == x` para todo `x` aceito.
+- Dois testes entram além dos vetores dourados: um do `svcmgr`, que recusa
+  o registro de dois serviços com o mesmo `interface_id` e nomes
+  diferentes, e um do `oidlc`, que recusa o método com mais de 4
+  `handle`.
 - O tamanho máximo de toda mensagem é conhecido em compilação; nenhum
   método pode estourar o buffer.
 - O exemplo do SDD (14.3) não compila como está: `string<4096>` e
@@ -294,10 +306,22 @@ palavras); o texto completo da EBNF (T-341).
 ## Lacunas do SDD e decisões para Eduardo
 
 1. **Resolvida aqui:** gramática, rótulo, corpo, erros, `handle<T>`.
-2. **Decisão de Eduardo:** alterar o exemplo da 14.3 (`string<1024>`,
-   `DirPage`) em vez de aumentar o buffer de IPC. A alternativa é mudar o
-   buffer para duas páginas (ABI, ADR 0027), o que encarece todo thread.
-3. **Decisão de Eduardo:** `Timestamp` como `i64` em ns UTC; e se o
-   `optimus.core` é um pacote do `oidlc` embutido ou um arquivo em `idl/`.
-4. **Decisão de Eduardo:** `interface_id` de 32 bits por BLAKE3 truncada
-   (colisão detectada em compilação) ou 64 bits ocupando mais do rótulo.
+2. **Decidido (2026-10-20):** alterar o exemplo da 14.3 (`string<1024>`,
+   `DirPage`) em vez de aumentar o buffer de IPC. O buffer de duas páginas
+   mudaria a ABI (ADR 0027) e encareceria todo thread.
+3. **Decidido (2026-10-20):** `Timestamp` como `i64` em ns UTC, e o
+   `optimus.core` como arquivo `idl/optimus.core.oidl`.
+4. **Decidido (2026-10-20):** `interface_id` de 32 bits por BLAKE3
+   truncada, com colisão detectada na compilação e, para serviços de
+   terceiros, conferida também no registro do `svcmgr`.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- O `svcmgr` recusa, no registro, dois serviços com o mesmo `interface_id`
+  e nomes diferentes (novo teste).
+- O `oidlc` recusa método com mais de 4 `handle` (novo teste).
+- `optimus.core` fica decidido como arquivo `idl/optimus.core.oidl`.
+- As decisões da seção final foram registradas como decididas.

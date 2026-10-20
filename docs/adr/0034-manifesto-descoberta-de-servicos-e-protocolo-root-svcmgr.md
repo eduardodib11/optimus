@@ -1,6 +1,6 @@
 # ADR 0034: Manifesto binário, descoberta de serviços e protocolo root/svcmgr
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 4.3, 5.3, 7.2, 13, 14.4 e 18; backlog do M3, T-307
 - Relaciona-se com: ADR 0011 (sem namespace global), ADR 0018 (assinaturas
@@ -13,7 +13,8 @@ O SDD diz que o `root` reparte as capabilities iniciais, que o `svcmgr`
 lê manifestos assinados, resolve dependências e entrega a cada serviço só o
 que o manifesto lista (4.3, 7.2). O exemplo da 14.4 usa nomes como
 `dev:net/*`, `log:write`, `time:read` e `mem:quota:32MiB` sem dizer que
-capability cada um vira nem quem a emite. Não há namespace global (ADR
+capability cada um vira nem quem a emite. (Esta ADR troca `log:write` e
+`time:read` por `svc:`, ver item 5.) Não há namespace global (ADR
 0011), então "descoberta" tem de ser um corretor de capabilities. O SDD
 também não define o formato do "TOML compilado para binário" nem quem o
 compila, e exige assinatura quando a `optcrypt` só tem BLAKE3 (Ed25519 e
@@ -41,6 +42,9 @@ Estado do código: o `root` carrega o `hello` do bootfs pelo `ostd::process`
   no protocolo, ver abaixo) qualquer mensagem com outro badge. Como o
   `svcmgr` é o único que tem capability para esse endpoint, o badge é só
   defesa em profundidade.
+- **Prioridade.** O `root` e o `svcmgr` rodam numa prioridade fixa acima
+  da faixa dos serviços (1 a 199): 200, constante em `services/root`.
+  Assim a supervisão não espera um serviço que fique girando.
 
 ### 2. Partida do svcmgr
 
@@ -121,7 +125,7 @@ Cabeçalho (96 bytes)
   70 _reservado   u16     0
   72 ipc_rate     u32     mensagens por segundo (0 = sem limite)
   76 needs_n      u16     ≤ 64
-  78 provides_n   u16     ≤ 32
+  78 provides_n   u16     ≤ 32 (needs_n + provides_n ≤ 94)
   80 needs_off    u32     alinhado a 8
   84 provides_off u32     alinhado a 8
   88 sig_off      u32     0 se sem assinatura
@@ -142,7 +146,9 @@ Registro de provide (16 bytes)
   8  name   ref  "pacote.Interface", ex.: "optimus.log.Log"
 ```
 
-Limites: arquivo ≤ 4096 bytes; campos reservados DEVEM ser zero (o leitor
+Limites: arquivo ≤ 4096 bytes; `needs_n + provides_n ≤ 94`, para que o
+descritor de partida (item 6) caiba com o canal de controle e a cota; campos
+reservados DEVEM ser zero (o leitor
 recusa, para a v2 poder usá-los); toda `ref` dentro do arquivo; `total_len`
 igual ao tamanho da entrada OBFS. `svcmgr` revalida tudo ao carregar (o
 leitor é um alvo de fuzzing, 17.3), inclusive a ausência de ciclo.
@@ -157,10 +163,12 @@ leitor é um alvo de fuzzing, 17.3), inclusive a ausência de ciclo.
 | `fs:<dir>[:ro|:rw]` | 4 | `Endpoint` de diretório (ADR 0011) | `storaged`/`optfs` (**fora do M3**) |
 | `kernel:debug`, `kernel:mem-pressure` | 5 | capability de origem do kernel (`DebugLog`, `Interrupt` de pressão; ADRs 0036 e 0038) | `root` (do kernel pool) |
 
-Os nomes do SDD `log:write` e `time:read` são apelidos, aceitos pelo
-compilador e substituídos por `svc:optimus.log.Log@1` e
-`svc:optimus.time.Clock@1` (tabela `tools/mkmanifest/aliases.toml`). No
-M3, `dev:` e `fs:` compilam, mas o `svcmgr` recusa iniciar o serviço
+Não há apelidos: cada coisa tem um nome só. Os nomes `log:write` e
+`time:read` do exemplo do SDD (14.4) viram `svc:optimus.log.Log@1` e
+`svc:optimus.time.Clock@1`, e o `mkmanifest` recusa os nomes antigos
+como desconhecidos. O exemplo da 14.4 ganha essa troca na próxima
+revisão do SDD. No M3, `dev:` e `fs:` compilam, mas o `svcmgr` recusa
+iniciar o serviço
 que os pede (`NotSupported` no log): evita rodar com menos privilégio do
 que o manifesto diz e mascarar erro.
 
@@ -175,7 +183,9 @@ entregá-la) e entrega ao provedor a capability completa
 
 Para cada serviço, antes de `start`, o `svcmgr` faz `cap_mint` (ADR 0029)
 dentro do `CapSpace` do filho, na ordem: canal de controle (`Endpoint` do
-`svcmgr`, badge = id do serviço), cota, `needs` e `provides`. Os handles
+`svcmgr`, badge = id do serviço), cota, `needs` e `provides`. A cota do
+processo ganha um `CapDesc` próprio, com `kind = 2` e `index = 0xFFFF`,
+para o `ostd` achá-la sem adivinhar (ADR 0039). Os handles
 resultantes são conhecidos do `svcmgr` (retorno de `cap_mint`). O filho
 recebe em `rdi` o handle do canal de controle e chama:
 
@@ -192,13 +202,18 @@ interface Control {      // só para quem o manifesto autoriza (memd no M3)
     kill(process: u32, reason: u8) -> result<(), SvcError>;
 }
 struct CapDesc { kind: u8, index: u16, handle: u32, name_hash: u32 }
-struct Boot { caps: vec<CapDesc, 64>, generation: u16 }
+struct Boot { caps: vec<CapDesc, 96>, generation: u16 }
 enum SvcError : u8 { NotInManifest, NotRunning, VersionTooOld, Busy }
 ```
 
 `CapDesc.handle` é o handle já presente no `CapSpace` do filho
-(`index` = posição em `needs`/`provides`); `name_hash` = `interface_id` do
-ADR 0033. O descritor cabe numa mensagem (64 × 16 + 16 < 4032).
+(`index` = posição em `needs`/`provides`, ou `0xFFFF` para a cota do
+processo); `name_hash` = `interface_id` da ADR 0033. Um `CapDesc` tem
+12 bytes pelo layout da ADR 0033 (`kind` em 0, `index` em 2, `handle`
+em 4, `name_hash` em 8). O manifesto aceita até 64 `needs` e 32
+`provides`, com `needs + provides ≤ 94`; somados o canal de controle e a
+cota, são até 96 capabilities, e o descritor cabe numa mensagem
+(96 × 12 + 16 = 1168 < 4032).
 `name_of` só atende serviços que o manifesto do `svcmgr` marca como
 consumidores de nomes (`logd`); `Control.kill` só atende o `memd`. `connect` serve a reconexão depois de `PeerClosed` e as dependências
 `opcional`; só atende o que está em `needs` (`NotInManifest` senão, que no
@@ -289,14 +304,34 @@ boot (15.4); atualização de manifesto em execução; `ipc_rate` aplicado
 
 1. **Resolvidas aqui:** formato do manifesto, quem compila, mapa de nomes
    para capabilities, protocolo root/svcmgr, badge, descoberta.
-2. **Decisão de Eduardo:** o caminho provisório de assinatura (item 10) e
-   o nome `trusted-bootfs` para a feature; quando a promoção é obrigatória
-   (marco de entrega do Ed25519/ML-DSA).
-3. **Decisão de Eduardo:** apelidos `log:write` e `time:read` do SDD:
-   manter na 14.4 ou trocar o exemplo por `svc:`.
-4. **Decisão de Eduardo:** quem paga o `Endpoint` do provedor (serviço ou
-   `svcmgr`).
-5. **Decisão de Eduardo:** faixa de prioridade aceita pelo compilador
-   (1 a 199 no M3; 200+ para drivers e 240+ para tempo real só com flag).
-6. **Decisão de Eduardo:** `ipc_rate` fica no formato, mas sem imposição
-   (ADR 0035).
+2. **Decidido (2026-10-20):** o caminho provisório de assinatura (item 10)
+   e o nome `trusted-bootfs` para a feature. A promoção torna-se
+   obrigatória antes da primeira imagem distribuída, junto com a ADR 0018.
+3. **Decidido (2026-10-20):** sem apelidos. O exemplo da 14.4 troca
+   `log:write` e `time:read` por `svc:`.
+4. **Decidido (2026-10-20):** o serviço paga o `Endpoint` do provedor. A
+   cota fixa de 8 MiB do `svcmgr` não cresce com o número de serviços.
+5. **Decidido (2026-10-20):** faixa de prioridade aceita pelo compilador
+   de 1 a 199 no M3 (200+ para drivers e 240+ para tempo real só com
+   flag). O `root` e o `svcmgr` rodam em 200.
+6. **Decidido (2026-10-20):** `ipc_rate` fica no formato, sem imposição no
+   M3 (ADR 0035).
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- O vetor de `Boot.caps` passa de 64 para 96 `CapDesc`, e o manifesto
+  exige `needs + provides ≤ 94`.
+- O texto corrige o tamanho do `CapDesc` para 12 bytes (a conta passa a ser
+  96 × 12 + 16).
+- A cota do processo ganha um `CapDesc` próprio (`kind = 2`,
+  `index = 0xFFFF`).
+- O `root` e o `svcmgr` rodam em prioridade 200, acima da faixa dos
+  serviços.
+- Os apelidos `log:write` e `time:read` saem; o exemplo da 14.4 usa
+  `svc:`, e a tabela `aliases.toml` deixa de existir.
+- As decisões da seção final foram registradas como decididas.
+- `name_of` continua como está; a ADR 0036 deixa de pedi-lo como item
+  adicional.

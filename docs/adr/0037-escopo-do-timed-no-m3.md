@@ -1,6 +1,6 @@
 # ADR 0037: Escopo do `timed` no M3 (relógio de parede sem NTS)
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 5.2, 6.8, 7.3 e 10.4; backlog do M3, T-310
 - Relaciona-se com: ADR 0033 (OIDL), ADR 0034 (manifesto), ADR 0035 (Timer),
@@ -34,9 +34,17 @@ chama `GetTime` do UEFI, e o driver de RTC por portas depende de
   porque o layout muda; `optboot` e `okernel` saem do mesmo build.
 - `EFI_TIME` é convertido em UTC assim: se `TimeZone` é
   `EFI_UNSPECIFIED_TIMEZONE` (0x07FF), assume-se que o RTC guarda UTC;
-  senão subtrai-se `TimeZone` minutos. Resolução do RTC: 1 s.
-- O kernel expõe os dois valores por **`sys_info(classe 3, …)`** (a classe
-  1 é a morte do ADR 0035, a 2 é a memória do ADR 0038), sem capability,
+  senão ajusta-se o horário por `TimeZone` minutos. Resolução do RTC: 1 s.
+  **O sinal desse ajuste está por conferir.** A proposta subtraía
+  `TimeZone`, mas a revisão lembra que a especificação UEFI define hora
+  local = UTC − `TimeZone`, o que faria o UTC sair somando. Isso não foi
+  conferido na especificação. A T-358 confere o sinal na versão do UEFI
+  que o `optboot` usa e ganha um teste que cobre os dois sinais de
+  `TimeZone` (no OVMF do QEMU o valor costuma ser 0x07FF, e o caso não
+  aparece nos testes de boot).
+- O kernel expõe os dois valores por **`sys_info(classe 4, …)`** (a
+  classe 1 é a de CPUs, ADR 0032; a 2 é a morte, ADR 0035; a 3 é a memória,
+  ADR 0038; a 5 é a aleatoriedade, ADR 0039), sem capability,
   porque a informação não é segredo: retorna `[wall_unix_ns, wall_tsc_ns,
   flags]` (flag bit 0 = válido). Quem calcula hora de parede é só o
   `timed`.
@@ -96,8 +104,9 @@ dele.
 ### 5. Fusos horários: fora do núcleo do M3
 
 O `timed` do M3 responde só em UTC. Os fusos (T-359, "pode ser adiado")
-ficam para o M4 porque precisam de dados (tzdata) e de um lugar de onde
-lê-los (bootfs ou imagem). Se Eduardo quiser no M3, o formato proposto é
+ficam para o M4 (decidido em 2026-10-20) porque precisam de dados
+(tzdata) e de um lugar de onde lê-los (bootfs ou imagem). O formato
+previsto para o M4 é
 `OTZ1`, gerado pela ferramenta de host `tools/mktz` a partir de uma
 versão fixa do tzdata (versionada no repositório, hash BLAKE3 registrado):
 
@@ -140,7 +149,7 @@ local (item 1 assume UTC).
 
 - `BootInfo` v2 (2 campos), `kabi::boot` e o `optboot` mudam; o teste de
   versão e os de `optboot` e `okernel` são atualizados.
-- `sys_info` ganha sua primeira classe pública.
+- `sys_info` ganha a classe 4 (hora de parede do boot), sem capability.
 - O `timed` do M3 é pequeno (estado de seis números e duas
   interfaces); o `Admin` abre caminho ao NTS sem mudar o protocolo.
 - Hora errada por horas, se o RTC guarda hora local (máquina com
@@ -151,11 +160,30 @@ local (item 1 assume UTC).
 
 1. **Corrigida a premissa do backlog:** o `boot_time_ns` não é hora de
    parede; é preciso o campo novo na `BootInfo`.
-2. **Decisão de Eduardo:** `BootInfo` v2 e `sys_info` classe 3 pública.
-3. **Decisão de Eduardo:** RTC tratado como UTC quando o fuso é
-   desconhecido.
-4. **Decisão de Eduardo:** `Clock` (leitura) e `Admin` (escrita) como
-   interfaces separadas.
-5. **Decisão de Eduardo:** fusos no M3 (T-359, formato `OTZ1`) ou adiados
-   para o M4, que é a recomendação.
-6. **Decisão de Eduardo:** limite de 500 ppm e 1 s para passo para trás.
+2. **Decidido (2026-10-20):** `BootInfo` v2 e `sys_info` classe 4
+   pública. O `optboot` e o kernel saem do mesmo build, então subir a
+   versão é barato.
+3. **Decidido (2026-10-20):** RTC tratado como UTC quando o fuso é
+   desconhecido. Uma máquina com Windows fica algumas horas errada até o
+   primeiro `set`.
+4. **Decidido (2026-10-20):** `Clock` (leitura) e `Admin` (escrita) como
+   interfaces separadas: quem só lê não recebe o direito de ajustar.
+5. **Decidido (2026-10-20):** fusos horários (T-359, formato `OTZ1`) no
+   M4, não no M3. Precisam do tzdata e de um lugar de onde lê-lo.
+6. **Decidido (2026-10-20):** limite de 500 ppm e 1 s para passo para
+   trás.
+7. **Por conferir na T-358:** o sinal do `TimeZone` do UEFI (item 1).
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- A hora de parede do boot passa a ser a classe 4 de `sys_info` (antes
+  classe 3), conforme a renumeração da ADR 0035.
+- Sai a frase "sys_info ganha sua primeira classe pública": a classe 1
+  (CPUs) já é pública.
+- A T-358 passa a conferir o sinal do `TimeZone` do UEFI e ganha um teste
+  que cobre os dois sinais.
+- Fusos horários ficam decididos para o M4 (antes eram uma pergunta).
+- As demais decisões da seção final foram registradas como decididas.
