@@ -1,0 +1,72 @@
+name: Bench em KVM
+
+# Medição das metas de desempenho (T-302, T-331) num runner hospedado com
+# KVM. Roda à mão (workflow_dispatch) e nos PRs que mudam este arquivo.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/bench-kvm.yml
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: KVM no runner
+        run: |
+          grep -m1 "model name" /proc/cpuinfo
+          echo "vmx/svm: $(grep -cE 'vmx|svm' /proc/cpuinfo)"
+          ls -l /dev/kvm
+          # O /dev/kvm dos runners é do grupo kvm; a regra o abre ao usuário.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: QEMU e OVMF
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+      - name: Toolchain fixada em rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Bench com 1 CPU
+        run: cargo xtask bench
+      - name: Bench com 4 CPUs
+        env:
+          # Falta tripla com -no-reboot fecha o QEMU: o log guarda o estado.
+          OPTIMUS_QEMU_ARGS: -d cpu_reset,guest_errors -D target/qemu-smp4.log
+        run: cargo xtask bench --smp 4
+      - name: Estado das CPUs no reset (só em falha)
+        if: failure()
+        run: tail -n 200 target/qemu-smp4.log || true
+      - name: Testes de kernel em KVM
+        if: always()
+        run: |
+          set -o pipefail
+          cargo xtask test kernel 2>&1 | tee target/ktest.log
+      - name: Onde as CPUs pararam (só em falha)
+        if: failure()
+        run: |
+          # Endereços de kernel do estado das CPUs (o xtask o mostra quando o
+          # tempo esgota), menos o deslocamento de KASLR da serial.
+          slide=$(grep -om1 'kaslr_slide 0x[0-9a-f]*' target/ktest.log | cut -d' ' -f2) || exit 0
+          grep -oE 'ffffffff[89a-f][0-9a-f]{7}\b' target/ktest.log | sort -u | while read -r a; do
+            printf '%s ' "$a"
+            addr2line -f -i -C -e target/x86_64-unknown-none/debug/okernel \
+              "$(printf '%x' $((0x$a - slide)))" | paste -sd' '
+          done
+      - name: Suíte de SMP com 4 CPUs em KVM
+        if: always()
+        run: cargo xtask test smp --smp 4
+      - name: Relatórios no resumo
+        if: always()
+        run: |
+          for f in $(git ls-files --others --exclude-standard docs/bench); do
+            # No log também: o artefato e o resumo exigem o navegador.
+            { cat "$f"; echo; } | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-kvm
+          path: docs/bench/*.md

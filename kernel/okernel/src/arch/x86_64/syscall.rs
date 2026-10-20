@@ -8,7 +8,7 @@ use super::cpu::{self, rdmsr, wrmsr};
 use super::gdt::{self, KERNEL_CODE, SYSRET_BASE};
 use super::percpu;
 
-const MSR_STAR: u32 = 0xc000_0081;
+pub(super) const MSR_STAR: u32 = 0xc000_0081;
 const MSR_LSTAR: u32 = 0xc000_0082;
 const MSR_FMASK: u32 = 0xc000_0084;
 const EFER_SCE: u64 = 1;

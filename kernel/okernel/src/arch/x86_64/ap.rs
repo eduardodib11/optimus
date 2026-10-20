@@ -38,11 +38,16 @@ const CR4_PAE: u64 = 1 << 5;
 const CR4_PGE: u64 = 1 << 7;
 
 /// GDT mínima do trampolim: nula, código de 32 bits, dados, código de 64.
+/// Os descritores já vêm com o bit de acessado: o salto para o código de 64
+/// bits carrega o CS com a paginação ligada, e a CPU gravaria esse bit na
+/// página de parâmetros, que a identidade mapeia só para leitura (com
+/// CR0.WP, um #PF sem IDT: falta tripla no AP, vista em KVM; o TCG não
+/// grava o bit pela paginação).
 const GDT: [u64; 4] = [
     0,
-    0x00cf_9a00_0000_ffff,
-    0x00cf_9200_0000_ffff,
-    0x00af_9a00_0000_ffff,
+    0x00cf_9b00_0000_ffff,
+    0x00cf_9300_0000_ffff,
+    0x00af_9b00_0000_ffff,
 ];
 
 // Deslocamentos na página de parâmetros (os de `ap.S`).

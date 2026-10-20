@@ -20,8 +20,11 @@ pub const KERNEL_CODE: u16 = 0x08;
 /// Seletor dos dados do kernel (índice 2, anel 0).
 pub const KERNEL_DATA: u16 = 0x10;
 /// Base dos seletores de usuário no STAR: SYSRET carrega SS = base + 8 e
-/// CS = base + 16 (índice 3 seria o código de 32 bits, ausente).
-pub const SYSRET_BASE: u16 = 0x18;
+/// CS = base + 16 (índice 3 seria o código de 32 bits, ausente). Leva o
+/// RPL 3: a Intel o força nos dois seletores, mas a AMD copia o do STAR
+/// para o SS. Com RPL 0, o usuário seguia com SS = 0x20, e o IRETQ de uma
+/// interrupção vinda do anel 3 dava #GP(0x20) (visto em KVM num EPYC).
+pub const SYSRET_BASE: u16 = 0x18 | 3;
 /// Seletor dos dados do usuário (índice 4, anel 3).
 pub const USER_DATA: u16 = 0x20 | 3;
 /// Seletor do código de 64 bits do usuário (índice 5, anel 3).

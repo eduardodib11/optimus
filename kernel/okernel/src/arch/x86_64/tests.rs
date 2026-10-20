@@ -4,8 +4,7 @@
 use core::arch::asm;
 
 use super::gdt::{self, KERNEL_CODE, Pointer};
-use super::idt;
-use super::percpu;
+use super::{cpu, idt, percpu, syscall};
 use crate::ktest::{Outcome, Test};
 
 /// Testes de kernel de x86-64.
@@ -17,6 +16,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "arch.segmento_de_codigo_do_kernel",
         run: segmento_de_codigo,
+    },
+    Test {
+        name: "arch.sysret_volta_com_os_seletores_de_usuario",
+        run: seletores_da_sysret,
     },
     Test {
         name: "percpu.bsp_e_a_cpu_zero",
@@ -99,5 +102,19 @@ fn segmento_de_codigo() -> Outcome {
     // SAFETY: ler CS não tem efeito colateral.
     unsafe { asm!("mov {:x}, cs", out(reg) cs, options(nomem, nostack)) };
     ensure!(cs == KERNEL_CODE);
+    Ok(())
+}
+
+/// O STAR desta CPU dá à SYSRET os seletores de usuário com RPL 3, nos dois
+/// fabricantes: a AMD copia o RPL do STAR para o SS, sem forçá-lo.
+fn seletores_da_sysret() -> Outcome {
+    // SAFETY: o STAR existe em toda CPU x86-64; ler não tem efeito.
+    let star = unsafe { cpu::rdmsr(syscall::MSR_STAR) };
+    #[allow(clippy::cast_possible_truncation, reason = "campo de 16 bits do STAR")]
+    let base = (star >> 48) as u16;
+    ensure!(base + 8 == gdt::USER_DATA && base + 16 == gdt::USER_CODE);
+    #[allow(clippy::cast_possible_truncation, reason = "campo de 16 bits do STAR")]
+    let kernel = (star >> 32) as u16;
+    ensure!(kernel == KERNEL_CODE);
     Ok(())
 }

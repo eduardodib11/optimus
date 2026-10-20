@@ -927,6 +927,11 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         && let Some(cur) = s.current.clone()
         && let Some(until) = keeps_running(&s, &cur, me, now)
     {
+        // Sem par no nível, a vez segue numa fatia nova: com a vencida, o
+        // timer seria armado no passado e dispararia sem parar.
+        if now >= s.slice_end {
+            s.slice_end = now.saturating_add(DEFAULT_SLICE_NS);
+        }
         charge_to(&mut s.charging, Some(&cur));
         publish(&s, None);
         program_timer(&s, until);
