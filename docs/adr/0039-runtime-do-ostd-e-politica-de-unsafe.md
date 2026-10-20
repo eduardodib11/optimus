@@ -375,3 +375,34 @@ são raras nos serviços do M3); estender as classes até 32 KiB (uma página
 guarda 2 a 4 blocos; a sobra no fim da página chega a 25%); ou páginas
 "médias" de 512 KiB como o mimalloc. Muda `MAX_SMALL` e a tabela de classes,
 sem mudar a API.
+
+## Notas da implementação (T-333, 2026-10-20)
+
+O que a T-333 fez diferente do texto acima ou acrescentou, sem mudar o
+desenho:
+
+- **"Só quando o valor muda".** A troca compara o TLS da thread que entra
+  com o valor que está na CPU (lido com `RDMSR`), não com o campo da thread
+  que sai. O usuário muda o `FS_BASE` sem syscall ao carregar um seletor em
+  FS (`mov fs, ax` zera a base), e a comparação com a thread que saiu
+  deixaria a próxima com o mesmo TLS, até de outro processo, com base zero.
+  O `WRMSR` continua só quando o valor difere.
+- **TLS de outra thread.** Com a capability, `CONFIGURE_TLS` vale também
+  para uma thread que roda noutra CPU; ela recebe o valor na próxima vez que
+  entrar numa CPU. Na própria thread (por `thread = 0` ou pela capability
+  dela) o kernel grava o `MSR` antes de voltar da syscall.
+- **`thread = 0` com ligação.** `cspace` ou `aspace` diferentes de zero com
+  `thread = 0` dão `InvalidArgument`.
+- **`aspace = 0`** vale como capability com `MAP | UNMAP` (os direitos de
+  um `AddressSpace` recém-criado). `vm_protect` não o aceita, como no item 2.
+- **`EXIT_GROUP` ainda não.** O item 5 o define como o `DESTROY` do próprio
+  `CapSpace` (ADR 0035, item 4), que é da T-348. Até lá `thread_exit` com
+  `EXIT_GROUP` volta `NotSupported` (flags desconhecidas, `InvalidArgument`)
+  e a thread segue; o `panic_handler` tenta o `EXIT_GROUP` e, recusado,
+  encerra a thread com o código `"pani"`. O código de `thread_exit` já vai
+  ao registro de morte da thread (`Exited`), e a falta fatal grava
+  `Faulted`; a leitura por `sys_info` (classe 2) e o registro do processo
+  são da T-348.
+- **`ostd`.** `rt::Env` ficou só com a cota. Há `thread::set_tls`,
+  `thread::exit_with`, `thread::exit_group`, `thread::SELF` e `vm::SELF`;
+  ler o TLS e o bloco da thread ficam para a T-335, com o módulo `tls`.
