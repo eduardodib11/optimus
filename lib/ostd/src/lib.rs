@@ -5,12 +5,13 @@
 //! a entrada do processo ([`entry!`] e [`rt`]), as syscalls cruas
 //! ([`sys`]), invólucros seguros para depuração, tempo, capabilities
 //! ([`cap`]), memória ([`vm`]), threads ([`thread`]) e o IPC síncrono com
-//! o buffer de IPC ([`ipc`], T-208), e o carregador de executáveis do
+//! o buffer de IPC ([`ipc`], T-208), o bloco da thread com `thread_local!` ([`tls`], T-335), e o carregador de executáveis do
 //! bootfs ([`process`], ADR 0029) e o alocador global ([`alloc`], T-334).
 //! `Mutex`/`Condvar` sobre futex e clientes OIDL ficam para depois.
 //!
 //! Só [`arch`] (a instrução `syscall`, o `_start` e o acesso à memória que o
-//! processo mapeou) e [`alloc`] (a cola do `GlobalAlloc`) usam `unsafe`,
+//! processo mapeou), [`alloc`] (a cola do `GlobalAlloc`) e [`tls`] (o bloco da
+//! thread) usam `unsafe`,
 //! como a seção 17.1 permite ao "ostd baixo nível" e a ADR 0039 detalha; o
 //! resto da crate o proíbe. A lista de módulos com `unsafe` e o teto de
 //! blocos de cada um estão em `unsafe-allowlist.toml`, e o `cargo xtask
@@ -20,6 +21,8 @@
 #![deny(unsafe_code)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+extern crate alloc as alloc_crate;
+
 pub mod alloc;
 pub mod arch;
 pub mod cap;
@@ -28,6 +31,7 @@ pub mod process;
 pub mod rt;
 pub mod sys;
 pub mod thread;
+pub mod tls;
 pub mod vm;
 
 /// Versão da biblioteca, exposta para diagnóstico.

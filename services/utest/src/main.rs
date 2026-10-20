@@ -102,6 +102,26 @@ const TESTS: &[Test] = &[
         name: "thread.exit_recusa_flags",
         run: exit_recusa_flags,
     },
+    Test {
+        name: "thread.cem_sem_vazar_cota",
+        run: threads_cem,
+    },
+    Test {
+        name: "thread.tls_de_cada_uma",
+        run: threads_tls,
+    },
+    Test {
+        name: "thread.alocacao_concorrente",
+        run: threads_alocacao,
+    },
+    Test {
+        name: "thread.buffer_de_ipc_proprio",
+        run: threads_buffer_ipc,
+    },
+    Test {
+        name: "thread.pilha_com_guarda",
+        run: threads_guarda,
+    },
     #[cfg(utest_falha)]
     Test {
         name: "proposital",
@@ -239,6 +259,14 @@ fn alocador_reaproveita_janela(_: &Ctx) -> Outcome {
 /// metade do kernel, TLS junto com o buffer de IPC, ligação com `thread =
 /// 0` e handle inválido.
 fn tls_configurar(ctx: &Ctx) -> Outcome {
+    // O `FS_BASE` da principal é o bloco da thread (T-335): devolve-o no fim.
+    let block = ostd::tls::current().addr();
+    let result = tls_configurar_com(ctx);
+    ostd::thread::set_tls(ostd::thread::SELF, block).map_err(|_| "restaurar o TLS")?;
+    result
+}
+
+fn tls_configurar_com(ctx: &Ctx) -> Outcome {
     use ostd::kabi::Syscall;
     use ostd::kabi::thread::{CONFIGURE_IPC_BUFFER, CONFIGURE_TLS};
     use ostd::kabi::vm::USER_END;
@@ -317,6 +345,310 @@ fn exit_recusa_flags(_: &Ctx) -> Outcome {
         return Err("flag desconhecida devia dar InvalidArgument");
     }
     Ok(())
+}
+
+/// Quantas páginas a cota `quota` ainda cobre: cria `MemoryObject`s de uma
+/// página até a cota negar e os apaga. Serve para comparar a cota antes e
+/// depois (a `sys_info` ainda não mostra o uso).
+fn quota_pages(quota: Handle) -> Result<usize, &'static str> {
+    use ostd::kabi::vm::PAGE_SIZE;
+    let mut held = Vec::new();
+    loop {
+        match create(quota, ObjectType::MemoryObject, PAGE_SIZE) {
+            Ok(h) => held.push(h),
+            Err(Error::QuotaExceeded) => break,
+            Err(_) => return Err("create(page) falhou por outro motivo"),
+        }
+    }
+    let n = held.len();
+    for h in held {
+        delete(h).map_err(|_| "delete(page)")?;
+    }
+    Ok(n)
+}
+
+/// Cota filha de `bytes` para os testes de thread.
+fn child_quota(ctx: &Ctx, bytes: u64) -> Result<Handle, &'static str> {
+    create(ctx.quota, ObjectType::MemoryQuota, bytes).map_err(|_| "create(quota)")
+}
+
+/// T-335: 100 threads criadas e juntadas, uma depois da outra e em lotes,
+/// com o resultado certo e sem vazar cota (pilha, bloco, `Thread`,
+/// `SchedContext`) nem segmentos do heap.
+fn threads_cem(ctx: &Ctx) -> Outcome {
+    use ostd::thread::Builder;
+    let q = child_quota(ctx, 4 << 20)?;
+    let segments = ostd::alloc::mapped_segments();
+    let before = quota_pages(q)?;
+    if before < 900 {
+        return Err("a cota filha devia cobrir quase 4 MiB");
+    }
+    let mut sum = 0u64;
+    for i in 0..50u64 {
+        let h = Builder::new()
+            .quota(q)
+            .spawn(move || {
+                let v: Vec<u64> = (0..100).map(|k| k * i).collect();
+                v.iter().sum::<u64>() + ostd::thread::id()
+            })
+            .map_err(|_| "spawn falhou")?;
+        let id = h.thread_id();
+        let got = h.join().map_err(|_| "join devolveu Err")?;
+        if got != (0..100u64).map(|k| k * i).sum::<u64>() + id {
+            return Err("resultado errado");
+        }
+        sum += got;
+    }
+    for _ in 0..5 {
+        let mut hs = Vec::new();
+        for i in 0..10u64 {
+            hs.push(
+                Builder::new()
+                    .quota(q)
+                    .spawn(move || {
+                        // Cede a vez no meio, para as threads se misturarem.
+                        ostd::thread::yield_now();
+                        i * 3
+                    })
+                    .map_err(|_| "spawn em lote falhou")?,
+            );
+        }
+        for (i, h) in (0..10u64).zip(hs) {
+            if h.join() != Ok(i * 3) {
+                return Err("resultado errado em lote");
+            }
+        }
+    }
+    if sum == 0 {
+        return Err("soma zerada");
+    }
+    // O kernel devolve o `Thread` e o `SchedContext` quando a thread acaba
+    // de sair; dá um tempo para a última terminar.
+    let mut after = 0;
+    for _ in 0..10_000 {
+        after = quota_pages(q)?;
+        if after == before {
+            break;
+        }
+        ostd::thread::yield_now();
+    }
+    let leaked = after != before;
+    let after_segments = ostd::alloc::mapped_segments();
+    let _ = delete(q);
+    if leaked {
+        return Err("a cota não voltou ao que era depois de juntar as threads");
+    }
+    if after_segments > segments + 1 {
+        return Err("segmentos do heap vazaram");
+    }
+    Ok(())
+}
+
+/// Byte de enchimento do bloco `i` da thread `k`.
+#[allow(clippy::cast_possible_truncation, reason = "só os 8 bits baixos")]
+fn pattern(i: usize, k: u64) -> u8 {
+    (i as u8) ^ (k as u8)
+}
+
+ostd::thread_local! {
+    static TAG: core::cell::Cell<u64> = core::cell::Cell::new(0);
+    static NOTE: Noted = Noted(0);
+}
+
+/// Valor de `thread_local!` que conta os destrutores.
+struct Noted(u64);
+
+static DROPPED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        DROPPED.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `thread_local!`: cada thread vê o seu valor (também depois de ceder a
+/// vez, em CPUs diferentes), a principal não é afetada e os destrutores
+/// rodam na saída de cada thread.
+fn threads_tls(_: &Ctx) -> Outcome {
+    use core::sync::atomic::Ordering::SeqCst;
+    TAG.with(|t| t.set(7));
+    NOTE.with(|n| assert_eq!(n.0, 0));
+    let dropped0 = DROPPED.load(SeqCst);
+    let mut hs = Vec::new();
+    for k in 0..4u64 {
+        hs.push(ostd::thread::spawn(move || {
+            if TAG.with(core::cell::Cell::get) != 0 {
+                return false;
+            }
+            TAG.with(|t| t.set(1000 + k));
+            NOTE.with(|_| ());
+            for _ in 0..200 {
+                ostd::thread::yield_now();
+                if TAG.with(core::cell::Cell::get) != 1000 + k {
+                    return false;
+                }
+            }
+            true
+        }));
+    }
+    for h in hs {
+        if h.join() != Ok(true) {
+            return Err("uma thread viu o thread_local de outra");
+        }
+    }
+    if TAG.with(core::cell::Cell::get) != 7 {
+        return Err("o thread_local da principal mudou");
+    }
+    if DROPPED.load(SeqCst) != dropped0 + 4 {
+        return Err("os destrutores dos thread_local não rodaram uma vez por thread");
+    }
+    Ok(())
+}
+
+/// Alocação em várias threads ao mesmo tempo, com liberação entre threads: a
+/// principal solta blocos de threads que já saíram (heap abandonado), e uma
+/// thread solta blocos da principal.
+fn threads_alocacao(_: &Ctx) -> Outcome {
+    let segments = ostd::alloc::mapped_segments();
+    let mut hs = Vec::new();
+    for k in 0..4u64 {
+        hs.push(ostd::thread::spawn(move || {
+            let mut keep: Vec<Vec<u8>> = Vec::new();
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ k;
+            for i in 0..6_000usize {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let size = 1 + (state >> 40) as usize % 3000;
+                let mut v = Vec::with_capacity(size);
+                v.resize(size, pattern(i, k));
+                if i % 8 == 0 {
+                    keep.push(v);
+                } else if v.iter().any(|&b| b != pattern(i, k)) {
+                    return None;
+                }
+            }
+            Some((k, keep))
+        }));
+    }
+    let mut survivors = Vec::new();
+    for h in hs {
+        match h.join() {
+            Ok(Some(s)) => survivors.push(s),
+            _ => return Err("uma thread de alocação falhou"),
+        }
+    }
+    // Das threads que já saíram: ler e soltar aqui.
+    for (k, keep) in &survivors {
+        for (j, v) in keep.iter().enumerate() {
+            let want = pattern(j * 8, *k);
+            if v.iter().any(|&b| b != want) {
+                return Err("bloco de thread que saiu corrompido");
+            }
+        }
+    }
+    drop(survivors);
+    // Da principal para outra thread soltar.
+    let blocks: Vec<Vec<u64>> = (0..2000u64).map(|i| alloc::vec![i; 50]).collect();
+    let h = ostd::thread::spawn(move || {
+        let ok = blocks
+            .iter()
+            .zip(0u64..)
+            .all(|(b, i)| b.iter().all(|&w| w == i));
+        drop(blocks);
+        ok
+    });
+    if h.join() != Ok(true) {
+        return Err("a thread viu blocos corrompidos da principal");
+    }
+    // Tudo solto: a principal ainda pode alocar (e adota o que sobrou).
+    let again: Vec<Vec<u8>> = (0..1000).map(|_| alloc::vec![1u8; 4000]).collect();
+    drop(again);
+    let after = ostd::alloc::mapped_segments();
+    if after > segments + 2 {
+        return Err("segmentos demais depois de soltar tudo");
+    }
+    Ok(())
+}
+
+/// Cada thread tem o seu buffer de IPC (no bloco dela), em endereços
+/// diferentes e que não se misturam.
+fn threads_buffer_ipc(_: &Ctx) -> Outcome {
+    use ostd::tls::{current, with_ipc_buffer};
+    with_ipc_buffer(|b| b.words[0] = 0xAAAA);
+    let main_va = current().ipc_va();
+    let hs: Vec<_> = (0..4u64)
+        .map(|k| {
+            ostd::thread::spawn(move || {
+                with_ipc_buffer(|b| b.words[0] = k);
+                ostd::thread::yield_now();
+                let own = with_ipc_buffer(|b| b.words[0]) == k;
+                (current().ipc_va(), own)
+            })
+        })
+        .collect();
+    let mut seen = Vec::new();
+    for h in hs {
+        let (va, own) = h.join().map_err(|_| "join")?;
+        if !own || va == main_va || va % 4096 != 0 || seen.contains(&va) {
+            return Err("buffer de IPC compartilhado ou desalinhado");
+        }
+        seen.push(va);
+    }
+    if with_ipc_buffer(|b| b.words[0]) != 0xAAAA {
+        return Err("o buffer da principal mudou");
+    }
+    Ok(())
+}
+
+/// Recursão sem fim numa thread de pilha pequena cai na página de guarda: a
+/// falta chega ao endpoint de exceções da thread com o endereço dentro da
+/// guarda. A resposta encerra a thread (que nunca é juntada; sua região fica
+/// na cota filha, que é apagada em seguida).
+fn threads_guarda(ctx: &Ctx) -> Outcome {
+    use ostd::kabi::Rights;
+    use ostd::kabi::fault::{PAGE_FAULT, WORD_ADDR};
+    use ostd::thread::Builder;
+    #[inline(never)]
+    fn deep(n: u64) -> u64 {
+        let pad = [n.to_le_bytes()[0]; 512];
+        let r = u64::from(core::hint::black_box(&pad)[3]);
+        // `black_box` impede o compilador de ver que a recursão não para.
+        if core::hint::black_box(n) == u64::MAX {
+            return r;
+        }
+        core::hint::black_box(r + deep(n + 1))
+    }
+    let q = child_quota(ctx, 1 << 20)?;
+    let ep = create(ctx.quota, ObjectType::Endpoint, 0).map_err(|_| "create(ep)")?;
+    let reply = create(ctx.quota, ObjectType::Reply, 0).map_err(|_| "create(reply)")?;
+    let exc = ostd::cap::mint(ep, Rights::SEND, 7, None).map_err(|_| "mint")?;
+    let h = Builder::new()
+        .quota(q)
+        .stack_size(16 * 1024)
+        .exception_endpoint(exc)
+        .spawn(|| deep(0))
+        .map_err(|_| "spawn")?;
+    let guard = h.guard_page();
+    let got = ipc::recv(ep, reply, ostd::time::now_ns() + 5_000_000_000);
+    let verdict = match got {
+        Ok(m) if m.badge == 7 && m.msg.label == PAGE_FAULT => {
+            let addr = m.msg.words[WORD_ADDR];
+            if (guard..guard + 4096).contains(&addr) {
+                Ok(())
+            } else {
+                Err("a falta não caiu na página de guarda")
+            }
+        }
+        Ok(_) => Err("mensagem de exceção inesperada"),
+        Err(_) => Err("nenhuma exceção chegou"),
+    };
+    // Qualquer rótulo diferente de RESUME encerra a thread.
+    let _ = ipc::send(reply, &Message::new(1, &[]), 0);
+    // Sem `join`: a thread morreu pela falta e a região vaza (cota filha).
+    drop(h);
+    let _ = (delete(exc), delete(ep), delete(reply), delete(q));
+    verdict
 }
 
 /// Falha de propósito (só com `UTEST_FALHA=1`): prova que o `xtask`

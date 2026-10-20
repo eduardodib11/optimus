@@ -590,6 +590,54 @@ fn thread_configure_do_tls_e_da_propria_thread() {
 }
 
 #[test]
+fn thread_configure_liga_ao_espaco_de_quem_chama() {
+    use kabi::thread::{CONFIGURE_BIND_SELF, SELF};
+    platform::install(fake_platform(1000).1);
+    let (_root, space, q) = setup();
+    let me_h = create(&space, q, ObjectType::Thread);
+    let other_h = create(&space, q, ObjectType::Thread);
+    let cs = create(&space, q, ObjectType::CapSpace);
+    let a = create(&space, q, ObjectType::AddressSpace);
+    let me = Arc::clone(get(&space, me_h).object.as_thread().unwrap());
+    let other = Arc::clone(get(&space, other_h).object.as_thread().unwrap());
+    let mut env = Fake {
+        current: Some(Arc::clone(&me)),
+        ..Fake::default()
+    };
+    let conf =
+        |args: [u64; 6], env: &mut Fake| invoke(&space, Syscall::ThreadConfigure, args, 4, env);
+    // Quem chama ainda não está ligado: não há o que copiar.
+    assert_eq!(
+        conf([other_h, 0, 0, 0, 0, CONFIGURE_BIND_SELF], &mut env),
+        Err(Error::InvalidHandle)
+    );
+    assert_eq!(conf([me_h, cs, a, 0, 0, 0], &mut env), Ok([0; 3]));
+    // Com handles, ou com a própria thread como alvo: recusado.
+    assert_eq!(
+        conf([other_h, cs, a, 0, 0, CONFIGURE_BIND_SELF], &mut env),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(
+        conf([SELF, 0, 0, 0, 0, CONFIGURE_BIND_SELF], &mut env),
+        Err(Error::InvalidArgument)
+    );
+    assert!(other.cspace().is_none() && other.aspace().is_none());
+    assert_eq!(
+        conf([other_h, 0, 0, 0, 0, CONFIGURE_BIND_SELF], &mut env),
+        Ok([0; 3])
+    );
+    assert!(Arc::ptr_eq(&other.cspace().unwrap(), &me.cspace().unwrap()));
+    assert!(Arc::ptr_eq(&other.aspace().unwrap(), &me.aspace().unwrap()));
+    // Religar depois de ligada: Busy só depois da partida.
+    other.set_state(crate::thread::RunState::Running);
+    assert_eq!(
+        conf([other_h, 0, 0, 0, 0, CONFIGURE_BIND_SELF], &mut env),
+        Err(Error::Busy)
+    );
+    other.set_state(crate::thread::RunState::Exited);
+}
+
+#[test]
 fn vm_map_e_unmap_no_proprio_espaco() {
     use kabi::vm::SELF;
     platform::install(fake_platform(1000).1);

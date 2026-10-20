@@ -276,7 +276,10 @@ fn mint(space: &Arc<SharedCapSpace>, a: [u64; 6]) -> Result<Values, Error> {
 /// qualquer campo. `thread = SELF` é a própria, sem capability, e não liga
 /// `CapSpace` nem `AddressSpace`.
 fn thread_configure(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<(), Error> {
-    use kabi::thread::{CONFIGURE_ALL, CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER, CONFIGURE_TLS};
+    use kabi::thread::{
+        CONFIGURE_ALL, CONFIGURE_BIND_SELF, CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER,
+        CONFIGURE_TLS,
+    };
     let flags = a[5];
     let buffer = flags & CONFIGURE_IPC_BUFFER != 0;
     let tls = flags & CONFIGURE_TLS != 0;
@@ -295,6 +298,20 @@ fn thread_configure(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> R
         Arc::clone(thread.object.as_thread()?)
     };
     let bind = match (a[1], a[2]) {
+        (0, 0) if flags & CONFIGURE_BIND_SELF != 0 => {
+            // O espaço e a tabela de quem chama; a própria thread como alvo
+            // não faz sentido (já está ligada).
+            if a[0] == kabi::thread::SELF {
+                return Err(Error::InvalidArgument);
+            }
+            let cspace = me.as_ref().and_then(|m| m.cspace());
+            let aspace = me.as_ref().and_then(|m| m.aspace());
+            Some((
+                cspace.ok_or(Error::InvalidHandle)?,
+                aspace.ok_or(Error::InvalidHandle)?,
+            ))
+        }
+        _ if flags & CONFIGURE_BIND_SELF != 0 => return Err(Error::InvalidArgument),
         (0, 0) => None,
         (0, _) | (_, 0) => return Err(Error::InvalidArgument),
         (c, s) => {
