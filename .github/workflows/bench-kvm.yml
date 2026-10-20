@@ -33,6 +33,9 @@ jobs:
         run: cargo xtask bench
       - name: Bench com 4 CPUs
         run: cargo xtask bench --smp 4
+      - name: Testes de kernel em KVM
+        if: always()
+        run: cargo xtask test kernel
       - name: Relatórios no resumo
         if: always()
         run: |
