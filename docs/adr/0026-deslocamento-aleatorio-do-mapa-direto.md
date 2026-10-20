@@ -36,6 +36,14 @@ RAM, usando bytes da semente que não vão para o kernel. Todos os ponteiros da
 
 - O kernel lê `direct_map_base` em vez de uma constante; `kabi` e `optboot`
   mudam juntos.
-- Entropia do mapa direto: cerca de 14 bits com passos de 1 GiB em 64 TiB,
-  descontada a RAM.
+- Entropia do mapa direto: cerca de 16 bits com passos de 1 GiB em 64 TiB
+  (65536 posições menos as ocupadas pela RAM).
 - A tabela 5.2 do SDD ganha uma linha na próxima revisão do documento.
+- A ADR 0037 acrescenta os campos da hora de parede na v1, pelo mesmo critério.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- Corrigida a entropia do mapa direto de 14 para cerca de 16 bits.
+- Acrescentada a remissão à ADR 0037, que segue o mesmo critério na v1.

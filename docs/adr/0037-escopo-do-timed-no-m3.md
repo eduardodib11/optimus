@@ -2,7 +2,7 @@
 
 - Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
-- Origem: SDD v1.0, seções 5.2, 6.8, 7.3 e 10.4; backlog do M3, T-310
+- Origem: SDD v1.0, seções 5.2, 6.8 e 7.3; backlog do M3, T-310
 - Relaciona-se com: ADR 0033 (OIDL), ADR 0034 (manifesto), ADR 0035 (Timer),
   T-358, T-359
 
@@ -27,11 +27,14 @@ chama `GetTime` do UEFI, e o driver de RTC por portas depende de
 ### 1. Fonte da hora inicial: UEFI `GetTime` no `optboot`
 
 - O `optboot` chama `RuntimeServices.GetTime` **antes** de
-  `ExitBootServices` e lê o TSC no mesmo ponto. A `BootInfo` passa à
-  versão 2 e ganha dois campos no fim: `wall_unix_ns: i64` (hora do RTC
-  em ns Unix; 0 se `GetTime` falhar) e `wall_tsc_ns: u64` (o instante do
-  TSC, em ns desde o reset, em que a leitura foi feita). A versão sobe
-  porque o layout muda; `optboot` e `okernel` saem do mesmo build.
+  `ExitBootServices` e lê o TSC no mesmo ponto. A `BootInfo` v1 ganha dois
+  campos no fim, como a ADR 0026 fez com `direct_map_base` (nenhuma versão
+  foi publicada, então não há v2; `BOOT_VERSION` continua 1):
+  `wall_unix_ns: i64` (hora do RTC em ns Unix; 0 se `GetTime` falhar) e
+  `wall_tsc_ns: u64` (o instante do TSC, em ns desde o reset, em que a
+  leitura foi feita). `optboot` e
+  `okernel` saem do mesmo build, e a tabela 5.2 do SDD ganha as duas
+  linhas na próxima revisão.
 - `EFI_TIME` é convertido em UTC assim: se `TimeZone` é
   `EFI_UNSPECIFIED_TIMEZONE` (0x07FF), assume-se que o RTC guarda UTC;
   senão ajusta-se o horário por `TimeZone` minutos. Resolução do RTC: 1 s.
@@ -73,7 +76,7 @@ struct WallTime { unix_ns: i64, mono_ns: u64, uncertainty_ns: u64, synced: bool 
 enum TimeError : u8 { AccessDenied, InvalidArgument, Unavailable }
 enum SetMode : u8 { Slew, Step }
 
-interface Clock {                    // manifesto: svc:optimus.time.Clock@1 (time:read)
+interface Clock {                    // manifesto: svc:optimus.time.Clock@1
     now() -> result<WallTime, TimeError>;
 }
 interface Admin {                    // manifesto: svc:optimus.time.Admin@1
@@ -147,8 +150,9 @@ local (item 1 assume UTC).
 
 ## Consequências
 
-- `BootInfo` v2 (2 campos), `kabi::boot` e o `optboot` mudam; o teste de
-  versão e os de `optboot` e `okernel` são atualizados.
+- `BootInfo` v1 com 2 campos a mais, `kabi::boot` e o `optboot` mudam; o
+  teste de versão continua afirmando 1, e os de layout, de `optboot` e de
+  `okernel` são atualizados.
 - `sys_info` ganha a classe 4 (hora de parede do boot), sem capability.
 - O `timed` do M3 é pequeno (estado de seis números e duas
   interfaces); o `Admin` abre caminho ao NTS sem mudar o protocolo.
@@ -160,9 +164,9 @@ local (item 1 assume UTC).
 
 1. **Corrigida a premissa do backlog:** o `boot_time_ns` não é hora de
    parede; é preciso o campo novo na `BootInfo`.
-2. **Decidido (2026-10-20):** `BootInfo` v2 e `sys_info` classe 4
-   pública. O `optboot` e o kernel saem do mesmo build, então subir a
-   versão é barato.
+2. **Decidido (2026-10-20):** os campos novos entram na `BootInfo` v1, sem
+   v2, seguindo a ADR 0026 (nenhuma versão foi publicada), e `sys_info`
+   classe 4 é pública. O `optboot` e o kernel saem do mesmo build.
 3. **Decidido (2026-10-20):** RTC tratado como UTC quando o fuso é
    desconhecido. Uma máquina com Windows fica algumas horas errada até o
    primeiro `set`.
@@ -187,3 +191,10 @@ Mudanças em relação à proposta:
   que cobre os dois sinais.
 - Fusos horários ficam decididos para o M4 (antes eram uma pergunta).
 - As demais decisões da seção final foram registradas como decididas.
+
+### Revisão geral
+
+- A `BootInfo` não vai à versão 2: os dois campos entram na v1, como na
+  ADR 0026, e o teste de versão continua em 1.
+- A origem não cita mais a seção 10.4 do SDD (que trata só do `updated`).
+- O comentário da interface `Clock` perde a menção a `time:read`.

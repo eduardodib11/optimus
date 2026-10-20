@@ -1,9 +1,11 @@
 # ADR 0029: Criação de processos pelo usuário
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.1, 6.2, 7.2, 14.2 e T-212
 - Relaciona-se com: ADR 0007 (IPC), ADR 0027, ADR 0028 (aceita), T-210, T-211
+- Alterada por: ADR 0039 (`thread = 0` como "eu mesmo", `CONFIGURE_TLS`; o
+  ciclo da capability da própria thread deixa de existir)
 
 ## Contexto
 
@@ -36,7 +38,9 @@ inteiro a partir do anel 3, e faltam peças que o SDD só nomeia:
      endpoint de exceções (handle no `CapSpace` da thread, 0 tira). Os dois
      podem mudar com a thread rodando. Bits desconhecidos dão
      `InvalidArgument`;
-   - tudo é conferido antes de mudar qualquer campo.
+   - tudo é conferido antes de mudar qualquer campo, salvo que o handle de
+     exceções é guardado como veio: sua validade só é conferida a cada falta
+     (apagar ou revogar a capability também tira o endpoint).
 2. **`thread_start(thread, rip, rsp, a0, a1, a2)`**, nos mesmos seis
    registradores: exige `START`; a thread começa em `rip` com a pilha em
    `rsp` e `a0`–`a2` em `rdi`, `rsi` e `rdx` (como a thread inicial do
@@ -80,11 +84,23 @@ de forma segura pelo `ostd`.
 ## Consequências
 
 - `kabi` ganha `thread::CONFIGURE_*` e `handle_pair`/`split_handle_pair`;
-  o `ostd` ganha invólucros de objetos, `vm_map` com mapeamento seguro,
-  threads e um carregador de ELF (`ostd::process`).
+  o `ostd` ganha invólucros de objetos, `vm_map` com mapeamento seguro
+  (`ostd::vm::Mapping`), threads e um carregador de ELF (`ostd::process`,
+  com `Spec`, `Child` e `load`).
 - Uma thread ligada à própria tabela, que guarda a capability dela, forma
   um ciclo de referências; o processo apaga a capability da própria thread
   quando não precisa mais dela (o `hello` faz isso logo depois de
-  registrar o buffer).
+  registrar o buffer). A ADR 0039 elimina esse ciclo: `thread = 0` vale
+  como "a própria thread" em `thread_configure`.
 - A seção 14.2 do SDD ganha os registradores das duas syscalls, e a 6.2 o
   destino de `cap_mint`, na próxima revisão do documento.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- A lista de ADRs relacionadas aponta a ADR 0039, que altera o item sobre a
+  capability da própria thread.
+- O item 1 diz que o handle de exceções não é validado na configuração.
+- As consequências citam `ostd::vm::Mapping` e os nomes de `ostd::process`.

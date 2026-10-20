@@ -37,10 +37,24 @@ O mapeamento fica num só lugar, nas constantes de alvo do `xtask`.
 
 ## Consequências
 
-- O kernel não escolhe o modelo de código nem as features de CPU pelo alvo.
-  O que for preciso (por exemplo, código sem SSE no kernel, modelo de código
-  `kernel`) vai por `RUSTFLAGS` no `xtask`, crate por crate.
-- `x86_64-unknown-none` já desliga SSE e a red zone, e gera binário estático
-  relocável, o que serve ao kernel e ao `ostd` no M0 a M2.
+- O alvo já fornece o modelo de código `kernel`, o código sem SSE e sem red
+  zone. Por `RUSTFLAGS` no `xtask` vai só o que falta, crate por crate:
+  `relocation-model=pie` no `okernel` e `static` nos binários de usuário.
+- `x86_64-unknown-none` é soft-float (`rustc-abi` softfloat), o que serve ao
+  kernel e ao `ostd` no M0 a M2.
+- Os processos de usuário ficam soft-float até o `build-std` estabilizar. O
+  `oie` (kernels SIMD de SSE2 a AMX, ADR 0021) e o `owr` (ponto flutuante,
+  ADR 0016) dependem de resolver isso antes do marco deles, porque o rustc não
+  deixa ligar SSE num alvo soft-float por `RUSTFLAGS`. Pendência: decisão
+  futura de Eduardo, ainda não tomada.
 - Quando `build-std` estabilizar, uma nova ADR troca para os alvos próprios,
   e só o `xtask` muda.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- Corrigido o que o alvo `x86_64-unknown-none` já fornece (modelo `kernel`,
+-   sem SSE, sem red zone) e o que vai por `RUSTFLAGS`.
+- Registrada a limitação soft-float dos processos de usuário e a decisão futura
+-   de Eduardo para o `oie` e o `owr`.

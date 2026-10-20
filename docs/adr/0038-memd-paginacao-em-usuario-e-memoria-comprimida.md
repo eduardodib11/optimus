@@ -4,7 +4,8 @@
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.1, 6.3, 6.4, 7.3 e 14.2; backlog do M3, T-311
 - Relaciona-se com: ADR 0006 (alocação cobrada de cota), ADR 0007, ADR 0029,
-  ADR 0031 (shootdown, futura), ADR 0033, ADR 0034, ADR 0035, T-360 a T-364
+  ADR 0031 (shootdown, implementada na T-326), ADR 0033, ADR 0034, ADR 0035,
+  T-360 a T-364
 
 ## Contexto
 
@@ -49,7 +50,11 @@ A solução precisa caber nas 34 syscalls da ABI v1.
   objeto e é recusada com `EXEC`. `ALL_FLAGS` passa a incluir `RAW`.
 - O objeto passa a conhecer suas regiões (lista de pares
   `AddressSpace` fraca, endereço, comprimento, `RAW`). Isso custa uma
-  entrada por mapeamento, cobrada da cota do espaço.
+  entrada por mapeamento, cobrada da cota do espaço. A trava do objeto é
+  da classe `Objeto` e vem antes da do `AddressSpace` (ADR 0031): `vm_unmap`
+  e o `Drop` do espaço soltam a trava do `AddressSpace` antes de tirar a
+  região da lista, que tolera entrada obsoleta; `HIDE` e `DECOMMIT` tomam
+  objeto e depois um espaço por vez.
 
 ### 2. `mem_op` (syscall 9)
 
@@ -91,7 +96,9 @@ fatiadas e preemptíveis (ADR 0009): o progresso fica no objeto e a syscall
   endpoint de exceções da thread, sem alterá-la. A falta de página em
   região de objeto `LAZY` em página não Present usa o mesmo caminho.
 - O `memd` é o tratador padrão: `svcmgr` configura o endpoint de exceções
-  do processo com uma capability do `memd` de **badge = id do processo**
+  do processo com uma capability do `memd` de **badge do serviço** (ADR 0034,
+  item 8: `(generation << 32) | id`; o `memd` usa o `id`, os 32 bits baixos,
+  como id do processo, e a `generation` para reconhecer instância velha)
   (método `Root.set_exception` da ADR 0034, chamado antes de `start`;
   `Root.spawn` não ganha parâmetro novo). O badge diz de qual processo é
   a falta; a mensagem tem o endereço.
@@ -117,16 +124,16 @@ fatiadas e preemptíveis (ADR 0009): o progresso fica no objeto e a syscall
 ```
 package optimus.mem @1.0;
 enum RegionKind : u8 { Heap, Stack, Anon }
-struct Region { object: handle<MemoryObject>, base: u64, len: u64,
-                kind: RegionKind, max_compressed: u64 }
 enum MemError : u8 { AccessDenied, InvalidArgument, TooMany, Busy }
 interface Mem {
-    manage(r: Region) -> result<u32, MemError>;     // id da região
+    manage(object: handle<MemoryObject>, base: u64, len: u64,
+           kind: RegionKind, max_compressed: u64)
+        -> result<u32, MemError>;                   // id da região
     unmanage(id: u32) -> result<(), MemError>;
 }
 ```
-- O cliente é o próprio processo, identificado pelo badge (id do processo
-  atribuído pelo `svcmgr`). `manage` confere por `cap_info` que `object` é
+- O cliente é o próprio processo, identificado pelo badge (ADR 0034, item 8; o
+  id é atribuído pelo `svcmgr`). `manage` confere por `cap_info` que `object` é
   `MemoryObject` com `READ|WRITE|MAP|EVICT`; o cliente garante que mapeou
   o objeto em `base`. Mentir só prejudica o próprio cliente (faltas fora
   da tabela viram encerramento).
@@ -136,14 +143,20 @@ interface Mem {
 
 ### 5. Pressão de memória
 
-- O kernel cria dois objetos `Interrupt` sintéticos no boot e os dá ao
-  `root` (que os passa a quem tem `kernel:mem-pressure` no manifesto):
+- O kernel cria dois objetos `Interrupt` sintéticos no boot e os põe na
+  tabela de handles de partida do `root` (ADR 0036, item 5), que os passa
+  a quem tem `kernel:mem-pressure` no manifesto:
   **baixa** (quadros livres < 1/8 do total) e **crítica** (< 1/32). Como
   qualquer `Interrupt`, ligam-se a uma `Notification` com
   `obj_bind_notify` e ficam mascarados até `irq_ack`; um novo `ack` com a
   condição ainda verdadeira dispara de novo. Histerese: a baixa rearma ao
   passar de livres > total/8 + total/16, e a crítica ao passar de
   livres > total/32 + total/64.
+- O kernel não sinaliza dentro do alocador: a contagem de livres muda sob
+  a trava `Frames` (nível 9), depois da `Notification` (nível 3) na ordem
+  da ADR 0031. Ao cruzar um limiar, o alocador só marca um bit pendente (e,
+  se preciso, um self-IPI); a sinalização roda num ponto sem travas (volta
+  ao usuário, `ipi::poll` ou entrada no ocioso).
 - Contagem de "livres": desde a T-328 os frames também ficam nos caches
   por CPU. Os limiares e o `sys_info` contam como livres os frames do
   buddy **e** os dos caches por CPU, porque ambos atendem uma alocação
@@ -188,7 +201,9 @@ interface Mem {
   o usam. O repositório guarda páginas sem criptografia no M3 (decisão de
   Eduardo abaixo). Após restaurar, o `memd` zera o espaço.
 - Prioridade do `memd`: 190 (serviço de sistema alto), para atender faltas
-  antes das aplicações; seu orçamento de CPU limita o despejo. **Premissa
+  antes das aplicações. No M3 ele roda com orçamento igual ao período (ADR
+  0034, decisão 8), então a prioridade, e não um orçamento, é o que limita o
+  despejo, que só roda sob pressão. **Premissa
   não conferida no código:** a falta vira um `ipc_call` em nome da thread
   (`fault.rs`), e a prioridade só vale para as faltas se esse `ipc_call`
   doar o `SchedContext` ao tratador, como o `ipc_call` comum. Com a
@@ -265,6 +280,10 @@ T-367 mostrar custo alto de falta), `CACHE` real, `dma_map` com objetos
 7. **Dependência:** ADR 0031 precisa garantir "ack antes de liberar frame"
    (invariante 1; pronto desde a T-326); a ADR 0034 já define
    `Root.set_exception` e `Control.kill`; ADR 0035 define `DESTROY`.
+8. **Decidido (2026-10-20):** no M3 o `memd` e os demais serviços rodam
+   com orçamento de CPU igual ao período; a frase "seu orçamento de CPU
+   limita o despejo" sai. O manifesto não ganha orçamento no M3 (ADR 0034,
+   decisão 8).
 
 ## Revisão de 2026-10-20
 
@@ -282,3 +301,17 @@ Mudanças em relação à proposta:
 - Registrado que a prioridade 190 do `memd` supõe doação de fatia na falta
   de página, a conferir como primeiro teste da T-360.
 - As decisões da seção final foram registradas como decididas.
+
+### Revisão geral
+
+- A relação com a ADR 0031 diz "implementada na T-326".
+- O `manage` recebe o `handle<MemoryObject>` como parâmetro direto (a regra
+  de `handle<T>` da ADR 0033 não admite `struct` aninhada).
+- O badge do `memd` é o do serviço (ADR 0034, item 8), e o `memd` usa o
+  `id` dos 32 bits baixos.
+- Os `Interrupt`s de pressão chegam ao `root` pela tabela de handles de
+  partida (ADR 0036, item 5), e a sinalização de pressão é diferida a um
+  ponto sem travas.
+- A lista de regiões do objeto segue a ordem de travas (objeto antes do
+  `AddressSpace`) em `vm_unmap` e no `Drop` do espaço.
+- Sai a frase "seu orçamento de CPU limita o despejo" (decisão 8).

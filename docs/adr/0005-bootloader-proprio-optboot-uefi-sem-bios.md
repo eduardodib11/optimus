@@ -25,6 +25,10 @@ O `optboot` é uma aplicação UEFI em Rust (alvo `x86_64-unknown-uefi`). Ele:
 
 Não há suporte a BIOS legado nem a Multiboot.
 
+No M3 a verificação das assinaturas fica provisória (ADR 0034, item 10): o
+`optboot` confere o hash do bootfs, e a promoção para as assinaturas híbridas
+é obrigatória antes da primeira imagem distribuída.
+
 ## Alternativas
 
 - **GRUB 2:** maduro e com Secure Boot via shim, mas é código C grande, fala
@@ -42,3 +46,9 @@ Não há suporte a BIOS legado nem a Multiboot.
 - Kernel livre de código de firmware: recebe tudo pronto na `BootInfo`.
 - Máquinas anteriores a ~2012, sem UEFI, não são suportadas.
 - Falhas repetidas trocam de slot ou iniciam o `rescue` (seção 5.5).
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- Registrada a verificação provisória de assinatura no M3 (ADR 0034).

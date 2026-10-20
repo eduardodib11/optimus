@@ -3,7 +3,8 @@
 - Status: aceita
 - Data: 2026-10-09
 - Origem: SDD v1.0, seção 3; seções 7.2, 7.4 e 13.2
-- Relaciona-se com: ADR 0001 (capabilities), ADR 0014 (OptFS), ADR 0016 (apps)
+- Relaciona-se com: ADR 0001 (capabilities), ADR 0014 (OptFS), ADR 0016 (apps),
+  ADR 0034 (manifesto e descoberta)
 
 ## Contexto
 
@@ -40,3 +41,9 @@ herdar o poder de uma conta inteira.
   que traduz caminhos para capabilities, ou pela VM Linux do plano B.
 - Todo serviço declara no manifesto as pastas de que precisa; o `svcmgr` e o
   `pkgd` entregam só essas.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- Acrescentada a ADR 0034 em "Relaciona-se com".

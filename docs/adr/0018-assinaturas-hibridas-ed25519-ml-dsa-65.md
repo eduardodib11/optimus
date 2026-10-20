@@ -20,7 +20,11 @@ histórico de uso e análise.
 - Toda assinatura do sistema é dupla: Ed25519 e ML-DSA-65. A verificação só
   aceita se as duas forem válidas.
 - Vale para o kernel ELF e o bootfs (verificados pelo `optboot`), a imagem `.osi`,
-  os pacotes `.opk`, os modelos `.omdl` e as atualizações `.oupd`.
+  os pacotes `.opk`, os modelos `.omdl`, as atualizações `.oupd` e os manifestos
+  de serviço (`.oman`).
+- No M3 a verificação fica provisória (ADR 0034, item 10): o manifesto vale pelo
+  hash do bootfs conferido pelo `optboot`. A promoção para a assinatura dupla é
+  obrigatória antes da primeira imagem distribuída.
 - A raiz fica offline em dois tokens de hardware; chaves de release são
   intermediárias com validade de 1 ano, rotacionadas no estilo TUF.
 
@@ -40,3 +44,10 @@ histórico de uso e análise.
 - O `optboot` carrega dois verificadores, ambos da `optcrypt` (ADR 0004).
 - Se um dos algoritmos for quebrado, o par restante segura a cadeia até a troca.
 - Ferramentas de build e assinatura offline precisam suportar os dois esquemas.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- Incluídos os manifestos de serviço no escopo da assinatura.
+- Registrada a verificação provisória do M3 (ADR 0034).

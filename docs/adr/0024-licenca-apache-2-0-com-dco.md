@@ -35,6 +35,14 @@ contribuição foi feita por quem tem direito de licenciá-la.
 
 - Usuários e fabricantes recebem concessão de patentes dos contribuidores.
 - Derivados podem ser fechados; o projeto aceita isso em troca de adoção ampla.
-- O CI rejeita commits sem `Signed-off-by`.
+- O CI ainda não confere `Signed-off-by`; a verificação fica para quando houver
+  contribuições externas. Pendência de Eduardo.
 - Código de terceiros nas ferramentas de build precisa ser compatível com
   Apache-2.0; modelos seguem a ADR 0022.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- O texto do CI deixa de afirmar uma checagem de DCO que ainda não existe;
+-   fica como pendência de Eduardo.

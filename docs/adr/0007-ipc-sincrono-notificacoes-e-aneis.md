@@ -18,8 +18,8 @@ O kernel oferece três mecanismos:
 
 1. **IPC síncrono** por `Endpoint` e `Reply` de uso único: `ipc_call`,
    `ipc_reply_recv`, `ipc_send` e `ipc_recv`, com prazo opcional. Mensagem com
-   rótulo de 64 bits, até 6 palavras em registradores ou 512 no buffer de IPC
-   de 4 KiB, e até 4 capabilities (exige `GRANT`). O caminho rápido troca
+   rótulo de 64 bits, até 6 palavras em registradores ou 504 no buffer de IPC
+   de 4 KiB (4 KiB menos 64 bytes de cabeçalho; ADR 0027), e até 4 capabilities (exige `GRANT`). O caminho rápido troca
    contexto direto na mesma CPU, sem passar pelo escalonador nem alocar.
 2. **Notificações**: palavra de 64 bits de sinais (`ntfy_signal`, `ntfy_wait`,
    `ntfy_poll`). IRQ, timer ou endpoint ligam-se a um bit via
@@ -42,3 +42,9 @@ O kernel oferece três mecanismos:
 - Cada padrão usa o mecanismo mais barato; o caminho rápido sustenta a meta.
 - Três mecanismos a documentar, especificar em TLA+ e testar.
 - A OIDL gera stubs sobre esses mecanismos e esconde a escolha dos serviços.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- O buffer de IPC passa de 512 para 504 palavras, como fixa a ADR 0027.

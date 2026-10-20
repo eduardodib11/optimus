@@ -1,6 +1,6 @@
 # ADR 0032: Escalonador SMP e IPC entre CPUs
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.6, 6.7, 6.9, 14.2 e 15; backlog do M3, T-305
   (lacunas 9, 10 e 11)
@@ -38,30 +38,37 @@ com meta de 1 µs. Nada disso diz:
 
 ### 1. Estado por CPU
 
-A `Sched` global vira uma por CPU, dentro da `PerCpu` (ADR 0030):
+A `Sched` global vira uma por CPU: `kthread::SCHEDS[cpu_id]` (a do BSP é
+estática; as dos APs são criadas por `init_cpu` antes da partida), não
+dentro da `PerCpu` (ADR 0030). Tudo o que é dela fica sob a trava `Fila`
+daquela CPU (ADR 0031, nível 6, chave = id lógico):
 
-- **Parte compartilhada**, sob a trava `Fila` daquela CPU (ADR 0031,
-  nível 6): fila de prontas (`RunQueue` de 256 níveis), `throttled`,
-  `timeouts` e `outbox` (threads a recolocar em outra CPU).
-- **Parte local**, só a própria CPU mexe, com IF=0 e sem trava: `current`,
-  `charging`, `charged_at`, `started_at`, `slice_end`, `dead`,
-  `switch_prev` e o registro dos testes (eventos ganham o id da CPU).
-- **Resumo atômico**, lido por outras CPUs sem trava para decidir onde
-  acordar e de quem roubar: `cur_prio` (prioridade da atual; um valor
-  especial para ocioso), `nr_ready`, `need_resched` e `idle_polling` (a CPU
-  está em `mwait` vigiando `need_resched`). Valores velhos só pioram a
-  escolha, nunca a correção.
+- fila de prontas (`RunQueue` de 256 níveis), `throttled`, `timeouts` e
+  `outbox` (threads a recolocar em outra CPU);
+- `current`, `charging`, `charged_at`, `started_at`, `slice_end`,
+  `switch_prev` (a thread que acabou de sair da CPU, ainda com `on_cpu`) e
+  o registro dos testes (`trace`, sem trava própria; eventos ganham o id da
+  CPU).
+
+**Resumo atômico**, lido por outras CPUs sem trava para decidir onde acordar
+e de quem roubar: `CUR_PRIO` (prioridade da atual mais um; zero para o
+ocioso) e `NR_READY` (prontas na fila), vetores estáticos por CPU gravados
+com a trava da fila na mão. O `need_resched` mora na `Mailbox` da `PerCpu`
+(ADR 0031). Valores velhos só pioram a escolha, nunca a correção.
 
 A `Thread` ganha `cpu: AtomicU32` (CPU dona da thread: a da fila em que
 está ou da última em que rodou) e `on_cpu: AtomicBool` (a pilha de kernel
 dela está em uso por uma CPU). As transições de `RunState` de `Blocked`
 para `Ready` passam a ser `compare_exchange`: só quem vence enfileira.
 
-O `SchedContext` ganha a máscara de afinidade (item 4) e o orçamento
-(`remaining`, `replenish_at`, `active`) passa para uma trava folha
-(`FolhaSched`, nível 7): `refill`, `consume` e `activate` viram uma seção
-crítica cada, porque duas CPUs podem cobrar o mesmo `SchedContext` na
-janela da doação (item 6).
+O `SchedContext` ganha a máscara de afinidade (item 4). O orçamento
+(`remaining`, `replenish_at`, `active`) continua em atômicas soltas, sem
+trava. **Limitação conhecida:** duas CPUs podem cobrar o mesmo
+`SchedContext` na janela da doação (item 6) e uma cobrança pode se perder.
+O efeito é só contábil: sem efeito de segurança, nenhum invariante I1 a I8
+é afetado, e o erro é limitado a um período do `SchedContext`. Uma trava
+folha (`FolhaSched`, nível 7) só entra se a medição (T-331, T-367) mostrar
+que importa.
 
 ### 2. Invariantes
 
@@ -93,26 +100,31 @@ Na CPU `c`, com IF=0:
 2. Toma a fila de `c`; cobra a atual; devolve à fila as `throttled` de `c`
    cujo período virou.
 3. `Preempt`: a atual segue se tem orçamento, ninguém mais prioritário
-   está pronto, a fatia não acabou **e** `c ∈ permitidas(atual)`.
+   está pronto, `c ∈ permitidas(atual)` **e** a vez não acabou. A vez só
+   acaba quando a fatia venceu e há pronta do mesmo nível; sem par no
+   nível, a fatia vencida é renovada (senão o timer seria armado no passado
+   e dispararia sem parar).
 4. A anterior, em `Yield` ou `Preempt`, volta à fila de `c` se `c` ainda é
    permitida; senão vai para `outbox`.
 5. Escolhe a próxima: `direct` (caminho rápido) ou a primeira da fila.
    Thread da fila que `c` não pode rodar (I4: a máscara mudou enquanto
-   esperava) vai para `outbox` e a busca continua. Fila vazia: roubo do
-   ocioso (item 7) antes de cair no ocioso.
+   esperava) vai para `outbox` e a busca continua. Fila vazia: cai no
+   ocioso, cujo laço faz o roubo (item 7) antes de dormir.
 6. Marca `next.on_cpu`, atualiza `cur_prio` e `nr_ready`, põe a anterior em
    `switch_prev`, solta a fila.
-7. Troca de espaço com a ordem da máscara `active` (ADR 0031, item 7),
-   `FS_BASE` (ADR 0030), FPU, e `switch_context`.
+7. FPU, pilha de kernel da próxima, troca de espaço (`note_root` antes do
+   `mov cr3`, ADR 0031, item 7) e `switch_context`. O `FS_BASE` por thread
+   (ADR 0030, item 6, e ADR 0039) entra aqui na T-333; ainda não existe.
 8. Já na próxima (`finish_switch`): `switch_prev.on_cpu = false`
    (`Release`), solta a morta e recoloca cada thread de `outbox` pelo item
    5 (escolha de CPU, trava da fila de destino, IPI), sem trava de `c` na
    mão.
 
-A saída de toda syscall e de todo tratador de interrupção que volta ao
-anel 3 consulta `need_resched` da CPU e chama `preempt()` se estiver
-ligado; é por aí que o IPI de reescalonar e a perda de afinidade (item 6)
-fazem efeito.
+O IPI de reescalonar liga `need_resched` e o tratador do IPI (`on_ipi`)
+consome o bit e chama `preempt()`; como o IPI pendente só é entregue na
+volta ao anel 3 (ou no ocioso), é por aí que ele e a perda de afinidade
+(item 6) fazem efeito. A syscall que muda a própria situação, como
+`sched_configure` com máscara nova, chama `preempt()` direto ao fim.
 
 ### 4. Afinidade na ABI
 
@@ -129,13 +141,16 @@ fazem efeito.
   todas as CPUs. Máscara sem nenhuma CPU ligada dá `InvalidArgument`;
   endereço ilegível também. O `ostd` atual já passa zero em `r8` e `r9`,
   então nada quebra.
-- Mudar a máscara de um `SchedContext` em uso numa CPU que saiu dela liga
-  `need_resched` lá (IPI `RESCHED`); a thread sai na próxima decisão. A
-  syscall volta sem esperar.
+- Mudar a máscara de um `SchedContext` manda `RESCHED` a todas as CPUs
+  ligadas fora da nova máscara (sem distinguir quais rodam aquele
+  `SchedContext`); a thread sai na próxima decisão. A syscall volta sem
+  esperar.
 - **`sys_info(seletor)`** ganha o formato: seletor em `rdi`, valores em
   `rdx`, `r10` e `r8`; seletor desconhecido dá `NotSupported`. Primeiro
   seletor, `SYS_INFO_CPUS = 1`: CPUs ligadas, total de ids lógicos e zero.
-  A ADR 0038 acrescenta os seletores de memória no mesmo formato.
+  A numeração completa está fixada nas ADRs 0035, 0037, 0038 e 0039: 0 =
+  versão da ABI (reservada), 1 = CPUs, 2 = morte, 3 = memória, 4 = hora de
+  parede do boot, 5 = entropia.
 
 ### 5. Acordar uma thread (`wake`)
 
@@ -148,25 +163,26 @@ mão (futex, notificação, `PeerClosed`, prazo) e **nunca espera**:
 3. Se o destino muda, tira o prazo da lista de `t.cpu` (trava dela) e só
    depois toma a fila do destino; nunca as duas juntas. Grava `t.cpu`,
    enfileira (ou põe em `throttled` sem orçamento).
-4. Aviso: destino = esta CPU e `t` mais prioritária que a atual, liga
-   `need_resched` local (quem chama decide o ponto de preempção, como hoje).
-   Destino remoto ocioso: se `idle_polling`, só grava `need_resched` (o
-   `mwait` acorda sem IPI); senão manda `RESCHED`. Destino remoto rodando
-   algo menos prioritário que `t`: `RESCHED`. Senão, nada.
+4. Aviso: destino = esta CPU, nada a fazer (quem chama decide o ponto de
+   preempção, como hoje). Destino remoto ocioso, ou rodando algo menos
+   prioritário que `t`, ou sem orçamento para ela (precisa rearmar o timer):
+   `RESCHED`. Senão, nada. No M3 o ocioso não usa `mwait` (item 8), então
+   todo despertar de CPU ociosa custa um IPI.
 
 **Escolha de CPU** (lê só os resumos atômicos), com `p` = prioridade de
 `t` e `P` = `permitidas(t)`:
 
 1. `t.cpu`, se está em `P` e está ociosa ou roda algo abaixo de `p`
    (cache quente);
-2. senão, uma CPU ociosa de `P`, procurada a partir de `t.cpu`;
+2. senão, uma CPU ociosa de `P` (sem atual e sem prontas), procurada a
+   partir de `t.cpu`;
 3. senão, a CPU de `P` com a menor `cur_prio`, se for menor que `p`
    (empurrão de tempo real: a pronta mais prioritária não espera atrás de
    uma menos prioritária noutra CPU);
-4. senão, `t.cpu` se está em `P`, ou a primeira de `P`.
+4. senão, `t.cpu` se está em `P`, ou a primeira de `P` a partir dela.
 
 A busca é linear nas CPUs (até 256 leituras atômicas); uma máscara de
-ociosas evita a varredura no caso comum.
+ociosas pode evitar a varredura no caso comum quando a medição pedir.
 
 ### 6. IPC entre CPUs e doação
 
@@ -214,20 +230,22 @@ ociosas evita a varredura no caso comum.
   uma thread ainda na janela é acordada na própria CPU e a encontra já
   `Ready` ao trocar de contexto.
 - **`thread_suspend`, destruição e leitura de estado de uma thread que
-  roda noutra CPU:** marcam o pedido na thread, mandam `RESCHED` e esperam
+  roda noutra CPU** (obrigação das syscalls 12 e 14, ainda sem implementação
+  na main, e da destruição de thread): marcam o pedido na thread, mandam `RESCHED` e esperam
   `on_cpu` falso sem travas (ADR 0031, regra 4), para que
   `thread_read_state` veja os registradores já salvos.
 
 ### 7. Balanceamento sem tick
 
-- **No ocioso:** antes de dormir, a CPU procura a de maior `nr_ready` que
-  tenha alguma pronta além da atual; toma as duas filas em ordem de id e
+- **No ocioso:** o laço ocioso do AP, antes de dormir, procura a CPU de
+  maior carga (prontas mais a atual) com alguma pronta além da atual; toma as duas filas em ordem de id e
   rouba a pronta mais prioritária que possa rodar aqui e não tenha
   `on_cpu` (I3, I4). Uma tentativa por vez; sem sucesso, dorme.
 - **Periódico, de carona no timer:** CPU ocupada já arma o timer no fim da
   fatia (5 ms). Na decisão vinda do timer, se passaram 10 ms desde o
-  último balanço, compara o próprio `nr_ready` com o das CPUs permitidas e
-  puxa uma thread se alguma tem pelo menos duas prontas a mais; a escolhida
+  último balanço, compara a própria carga (prontas mais a atual) com a das
+  outras CPUs ligadas e puxa uma thread da mais carregada se ela tem pelo
+  menos duas a mais (só threads que podem rodar aqui, I4); a escolhida
   é a mais prioritária roubável cuja prioridade não seja menor que a da
   melhor pronta local.
 - **Na hora de acordar:** a escolha de CPU (item 5) já espalha threads
@@ -237,10 +255,13 @@ ociosas evita a varredura no caso comum.
 
 ### 8. Ocioso por CPU
 
-O ocioso é o contexto de boot de cada CPU (ADR 0030). Com `MONITOR` e
-`MWAIT`, vigia a linha de `need_resched` e marca `idle_polling`; sem eles
-(TCG), `sti; hlt` e IPI para acordar. Antes de dormir: `ipi::poll()`, roubo
-(item 7) e IF=0 para olhar a fila de novo.
+O ocioso é o contexto de boot de cada CPU (ADR 0030). No M3 ele dorme em
+`sti; hlt`, com timer de 10 ms no mínimo, e o IPI acorda a CPU; o IPI que
+chega entre olhar a fila e o `hlt` fica pendente e acorda o `hlt` (sombra
+do `sti`). Antes de dormir: `ipi::poll()`, roubo (item 7) e IF=0 para olhar
+a fila de novo. `MONITOR/MWAIT` com um `idle_polling` (acordar sem IPI) fica
+como otimização futura, a adotar só se a medição de latência de despertar
+justificar.
 
 ### 9. NUMA
 
@@ -332,15 +353,46 @@ preferir CPUs do mesmo nó depois, sem mudar a ABI.
   permite (I4). Uma thread presa a hardware usa a função remota do kernel
   (ADR 0031), não máscara de thread.
 - A 6.7 diz "mesma CPU" sem dizer o que acontece entre CPUs nem em que CPU
-  roda o servidor que recebe a doação. **Eduardo precisa decidir** se o
-  servidor segue quem chama (esta ADR) ou fica na CPU dele.
+  roda o servidor que recebe a doação. **Decidido (2026-10-20):** o
+  servidor segue quem chama (esta ADR), como o código implementa
+  (`kthread::follow`); a alternativa "fica na CPU dele" continua descrita
+  nas Alternativas se o T-331 mostrar sofrimento. Eduardo confirma no PR.
 - A 6.9 indexa o futex por (AddressSpace, endereço); o código e esta ADR
   usam o endereço físico. Um frame liberado e reaproveitado pode dar
   despertar espúrio a quem ainda esperava na chave antiga, o que a
   semântica de futex já permite.
 - A 6.6 não diz quando acontece a "migração periódica" sem tick; aqui é
-  de carona no timer de fim de fatia, a cada 10 ms.
-- A 6.6 pede NUMA; esta ADR o adia (backlog, lacuna 11). **Eduardo
-  precisa confirmar** o adiamento.
+  de carona no timer de fim de fatia, a cada 10 ms (como o código faz).
+- O orçamento do `SchedContext` não ganhou a trava folha prevista na
+  proposta. **Decidido (2026-10-20):** manter as atômicas e registrar a
+  limitação do item 1 (cobrança perdida só na janela da doação, sem efeito
+  de segurança, limitada a um período). Eduardo confirma no PR.
+- O ocioso sem `mwait`. **Decidido (2026-10-20):** `hlt` e IPI no M3 (item
+  8); `mwait` e `idle_polling` ficam como otimização futura medida. Eduardo
+  confirma no PR.
+- A 6.6 pede NUMA; esta ADR o adia (backlog, lacuna 11). **Decidido
+  (2026-10-20):** NUMA fica adiado; o kernel não lê a SRAT no M3. Eduardo
+  confirma no PR.
 - O Gate 1 (seção 19) não diz se o 1 µs vale com o par na mesma CPU; o
   backlog propõe que sim, e esta ADR faz disso o caso comum.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- O estado por CPU fica em `kthread::SCHEDS`, sob a trava `Fila`, com os
+  resumos atômicos `CUR_PRIO` e `NR_READY`; `need_resched` está na `Mailbox`.
+- O orçamento do `SchedContext` segue em atômicas, com a limitação escrita.
+- O passo 3 da troca de contexto diz que a fatia vencida sem par no nível é
+  renovada (correção do #62); o passo 5 e o passo 7 seguem o código.
+- A saída para `preempt()` é pelo tratador do IPI e por chamadas diretas,
+  não por consulta em toda syscall.
+- A mudança de máscara manda `RESCHED` a todas as CPUs fora da nova máscara.
+- `sys_info` cita a numeração completa dos seletores.
+- O despertar não usa `idle_polling`; o ocioso é `hlt` com IPI no M3.
+- O balanceamento compara a carga com todas as CPUs ligadas.
+- Suspensão, destruição e leitura de estado remotas são obrigação das
+  syscalls ainda não implementadas.
+- Decididos: o servidor segue quem chama, NUMA adiado, atômicas no
+  orçamento, `mwait` adiado.

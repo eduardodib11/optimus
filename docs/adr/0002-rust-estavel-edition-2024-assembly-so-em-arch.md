@@ -19,8 +19,9 @@ Todo o sistema é escrito em Rust estável, edition 2024, com a versão fixada e
 `rust-toolchain.toml` e atualizada a cada 6 semanas por PR dedicado. Nightly só
 em jobs de Miri e fuzzing.
 
-Assembly (inline ou em arquivo) só existe em `kernel/okernel/arch/` e no código
-de entrada do `optboot`. `#![forbid(unsafe_code)]` vale em toda crate, exceto as
+Assembly (inline ou em arquivo) só existe no `arch/` de cada crate permitida:
+`kernel/okernel/src/arch/`, `lib/ostd/src/arch/` (syscall e `_start`) e o
+código de entrada do `optboot`. `#![forbid(unsafe_code)]` vale em toda crate, exceto as
 listadas em `unsafe-allowlist.toml`; cada bloco `unsafe` traz `// SAFETY:` e é
 revisado por duas pessoas (RNF-09). `panic = "abort"` em todo o sistema.
 
@@ -41,3 +42,11 @@ revisado por duas pessoas (RNF-09). `panic = "abort"` em todo o sistema.
   contado e auditável no CI.
 - A equipe precisa dominar Rust de sistemas (trilha de estudo na seção 17.4).
 - Alvos próprios dependem de `build-std`, ainda instável; ADR 0025 resolve isso.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- O assembly passa a valer para o `arch/` de cada crate permitida, com o
+-   caminho real do kernel (`kernel/okernel/src/arch/`) e o `lib/ostd/src/arch/`,
+-   que já tinha assembly desde o M2.

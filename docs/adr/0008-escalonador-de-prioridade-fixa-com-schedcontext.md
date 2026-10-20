@@ -41,4 +41,12 @@ quando um cliente chama um servidor por IPC.
 - Tempo real para áudio e UI e isolamento temporal entre serviços.
 - A doação em IPC evita inversão de prioridade sem protocolo extra.
 - A política de prioridades é centralizada na seção 6.6; manifestos declaram a
-  prioridade dentro dessas faixas.
+  prioridade dentro dessas faixas. O `root` e o `svcmgr` rodam em 200, na faixa
+  de drivers, por exceção da ADR 0034, que também define a faixa de prioridade
+  que o compilador de manifestos aceita.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- Acrescentada a remissão à ADR 0034 sobre a prioridade do `root` e do `svcmgr`.
