@@ -8,8 +8,8 @@
 //! a configuração comum a todas as CPUs (modo do APIC, calibragem do TSC,
 //! XSAVE), o dono do pânico e o escalonador (T-323). Cada CPU tem também a
 //! caixa de pedidos de IPI (T-322), a thread atual, o quadro gravado
-//! quando um pânico a congela e os caches de frames e de objetos do heap
-//! (T-328). O BSP usa a
+//! quando um pânico a congela, os caches de frames e de objetos do heap
+//! (T-328) e o DRBG da CPU (T-337). O BSP usa a
 //! instância estática (as exceções podem chegar antes do alocador); os APs
 //! recebem a sua na partida (T-318).
 //!
@@ -25,6 +25,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use okernel::ipi::Mailbox;
 use okernel::mm::cache::{FrameCache, ObjectCache, object_cache};
+use okernel::rand::Drbg;
 use okernel::sync::HeldLocks;
 
 use super::cpu::{rdmsr, wrmsr};
@@ -86,6 +87,11 @@ pub struct PerCpu {
     objects_cached: AtomicU32,
     /// O cache de objetos está emprestado.
     objects_busy: AtomicBool,
+    /// DRBG desta CPU (T-337; ADR 0039, item 4), por [`with_drbg`]; `None`
+    /// sem semente.
+    drbg: UnsafeCell<Option<Drbg>>,
+    /// O DRBG está emprestado.
+    drbg_busy: AtomicBool,
 }
 
 // Os deslocamentos que `syscall.S` usa.
@@ -98,8 +104,9 @@ const _: () = assert!(offset_of!(PerCpu, apic_id) == 28);
 // SAFETY: os campos compartilháveis são atômicos; GDT e TSS (as células)
 // só são tocadas pela própria CPU, com interrupções desligadas (`load` e
 // `set_kernel_stack`), e a CPU as lê pelo hardware; os caches de frames e
-// de objetos, só pela própria CPU em `with_frame_cache` e
-// `with_object_cache`.
+// de objetos e o DRBG, só pela própria CPU em `with_frame_cache`,
+// `with_object_cache` e `with_drbg` (e o DRBG por `set_drbg`, com `&mut`,
+// antes de a área ser publicada).
 unsafe impl Sync for PerCpu {}
 
 impl PerCpu {
@@ -142,7 +149,15 @@ impl PerCpu {
             objects: UnsafeCell::new(object_cache()),
             objects_cached: AtomicU32::new(0),
             objects_busy: AtomicBool::new(false),
+            drbg: UnsafeCell::new(None),
+            drbg_busy: AtomicBool::new(false),
         }
+    }
+
+    /// Põe o DRBG da área, antes de ela ser instalada ou publicada (a
+    /// partida de um AP).
+    pub fn set_drbg(&mut self, drbg: Option<Drbg>) {
+        *self.drbg.get_mut() = drbg;
     }
 
     /// Id lógico.
@@ -376,6 +391,19 @@ pub fn with_object_cache<R>(f: impl FnOnce(&mut ObjectCache) -> R) -> R {
             r
         })
     }
+}
+
+/// Roda `f` com o DRBG desta CPU (T-337; sem trava, como os caches). `f`
+/// não pode trocar de contexto nem chamar `with_drbg` de novo.
+///
+/// # Panics
+///
+/// Se o DRBG desta CPU já está emprestado (reentrada).
+pub fn with_drbg<R>(f: impl FnOnce(&mut Option<Drbg>) -> R) -> R {
+    let p = this();
+    // SAFETY: a célula é desta CPU e só se chega a ela por aqui (e por
+    // `set_drbg`, que exige `&mut` da área ainda não publicada).
+    unsafe { borrow(&p.drbg, &p.drbg_busy, f) }
 }
 
 fn count(n: usize) -> u32 {

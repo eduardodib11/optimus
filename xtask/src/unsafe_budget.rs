@@ -16,7 +16,7 @@
 //! crates externas, então o TOML (só duas formas) e os tokens do Rust (só o
 //! que importa: identificadores, comentários e literais) são lidos aqui.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -180,6 +180,15 @@ pub struct Scan {
     unsafe_doc: bool,
     /// Linhas dos comentários com `SAFETY:`.
     safety: Vec<usize>,
+    /// Linhas que só têm comentário (sem código).
+    comment_lines: BTreeSet<usize>,
+    /// Linhas que começam um atributo (`#[...]`), que pode vir entre a
+    /// documentação e o item.
+    attr_lines: BTreeSet<usize>,
+    /// Linhas de documentação com `# Safety`.
+    doc_safety: BTreeSet<usize>,
+    /// Linha de cada declaração `unsafe fn nome`.
+    unsafe_fns: Vec<usize>,
 }
 
 fn tokenize(src: &str) -> (Vec<(Tok, usize)>, Vec<Comment>) {
@@ -334,6 +343,9 @@ pub fn scan(src: &str) -> Scan {
             let needs_safety =
                 matches!(toks.get(k + 1), Some((Tok::Punct('{'), _))) || ident(k + 1, "impl");
             out.uses.push((*line, needs_safety));
+            if ident(k + 1, "fn") && matches!(toks.get(k + 2), Some((Tok::Ident(_), _))) {
+                out.unsafe_fns.push(*line);
+            }
         } else if name == "path"
             && k >= 2
             && toks[k - 1].0 == Tok::Punct('[')
@@ -382,7 +394,20 @@ pub fn scan(src: &str) -> Scan {
             }
         }
     }
+    let code_lines: BTreeSet<usize> = toks.iter().map(|(_, l)| *l).collect();
+    for (k, (tok, line)) in toks.iter().enumerate() {
+        let first = k == 0 || toks[k - 1].1 != *line;
+        if first && *tok == Tok::Punct('#') {
+            out.attr_lines.insert(*line);
+        }
+    }
     for c in &comments {
+        if !code_lines.contains(&c.end) {
+            out.comment_lines.insert(c.end);
+        }
+        if c.text.trim() == "/ # Safety" || c.text.trim() == "/# Safety" {
+            out.doc_safety.insert(c.end);
+        }
         if c.text.contains("SAFETY:") {
             out.safety.push(c.end);
         }
@@ -426,12 +451,31 @@ fn budget_of<'a>(allow: &'a Allowlist, file: &str) -> Option<&'a str> {
         .max_by_key(|k| k.len())
 }
 
-/// O `unsafe` desta linha tem um `// SAFETY:` logo antes (até 8 linhas
-/// acima, sem outro `unsafe` no meio) ou logo depois (até 2 linhas).
-fn documented(scan: &Scan, line: usize, previous_use: usize) -> bool {
-    scan.safety
-        .iter()
-        .any(|&c| (c > previous_use && c <= line && line - c <= 8) || (c > line && c - line <= 2))
+/// O `unsafe` desta linha tem um `// SAFETY:` no bloco de comentários
+/// imediatamente acima: sem linha em branco ou código no meio, e um
+/// comentário de várias linhas vale se alguma delas tem `SAFETY:`.
+fn documented(scan: &Scan, line: usize) -> bool {
+    let mut l = line;
+    while l > 1 && scan.comment_lines.contains(&(l - 1)) {
+        l -= 1;
+        if scan.safety.contains(&l) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A `unsafe fn` desta linha tem `# Safety` na documentação logo acima
+/// (atributos podem vir entre a documentação e a função).
+fn has_safety_doc(scan: &Scan, line: usize) -> bool {
+    let mut l = line;
+    while l > 1 && (scan.comment_lines.contains(&(l - 1)) || scan.attr_lines.contains(&(l - 1))) {
+        l -= 1;
+        if scan.doc_safety.contains(&l) {
+            return true;
+        }
+    }
+    false
 }
 
 type Scans<'a> = BTreeMap<&'a str, Scan>;
@@ -496,14 +540,19 @@ fn check_files<'a>(
             continue;
         };
         *used.get_mut(key).unwrap() += sc.uses.len();
-        let mut previous = 0;
         for &(line, needs_safety) in &sc.uses {
-            if needs_safety && !documented(sc, line, previous) {
+            if needs_safety && !documented(sc, line) {
                 problems.push(format!(
-                    "{path}:{line}: bloco `unsafe` sem comentário `// SAFETY:`"
+                    "{path}:{line}: bloco `unsafe` sem comentário `// SAFETY:` imediatamente acima"
                 ));
             }
-            previous = line;
+        }
+        for &line in &sc.unsafe_fns {
+            if !has_safety_doc(sc, line) {
+                problems.push(format!(
+                    "{path}:{line}: `unsafe fn` sem a seção `# Safety` na documentação"
+                ));
+            }
         }
     }
     used
@@ -863,12 +912,64 @@ unsafe fn real() {}
         assert!(err.contains("heap.rs:3"), "{err}");
         assert!(err.contains("heap.rs:5"), "{err}");
         assert!(!err.contains("heap.rs:2"), "{err}");
-        // `unsafe fn` e `unsafe extern` não pedem comentário.
+        // `unsafe fn` (com `# Safety`) e `unsafe extern` não pedem comentário.
         let extra = [file(
             "lib/oalloc/src/heap.rs",
-            "unsafe fn f() {}\nunsafe extern \"C\" {}\n",
+            "/// # Safety\nunsafe fn f() {}\nunsafe extern \"C\" {}\n",
         )];
         check_sources(&allow(), &tree(&extra)).unwrap();
+    }
+
+    #[test]
+    fn safety_so_vale_imediatamente_acima() {
+        let check = |body: &str| {
+            let extra = [file("lib/oalloc/src/heap.rs", body)];
+            check_sources(&allow(), &tree(&extra))
+        };
+        // Comentário de várias linhas colado ao `unsafe`: vale.
+        check("// SAFETY: primeira linha\n// e a continuação.\nunsafe { a() }\n").unwrap();
+        // A continuação do comentário não precisa repetir `SAFETY:` e a
+        // linha em branco entre os dois quebra a ligação.
+        let err = check("// SAFETY: solto.\n\nunsafe { a() }\n").unwrap_err();
+        assert!(err.contains("heap.rs:3"), "{err}");
+        // Código entre o comentário e o `unsafe` (a janela antiga de 8
+        // linhas aceitava).
+        let err = check("// SAFETY: longe.\nlet x = 1;\nunsafe { a() }\n").unwrap_err();
+        assert!(err.contains("heap.rs:3"), "{err}");
+        // Comentário no fim da linha, ou depois do `unsafe`, não vale.
+        let err = check("unsafe { a() } // SAFETY: depois.\n").unwrap_err();
+        assert!(err.contains("heap.rs:1"), "{err}");
+        let err = check("unsafe {\n    // SAFETY: dentro.\n    a()\n}\n").unwrap_err();
+        assert!(err.contains("heap.rs:1"), "{err}");
+        // Comentário de código anterior com `SAFETY:` não passa adiante.
+        let err = check("a(); // SAFETY: do outro.\nunsafe { b() }\n").unwrap_err();
+        assert!(err.contains("heap.rs:2"), "{err}");
+    }
+
+    #[test]
+    fn unsafe_fn_exige_secao_safety() {
+        let check = |body: &str| {
+            let extra = [file("lib/oalloc/src/heap.rs", body)];
+            check_sources(&allow(), &tree(&extra))
+        };
+        check("/// Faz.\n///\n/// # Safety\n///\n/// Contrato.\npub unsafe fn f() {}\n").unwrap();
+        // Atributos entre a documentação e a função não atrapalham.
+        check("/// # Safety\n#[inline]\n#[must_use]\nunsafe fn f() {}\n").unwrap();
+        let err = check("/// Faz.\npub unsafe fn f() {}\n").unwrap_err();
+        assert!(
+            err.contains("heap.rs:2: `unsafe fn` sem a seção `# Safety`"),
+            "{err}"
+        );
+        let err = check("unsafe fn f() {}\n").unwrap_err();
+        assert!(err.contains("heap.rs:1"), "{err}");
+        // Linha em branco entre a seção e a função, ou `// Safety` comum.
+        let err = check("/// # Safety\n\nunsafe fn f() {}\n").unwrap_err();
+        assert!(err.contains("heap.rs:3"), "{err}");
+        // Tipo de ponteiro de função e `unsafe extern`/`impl` não são declarações.
+        check("type F = Option<unsafe fn(usize)>;\nunsafe extern \"C\" {}\n").unwrap();
+        // Também nos métodos de `impl`, onde a trait manda.
+        let err = check("impl A {\n    unsafe fn g(&self) {}\n}\n").unwrap_err();
+        assert!(err.contains("heap.rs:2"), "{err}");
     }
 
     #[test]

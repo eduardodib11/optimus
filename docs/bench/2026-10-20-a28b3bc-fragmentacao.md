@@ -65,3 +65,24 @@ Achados da revisão que ficam para depois, junto da T-337 (coleções, strings e
 - **Ponteiro interior no 2º segmento de um bloco enorme.** O cabeçalho do segmento é achado por `ptr & !(2 MiB - 1)`; um ponteiro interior no segundo segmento de um bloco enorme (de vários segmentos) cai num "cabeçalho" que é dado do usuário. O `owns` só confere a janela. Resolver ao ter a entropia (sorteio de endereços) e um mapa de segmentos de blocos enormes.
 - **Janela de `SAFETY:`.** O `xtask` aceita o comentário até 8 linhas antes do `unsafe` (sem outro `unsafe` no meio); apertar para o comentário imediatamente acima.
 - **`unsafe fn` sem `# Safety`.** A política exige `// SAFETY:` em blocos e `impl`, mas não a seção `# Safety` na documentação de `unsafe fn`; acrescentar ao `xtask` junto com o `clippy::missing_safety_doc`.
+
+## Carga de coleções (T-337, 2026-10-20)
+
+Para a "Decisão pendente" acima. Comando: `cargo test -p oalloc --release colecoes -- --nocapture` (teste `tests_colecoes::colecoes_fragmentacao`; fora do Miri).
+
+**Método.** Uma thread roda coleções de verdade: 60 `HashMap<u64, String>` (o do `ocoll`, de 4 a 4000 entradas, valores de 4 a 40 B), 300 `Vec<u8>` crescendo por `extend` até 300 KiB, 200 `String` crescendo por `push_str` até 40 KiB; no fim cada tipo perde metade ao acaso. Um `#[global_allocator]` de teste grava cada `alloc`/`dealloc` (o `realloc` padrão é alocar, copiar, liberar, o mesmo que o `ostd` faz) e a sequência (120 821 alocações) é reexecutada num `Heap` do `oalloc`. As colunas "Classes até 32 KiB" e "Páginas médias" calculam o custo de cada bloco vivo sob as opções 2 e 3 (classes de 4 por duplicação até 32 KiB em páginas de 64 KiB; até 64 KiB em páginas de 512 KiB), contando a sobra no fim da página; a tabela de classes **não** foi alterada. O custo "Atual" calculado (12 349 KiB) confere com o do heap real (12,05 MiB, `Stats::live_bytes`). Determinista (semente fixa; os tamanhos das tabelas não dependem da chave do `RandomState`).
+
+Heap real no fim: 21 120 blocos vivos, 8,59 MiB pedidos, 12,05 MiB em blocos (perda de arredondamento **40,3%**), 26,0 MiB mapeados (3,0 vezes o pedido; o pico é o mesmo, porque o churn deixa segmentos meio vazios que não voltam à fonte).
+
+| Faixa | Blocos | Pedido (KiB) | Atual (KiB) | Perda | Classes até 32 KiB (KiB) | Perda | Páginas médias (KiB) | Perda |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| até 64 B | 16789 | 586 | 634 | 8,2% | 634 | 8,2% | 634 | 8,2% |
+| 65 B a 8 KiB | 4235 | 467 | 515 | 10,3% | 515 | 10,3% | 515 | 10,3% |
+| 8 a 64 KiB | 63 | 1701 | 4032 | 137,0% | 2359 | 38,7% | 1867 | 9,8% |
+| 64 a 512 KiB | 33 | 6041 | 7168 | 18,6% | 7168 | 18,6% | 7168 | 18,6% |
+| > 512 KiB | 0 | 0 | 0 | 0,0% | 0 | 0,0% | 0 | 0,0% |
+| **Total** | 21120 | 8796 | 12349 | **40,4%** | 10677 | **21,4%** | 10185 | **15,8%** |
+
+**Leitura.** Só 63 blocos (0,3% deles) estão na faixa de 8 a 64 KiB, mas custam 33% de tudo o que o alocador entrega (4 032 de 12 349 KiB) e quase todo o desperdício de arredondamento da carga: 2,3 MiB dos 3,5 MiB perdidos. Os `Vec` e `String` que dobram a capacidade (8, 16, 32, 64 KiB) pagam uma página de 64 KiB inteira, e as tabelas do `HashMap` (40 B por balde, 2ⁿ baldes) caem na mesma faixa a partir de 256 baldes. Abaixo de 8 KiB a perda fica em torno de 8 a 10%, e a faixa de 64 a 512 KiB perde 18,6% por arredondar para páginas de 64 KiB, o que nenhuma das duas opções muda.
+
+**Recomendação (para Eduardo decidir).** A opção 2, classes até 32 KiB: derruba a perda total de 40% para 21%, mexe só em `class.rs` (e na capacidade de uma página: 2 a 6 blocos) e não toca o formato do segmento. A opção 3 chega a 16%, mas pede um novo tipo de página no segmento (mapa de páginas, `settle`, adoção e `trim` aprendem de duas granularidades), para ganhar 5 pontos a mais numa faixa que a opção 2 já reduziu de 137% para 39%. A opção 1 (manter) só se justifica se os serviços do M3 não crescerem coleções acima de 8 KiB; esta carga mostra que um `HashMap` com cerca de 200 entradas já cruza essa linha. Nada foi alterado na tabela de classes.

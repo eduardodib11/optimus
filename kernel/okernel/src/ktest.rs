@@ -56,6 +56,7 @@ const SUITES: &[&[Test]] = &[
     crate::kipc::TESTS,
     crate::kfault::TESTS,
     crate::kroot::TESTS,
+    crate::krand::TESTS,
 ];
 
 /// Roda os testes selecionados (`ktest=` com um ou mais prefixos separados

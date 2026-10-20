@@ -31,6 +31,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
     ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
     ("oalloc", "lib/oalloc/src/lib.rs", KERNEL_TARGET),
+    ("ocoll", "lib/ocoll/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
     ("root", "services/root/src/main.rs", USER_TARGET),
     ("hello", "services/hello/src/main.rs", USER_TARGET),
@@ -39,7 +40,7 @@ const CRATES: &[(&str, &str, &str)] = &[
 ];
 
 /// Bibliotecas portáveis cujos testes rodam no host.
-const HOST_TESTED: &[&str] = &["oalloc", "obfs", "oelf", "optcrypt"];
+const HOST_TESTED: &[&str] = &["oalloc", "obfs", "ocoll", "oelf", "optcrypt"];
 
 const PROFILES: &[&str] = &["lite", "basic", "jarvis", "premium", "server"];
 

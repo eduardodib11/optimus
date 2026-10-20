@@ -17,3 +17,4 @@ workspace = true
 kabi = { path = "../kabi" }
 obfs = { path = "../../lib/obfs" }
 oelf = { path = "../../lib/oelf" }
+optcrypt = { path = "../../lib/optcrypt" }

@@ -95,6 +95,8 @@ fn new_percpu(cpu: u32, apic_id: u32) -> Option<&'static PerCpu> {
     let order = pages.next_power_of_two().trailing_zeros() as usize;
     let frame = kmem::alloc_frames(order)?;
     let p = kmem::direct(frame) as *mut PerCpu;
+    // O DRBG da CPU sai do principal aqui, no BSP, antes de o AP rodar.
+    let drbg = crate::krand::fork_for(cpu);
     // SAFETY: frames recém-saídos do buddy, só nossos, alinhados a 4 KiB
     // (o alinhamento da `PerCpu`) e com espaço para ela; nunca voltam ao
     // buddy, então a referência vive para sempre. Zerados antes, como as
@@ -103,6 +105,7 @@ fn new_percpu(cpu: u32, apic_id: u32) -> Option<&'static PerCpu> {
         core::ptr::write_bytes(p.cast::<u8>(), 0, 4096 << order);
         p.write(PerCpu::new(cpu));
         (*p).set_apic_id(apic_id);
+        (*p).set_drbg(drbg);
         Some(&*p)
     }
 }

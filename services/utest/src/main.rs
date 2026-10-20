@@ -34,6 +34,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -137,6 +138,30 @@ const TESTS: &[Test] = &[
     Test {
         name: "sync.rwlock",
         run: sync_rwlock,
+    },
+    Test {
+        name: "rand.entropia_do_kernel",
+        run: rand_entropia,
+    },
+    Test {
+        name: "rand.fast_e_reserva",
+        run: rand_fast,
+    },
+    Test {
+        name: "rand.semente_e_heap_sorteado",
+        run: rand_semente,
+    },
+    Test {
+        name: "collections.hashmap_contra_modelo",
+        run: colecoes_hashmap,
+    },
+    Test {
+        name: "collections.ring_e_fila",
+        run: colecoes_ring,
+    },
+    Test {
+        name: "utf8.bordas_e_decodificador",
+        run: utf8_bordas,
     },
     #[cfg(utest_falha)]
     Test {
@@ -682,7 +707,9 @@ fn sync_condvar(_: &Ctx) -> Outcome {
     let mut seen = alloc::vec![0u8; (PRODUCERS * PER) as usize];
     for h in consumers {
         for v in h.join().map_err(|_| "consumidor falhou")? {
-            let slot = seen.get_mut(v as usize).ok_or("item fora da faixa")?;
+            let slot = seen
+                .get_mut(usize::try_from(v).unwrap_or(usize::MAX))
+                .ok_or("item fora da faixa")?;
             *slot += 1;
         }
     }
@@ -889,6 +916,313 @@ fn threads_guarda(ctx: &Ctx) -> Outcome {
     drop(h);
     let _ = (delete(exc), delete(ep), delete(reply), delete(q));
     verdict
+}
+
+/// T-337: a entropia do kernel (`sys_info` classe 5) muda a cada pedido,
+/// enche pedidos de qualquer tamanho e recusa argumento diferente de zero.
+/// A amostra vai ao registro para comparar entre boots (a semente do
+/// `optboot` muda a cada boot).
+fn rand_entropia(_: &Ctx) -> Outcome {
+    use ostd::kabi::Syscall;
+    use ostd::kabi::sched::SYS_INFO_ENTROPY;
+    let mut a = [0u8; 24];
+    let mut b = [0u8; 24];
+    ostd::rand::secure_fill(&mut a).map_err(|_| "secure_fill falhou")?;
+    ostd::rand::secure_fill(&mut b).map_err(|_| "secure_fill falhou")?;
+    if a == b || a == [0; 24] {
+        return Err("duas leituras de entropia iguais (ou zeradas)");
+    }
+    let mut big = [0u8; 100];
+    ostd::rand::secure_fill(&mut big).map_err(|_| "secure_fill(100) falhou")?;
+    if big.chunks(8).any(|c| c.iter().all(|&x| x == 0)) {
+        return Err("pedido de 100 bytes não foi preenchido");
+    }
+    let raw = ostd::sys::syscall(Syscall::SysInfo, [SYS_INFO_ENTROPY, 1, 0, 0, 0, 0]);
+    if raw != Err(Error::InvalidArgument) {
+        return Err("argumento diferente de zero devia dar InvalidArgument");
+    }
+    ostd::debug::print_fmt(format_args!(
+        "utest: amostra de entropia {:016x}",
+        u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]])
+    ));
+    Ok(())
+}
+
+/// T-337: `fast()` (xoshiro por thread) muda a cada chamada, fica dentro do
+/// limite pedido, difere entre threads; a mistura de reserva (usada se o
+/// kernel recusar a entropia) também muda a cada chamada; e, com o RNG do
+/// QEMU, o processo não está degradado.
+fn rand_fast(_: &Ctx) -> Outcome {
+    use ostd::rand::{fast_below, fast_fill, fast_u64, is_degraded, mix_fill};
+    if is_degraded() {
+        return Err("o kernel devia ter entropia sob o QEMU (virtio-rng)");
+    }
+    let (a, b) = (fast_u64(), fast_u64());
+    if a == b {
+        return Err("duas saídas seguidas de fast() iguais");
+    }
+    let mut buckets = [0u32; 8];
+    for _ in 0..4000 {
+        let v = fast_below(8);
+        *buckets
+            .get_mut(usize::try_from(v).unwrap_or(usize::MAX))
+            .ok_or("fast_below fora do limite")? += 1;
+    }
+    // Esperado 500 por balde (desvio ~21): 6 sigmas.
+    if buckets.iter().any(|&c| !(370..630).contains(&c)) {
+        return Err("fast_below com distribuição torta");
+    }
+    if fast_below(0) != 0 || fast_below(1) != 0 {
+        return Err("fast_below(0|1) devia dar 0");
+    }
+    let mut buf = [0u8; 21];
+    fast_fill(&mut buf);
+    if buf.iter().all(|&x| x == 0) {
+        return Err("fast_fill não preencheu");
+    }
+    // Outra thread semeia o próprio gerador: a primeira saída difere.
+    let other = ostd::thread::spawn(fast_u64);
+    let other = other.join().map_err(|_| "join")?;
+    if other == a || other == b {
+        return Err("a thread filha repetiu o gerador da principal");
+    }
+    // A mistura de reserva muda a cada chamada, mesmo no mesmo instante.
+    let (mut m1, mut m2) = ([0u8; 32], [0u8; 32]);
+    mix_fill(&mut m1);
+    mix_fill(&mut m2);
+    if m1 == m2 || m1 == [0; 32] {
+        return Err("mix_fill repetiu ou zerou");
+    }
+    if is_degraded() {
+        return Err("mix_fill não deve marcar a degradação por conta própria");
+    }
+    Ok(())
+}
+
+/// T-337: a semente do processo vem do kernel e o heap cai num lugar
+/// sorteado da janela (ADR 0039, itens 2 e 4). Escreve a amostra no registro
+/// para comparar entre boots: `cargo xtask test user` duas vezes dá valores
+/// diferentes.
+fn rand_semente(_: &Ctx) -> Outcome {
+    use core::hash::BuildHasher;
+    use ostd::alloc::heap_range;
+    use ostd::collections::RandomState;
+    let seed = ostd::rand::process_seed();
+    if seed == [0; 4] || seed[0] == seed[1] {
+        return Err("semente do processo zerada ou repetida");
+    }
+    // Cada mapa tem a sua chave; o mesmo dado tem hash diferente.
+    let (r1, r2) = (RandomState::new(), RandomState::new());
+    if r1.hash_one("amostra") == r2.hash_one("amostra") {
+        return Err("dois mapas com a mesma chave");
+    }
+    let (base, limit) = heap_range();
+    let window = 0x0000_1000_0000_0000..0x0000_2000_0000_0000;
+    if base % (2 << 20) != 0
+        || !window.contains(&base)
+        || !window.contains(&(limit - 1))
+        || limit - base != 512 << 30
+    {
+        return Err("faixa do heap fora da janela ou desalinhada");
+    }
+    let probe = Box::new(7u8);
+    let at = (&raw const *probe).addr() as u64;
+    if !(base..limit).contains(&at) {
+        return Err("alocação fora da faixa do heap");
+    }
+    let block = Vec::<u8>::with_capacity(3 << 20);
+    let at = block.as_ptr().addr() as u64;
+    if !(base..limit).contains(&at) {
+        return Err("bloco enorme fora da faixa do heap");
+    }
+    // Uma linha curta por valor (o registro corta linhas longas).
+    ostd::debug::print_fmt(format_args!("utest: amostra de semente {:016x}", seed[0]));
+    ostd::debug::print_fmt(format_args!("utest: base do heap {base:012x}"));
+    ostd::debug::print_fmt(format_args!(
+        "utest: hash do mapa {:016x}",
+        r1.hash_one("amostra")
+    ));
+    Ok(())
+}
+
+/// T-337: `HashMap` contra um `BTreeMap` de modelo, com operações sorteadas
+/// (chaves em faixa pequena para forçar remoções e reinserções), mais
+/// `HashSet`.
+fn colecoes_hashmap(_: &Ctx) -> Outcome {
+    use ostd::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use ostd::rand::fast_below;
+    let mut map: HashMap<u64, String> = HashMap::new();
+    let mut model: BTreeMap<u64, String> = BTreeMap::new();
+    for step in 0..3000u64 {
+        let key = fast_below(400);
+        match fast_below(5) {
+            0..=1 => {
+                let value = format!("v{step}");
+                if map.insert(key, value.clone()) != model.insert(key, value) {
+                    return Err("insert divergiu do modelo");
+                }
+            }
+            2 => {
+                if map.remove(&key) != model.remove(&key) {
+                    return Err("remove divergiu do modelo");
+                }
+            }
+            3 => {
+                if map.get(&key) != model.get(&key) {
+                    return Err("get divergiu do modelo");
+                }
+            }
+            _ => {
+                if map.contains_key(&key) != model.contains_key(&key) {
+                    return Err("contains_key divergiu do modelo");
+                }
+            }
+        }
+        if map.len() != model.len() {
+            return Err("len divergiu do modelo");
+        }
+    }
+    let seen: BTreeMap<u64, String> = map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    if seen != model {
+        return Err("o conteúdo final divergiu do modelo");
+    }
+    // Crescimento grande e esvaziamento.
+    let mut big: HashMap<u32, u32> = HashMap::new();
+    for i in 0..5000 {
+        big.insert(i, i * 2);
+    }
+    if (0..5000).any(|i| big.get(&i) != Some(&(i * 2))) {
+        return Err("perdeu entradas ao crescer");
+    }
+    for i in 0..5000 {
+        if big.remove(&i) != Some(i * 2) {
+            return Err("remove de entrada presente falhou");
+        }
+    }
+    if !big.is_empty() {
+        return Err("devia esvaziar");
+    }
+    let mut set: HashSet<u16> = HashSet::new();
+    let mut set_model = BTreeSet::new();
+    for _ in 0..1500 {
+        let v = u16::try_from(fast_below(200)).unwrap_or(0);
+        if set.insert(v) != set_model.insert(v) {
+            return Err("HashSet::insert divergiu do modelo");
+        }
+    }
+    if set.len() != set_model.len() || !set_model.iter().all(|v| set.contains(v)) {
+        return Err("HashSet divergiu do modelo");
+    }
+    Ok(())
+}
+
+/// T-337: anel de capacidade fixa e fila contra modelos simples.
+fn colecoes_ring(_: &Ctx) -> Outcome {
+    use ostd::collections::{Queue, Ring, VecDeque};
+    use ostd::rand::fast_below;
+    let mut ring: Ring<u32> = Ring::new(5);
+    let mut model: VecDeque<u32> = VecDeque::new();
+    let mut queue: Queue<u32> = Queue::new();
+    let mut plain: Vec<u32> = Vec::new();
+    for i in 0..2000u32 {
+        match fast_below(4) {
+            0 => {
+                let ok = ring.push(i).is_ok();
+                if ok != (model.len() < 5) {
+                    return Err("push no anel divergiu");
+                }
+                if ok {
+                    model.push_back(i);
+                }
+            }
+            1 => {
+                if ring.pop() != model.pop_front() {
+                    return Err("pop do anel divergiu");
+                }
+            }
+            2 => {
+                let dropped = ring.push_overwrite(i);
+                let old = if model.len() == 5 {
+                    model.pop_front()
+                } else {
+                    None
+                };
+                model.push_back(i);
+                if dropped != old {
+                    return Err("push_overwrite descartou o errado");
+                }
+            }
+            _ => {
+                queue.push_back(i);
+                plain.push(i);
+                if fast_below(2) == 0 {
+                    let first = if plain.is_empty() {
+                        None
+                    } else {
+                        Some(plain.remove(0))
+                    };
+                    if queue.pop_front() != first {
+                        return Err("fila divergiu do modelo");
+                    }
+                }
+            }
+        }
+        if ring.len() != model.len() || !ring.iter().eq(model.iter()) {
+            return Err("anel divergiu do modelo");
+        }
+        if queue.len() != plain.len() {
+            return Err("tamanho da fila divergiu");
+        }
+    }
+    Ok(())
+}
+
+/// T-337: UTF-8 nas bordas: formas longas demais, substitutos, acima de
+/// `U+10FFFF`, sequência cortada, decodificador com caractere partido.
+fn utf8_bordas(_: &Ctx) -> Outcome {
+    use ostd::utf8::{self, Decoder};
+    for ok in ["", "a", "é", "€", "𝄞", "a€𝄞é"] {
+        if utf8::validate(ok.as_bytes()) != Ok(ok) {
+            return Err("texto válido recusado");
+        }
+    }
+    let bad: [&[u8]; 8] = [
+        &[0xC0, 0x80],
+        &[0xE0, 0x80, 0x80],
+        &[0xED, 0xA0, 0x80],
+        &[0xF4, 0x90, 0x80, 0x80],
+        &[0xF5, 0x80, 0x80, 0x80],
+        &[0x80],
+        &[0xE2, 0x82],
+        &[0xF0, 0x9F, 0x98],
+    ];
+    for b in bad {
+        if utf8::validate(b).is_ok() {
+            return Err("UTF-8 inválido aceito");
+        }
+    }
+    if utf8::validate(&[b'a', 0xE2, 0x82])
+        .err()
+        .map(|e| (e.valid_up_to, e.error_len))
+        != Some((1, None))
+    {
+        return Err("erro de sequência cortada mal descrito");
+    }
+    let s = "aé€𝄞z";
+    if utf8::truncate(s, 2) != "a" || utf8::truncate(s, 3) != "aé" || utf8::truncate(s, 99) != s {
+        return Err("corte fora da fronteira");
+    }
+    let mut dec = Decoder::new();
+    let mut out = String::new();
+    for b in "€𝄞".as_bytes() {
+        dec.push(&[*b], &mut out);
+    }
+    dec.push(&[0xE2, 0x82], &mut out);
+    dec.finish(&mut out);
+    if out != "€𝄞\u{FFFD}" {
+        return Err("decodificador incremental errou");
+    }
+    Ok(())
 }
 
 /// Falha de propósito (só com `UTEST_FALHA=1`): prova que o `xtask`

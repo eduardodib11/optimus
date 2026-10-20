@@ -23,6 +23,9 @@ dependencies = [
 [[package]]
 name = "oalloc"
 version = "0.1.0"
+dependencies = [
+ "ocoll",
+]
 
 [[package]]
 name = "obfs"
@@ -30,6 +33,10 @@ version = "0.1.0"
 dependencies = [
  "optcrypt",
 ]
+
+[[package]]
+name = "ocoll"
+version = "0.1.0"
 
 [[package]]
 name = "oelf"
@@ -42,6 +49,7 @@ dependencies = [
  "kabi",
  "obfs",
  "oelf",
+ "optcrypt",
 ]
 
 [[package]]
@@ -70,6 +78,7 @@ version = "0.1.0"
 dependencies = [
  "kabi",
  "oalloc",
+ "ocoll",
  "oelf",
 ]
 

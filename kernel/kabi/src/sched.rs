@@ -85,6 +85,16 @@ impl CpuMask {
 /// Seletor desconhecido dá `NotSupported`.
 pub const SYS_INFO_CPUS: u64 = 1;
 
+/// Seletor de `sys_info(seletor, 0)`: entropia (ADR 0039, item 4). Devolve
+/// [`SYS_INFO_ENTROPY_BYTES`] bytes aleatórios criptográficos em `rdx`,
+/// `r10` e `r8` (little-endian, nessa ordem), sem capability. O argumento
+/// (`rsi`) tem de ser zero (senão `InvalidArgument`); sem semente de
+/// entropia no boot, `NotSupported`.
+pub const SYS_INFO_ENTROPY: u64 = 5;
+
+/// Bytes de entropia por chamada de [`SYS_INFO_ENTROPY`] (três palavras).
+pub const SYS_INFO_ENTROPY_BYTES: usize = 24;
+
 #[cfg(test)]
 mod tests {
     use super::*;
