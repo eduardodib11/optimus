@@ -213,6 +213,20 @@ invalidar e só confirma.
   etiqueta", com geração por espaço (`tlb_gen`) e cache de etiquetas por
   CPU. Esse desenho fica descrito aqui e só entra se o T-331 mostrar que a
   troca entre processos não chega a 2 µs sem ele, com emenda a esta ADR.
+- **Páginas globais no kernel (emenda de 2026-10-19, T-331).**
+  - **O que muda:** toda folha da metade alta leva o bit G e o BSP liga o CR4.PGE no `kmem::init`; os APs herdam o CR4 do BSP.
+    - `PageTables::globalize_kernel_half` marca as folhas deixadas pelo optboot.
+    - `kmem::map` e `kmem::protect` marcam as novas.
+    - A metade baixa nunca é global.
+  - **Por quê:** a metade alta é a mesma em todo espaço, então as traduções do kernel podem sobreviver à troca de `CR3`. Sem isso, cada troca de processo jogava fora também as traduções do kernel.
+  - **O que o protocolo já cobria:** uma tradução global só sai com `invlpg` ou desligando o PGE.
+    - O shootdown do kernel já usa `invlpg` por página e `flush_tlb_all` (PGE desligado e religado) para "tudo".
+    - Os alvos do kernel já são todas as CPUs ligadas, e não a máscara `active`, então a premissa "trocar `CR3` limpa a TLB" nunca valeu para ele.
+    - O `Shootdown.tla` não muda.
+  - **Testes:**
+    - `mm.folhas_do_kernel_globais`;
+    - `smp.shootdown_do_kernel_sem_traducao_velha`, que agora exercita traduções que atravessam a troca de `CR3`.
+  - **PCID continua desligado.**
 
 ### 8. Pânico em SMP
 

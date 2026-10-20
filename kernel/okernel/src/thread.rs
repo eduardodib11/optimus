@@ -78,6 +78,23 @@ pub struct Binding {
     pub aspace: Option<Arc<SharedAddressSpace>>,
 }
 
+/// `SchedContext`s de uma thread, sob uma trava só: o escalonador lê o
+/// ativo várias vezes por troca (T-331).
+#[derive(Default)]
+struct SchedSlots {
+    /// O dela, ligado por `sched_bind`.
+    own: Option<Arc<SchedContext>>,
+    /// O doado por quem chamou, enquanto ela atende a chamada (seção
+    /// 6.6); vale no lugar de `own`.
+    donated: Option<Arc<SchedContext>>,
+}
+
+impl SchedSlots {
+    fn active(&self) -> Option<&Arc<SchedContext>> {
+        self.donated.as_ref().or(self.own.as_ref())
+    }
+}
+
 /// Contexto de execução.
 pub struct Thread {
     charge: Charge,
@@ -106,12 +123,9 @@ pub struct Thread {
     fpu: Vec<Block>,
     fpu_addr: usize,
     binding: SpinLock<Binding>,
-    /// `SchedContext` em que a thread roda; trava folha (nada é tomado
-    /// com ela na mão), lida pelo escalonador.
-    sched: SpinLock<Option<Arc<SchedContext>>>,
-    /// `SchedContext` doado por quem chamou, enquanto a thread atende a
-    /// chamada (seção 6.6); vale no lugar de `sched`. Trava folha.
-    donated: SpinLock<Option<Arc<SchedContext>>>,
+    /// `SchedContext` dela e o doado; trava folha (nada é tomado com ela
+    /// na mão), lida pelo escalonador.
+    sched: SpinLock<SchedSlots>,
     /// Estado de IPC (T-208); trava folha, depois da fila do objeto.
     ipc: SpinLock<IpcSlot>,
     /// Endereço de usuário do buffer de IPC (zero: sem buffer).
@@ -162,8 +176,7 @@ impl Thread {
             fpu,
             fpu_addr,
             binding: SpinLock::with_class(LockClass::Object, Binding::default()),
-            sched: SpinLock::with_class(LockClass::SchedLeaf, None),
-            donated: SpinLock::with_class(LockClass::SchedLeaf, None),
+            sched: SpinLock::with_class(LockClass::SchedLeaf, SchedSlots::default()),
             ipc: SpinLock::with_class(LockClass::IpcSlot, IpcSlot::default()),
             ipc_buffer: AtomicU64::new(0),
             exception: AtomicU32::new(0),
@@ -202,6 +215,7 @@ impl Thread {
 
     /// PML4 do espaço (para o CR3), se configurada.
     #[must_use]
+    #[inline]
     pub fn root(&self) -> Option<u64> {
         let root = self.root.load(Ordering::Acquire);
         (root != 0).then_some(root)
@@ -209,11 +223,13 @@ impl Thread {
 
     /// Estado de execução.
     #[must_use]
+    #[inline]
     pub fn state(&self) -> RunState {
         RunState::from_u8(self.state.load(Ordering::Acquire))
     }
 
     /// Muda o estado (pelo escalonador).
+    #[inline]
     pub fn set_state(&self, state: RunState) {
         self.state.store(state as u8, Ordering::Release);
     }
@@ -221,6 +237,7 @@ impl Thread {
     /// Passa de `Blocked` a `Ready` se ainda estiver bloqueada; só quem
     /// vence põe a thread numa fila (ADR 0032, item 5): dois despertares
     /// ao mesmo tempo, de CPUs diferentes, nunca a enfileiram duas vezes.
+    #[inline]
     pub fn claim_wake(&self) -> bool {
         self.state
             .compare_exchange(
@@ -240,28 +257,33 @@ impl Thread {
 
     /// Muda a CPU dona da thread (pelo escalonador, com a thread fora de
     /// qualquer CPU).
+    #[inline]
     pub fn set_cpu(&self, cpu: u32) {
         self.cpu.store(cpu, Ordering::Release);
     }
 
     /// CPU dona da thread (a da fila em que está ou a última em que rodou).
+    #[inline]
     pub fn cpu(&self) -> u32 {
         self.cpu.load(Ordering::Acquire)
     }
 
     /// Marca a pilha de kernel em uso (ao virar a atual de uma CPU) ou
     /// livre (pela CPU, depois de terminar a troca para outra).
+    #[inline]
     pub fn set_on_cpu(&self, on: bool) {
         self.on_cpu.store(on, Ordering::Release);
     }
 
     /// A pilha de kernel da thread está em uso por uma CPU.
     #[must_use]
+    #[inline]
     pub fn on_cpu(&self) -> bool {
         self.on_cpu.load(Ordering::Acquire)
     }
 
     /// Guarda o valor que a thread recebe ao acordar.
+    #[inline]
     pub fn set_wake_value(&self, value: u64) {
         self.wake_value.store(value, Ordering::Release);
     }
@@ -314,11 +336,11 @@ impl Thread {
     /// [`Error::Busy`] se a thread já iniciou ou já tem um `SchedContext`,
     /// ou se `sc` já está ligado a outra.
     pub fn bind_sched(&self, sc: Arc<SchedContext>) -> Result<(), Error> {
-        let mut slot = self.sched.lock();
-        if self.state() != RunState::Inactive || slot.is_some() || !sc.try_bind() {
+        let mut slots = self.sched.lock();
+        if self.state() != RunState::Inactive || slots.own.is_some() || !sc.try_bind() {
             return Err(Error::Busy);
         }
-        *slot = Some(sc);
+        slots.own = Some(sc);
         Ok(())
     }
 
@@ -326,21 +348,31 @@ impl Thread {
     /// chamada, ou o dela, se ligado.
     #[must_use]
     pub fn sched_context(&self) -> Option<Arc<SchedContext>> {
-        let donated = self.donated.lock().clone();
-        donated.or_else(|| self.sched.lock().clone())
+        self.sched.lock().active().cloned()
+    }
+
+    /// `f` sobre o [`sched_context`](Self::sched_context), sem tomar uma
+    /// referência a ele; `f` roda com a trava folha na mão e não pode
+    /// tomar outra.
+    pub fn with_sched_context<R>(&self, f: impl FnOnce(&Arc<SchedContext>) -> R) -> Option<R> {
+        self.sched.lock().active().map(f)
     }
 
     /// Doação em `ipc_call` (seção 6.6): a thread passa a rodar com `sc`,
     /// o tempo e a prioridade de quem chamou, até [`undonate`](Self::undonate).
     pub fn donate(&self, sc: Arc<SchedContext>) {
-        *self.donated.lock() = Some(sc);
+        let old = self.sched.lock().donated.replace(sc);
+        // A última referência pode ir aqui: solta sem a trava na mão.
+        drop(old);
     }
 
     /// Devolve a doação `sc`, se for a que a thread usa agora.
     pub fn undonate(&self, sc: &Arc<SchedContext>) {
-        let mut donated = self.donated.lock();
-        if donated.as_ref().is_some_and(|d| Arc::ptr_eq(d, sc)) {
-            *donated = None;
+        let mut slots = self.sched.lock();
+        if slots.donated.as_ref().is_some_and(|d| Arc::ptr_eq(d, sc)) {
+            let old = slots.donated.take();
+            drop(slots);
+            drop(old);
         }
     }
 
@@ -358,6 +390,7 @@ impl Thread {
 
     /// Endereço de usuário do buffer de IPC, se houver.
     #[must_use]
+    #[inline]
     pub fn ipc_buffer(&self) -> Option<u64> {
         let va = self.ipc_buffer.load(Ordering::Acquire);
         (va != 0).then_some(va)

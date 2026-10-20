@@ -235,3 +235,21 @@ pub fn flush_tlb_all() {
         write_cr4(cr4);
     }
 }
+
+/// Liga CR4.PGE, se a CPU tem páginas globais (CPUID.1:EDX.PGE), e
+/// descarta a TLB inteira; devolve se ficou ligado. Os APs herdam o bit do
+/// CR4 do BSP.
+pub fn enable_global_pages() -> bool {
+    if cpuid(1, 0).edx & (1 << 13) == 0 {
+        flush_tlb_all();
+        return false;
+    }
+    let cr4 = read_cr4();
+    // SAFETY: só PGE muda; desligá-lo e ligá-lo descarta a TLB inteira,
+    // globais incluídas, e a CPU anuncia o recurso.
+    unsafe {
+        write_cr4(cr4 & !CR4_PGE);
+        write_cr4(cr4 | CR4_PGE);
+    }
+    true
+}

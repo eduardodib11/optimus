@@ -377,6 +377,38 @@ impl<M: TableMemory> PageTables<M> {
         }
     }
 
+    /// Marca como globais todas as folhas da metade alta (entradas 256 a 511
+    /// do PML4), a do kernel, que é a mesma em todo espaço; devolve quantas.
+    /// Quem chama invalida a TLB.
+    pub fn globalize_kernel_half(&mut self) -> usize {
+        let mut leaves = 0;
+        for i in ENTRIES / 2..ENTRIES {
+            let entry = self.mem.table(self.root)[i];
+            if entry & PRESENT != 0 {
+                leaves += self.globalize(PhysAddr(entry & ADDR_4K), 3);
+            }
+        }
+        leaves
+    }
+
+    fn globalize(&mut self, table: PhysAddr, level: u32) -> usize {
+        let mut leaves = 0;
+        for i in 0..ENTRIES {
+            let entry = self.mem.table(table)[i];
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            // No nível 1 o bit 7 é o do PAT, não o de folha grande.
+            if level == 1 || entry & HUGE != 0 {
+                self.mem.table(table)[i] = entry | GLOBAL;
+                leaves += 1;
+            } else {
+                leaves += self.globalize(PhysAddr(entry & ADDR_4K), level - 1);
+            }
+        }
+        leaves
+    }
+
     fn free_tree(&mut self, table: PhysAddr, level: u32) {
         if level > 1 {
             for i in 0..ENTRIES {

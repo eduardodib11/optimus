@@ -5,7 +5,8 @@
 //! passam a ser geridas pelo kernel através do mapa direto. Na partida, o
 //! kernel remove a identidade temporária da metade baixa, deixa só de leitura
 //! o apelido do texto e dos dados só de leitura no mapa direto (W^X vale em
-//! todos os apelidos) e liga SMEP, SMAP e UMIP quando a CPU os tem.
+//! todos os apelidos), marca as folhas da metade alta como globais com o
+//! CR4.PGE (ADR 0031, item 7) e liga SMEP, SMAP e UMIP quando a CPU os tem.
 //!
 //! Ordem das travas: tabelas de página antes de frames.
 //!
@@ -209,9 +210,19 @@ fn with_tables<T>(
     f(KERNEL_PT.lock().as_mut().ok_or(MapError::NotMapped)?)
 }
 
+/// As folhas da metade alta são globais (ADR 0031, item 7): ela é a mesma
+/// em todo espaço, e as traduções do kernel sobrevivem à troca de CR3. Só
+/// `invlpg` ou desligar o CR4.PGE as tiram, o que o shootdown faz.
+const fn kernel_flags(virt: u64, flags: Flags) -> Flags {
+    Flags {
+        global: virt >> 63 == 1,
+        ..flags
+    }
+}
+
 /// Mapeia uma página no espaço do kernel.
 pub fn map(virt: u64, phys: PhysAddr, size: PageSize, flags: Flags) -> Result<(), MapError> {
-    with_tables(|pt| pt.map(virt, phys, size, flags))
+    with_tables(|pt| pt.map(virt, phys, size, kernel_flags(virt, flags)))
 }
 
 /// Desmapeia uma página do kernel e invalida a TLB em toda CPU
@@ -246,7 +257,7 @@ pub fn unmap_pages(start: u64, pages: u64, freed: &mut dyn FnMut(PhysAddr)) {
 /// Troca as permissões de uma página do kernel e invalida a TLB em toda
 /// CPU.
 pub fn protect(virt: u64, size: PageSize, flags: Flags) -> Result<(), MapError> {
-    with_tables(|pt| pt.protect(virt, size, flags))?;
+    with_tables(|pt| pt.protect(virt, size, kernel_flags(virt, flags)))?;
     tlb::flush(KERNEL_ROOT, Flush::range(virt, size.bytes() / 4096));
     Ok(())
 }
@@ -304,16 +315,17 @@ pub fn init(map: &[MemRegion]) {
                 continue;
             };
             let alias = direct(m.phys);
-            match pt.protect(alias, PageSize::Size4K, Flags::READ) {
+            match pt.protect(alias, PageSize::Size4K, kernel_flags(alias, Flags::READ)) {
                 Ok(()) => protected += 1,
                 Err(e) => error!("okernel: protegendo {alias:#x}: {e:?}"),
             }
         }
     }
+    let global = pt.globalize_kernel_half();
     *KERNEL_PT.lock() = Some(pt);
-    cpu::flush_tlb();
+    let pge = cpu::enable_global_pages();
     info!(
-        "okernel: identidade removida; {protected} páginas do kernel só de leitura no mapa direto; {missing} entradas da metade alta criadas"
+        "okernel: identidade removida; {protected} páginas do kernel só de leitura no mapa direto; {missing} entradas da metade alta criadas; {global} folhas do kernel globais (PGE {pge})"
     );
     harden_cpu();
 }

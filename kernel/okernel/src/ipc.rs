@@ -36,6 +36,7 @@ use crate::sched::SchedContext;
 use crate::sync::{LockClass, SpinLock};
 use crate::thread::Thread;
 
+pub mod fast;
 pub mod ops;
 
 /// Rótulo, `info` e palavras em registradores.
@@ -153,6 +154,18 @@ fn push(queue: &mut VecDeque<Arc<Thread>>, t: &Arc<Thread>) -> Result<(), Error>
     Ok(())
 }
 
+/// Como [`push`], com `mark` logo antes de entrar (e só se couber).
+fn push_marked(
+    queue: &mut VecDeque<Arc<Thread>>,
+    t: &Arc<Thread>,
+    mark: impl FnOnce(),
+) -> Result<(), Error> {
+    queue.try_reserve(1).map_err(|_| Error::QuotaExceeded)?;
+    mark();
+    queue.push_back(Arc::clone(t));
+    Ok(())
+}
+
 fn remove(queue: &mut VecDeque<Arc<Thread>>, t: &Thread) -> bool {
     let at = queue.iter().position(|q| core::ptr::eq(Arc::as_ptr(q), t));
     at.and_then(|i| queue.remove(i)).is_some()
@@ -222,44 +235,73 @@ impl Endpoint {
     /// CPUs, um remetente e um receptor ambos na fila, esperando um pelo
     /// outro (`NoMissedRendezvous`).
     ///
+    /// `mark` roda, com a trava das filas na mão, logo antes de `t` entrar
+    /// na fila: marca `t` como bloqueada (a trava do slot de IPC vem depois
+    /// da do objeto), já que outra CPU pode tirá-la de lá assim que a trava
+    /// for solta. Quem acha par não é marcado (T-331).
+    ///
     /// # Errors
     ///
-    /// [`Error::QuotaExceeded`] sem memória para a fila.
+    /// [`Error::QuotaExceeded`] sem memória para a fila; `mark` não roda.
     pub fn pop_receiver_or_push_sender(
         &self,
         t: &Arc<Thread>,
         queue: bool,
+        mark: impl FnOnce(),
     ) -> Result<Option<Arc<Thread>>, Error> {
         let mut q = self.queues.lock();
         if let Some(r) = q.receivers.pop_front() {
             return Ok(Some(r));
         }
         if queue {
-            push(&mut q.senders, t)?;
+            push_marked(&mut q.senders, t, mark)?;
         }
         Ok(None)
     }
 
     /// `RecvPart` da spec `Ipc.tla`, num passo só: tira o primeiro
     /// remetente ou, se não houver (e `queue`), põe `t` no fim da fila de
-    /// receptores. Ver [`Endpoint::pop_receiver_or_push_sender`].
+    /// receptores, marcada por `mark`. Ver
+    /// [`Endpoint::pop_receiver_or_push_sender`].
     ///
     /// # Errors
     ///
-    /// [`Error::QuotaExceeded`] sem memória para a fila.
+    /// [`Error::QuotaExceeded`] sem memória para a fila; `mark` não roda.
     pub fn pop_sender_or_push_receiver(
         &self,
         t: &Arc<Thread>,
         queue: bool,
+        mark: impl FnOnce(),
     ) -> Result<Option<Arc<Thread>>, Error> {
         let mut q = self.queues.lock();
         if let Some(s) = q.senders.pop_front() {
             return Ok(Some(s));
         }
         if queue {
-            push(&mut q.receivers, t)?;
+            push_marked(&mut q.receivers, t, mark)?;
         }
         Ok(None)
+    }
+
+    /// Há remetente na fila (o caminho rápido de `ipc_reply_recv` só vale
+    /// sem ninguém para receber).
+    #[must_use]
+    pub fn has_senders(&self) -> bool {
+        !self.queues.lock().senders.is_empty()
+    }
+
+    /// Caminho rápido de `ipc_call` (`Deliver` da spec): com a trava das
+    /// filas na mão, passa o primeiro receptor a `take`, que confere se ele
+    /// serve e o atende (com a trava do slot dele, que vem depois); só então
+    /// ele sai da fila. Nada muda se a fila está vazia ou `take` recusa.
+    pub fn take_receiver<T>(
+        &self,
+        take: impl FnOnce(&Arc<Thread>) -> Option<T>,
+    ) -> Option<(Arc<Thread>, T)> {
+        let mut q = self.queues.lock();
+        let got = take(q.receivers.front()?)?;
+        let r = q.receivers.pop_front()?;
+        Some((r, got))
     }
 
     /// Tira `t` de qualquer das filas; falso se não estava em nenhuma.
@@ -312,6 +354,16 @@ impl Reply {
     #[must_use]
     pub fn grant(&self) -> Option<bool> {
         self.caller.lock().as_ref().map(|c| c.1)
+    }
+
+    /// Quem espera está na CPU `cpu`, fora dela (a pilha livre), para a
+    /// troca direta do caminho rápido.
+    #[must_use]
+    pub fn caller_on(&self, cpu: u32) -> bool {
+        self.caller
+            .lock()
+            .as_ref()
+            .is_some_and(|c| c.0.cpu() == cpu && !c.0.on_cpu())
     }
 
     /// Verdadeiro se `t` é quem espera.

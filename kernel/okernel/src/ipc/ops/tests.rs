@@ -133,7 +133,7 @@ pub fn regs(target: u64, label: u64, words: &[u64]) -> Regs {
     }
 }
 
-fn raw(h: Handle) -> u64 {
+pub fn raw(h: Handle) -> u64 {
     u64::from(h.raw())
 }
 
@@ -141,17 +141,17 @@ fn blocked(step: &Result<Step, Error>) -> bool {
     matches!(step, Ok(Step::Block { .. }))
 }
 
-struct World {
-    quota: Arc<MemoryQuota>,
-    ep: Object,
-    client: Proc,
-    server: Proc,
+pub struct World {
+    pub quota: Arc<MemoryQuota>,
+    pub ep: Object,
+    pub client: Proc,
+    pub server: Proc,
     /// Handles do endpoint no cliente (SEND, badge 7) e no servidor.
-    c_ep: u64,
-    s_target: u64,
+    pub c_ep: u64,
+    pub s_target: u64,
 }
 
-fn world(client_rights: Rights) -> World {
+pub fn world(client_rights: Rights) -> World {
     let quota = MemoryQuota::root(64 << 20);
     let ep = obj_create(&quota, ObjectType::Endpoint, 0).unwrap();
     let reply = obj_create(&quota, ObjectType::Reply, 0).unwrap();
@@ -575,7 +575,7 @@ fn reply_destruido_acorda_quem_chamou_com_peer_closed() {
 }
 
 /// Liga a `t` um `SchedContext` novo com prioridade `priority`.
-fn bind_sc(quota: &Arc<MemoryQuota>, t: &Thread, priority: u64) -> Arc<SchedContext> {
+pub fn bind_sc(quota: &Arc<MemoryQuota>, t: &Thread, priority: u64) -> Arc<SchedContext> {
     let sc = obj_create(quota, ObjectType::SchedContext, 0).unwrap();
     let sc = Arc::clone(sc.as_sched_context().unwrap());
     sc.configure(Params::new(1_000_000, 1_000_000, priority).unwrap());
@@ -583,7 +583,7 @@ fn bind_sc(quota: &Arc<MemoryQuota>, t: &Thread, priority: u64) -> Arc<SchedCont
     sc
 }
 
-fn runs_on(t: &Thread, sc: &Arc<SchedContext>) -> bool {
+pub fn runs_on(t: &Thread, sc: &Arc<SchedContext>) -> bool {
     t.sched_context().is_some_and(|s| Arc::ptr_eq(&s, sc))
 }
 

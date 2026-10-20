@@ -57,8 +57,8 @@ use kabi::sched::CpuMask;
 
 use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Syscall};
-use okernel::sched::{DEFAULT_SLICE_NS, Params, RunQueue, SchedContext};
-use okernel::sync::{LockClass, SpinLock};
+use okernel::sched::{Budget, DEFAULT_SLICE_NS, Params, RunQueue, SchedContext};
+use okernel::sync::{LockClass, SpinGuard, SpinLock};
 use okernel::sys::{self, Values};
 use okernel::thread::{RunState, Thread};
 
@@ -212,7 +212,7 @@ static NR_READY: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS]
 /// Prioridade de `t` mais um, a escala de [`CUR_PRIO`] (zero sem
 /// `SchedContext`).
 fn rank(t: &Thread) -> u32 {
-    sc_of(t).map_or(0, |(_, p)| u32::from(p.priority) + 1)
+    with_sc(t, |_, p| u32::from(p.priority) + 1).unwrap_or(0)
 }
 
 /// Atualiza o resumo da CPU de `s` (com a trava dela): as prontas e, com
@@ -238,12 +238,13 @@ fn usable(cpu: usize) -> bool {
 /// CPUs em que `t` pode começar a rodar: a máscara do `SchedContext` em
 /// que ela roda (o doado, se houver; todas, sem nenhum).
 fn mask_of(t: &Thread) -> CpuMask {
-    t.sched_context().map_or(CpuMask::ALL, |sc| sc.mask())
+    t.with_sched_context(|sc| sc.mask()).unwrap_or(CpuMask::ALL)
 }
 
 /// `t` pode começar a rodar na CPU `cpu` (ADR 0032, I4).
 fn allowed(t: &Thread, cpu: u32) -> bool {
-    t.sched_context().is_none_or(|sc| sc.allows(cpu as usize))
+    t.with_sched_context(|sc| sc.allows(cpu as usize))
+        .unwrap_or(true)
 }
 
 /// Onde acordar `t` (ADR 0032, item 5), com `p` o [`rank`] de `t` e só
@@ -443,16 +444,32 @@ pub fn affinity_misses() -> u64 {
     AFFINITY_MISSES.load(Ordering::Relaxed)
 }
 
-/// Trocas diretas do caminho rápido de IPC.
-static FAST_SWITCHES: AtomicU64 = AtomicU64::new(0);
+/// Trocas diretas do caminho rápido de IPC, por CPU: só a própria CPU
+/// grava a dela, sem RMW atômico (T-331).
+static FAST_SWITCHES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Servidores trazidos de outra CPU por quem os chamou ([`follow`]).
 static FOLLOWS: AtomicU64 = AtomicU64::new(0);
 static DEBUG_LOG: SpinLock<([u8; 256], usize)> =
     SpinLock::with_class(LockClass::Diagnostic, ([0; 256], 0));
 
 /// A thread na CPU (`None` no ocioso).
+///
+/// Lida da área por CPU, sem a trava da fila (T-331): `schedule_to` grava
+/// lá a próxima antes de trocar para ela, e só esta CPU lê e grava.
 pub fn current() -> Option<Arc<Thread>> {
-    this_sched().lock().current.clone()
+    let addr = percpu::with(|p| p.thread().load(Ordering::Relaxed));
+    let thread = core::ptr::with_exposed_provenance::<Thread>(usize::try_from(addr).ok()?);
+    if thread.is_null() {
+        return None;
+    }
+    // SAFETY: `addr` veio de `Arc::as_ptr` da thread que roda nesta CPU, e
+    // `Sched::current` desta CPU guarda uma referência a ela enquanto ela
+    // roda aqui; quem chama roda nesta CPU, com interrupções desligadas,
+    // então ela não sai da CPU até a referência nova existir.
+    unsafe {
+        Arc::increment_strong_count(thread);
+        Some(Arc::from_raw(thread))
+    }
 }
 
 fn user_addr(addr: u64) -> bool {
@@ -547,23 +564,32 @@ pub fn start_on(thread: &Arc<Thread>, entry: &UserEntry, cpu: u32) -> Result<(),
     Ok(())
 }
 
-/// `SchedContext` e parâmetros de uma thread iniciada (`start` exige).
-fn sc_of(t: &Thread) -> Option<(Arc<SchedContext>, Params)> {
-    let sc = t.sched_context()?;
-    let params = sc.params()?;
-    Some((sc, params))
+/// `f` sobre o `SchedContext` em que `t` roda e os parâmetros dele (os
+/// de uma thread iniciada; `start` os exige), sem tomar referência: roda
+/// com a trava folha da thread na mão (T-331).
+fn with_sc<R>(t: &Thread, f: impl FnOnce(&SchedContext, Params) -> R) -> Option<R> {
+    t.with_sched_context(|sc| sc.params().map(|p| f(sc, p)))
+        .flatten()
+}
+
+/// Reabastece o orçamento de `sc` em `now` e o devolve.
+fn refill(sc: &SchedContext, p: &Params, now: u64) -> Budget {
+    let mut b = sc.budget();
+    b.refill(p, now);
+    sc.set_budget(b);
+    b
 }
 
 /// Põe `t` na fila do nível dela ou, sem orçamento, na espera (devolve
 /// `false` nesse caso).
 fn enqueue(s: &mut Sched, t: Arc<Thread>, now: u64) -> bool {
-    let Some((sc, p)) = sc_of(&t) else {
+    let Some((b, exhausted, priority)) = with_sc(&t, |sc, p| {
+        let b = refill(sc, &p, now);
+        (b, b.exhausted(&p), p.priority)
+    }) else {
         return false;
     };
-    let mut b = sc.budget();
-    b.refill(&p, now);
-    sc.set_budget(b);
-    if b.exhausted(&p) {
+    if exhausted {
         if s.trace.len() < s.trace.capacity() {
             let thread = Arc::as_ptr(&t).addr();
             let until = b.replenish_at;
@@ -580,30 +606,44 @@ fn enqueue(s: &mut Sched, t: Arc<Thread>, now: u64) -> bool {
         false
     } else {
         t.set_state(RunState::Ready);
-        let _ = s.ready.push(p.priority, t);
+        let _ = s.ready.push(priority, t);
         true
     }
 }
 
-/// Desconta do `SchedContext` da atual o tempo desde a última cobrança e
-/// passa a cobrar o que ela usa agora.
+/// Desconta do `SchedContext` cobrado o tempo desde a última cobrança;
+/// quem chama passa a cobrar o da atual (ou da próxima) com [`charge_to`]
+/// ou pelo que [`run_here`] leu.
 fn charge_current(s: &mut Sched, now: u64) {
-    if let Some(sc) = s.charging.take()
+    if let Some(sc) = &s.charging
         && let Some(p) = sc.params()
     {
         let mut b = sc.budget();
         b.consume(&p, now.saturating_sub(s.charged_at));
         sc.set_budget(b);
     }
-    s.charging = s.current.as_deref().and_then(Thread::sched_context);
     s.charged_at = now;
+}
+
+/// Passa a cobrar em `charging` o `SchedContext` em que `t` roda agora.
+/// Sem trocar a referência se é o mesmo: no ping-pong de IPC com doação,
+/// os dois lados rodam no de quem chama (T-331).
+fn charge_to(charging: &mut Option<Arc<SchedContext>>, t: Option<&Thread>) {
+    let same = match (t, &*charging) {
+        (Some(t), Some(c)) => t.with_sched_context(|sc| Arc::ptr_eq(sc, c)) == Some(true),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same {
+        *charging = t.and_then(Thread::sched_context);
+    }
 }
 
 /// Devolve à fila as threads em espera cuja janela acabou.
 fn release_throttled(s: &mut Sched, now: u64) {
     let mut i = 0;
     while i < s.throttled.len() {
-        let due = sc_of(&s.throttled[i]).is_some_and(|(sc, _)| now >= sc.budget().replenish_at);
+        let due = with_sc(&s.throttled[i], |sc, _| now >= sc.budget().replenish_at) == Some(true);
         if due {
             let t = s.throttled.swap_remove(i);
             enqueue(s, t, now);
@@ -613,19 +653,35 @@ fn release_throttled(s: &mut Sched, now: u64) {
     }
 }
 
-/// Arma o timer para o próximo evento: fim da fatia ou do orçamento da
-/// atual, ou o primeiro reabastecimento.
-fn program_timer(s: &Sched, now: u64) {
-    let mut at = u64::MAX;
-    if let Some((sc, p)) = s.current.as_deref().and_then(sc_of) {
-        at = at.min(s.slice_end);
-        if let Some(d) = sc.budget().deadline(&p, now) {
-            at = at.min(d);
-        }
+/// O que limita a vez da atual, para [`program_timer`].
+#[derive(Clone, Copy)]
+enum Until {
+    /// Nada: sem atual com `SchedContext`.
+    Nothing,
+    /// O fim da fatia (orçamento sem limite).
+    Slice,
+    /// O fim da fatia ou o do orçamento, no instante dado.
+    Budget(u64),
+}
+
+impl Until {
+    fn of(b: &Budget, p: &Params, now: u64) -> Self {
+        b.deadline(p, now).map_or(Self::Slice, Self::Budget)
     }
+}
+
+/// Arma o timer para o próximo evento: fim da fatia ou do orçamento da
+/// atual (`cur`, como quem chama já o leu), ou o primeiro
+/// reabastecimento.
+fn program_timer(s: &Sched, cur: Until) {
+    let mut at = match cur {
+        Until::Nothing => u64::MAX,
+        Until::Slice => s.slice_end,
+        Until::Budget(d) => s.slice_end.min(d),
+    };
     for t in &s.throttled {
-        if let Some((sc, _)) = sc_of(t) {
-            at = at.min(sc.budget().replenish_at);
+        if let Some(r) = with_sc(t, |sc, _| sc.budget().replenish_at) {
+            at = at.min(r);
         }
     }
     for &(deadline, _) in &s.timeouts {
@@ -651,18 +707,16 @@ enum Why {
     Preempt,
 }
 
-/// A atual pode seguir na CPU (só para [`Why::Preempt`]).
-fn keeps_running(s: &Sched, t: &Thread, now: u64) -> bool {
-    let Some((sc, p)) = sc_of(t) else {
-        return false;
-    };
-    let mut b = sc.budget();
-    b.refill(&p, now);
-    sc.set_budget(b);
+/// A atual pode seguir na CPU `me` (só para [`Why::Preempt`]): devolve
+/// então o que limita a vez dela.
+fn keeps_running(s: &Sched, t: &Thread, me: u32, now: u64) -> Option<Until> {
+    let (b, p) = with_sc(t, |sc, p| {
+        sc.allows(me as usize).then(|| (refill(sc, &p, now), p))
+    })??;
     let top = s.ready.highest();
     let higher = top.is_some_and(|h| h > p.priority);
     let turn_over = now >= s.slice_end && top == Some(p.priority);
-    !b.exhausted(&p) && !higher && !turn_over
+    (!b.exhausted(&p) && !higher && !turn_over).then(|| Until::of(&b, &p, now))
 }
 
 /// Escolhe a próxima thread e troca para ela. Volta quando a que chamou
@@ -671,16 +725,38 @@ fn schedule(why: Why) {
     schedule_to(why, None);
 }
 
-/// `direct` (bloqueada, já atendida por IPC) pode rodar já, sem passar
-/// pela fila: tem orçamento e ninguém pronto tem prioridade maior.
-fn runs_directly(s: &Sched, t: &Thread, now: u64) -> bool {
-    let Some((sc, p)) = sc_of(t) else {
-        return false;
-    };
-    let mut b = sc.budget();
-    b.refill(&p, now);
-    sc.set_budget(b);
-    !b.exhausted(&p) && s.ready.highest().is_none_or(|h| h <= p.priority)
+/// Destino de `direct` (bloqueada, já atendida por IPC) em [`pick_next`].
+enum Direct {
+    /// Roda já, sem passar pela fila: a CPU está na máscara, tem orçamento
+    /// e ninguém pronto tem prioridade maior.
+    Run,
+    /// Vai para a fila desta CPU.
+    Queue,
+    /// Fora da máscara: vai para outra CPU ([`to_outbox`]).
+    Elsewhere,
+}
+
+/// Para onde vai `direct` na CPU `me`, numa leitura só do `SchedContext`
+/// dela (T-331).
+fn direct_verdict(s: &Sched, t: &Thread, me: u32, now: u64) -> Direct {
+    let verdict = with_sc(t, |sc, p| {
+        if !sc.allows(me as usize) {
+            return Direct::Elsewhere;
+        }
+        let b = refill(sc, &p, now);
+        if !b.exhausted(&p) && s.ready.highest().is_none_or(|h| h <= p.priority) {
+            Direct::Run
+        } else {
+            Direct::Queue
+        }
+    });
+    verdict.unwrap_or_else(|| {
+        if allowed(t, me) {
+            Direct::Queue
+        } else {
+            Direct::Elsewhere
+        }
+    })
 }
 
 /// Tira `t` da lista de prazos, se estiver nela.
@@ -717,15 +793,21 @@ fn expire_timeouts() {
 fn pick_next(s: &mut Sched, direct: Option<Arc<Thread>>, me: u32, now: u64) -> Option<Arc<Thread>> {
     if let Some(t) = direct {
         drop_timeout(s, &t);
-        if !allowed(&t, me) {
-            if let Some(t) = to_outbox(s, t) {
+        match direct_verdict(s, &t, me, now) {
+            Direct::Run => {
+                if let Some(c) = FAST_SWITCHES.get(me as usize) {
+                    c.store(c.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                }
                 return Some(t);
             }
-        } else if runs_directly(s, &t, now) {
-            FAST_SWITCHES.fetch_add(1, Ordering::Relaxed);
-            return Some(t);
-        } else {
-            enqueue(s, t, now);
+            Direct::Queue => {
+                enqueue(s, t, now);
+            }
+            Direct::Elsewhere => {
+                if let Some(t) = to_outbox(s, t) {
+                    return Some(t);
+                }
+            }
         }
     }
     while let Some((_, t)) = s.ready.pop() {
@@ -739,10 +821,27 @@ fn pick_next(s: &mut Sched, direct: Option<Arc<Thread>>, me: u32, now: u64) -> O
     None
 }
 
+/// O que [`run_here`] leu do `SchedContext` da nova atual.
+struct Started {
+    /// O [`rank`] dela.
+    rank: u32,
+    /// O que limita a vez dela, para [`program_timer`].
+    until: Until,
+    /// Ela roda no `SchedContext` que já é cobrado.
+    same_charge: bool,
+}
+
 /// `n` passa a ser a atual desta CPU (`me`): estado, CPU dona, `on_cpu`
-/// se acabou de chegar (`arriving`) e início da janela de orçamento.
-/// Devolve o [`rank`] dela.
-fn run_here(n: &Thread, me: u32, arriving: bool, now: u64) -> u32 {
+/// se acabou de chegar (`arriving`) e início da janela de orçamento, numa
+/// leitura só do `SchedContext` dela (T-331). `charging` é o cobrado até
+/// aqui.
+fn run_here(
+    n: &Thread,
+    me: u32,
+    arriving: bool,
+    now: u64,
+    charging: Option<&Arc<SchedContext>>,
+) -> Started {
     n.set_state(RunState::Running);
     n.set_cpu(me);
     if arriving {
@@ -751,50 +850,91 @@ fn run_here(n: &Thread, me: u32, arriving: bool, now: u64) -> u32 {
         debug_assert!(!n.on_cpu(), "thread na fila ainda em outra CPU");
         n.set_on_cpu(true);
     }
-    let Some((sc, p)) = sc_of(n) else {
-        return 0;
-    };
-    let mut b = sc.budget();
-    b.activate(&p, now);
-    sc.set_budget(b);
-    u32::from(p.priority) + 1
+    let charged = |sc: &SchedContext| charging.is_some_and(|c| core::ptr::eq(sc, Arc::as_ptr(c)));
+    n.with_sched_context(|sc| {
+        let same_charge = charged(sc);
+        let Some(p) = sc.params() else {
+            return Started {
+                rank: 0,
+                until: Until::Nothing,
+                same_charge,
+            };
+        };
+        let mut b = sc.budget();
+        b.activate(&p, now);
+        sc.set_budget(b);
+        Started {
+            rank: u32::from(p.priority) + 1,
+            until: Until::of(&b, &p, now),
+            same_charge,
+        }
+    })
+    .unwrap_or(Started {
+        rank: 0,
+        until: Until::Nothing,
+        same_charge: charging.is_none(),
+    })
+}
+
+/// Destino da atual `p`, que sai da CPU `me` por `why`.
+fn put_back(s: &mut Sched, p: &Arc<Thread>, why: Why, me: u32, now: u64) {
+    match why {
+        Why::Exit => p.set_state(RunState::Exited),
+        Why::Block => {}
+        // Fora da máscara (mudou ou veio com uma doação): sai para uma CPU
+        // permitida depois da troca, quando já não tiver `on_cpu`.
+        Why::Yield | Why::Preempt if !allowed(p, me) => {
+            if let Some(p) = to_outbox(s, Arc::clone(p)) {
+                enqueue(s, p, now);
+            }
+        }
+        Why::Yield | Why::Preempt => {
+            enqueue(s, Arc::clone(p), now);
+        }
+    }
+}
+
+/// Registra nos testes que `p` rodou até `now`.
+fn trace_ran(s: &mut Sched, p: &Thread, now: u64) {
+    if s.trace.len() < s.trace.capacity() {
+        let thread = core::ptr::from_ref(p).addr();
+        let start = s.started_at;
+        s.trace.push(Event::Ran {
+            thread,
+            start,
+            end: now,
+        });
+    }
 }
 
 /// Como [`schedule`], mas com `direct` como próxima (caminho rápido de
 /// IPC) se ela puder rodar já; senão, ela vai para a fila.
 fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
-    expire_timeouts();
-    let now = ktime::now_ns();
+    let mut now = ktime::now_ns();
     let me = percpu::cpu_id();
     let mut s = this_sched().lock();
+    // Prazos vencidos: só então solta a fila para os cancelar (a do objeto
+    // vem antes). O caso comum, sem prazo, fica numa trava só (T-331).
+    if s.timeouts.iter().any(|(d, _)| *d <= now) {
+        drop(s);
+        expire_timeouts();
+        now = ktime::now_ns();
+        s = this_sched().lock();
+    }
     charge_current(&mut s, now);
     release_throttled(&mut s, now);
     if why == Why::Preempt
         && let Some(cur) = s.current.clone()
-        && keeps_running(&s, &cur, now)
-        && allowed(&cur, me)
+        && let Some(until) = keeps_running(&s, &cur, me, now)
     {
+        charge_to(&mut s.charging, Some(&cur));
         publish(&s, None);
-        program_timer(&s, now);
+        program_timer(&s, until);
         return;
     }
     let prev = s.current.take();
     if let Some(p) = &prev {
-        match why {
-            Why::Exit => p.set_state(RunState::Exited),
-            Why::Block => {}
-            // Fora da máscara (mudou ou veio com uma doação): sai para
-            // uma CPU permitida depois da troca, quando já não tiver
-            // `on_cpu`.
-            Why::Yield | Why::Preempt if !allowed(p, me) => {
-                if let Some(p) = to_outbox(&mut s, Arc::clone(p)) {
-                    enqueue(&mut s, p, now);
-                }
-            }
-            Why::Yield | Why::Preempt => {
-                enqueue(&mut s, Arc::clone(p), now);
-            }
-        }
+        put_back(&mut s, p, why, me, now);
     }
     let next = pick_next(&mut s, direct, me, now);
     let same = match (&prev, &next) {
@@ -802,33 +942,78 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         (None, None) => true,
         _ => false,
     };
-    let cur_rank = next.as_deref().map_or(0, |n| run_here(n, me, !same, now));
+    let started = next
+        .as_deref()
+        .map(|n| run_here(n, me, !same, now, s.charging.as_ref()));
     if !same {
-        if let Some(p) = &prev
-            && s.trace.len() < s.trace.capacity()
-        {
-            let thread = Arc::as_ptr(p).addr();
-            let start = s.started_at;
-            s.trace.push(Event::Ran {
-                thread,
-                start,
-                end: now,
-            });
+        if let Some(p) = &prev {
+            trace_ran(&mut s, p, now);
         }
         s.started_at = now;
     }
     if !same || why == Why::Yield {
         s.slice_end = now.saturating_add(DEFAULT_SLICE_NS);
     }
-    s.current.clone_from(&next);
-    s.charging = next.as_deref().and_then(Thread::sched_context);
-    publish(&s, Some(cur_rank));
-    program_timer(&s, now);
+    if !started.as_ref().is_some_and(|st| st.same_charge) {
+        s.charging = next.as_deref().and_then(Thread::sched_context);
+    }
+    publish(&s, Some(started.as_ref().map_or(0, |st| st.rank)));
+    program_timer(&s, started.map_or(Until::Nothing, |st| st.until));
     if same {
+        s.current = next;
+        let outbox = !s.outbox.is_empty();
         drop(s);
-        drain_outbox();
+        drop(prev);
+        if outbox {
+            drain_outbox();
+        }
         return;
     }
+    switch_away(s, prev, next);
+}
+
+/// O que a troca usa da próxima: lido com a trava da fila na mão, para a
+/// referência ir para `current` sem clonar (T-331).
+struct Incoming {
+    /// rsp salvo dela (ou o do ocioso).
+    rsp: u64,
+    /// Área de FPU dela.
+    fpu: Option<usize>,
+    /// Topo da pilha de kernel dela, para a entrada de syscall.
+    stack_top: Option<u64>,
+    /// Raiz do espaço dela, se tiver um.
+    root: Option<u64>,
+    /// Ponteiro dela, para `current` e o dump do pânico (0 é o ocioso).
+    thread: u64,
+}
+
+impl Incoming {
+    fn of(next: Option<&Arc<Thread>>) -> Self {
+        next.map_or_else(
+            || Self {
+                rsp: idle_rsp(),
+                fpu: None,
+                stack_top: None,
+                root: None,
+                thread: 0,
+            },
+            |t| Self {
+                rsp: t.saved_rsp().load(Ordering::Acquire),
+                fpu: Some(t.fpu_area()),
+                stack_top: Some(t.stack().top),
+                root: t.root(),
+                thread: Arc::as_ptr(t).expose_provenance() as u64,
+            },
+        )
+    }
+}
+
+/// Fim de uma troca que muda de thread: `next` (já escolhida, com o
+/// estado de quem roda) passa a ser a atual de `s` e a CPU troca para ela.
+/// Volta quando `prev` (a que sai) rodar de novo.
+fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Option<Arc<Thread>>) {
+    let incoming = Incoming::of(next.as_ref());
+    s.current = next;
     let idle_slot = percpu::with(|p| p.idle_rsp().as_ptr());
     let prev_slot = prev.as_ref().map_or(idle_slot, |p| p.saved_rsp().as_ptr());
     let prev_fpu = prev
@@ -843,23 +1028,23 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
     drop(s);
     // SAFETY: as áreas são das threads (alinhadas a 64, do tamanho que
     // `fpu::area_bytes` pede), só a troca de contexto as acessa, e a pilha
-    // de `next` está mapeada.
+    // da próxima está mapeada. A próxima segue viva em `current`, que só
+    // esta CPU muda.
     unsafe {
         if let Some(area) = prev_fpu {
             fpu::save(core::ptr::with_exposed_provenance_mut(area));
         }
-        if let Some(t) = &next {
-            fpu::restore(core::ptr::with_exposed_provenance(t.fpu_area()));
-            syscall::set_kernel_stack(t.stack().top);
+        if let Some(area) = incoming.fpu {
+            fpu::restore(core::ptr::with_exposed_provenance(area));
+        }
+        if let Some(top) = incoming.stack_top {
+            syscall::set_kernel_stack(top);
         }
     }
-    let (next_rsp, root) = next.as_ref().map_or((idle_rsp(), None), |t| {
-        (t.saved_rsp().load(Ordering::Acquire), t.root())
-    });
-    let root = root.or_else(|| kmem::kernel_root().map(|r| r.0));
-    // Para o dump do pânico (ADR 0031, item 8): quem roda nesta CPU.
-    let thread = next.as_ref().map_or(0, |t| Arc::as_ptr(t).addr() as u64);
-    percpu::with(|p| p.thread().store(thread, Ordering::Relaxed));
+    let root = incoming.root.or_else(|| kmem::kernel_root().map(|r| r.0));
+    // Para o dump do pânico (ADR 0031, item 8) e para `current`: quem roda
+    // nesta CPU.
+    percpu::with(|p| p.thread().store(incoming.thread, Ordering::Relaxed));
     if let Some(root) = root
         && cpu::read_cr3() & 0x000f_ffff_ffff_f000 != root
     {
@@ -867,13 +1052,12 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         // estiver em `current`) ou o do kernel; ambos mapeiam o kernel.
         unsafe { crate::kvm::load_root(root) };
     }
-    drop(next);
     // SAFETY: `prev_slot` é o rsp salvo da anterior, viva (em
-    // `switch_prev`) ou o ocioso; `next_rsp` foi salvo por esta mesma função ou
-    // montado por `start`.
+    // `switch_prev`) ou o ocioso; `incoming.rsp` foi salvo por esta mesma
+    // função ou montado por `start`.
     crate::ksync::assert_none_held("switch_context");
     percpu::assert_no_borrows();
-    unsafe { switch_context(prev_slot, next_rsp) };
+    unsafe { switch_context(prev_slot, incoming.rsp) };
     finish_switch();
 }
 
@@ -887,12 +1071,17 @@ fn idle_rsp() -> u64 {
 /// referência a ela (a última, se ela terminou) e manda as prontas que
 /// esta CPU não pode rodar para outra.
 fn finish_switch() {
-    let prev = this_sched().lock().switch_prev.take();
+    let (prev, outbox) = {
+        let mut s = this_sched().lock();
+        (s.switch_prev.take(), !s.outbox.is_empty())
+    };
     if let Some(p) = prev {
         p.set_on_cpu(false);
         drop(p);
     }
-    drain_outbox();
+    if outbox {
+        drain_outbox();
+    }
 }
 
 /// Primeira execução de uma thread, chamada por `thread_trampoline`.
@@ -981,6 +1170,83 @@ pub fn handoff(to: Arc<Thread>, deadline: u64) {
     }
 }
 
+/// Troca direta do caminho rápido de IPC (`okernel::ipc::fast`, T-331):
+/// como [`handoff`] sem prazo, sem as conferências que ele já fez. `to` é
+/// desta CPU, com a pilha livre, e foi atendida pelo IPC; segue bloqueada
+/// até aqui, e ninguém mais a pode acordar (saiu da fila e do `Reply`).
+pub fn switch_direct(to: Arc<Thread>) {
+    debug_assert_eq!(to.cpu(), percpu::cpu_id(), "troca direta de outra CPU");
+    if !to.claim_wake() {
+        schedule(Why::Block);
+    } else if let Err(to) = direct_switch(to) {
+        schedule_to(Why::Block, Some(to));
+    }
+}
+
+/// A troca de [`switch_direct`] sem a escolha geral de [`schedule_to`]: a
+/// atual sai bloqueada e `to` roda já, com o que [`pick_next`] e
+/// [`run_here`] fariam com ela, numa leitura só do `SchedContext` dela.
+///
+/// Devolve `to` se ela não pode rodar já (máscara, orçamento ou alguém
+/// pronto mais prioritário) ou se há prazo vencido a tratar; então
+/// [`schedule_to`] decide. Até aí só cobrou a atual e reabasteceu os
+/// orçamentos que já podiam voltar, o que ele refaz igual.
+fn direct_switch(to: Arc<Thread>) -> Result<(), Arc<Thread>> {
+    let now = ktime::now_ns();
+    let me = percpu::cpu_id();
+    let mut s = this_sched().lock();
+    if s.current.is_none() || s.timeouts.iter().any(|(d, _)| *d <= now) {
+        return Err(to);
+    }
+    charge_current(&mut s, now);
+    release_throttled(&mut s, now);
+    let highest = s.ready.highest();
+    let charging = s.charging.as_ref().map(Arc::as_ptr);
+    let started = to
+        .with_sched_context(|sc| {
+            let p = sc.params()?;
+            if !sc.allows(me as usize) {
+                return None;
+            }
+            let mut b = refill(sc, &p, now);
+            if b.exhausted(&p) || highest.is_some_and(|h| h > p.priority) {
+                return None;
+            }
+            b.activate(&p, now);
+            sc.set_budget(b);
+            Some(Started {
+                rank: u32::from(p.priority) + 1,
+                until: Until::of(&b, &p, now),
+                same_charge: charging.is_some_and(|c| core::ptr::eq(Arc::as_ptr(sc), c)),
+            })
+        })
+        .flatten();
+    let Some(started) = started else {
+        return Err(to);
+    };
+    drop_timeout(&mut s, &to);
+    to.set_state(RunState::Running);
+    to.set_cpu(me);
+    debug_assert!(!to.on_cpu(), "troca direta para thread ainda em outra CPU");
+    to.set_on_cpu(true);
+    let prev = s.current.take();
+    if let Some(p) = &prev {
+        trace_ran(&mut s, p, now);
+    }
+    s.started_at = now;
+    s.slice_end = now.saturating_add(DEFAULT_SLICE_NS);
+    if !started.same_charge {
+        s.charging = to.sched_context();
+    }
+    if let Some(c) = FAST_SWITCHES.get(me as usize) {
+        c.store(c.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    }
+    publish(&s, Some(started.rank));
+    program_timer(&s, started.until);
+    switch_away(s, prev, Some(to));
+    Ok(())
+}
+
 /// Caminho rápido de `ipc_call` que achou o servidor `to` esperando (ADR
 /// 0032, item 6): ele segue quem chama e roda nesta CPU. A atual já está
 /// bloqueada esperando a resposta, com prazo `deadline`.
@@ -1019,7 +1285,10 @@ pub fn follow(to: Arc<Thread>, deadline: u64) {
 
 /// Trocas diretas do caminho rápido de IPC desde o boot.
 pub fn fast_switches() -> u64 {
-    FAST_SWITCHES.load(Ordering::Relaxed)
+    FAST_SWITCHES
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum()
 }
 
 /// Servidores que seguiram quem os chamou para outra CPU desde o boot.

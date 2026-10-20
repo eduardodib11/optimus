@@ -18,16 +18,18 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use kabi::ipc::recv_target;
 use kabi::vm::PAGE_SIZE;
 use kabi::{Handle, ObjectType, Rights};
 use okernel::thread::Thread;
 
-use crate::arch::x86_64::{QemuExit, apic, cpu, qemu_exit};
+use crate::arch::x86_64::{QemuExit, apic, cpu, percpu, qemu_exit};
 use crate::kipc::tests::{create, give};
 use crate::kthread::tests::{
-    DATA_VA, Process, delete, process, run_until_exit, thread, user_symbol,
+    DATA_VA, Process, RUN_LIMIT_NS, delete, pin, process, run_until_exit_within, thread,
+    user_symbol,
 };
 use crate::kthread::{UserEntry, fast_switches, start};
 use crate::{kmem, ktime};
@@ -47,6 +49,21 @@ unsafe extern "C" {
     static user_bench_ipc_client: u8;
     static user_bench_ipc_server: u8;
     static user_bench_yield: u8;
+}
+
+/// Com `test=perfil`, as threads não têm limite de tempo: o gdb para a
+/// máquina a cada entrada de syscall enquanto espera a volta escolhida.
+static NO_LIMIT: AtomicBool = AtomicBool::new(false);
+
+/// Roda as threads até terminarem (no limite dos testes, ou sem limite no
+/// perfil).
+fn run_until_exit(threads: &[Arc<Thread>]) -> Result<(), &'static str> {
+    let limit = if NO_LIMIT.load(Ordering::Relaxed) {
+        u64::MAX
+    } else {
+        RUN_LIMIT_NS
+    };
+    run_until_exit_within(threads, limit)
 }
 
 /// Um benchmark: nome e função que devolve as amostras em ciclos do TSC
@@ -72,7 +89,9 @@ const BENCHES: &[Bench] = &[
 ];
 
 /// Inicia em `p` uma thread em `sym` com `args` e a pilha na página
-/// `stack_page`.
+/// `stack_page`, presa à CPU que roda o benchmark: em SMP as duas threads de
+/// cada par ficam na mesma CPU (a meta é a do par fixado; T-331), sem o
+/// balanceamento separá-las.
 fn spawn(
     p: &Process,
     sym: *const u8,
@@ -80,6 +99,7 @@ fn spawn(
     stack_page: u64,
 ) -> Result<(Handle, Arc<Thread>), &'static str> {
     let (h, t) = thread(p)?;
+    pin(&t, percpu::cpu_id())?;
     let e = UserEntry {
         rip: user_symbol(sym),
         rsp: DATA_VA + (stack_page + 1) * PAGE_SIZE,
@@ -116,7 +136,7 @@ fn ipc() -> Result<Vec<u64>, &'static str> {
     let (ep_h, ep) = create(&server, ObjectType::Endpoint)?;
     let (reply, _) = create(&server, ObjectType::Reply)?;
     let c_ep = give(&client, &ep, Rights::SEND, 1)?;
-    let fast0 = fast_switches();
+    let (fast0, paths0) = (fast_switches(), crate::kipc::fast_paths());
     let rounds = ROUNDS as u64;
     let target = recv_target(ep_h, reply);
     let server_sym = &raw const user_bench_ipc_server;
@@ -126,8 +146,11 @@ fn ipc() -> Result<Vec<u64>, &'static str> {
     let (hc, tc) = spawn(&client, client_sym, args, STACK_PAGE)?;
     run_until_exit(&[Arc::clone(&ts), Arc::clone(&tc)])?;
     let fast = fast_switches() - fast0;
-    // Só a primeira chamada e a última resposta podem não ser diretas.
+    let paths = crate::kipc::fast_paths() - paths0;
+    // Só a primeira chamada e a última resposta podem não ser diretas, nem
+    // ir pelo caminho rápido (`okernel::ipc::fast`).
     ensure!(fast + 2 >= 2 * rounds);
+    ensure!(paths + 2 >= 2 * rounds);
     let out = samples(&client, 1)?;
     drop((ts, tc));
     delete(&client, &[hc])?;
@@ -156,6 +179,22 @@ fn switches(same: bool) -> Result<Vec<u64>, &'static str> {
     Ok(out)
 }
 
+/// Com `test=perfil` (T-331): o benchmark de IPC e o de troca entre
+/// processos em laço até o QEMU ser desligado, para o `cargo xtask perfil`
+/// conectar o gdb a qualquer momento e seguir uma volta instrução a
+/// instrução.
+pub fn profile() -> ! {
+    NO_LIMIT.store(true, Ordering::Relaxed);
+    environment();
+    info!("perfil: pronto");
+    loop {
+        if let Err(why) = ipc().and_then(|_| switches(false)) {
+            error!("perfil: FALHOU: {why}");
+            qemu_exit(QemuExit::Failure);
+        }
+    }
+}
+
 /// Ciclos do TSC em ns.
 fn ns(cycles: u64) -> u64 {
     let hz = u128::from(ktime::tsc_hz().max(1));
@@ -178,8 +217,8 @@ fn cpu_brand() -> ([u8; 48], usize) {
     (brand, len)
 }
 
-/// Roda os benchmarks e desliga o QEMU.
-pub fn run() -> ! {
+/// A linha `bench: ambiente` (CPU, acelerador, TSC, APIC e timer).
+fn environment() {
     let (brand, len) = cpu_brand();
     let accel = match cpu::hypervisor() {
         Some(sig) if &sig == b"TCGTCGTCGTCG" => "TCG",
@@ -198,6 +237,11 @@ pub fn run() -> ! {
             "one-shot"
         }
     );
+}
+
+/// Roda os benchmarks e desliga o QEMU.
+pub fn run() -> ! {
+    environment();
     let mut ok = true;
     for b in BENCHES {
         match (b.run)() {
