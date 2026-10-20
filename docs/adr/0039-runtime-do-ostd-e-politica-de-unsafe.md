@@ -325,3 +325,53 @@ Mudanças em relação à proposta:
 - O dono sugerido de `EXIT_GROUP`, `thread = 0` e `aspace = 0` é a T-333;
   o do DRBG e da classe 5 de `sys_info` é a T-337.
 - A cota do processo é o `mem:quota` obrigatório do manifesto.
+
+## Notas da implementação (T-334, 2026-10-20)
+
+O que a T-334 fez diferente do texto acima ou acrescentou, sem mudar o
+desenho:
+
+- **Orçamento de `unsafe`.** Os tetos de partida foram ajustados ao uso real:
+  `lib/ostd/src/arch` 7 (era 40), `lib/ostd/src/alloc` 8 (era 6) e
+  `lib/oalloc` 64 (era 80; 44 no núcleo e 20 nos testes). Os caminhos `sync`,
+  `tls` e `ring` entram no primeiro PR de cada módulo. O `xtask check` conta
+  `unsafe` (bloco, `impl`, `fn`, `trait`, `extern`), recusa `unsafe` e
+  `allow(unsafe_code)` fora dos caminhos do orçamento em `lib/ostd/src/**`,
+  exige `// SAFETY:` em todo bloco e `impl`, `#![allow(unsafe_code)]` e a
+  seção `# Unsafe` na raiz de cada módulo, e `#![deny(unsafe_code)]` na raiz
+  da crate que só tem `unsafe` em módulos (`lib/ostd`).
+- **`rt::init`.** O texto diz que `entry!` chama `rt::init`. Como o kernel
+  entrega a cota e o espaço de endereços em posições diferentes por processo
+  (`rdi`/`rsi` no `root` e no `utest`; juntos em `rsi` no `hello`), quem
+  chama `ostd::rt::init(Env { quota, aspace })` é a função principal, antes
+  da primeira alocação. Alocar antes aborta (encerra a thread, com uma linha
+  no registro, até o `EXIT_GROUP` da T-333). O `aspace` em `Env` some com o
+  `aspace = 0` da T-333.
+- **Endurecimento.** Além do elo `endereço ^ chave` por página, um bitmap por
+  página marca os blocos livres: a liberação dupla é detectada com
+  exatidão, sem ler o conteúdo do bloco do usuário (que pode estar por
+  inicializar), e um elo adulterado que aponte para bloco entregue também
+  falha. O *canary* fica no cabeçalho do segmento (valor fixo mais um valor
+  que depende do endereço e do segredo do `Global`). Um ponteiro fora da
+  janela é recusado por `PageSource::owns` sem ser tocado. Liberação dupla
+  entre threads é detectada quando o dono recolhe a `thread_free`.
+- **Alinhamento.** Até 64 KiB (o início das páginas e dos blocos grandes);
+  acima disso o pedido falha com nulo.
+- **Heap global provisório.** Sem TLS (T-333) e sem threads do `ostd`
+  (T-335), `ostd::alloc` usa um heap só atrás de um spinlock. O `oalloc` já
+  é por thread; a T-335 liga um `Heap` por thread ao bloco da thread.
+- **Endereço do segmento.** Contador a partir de 16 TiB na janela, sem
+  sorteio e sem reaproveitar endereços (a entropia é da T-337).
+- **Miri.** O CI não filtra `paths` por job; o job `miri` roda em todo PR e
+  só instala o nightly e roda os testes se `git diff` contra a base tocar
+  `lib/oalloc/`.
+
+**Observação para decisão (não implementada).** A fragmentação medida
+(`docs/bench/`) mostra que pedidos de 8 KiB a 64 KiB ocupam uma página
+inteira de 64 KiB (perda de até 87%), porque as classes param em 8 KiB e os
+blocos de várias páginas começam em 64 KiB. Numa carga de 8 B a 64 KiB a
+perda de arredondamento chega a 120%. Opções: manter (alocações dessa faixa
+são raras nos serviços do M3); estender as classes até 32 KiB (uma página
+guarda 2 a 4 blocos; a sobra no fim da página chega a 25%); ou páginas
+"médias" de 512 KiB como o mimalloc. Muda `MAX_SMALL` e a tabela de classes,
+sem mudar a API.

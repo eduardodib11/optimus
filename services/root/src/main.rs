@@ -203,6 +203,10 @@ fn main(start: Start) -> ! {
         thread,
         bootfs,
     };
+    ostd::rt::init(ostd::rt::Env {
+        quota: boot.quota,
+        aspace: boot.aspace,
+    });
     ostd::debug::print("root: iniciado");
     match ipc_alone(boot.quota) {
         Ok(()) => ostd::debug::print("root: IPC sem par: TimedOut e WouldBlock"),

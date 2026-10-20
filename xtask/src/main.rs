@@ -13,6 +13,7 @@ use std::{env, fs, sync::mpsc, thread};
 
 mod bench;
 mod perfil;
+mod unsafe_budget;
 
 /// Alvo do kernel no lugar de `x86_64-optimus-kernel`: alvos próprios em JSON
 /// exigem `-Zbuild-std`, que não existe no Rust estável (ADR 0025).
@@ -29,6 +30,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("oelf", "lib/oelf/src/lib.rs", KERNEL_TARGET),
     ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
     ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
+    ("oalloc", "lib/oalloc/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
     ("root", "services/root/src/main.rs", USER_TARGET),
     ("hello", "services/hello/src/main.rs", USER_TARGET),
@@ -37,7 +39,7 @@ const CRATES: &[(&str, &str, &str)] = &[
 ];
 
 /// Bibliotecas portáveis cujos testes rodam no host.
-const HOST_TESTED: &[&str] = &["obfs", "oelf", "optcrypt"];
+const HOST_TESTED: &[&str] = &["oalloc", "obfs", "oelf", "optcrypt"];
 
 const PROFILES: &[&str] = &["lite", "basic", "jarvis", "premium", "server"];
 
@@ -1384,25 +1386,15 @@ const KANI_HARNESSES: &[&str] = &[
     "cap::space::proofs::mint_nunca_aumenta",
 ];
 
+/// Regra de `unsafe` da seção 17.1 e da ADR 0039: `forbid(unsafe_code)` fora
+/// da allowlist e orçamento de `unsafe` por caminho (ver `unsafe_budget`).
 fn check_unsafe() -> Result {
-    let allowlist =
-        fs::read_to_string(root().join("unsafe-allowlist.toml")).map_err(|e| e.to_string())?;
-    let crates = CRATES
+    let roots: Vec<&str> = CRATES
         .iter()
         .map(|(_, file, _)| *file)
-        .chain(["xtask/src/main.rs", "tools/mkobfs/src/main.rs"]);
-    for file in crates {
-        let dir = file.split("/src/").next().unwrap_or(file);
-        let allowed = allowlist.contains(&format!("\"{dir}\""));
-        let source = fs::read_to_string(root().join(file)).map_err(|e| e.to_string())?;
-        if !allowed && !source.contains("#![forbid(unsafe_code)]") {
-            return Err(format!(
-                "{file}: falta #![forbid(unsafe_code)] (ou inclua {dir} em unsafe-allowlist.toml)"
-            ));
-        }
-    }
-    println!("xtask: allowlist de unsafe ok");
-    Ok(())
+        .chain(["xtask/src/main.rs", "tools/mkobfs/src/main.rs"])
+        .collect();
+    unsafe_budget::check(&roots)
 }
 
 #[cfg(test)]

@@ -47,3 +47,33 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Testes de kernel no QEMU com ${{ matrix.cpus }} CPUs
         run: cargo xtask test smp --smp ${{ matrix.cpus }}
+
+  # Miri sobre os testes do alocador (ADR 0039, item 1): só nos PRs que mudam
+  # a lib/oalloc. O GitHub Actions não filtra `paths` por job, então o job
+  # roda sempre no PR e pula os passos se a crate não mudou. O job noturno de
+  # Miri da seção 16.4 não existe de propósito (decisão de 2026-10-20).
+  miri:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: O oalloc, a toolchain ou este workflow mudaram neste PR?
+        id: changed
+        run: |
+          base="origin/${{ github.base_ref }}"
+          if git diff --name-only "$base"...HEAD | grep -Eq '^(lib/oalloc/|Cargo\.lock|rust-toolchain\.toml|\.github/workflows/ci\.yml)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Nada que afete o oalloc mudou: Miri não roda."
+          fi
+      - name: Nightly com Miri (único uso de nightly no CI; data fixada)
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          rustup toolchain install nightly-2026-08-21 --profile minimal --component miri
+          cargo +nightly-2026-08-21 miri setup
+      - name: Testes do oalloc sob Miri
+        if: steps.changed.outputs.run == 'true'
+        run: cargo +nightly-2026-08-21 miri test -p oalloc

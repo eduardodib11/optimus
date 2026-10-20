@@ -65,6 +65,7 @@ fn main(start: Start) -> ! {
     let (ep, thread) = split_handle_pair(start.args[0]);
     let (aspace, quota) = split_handle_pair(start.args[1]);
     let rounds = start.args[2];
+    ostd::rt::init(ostd::rt::Env { quota, aspace });
     ostd::debug::print("hello: iniciado pelo root");
     let result = Buffer::new(quota, aspace, thread, ipc::DEFAULT_BUFFER_VA).and_then(|mut b| {
         greet(ep, &mut b)?;
