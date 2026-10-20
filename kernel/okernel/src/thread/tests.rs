@@ -78,3 +78,39 @@ fn so_um_despertar_vence() {
     t.set_on_cpu(true);
     assert!(t.on_cpu());
 }
+
+#[test]
+fn tls_so_na_metade_de_usuario() {
+    let (_, p) = platform(100);
+    let quota = MemoryQuota::root(1 << 20);
+    let t = Thread::new(&quota, p).unwrap();
+    assert_eq!(t.tls(), 0);
+    for va in [0x1234_5678, 0, USER_END - 1, 8] {
+        assert_eq!(t.set_tls(va), Ok(()));
+        assert_eq!(t.tls(), va);
+    }
+    // Não canônico (daria #GP no WRMSR), metade alta e o próprio fim.
+    for bad in [
+        USER_END,
+        0x0000_8000_0000_1000,
+        0xffff_8000_0000_0000,
+        u64::MAX,
+    ] {
+        assert_eq!(t.set_tls(bad), Err(Error::InvalidArgument));
+        assert_eq!(t.tls(), 8);
+    }
+}
+
+#[test]
+fn registro_de_morte_so_a_primeira() {
+    use kabi::exit::{CAUSE_EXITED, CAUSE_FAULTED};
+    let (_, p) = platform(100);
+    let quota = MemoryQuota::root(1 << 20);
+    let t = Thread::new(&quota, p).unwrap();
+    assert_eq!(t.death(), None);
+    t.record_death(0, 1, 2);
+    assert_eq!(t.death(), None);
+    t.record_death(CAUSE_EXITED, kabi::exit::PANIC_CODE, 0);
+    t.record_death(CAUSE_FAULTED, 14, 0xdead);
+    assert_eq!(t.death(), Some((CAUSE_EXITED, kabi::exit::PANIC_CODE, 0)));
+}

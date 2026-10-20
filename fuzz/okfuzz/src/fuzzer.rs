@@ -327,10 +327,15 @@ impl Fuzzer {
         let _ = syscall(Syscall::VmProtect, [aspace, addr, len, flags, 0, 0]);
     }
 
-    /// Um `AddressSpace` alvo: o próprio (a maior parte) ou outro handle.
+    /// Um `AddressSpace` alvo: o próprio (a maior parte; pelo handle ou por
+    /// `aspace = 0`, ADR 0039) ou outro handle.
     fn pick_aspace(&mut self) -> u64 {
         if self.rng.chance(2, 3) {
-            u64::from(self.self_as)
+            if self.rng.chance(1, 2) {
+                ostd::kabi::vm::SELF
+            } else {
+                u64::from(self.self_as)
+            }
         } else {
             self.some_handle()
         }
@@ -341,7 +346,7 @@ impl Fuzzer {
     fn map_addr(&mut self, aspace: u64) -> u64 {
         // No próprio espaço, só a janela de trabalho (não se derrubar);
         // em outro, às vezes a janela, às vezes lixo.
-        let safe = self.pool.flags(aspace) & pool::SELF_AS != 0;
+        let safe = aspace == ostd::kabi::vm::SELF || self.pool.flags(aspace) & pool::SELF_AS != 0;
         if safe || self.rng.chance(1, 2) {
             self.scratch_addr()
         } else {

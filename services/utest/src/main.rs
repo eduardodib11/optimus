@@ -21,8 +21,8 @@
 //!
 //! O `utest` também é o primeiro processo a usar o alocador global do `ostd`
 //! (T-334): `Box`, `Vec` e `String` funcionam porque a função principal
-//! registra a cota e o espaço de endereços em [`ostd::rt::init`] antes de
-//! alocar.
+//! registra a cota em [`ostd::rt::init`] antes de alocar (o alocador mapeia
+//! no próprio espaço com `aspace = 0`, T-333).
 //!
 //! Para acrescentar um teste, escreva uma `fn(&Ctx) -> Result<(), &'static
 //! str>` e a ponha em [`TESTS`].
@@ -89,6 +89,18 @@ const TESTS: &[Test] = &[
     Test {
         name: "alloc.janela_reaproveitada",
         run: alocador_reaproveita_janela,
+    },
+    Test {
+        name: "tls.configurar_e_recusar",
+        run: tls_configurar,
+    },
+    Test {
+        name: "vm.proprio_espaco_sem_handle",
+        run: vm_proprio_espaco,
+    },
+    Test {
+        name: "thread.exit_recusa_flags",
+        run: exit_recusa_flags,
     },
     #[cfg(utest_falha)]
     Test {
@@ -222,6 +234,91 @@ fn alocador_reaproveita_janela(_: &Ctx) -> Outcome {
     Ok(())
 }
 
+/// `thread_configure` com `CONFIGURE_TLS` (T-333): na própria thread
+/// (`thread = 0`) e noutra pela capability; recusa endereço não canônico, da
+/// metade do kernel, TLS junto com o buffer de IPC, ligação com `thread =
+/// 0` e handle inválido.
+fn tls_configurar(ctx: &Ctx) -> Outcome {
+    use ostd::kabi::Syscall;
+    use ostd::kabi::thread::{CONFIGURE_IPC_BUFFER, CONFIGURE_TLS};
+    use ostd::kabi::vm::USER_END;
+    use ostd::thread::{SELF, set_tls};
+    let va = 0x7000_0000;
+    set_tls(SELF, va).map_err(|_| "TLS da própria thread")?;
+    set_tls(SELF, USER_END - 1).map_err(|_| "TLS no fim da metade de usuário")?;
+    for bad in [
+        USER_END,
+        0x0000_8000_0000_1000,
+        0xffff_8000_0000_0000,
+        u64::MAX,
+    ] {
+        if set_tls(SELF, bad) != Err(Error::InvalidArgument) {
+            return Err("TLS fora da metade de usuário devia ser recusado");
+        }
+    }
+    let raw = |args| ostd::sys::syscall(Syscall::ThreadConfigure, args).map(drop);
+    if raw([0, 0, 0, va, 0, CONFIGURE_TLS | CONFIGURE_IPC_BUFFER]) != Err(Error::InvalidArgument) {
+        return Err("TLS junto com o buffer de IPC devia ser recusado");
+    }
+    if raw([0, 1, 1, va, 0, CONFIGURE_TLS]) != Err(Error::InvalidArgument) {
+        return Err("thread = 0 não liga CapSpace nem AddressSpace");
+    }
+    if set_tls(Handle::from_raw(0x00ab_cdef), va) != Err(Error::InvalidHandle) {
+        return Err("handle inválido devia dar InvalidHandle");
+    }
+    let ep = create(ctx.quota, ObjectType::Endpoint, 0).map_err(|_| "create(endpoint)")?;
+    let not_thread = set_tls(ep, va).is_err();
+    let other = create(ctx.quota, ObjectType::Thread, 0).map_err(|_| "create(thread)")?;
+    let on_other = set_tls(other, va);
+    let _ = (delete(ep), delete(other));
+    set_tls(SELF, 0).map_err(|_| "tirar o TLS")?;
+    match (not_thread, on_other) {
+        (true, Ok(())) => Ok(()),
+        (false, _) => Err("TLS num endpoint devia falhar"),
+        (_, Err(_)) => Err("TLS noutra thread pela capability falhou"),
+    }
+}
+
+/// `vm_map` e `vm_unmap` com `aspace = 0` (T-333): o espaço de quem chama,
+/// sem handle.
+fn vm_proprio_espaco(ctx: &Ctx) -> Outcome {
+    use ostd::kabi::vm::{PAGE_SIZE, WRITE};
+    use ostd::vm::{Mapping, SELF};
+    let va = 0x7100_0000;
+    let object = create(ctx.quota, ObjectType::MemoryObject, PAGE_SIZE).map_err(|_| "create")?;
+    let result = (|| {
+        let mut m = Mapping::new(SELF, object, va, PAGE_SIZE, WRITE).map_err(|_| "vm_map(0)")?;
+        let bytes = m.bytes_mut().ok_or("não gravável")?;
+        bytes[0] = 0x5a;
+        bytes[4095] = 0xa5;
+        if m.bytes()[0] != 0x5a || m.bytes()[4095] != 0xa5 {
+            return Err("a página mapeada não guardou os bytes");
+        }
+        drop(m);
+        // O `Drop` desmapeou com `aspace = 0`: mapear de novo funciona.
+        let again = Mapping::new(SELF, object, va, PAGE_SIZE, 0).map_err(|_| "vm_map de novo")?;
+        drop(again);
+        Ok(())
+    })();
+    let _ = delete(object);
+    result
+}
+
+/// `thread_exit` com `EXIT_GROUP` volta `NotSupported` até a T-348, e com
+/// flag desconhecida, `InvalidArgument`; nos dois casos a thread segue.
+fn exit_recusa_flags(_: &Ctx) -> Outcome {
+    use ostd::kabi::Syscall;
+    if ostd::thread::exit_group(1) != Error::NotSupported {
+        return Err("EXIT_GROUP devia dar NotSupported");
+    }
+    if ostd::sys::syscall(Syscall::ThreadExit, [0, 2, 0, 0, 0, 0]).map(drop)
+        != Err(Error::InvalidArgument)
+    {
+        return Err("flag desconhecida devia dar InvalidArgument");
+    }
+    Ok(())
+}
+
 /// Falha de propósito (só com `UTEST_FALHA=1`): prova que o `xtask`
 /// derruba o comando quando um teste falha.
 #[cfg(utest_falha)]
@@ -234,10 +331,7 @@ fn main(start: Start) -> ! {
     let ctx = Ctx {
         quota: handle(start.args[0]),
     };
-    ostd::rt::init(Env {
-        quota: ctx.quota,
-        aspace: handle(start.args[1]),
-    });
+    ostd::rt::init(Env { quota: ctx.quota });
     ostd::debug::print_fmt(format_args!("utest: início, {} testes", TESTS.len()));
     let mut passed = 0usize;
     for test in TESTS {

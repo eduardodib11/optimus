@@ -6,8 +6,8 @@
 //! criação. Os registradores de usuário ficam num quadro no topo da pilha de
 //! kernel, montado e lido pelo código de arquitetura.
 //!
-//! O que o escalonador lê a cada troca (estado, rsp salvo, CR3, área de FPU)
-//! fica em atômicas e endereços fixos, para ele não tomar a trava da thread
+//! O que o escalonador lê a cada troca (estado, rsp salvo, CR3, área de FPU,
+//! `FS_BASE`) fica em atômicas e endereços fixos, para ele não tomar a trava da thread
 //! com a da fila na mão (ordem da seção 6.9: objeto antes da fila).
 
 #![forbid(unsafe_code)]
@@ -133,6 +133,13 @@ pub struct Thread {
     /// Handle cru, no `CapSpace` da thread, do endpoint de exceções (T-210;
     /// zero: sem endpoint).
     exception: AtomicU32,
+    /// `FS_BASE` do usuário (T-333; ADR 0039, item 3): a troca de contexto
+    /// o põe na CPU ao entrar a thread.
+    fs_base: AtomicU64,
+    /// Registro de morte (ADR 0035, item 2): causa (`kabi::exit::CAUSE_*`;
+    /// zero: viva), código e auxiliar. A causa é gravada por último.
+    death_cause: AtomicU8,
+    death: [AtomicU64; 2],
 }
 
 impl fmt::Debug for Thread {
@@ -180,6 +187,9 @@ impl Thread {
             ipc: SpinLock::with_class(LockClass::IpcSlot, IpcSlot::default()),
             ipc_buffer: AtomicU64::new(0),
             exception: AtomicU32::new(0),
+            fs_base: AtomicU64::new(0),
+            death_cause: AtomicU8::new(0),
+            death: [const { AtomicU64::new(0) }; 2],
         })
     }
 
@@ -437,6 +447,63 @@ impl Thread {
     #[must_use]
     pub fn cspace(&self) -> Option<Arc<SharedCapSpace>> {
         self.binding.lock().cspace.clone()
+    }
+
+    /// `va` serve de `FS_BASE` (ADR 0039, item 3): zero ou um endereço
+    /// canônico da metade de usuário (abaixo de `USER_END`). Um valor não
+    /// canônico daria #GP no `WRMSR` do kernel; um da metade alta
+    /// apontaria o TLS para o kernel.
+    #[must_use]
+    pub const fn valid_tls(va: u64) -> bool {
+        va < USER_END
+    }
+
+    /// Fixa o `FS_BASE` (parte de `thread_configure`, `CONFIGURE_TLS`). A
+    /// CPU o recebe na próxima vez que a thread entrar nela (ou já, se
+    /// quem chama for a própria thread e gravar o MSR).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] fora da metade de usuário.
+    pub fn set_tls(&self, va: u64) -> Result<(), Error> {
+        if !Self::valid_tls(va) {
+            return Err(Error::InvalidArgument);
+        }
+        self.fs_base.store(va, Ordering::Release);
+        Ok(())
+    }
+
+    /// O `FS_BASE` da thread (zero: nenhum).
+    #[must_use]
+    #[inline]
+    pub fn tls(&self) -> u64 {
+        self.fs_base.load(Ordering::Acquire)
+    }
+
+    /// Grava o registro de morte (ADR 0035, item 2): `cause` é uma de
+    /// `kabi::exit::CAUSE_*`. Só a primeira gravação vale; chamada pela
+    /// própria thread no caminho de saída.
+    pub fn record_death(&self, cause: u8, code: u64, aux: u64) {
+        if cause == 0 || self.death_cause.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        self.death[0].store(code, Ordering::Relaxed);
+        self.death[1].store(aux, Ordering::Relaxed);
+        self.death_cause.store(cause, Ordering::Release);
+    }
+
+    /// O registro de morte, `(causa, código, auxiliar)`, se a thread já
+    /// morreu.
+    #[must_use]
+    pub fn death(&self) -> Option<(u8, u64, u64)> {
+        let cause = self.death_cause.load(Ordering::Acquire);
+        (cause != 0).then(|| {
+            (
+                cause,
+                self.death[0].load(Ordering::Relaxed),
+                self.death[1].load(Ordering::Relaxed),
+            )
+        })
     }
 }
 

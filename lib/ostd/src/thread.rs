@@ -1,19 +1,55 @@
 //! Threads e escalonamento (SDD v1.0, seções 6.1, 6.6 e 14.2; ADR 0029).
 
 use kabi::sched::{CpuMask, SYS_INFO_CPUS};
-use kabi::thread::{CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER};
+use kabi::thread::{CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER, CONFIGURE_TLS};
 use kabi::{Error, Handle, Syscall};
 
 use crate::cap::raw;
 use crate::sys::syscall;
 
-/// Termina a thread atual (`thread_exit`).
+/// `thread = SELF` em `thread_configure`: a própria thread, sem capability
+/// (ADR 0039, item 3; o `kabi::thread::SELF`, zero). Vale para [`set_ipc_buffer`],
+/// [`set_exception_handler`] e [`set_tls`]; [`bind`] exige a capability.
+pub const SELF: Handle = Handle::from_raw(0);
+const _: () = assert!(kabi::thread::SELF == 0);
+
+/// Termina a thread atual (`thread_exit`) com o código 0.
 pub fn exit() -> ! {
-    let _ = syscall(Syscall::ThreadExit, [0; 6]);
-    // O kernel nunca volta de `thread_exit`.
+    exit_with(0)
+}
+
+/// Termina a thread atual com `code`, que vai ao registro de morte dela
+/// (ADR 0035, item 2).
+pub fn exit_with(code: u64) -> ! {
+    let _ = syscall(Syscall::ThreadExit, [code, 0, 0, 0, 0, 0]);
+    // O kernel nunca volta de `thread_exit` sem flags.
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// `thread_exit` com `EXIT_GROUP`: encerra o processo inteiro com `code`
+/// (ADR 0039, item 5). Só volta com o erro do kernel: `NotSupported` até o
+/// encerramento de processos da T-348.
+#[must_use]
+pub fn exit_group(code: u64) -> Error {
+    match syscall(Syscall::ThreadExit, [code, kabi::exit::GROUP, 0, 0, 0, 0]) {
+        Err(e) => e,
+        Ok(_) => Error::NotSupported,
+    }
+}
+
+/// `thread_configure` do TLS: o `FS_BASE` de `thread` ([`SELF`] para a
+/// própria) passa a ser `va`, zero ou um endereço da metade de usuário
+/// (ADR 0039, item 3). Na própria thread vale já; noutra que roda, na
+/// próxima vez que ela entrar numa CPU.
+///
+/// # Errors
+///
+/// Os do kernel (`InvalidArgument` fora da metade de usuário).
+pub fn set_tls(thread: Handle, va: u64) -> Result<(), Error> {
+    let args = [raw(thread), 0, 0, va, 0, CONFIGURE_TLS];
+    syscall(Syscall::ThreadConfigure, args).map(drop)
 }
 
 /// Cede a CPU (`yield`).

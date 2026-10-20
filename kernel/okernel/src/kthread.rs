@@ -988,6 +988,8 @@ struct Incoming {
     stack_top: Option<u64>,
     /// Raiz do espaço dela, se tiver um.
     root: Option<u64>,
+    /// `FS_BASE` dela (ADR 0039, item 3); o ocioso não usa FS.
+    fs_base: Option<u64>,
     /// Ponteiro dela, para `current` e o dump do pânico (0 é o ocioso).
     thread: u64,
 }
@@ -1000,6 +1002,7 @@ impl Incoming {
                 fpu: None,
                 stack_top: None,
                 root: None,
+                fs_base: None,
                 thread: 0,
             },
             |t| Self {
@@ -1007,6 +1010,7 @@ impl Incoming {
                 fpu: Some(t.fpu_area()),
                 stack_top: Some(t.stack().top),
                 root: t.root(),
+                fs_base: Some(t.tls()),
                 thread: Arc::as_ptr(t).expose_provenance() as u64,
             },
         )
@@ -1056,6 +1060,12 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
         // SAFETY: o espaço da thread que vai rodar (vivo enquanto ela
         // estiver em `current`) ou o do kernel; ambos mapeiam o kernel.
         unsafe { crate::kvm::load_root(root) };
+    }
+    // Todo caminho até o anel 3 passa por aqui antes de voltar ao usuário
+    // (a primeira entrada pelo trampolim, a troca direta do IPC e a thread
+    // que mudou de CPU), então o TLS dela vale ao chegar no usuário.
+    if let Some(fs) = incoming.fs_base {
+        cpu::load_user_fs_base(fs);
     }
     // SAFETY: `prev_slot` é o rsp salvo da anterior, viva (em
     // `switch_prev`) ou o ocioso; `incoming.rsp` foi salvo por esta mesma
@@ -1372,6 +1382,10 @@ impl sys::Env for KernelEnv {
             }
         }
     }
+
+    fn load_tls(&mut self, va: u64) {
+        cpu::load_user_fs_base(va);
+    }
 }
 
 /// Disparo do timer do APIC (com o EOI já feito), vindo do anel 3 ou do
@@ -1395,8 +1409,9 @@ pub fn trace_take() -> Vec<Event> {
     core::mem::take(&mut this_sched().lock().trace)
 }
 
-/// `thread_exit`: a thread atual termina. Quem chama solta antes as
-/// referências que tiver na pilha: esta função nunca volta.
+/// A thread atual termina (por `thread_exit` ou por falta, com o registro
+/// de morte já gravado). Quem chama solta antes as referências que tiver na
+/// pilha: esta função nunca volta.
 pub fn exit_current() -> ! {
     schedule(Why::Exit);
     unreachable!("thread terminada voltou a rodar");
@@ -1442,7 +1457,7 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
             yield_now();
             Ok([0; 3])
         }
-        Syscall::ThreadExit => exit_current(),
+        Syscall::ThreadExit => thread_exit(a[0], a[1]),
         Syscall::ClockGet => Ok([ktime::now_ns(), 0, 0]),
         Syscall::SysInfo => sys_info(a[0]),
         Syscall::ThreadStart => thread_start(a).map(|()| [0; 3]),
@@ -1453,6 +1468,25 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
             sys::invoke(&space, call, a, kcap::REVOKE_SLICE_BUDGET, &mut KernelEnv)
         }
     }
+}
+
+/// `thread_exit(código, flags)` (ADR 0035, item 2, e ADR 0039, item 5): o
+/// código vai ao registro de morte da thread, com a causa `Exited`.
+///
+/// `EXIT_GROUP` precisa do encerramento de processos da ADR 0035 (item 4,
+/// T-348): até lá volta `NotSupported` e a thread segue, como com flags
+/// desconhecidas (`InvalidArgument`).
+fn thread_exit(code: u64, flags: u64) -> Result<Values, Error> {
+    if flags & !kabi::exit::ALL_FLAGS != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    if flags & kabi::exit::GROUP != 0 {
+        return Err(Error::NotSupported);
+    }
+    if let Some(me) = current() {
+        me.record_death(kabi::exit::CAUSE_EXITED, code, 0);
+    }
+    exit_current()
 }
 
 /// `sys_info(seletor)` (ADR 0032, item 4): com [`kabi::sched::SYS_INFO_CPUS`],

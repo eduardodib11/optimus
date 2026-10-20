@@ -26,6 +26,7 @@ mod smp_ipc;
 mod smp_stress;
 mod sync;
 mod tlb;
+mod tls;
 
 /// Testes de kernel de threads de usuário.
 pub const TESTS: &[Test] = &[
@@ -92,6 +93,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "smp.carga_desigual_converge",
         run: affinity::carga_desigual_converge,
+    },
+    Test {
+        name: "smp.tls_cada_thread_ve_o_seu",
+        run: tls::cada_thread_ve_o_seu,
     },
     Test {
         name: "smp.estresse",

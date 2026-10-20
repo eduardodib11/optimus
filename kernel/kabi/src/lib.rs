@@ -83,11 +83,11 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     CapRevoke = 3 => "`cap_revoke`: apaga todos os descendentes.",
     CapInfo = 4 => "`cap_info`.",
     ObjCreate = 5 => "`obj_create(quota, tipo, args)`.",
-    VmMap = 6 => "`vm_map`.",
-    VmUnmap = 7 => "`vm_unmap`.",
+    VmMap = 6 => "`vm_map`; `aspace = 0` é o espaço de quem chama (ADR 0039).",
+    VmUnmap = 7 => "`vm_unmap`; `aspace = 0` é o espaço de quem chama (ADR 0039).",
     VmProtect = 8 => "`vm_protect`.",
     MemOp = 9 => "`mem_op`: commit, zero, cache.",
-    ThreadConfigure = 10 => "`thread_configure`: `CapSpace`, `AddressSpace`, buffer de IPC e endpoint de exceções (ADR 0029).",
+    ThreadConfigure = 10 => "`thread_configure`: `CapSpace`, `AddressSpace`, buffer de IPC, endpoint de exceções (ADR 0029) e TLS; `thread = 0` é a própria (ADR 0039).",
     ThreadStart = 11 => "`thread_start`: `rip`, `rsp` e três valores iniciais (ADR 0029).",
     ThreadSuspend = 12 => "`thread_suspend`.",
     ThreadResume = 13 => "`thread_resume`.",
@@ -110,7 +110,7 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     FutexWake = 30 => "`futex_wake`.",
     DmaMap = 31 => "`dma_map` / `dma_unmap`, escolhidos por flag.",
     SysInfo = 32 => "`sys_info`.",
-    ThreadExit = 33 => "`thread_exit`.",
+    ThreadExit = 33 => "`thread_exit(código, flags)`: o código vai ao registro de morte (ADR 0035 e 0039).",
 }
 
 /// Quantidade de syscalls da ABI v1 ("34 syscalls estáveis").
@@ -191,18 +191,54 @@ pub mod vm {
     pub const EXEC: u64 = 1 << 1;
     /// Flags definidas; as demais são recusadas com `InvalidArgument`.
     pub const ALL_FLAGS: u64 = WRITE | EXEC;
+    /// `aspace = SELF` (0) em `vm_map` e `vm_unmap`: o espaço da thread
+    /// que chama, sem capability (ADR 0039, item 2).
+    pub const SELF: u64 = 0;
 }
 
-/// Flags de `thread_configure` (ADR 0029): o que muda além do `CapSpace` e
-/// do `AddressSpace`.
+/// Flags de `thread_configure` (ADR 0029 e ADR 0039, item 3): o que muda
+/// além do `CapSpace` e do `AddressSpace`.
+///
+/// `thread = `[`SELF`] (0) é a própria thread, sem capability: vale para o
+/// buffer de IPC, o endpoint de exceções e o TLS. Ligar `CapSpace` e
+/// `AddressSpace` continua exigindo a capability da thread (com `SELF`, os
+/// dois têm de ser 0; senão `InvalidArgument`).
 pub mod thread {
+    /// `thread_configure(SELF, ...)`: a thread que chama.
+    pub const SELF: u64 = 0;
     /// Registra o buffer de IPC (`r10`; 0 tira o buffer).
     pub const CONFIGURE_IPC_BUFFER: u64 = 1;
     /// Registra o endpoint de exceções (`r8`, handle no `CapSpace` da
     /// thread; 0 tira o endpoint).
     pub const CONFIGURE_EXCEPTION: u64 = 1 << 1;
+    /// Registra o `FS_BASE` da thread (`r10`, o registrador do buffer de
+    /// IPC: as duas flags juntas são `InvalidArgument`). Aceita 0 e
+    /// endereços abaixo de `vm::USER_END`, sem exigir alinhamento. Na
+    /// própria thread vale ao voltar da syscall; numa thread que roda em
+    /// outra CPU, na próxima vez que ela entrar numa CPU.
+    pub const CONFIGURE_TLS: u64 = 1 << 2;
     /// Flags definidas; as demais são recusadas com `InvalidArgument`.
-    pub const CONFIGURE_ALL: u64 = CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION;
+    pub const CONFIGURE_ALL: u64 = CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION | CONFIGURE_TLS;
+}
+
+/// `thread_exit(código, flags)` (`rdi`, `rsi`; ADR 0035, item 2, e ADR
+/// 0039, item 5) e as causas do registro de morte de uma thread.
+pub mod exit {
+    /// Flag de `thread_exit`: encerra o processo inteiro (o `CapSpace` da
+    /// thread). Reservada: até o encerramento de processos da ADR 0035
+    /// (T-348), o kernel a recusa com `NotSupported` e a thread segue.
+    pub const GROUP: u64 = 1;
+    /// Flags definidas; as demais são recusadas com `InvalidArgument` (a
+    /// thread segue).
+    pub const ALL_FLAGS: u64 = GROUP;
+    /// Código de saída do pânico do `ostd` (`"pani"`).
+    pub const PANIC_CODE: u64 = 0x7061_6E69;
+    /// Causa: a thread chamou `thread_exit`; o código é o de `rdi`.
+    pub const CAUSE_EXITED: u8 = 1;
+    /// Causa: falta fatal; o código é o vetor e o auxiliar, o endereço.
+    pub const CAUSE_FAULTED: u8 = 2;
+    /// Causa: encerrada por outra (`cap_delete` com `DESTROY`, T-348).
+    pub const CAUSE_KILLED: u8 = 3;
 }
 
 /// Rótulo de 64 bits de uma mensagem de IPC (seção 6.7).
@@ -281,6 +317,29 @@ mod tests {
             assert_eq!(Error::try_from(raw), Err(UnknownValue(raw)));
         }
         assert_eq!(ObjectType::try_from(14), Err(UnknownValue(14)));
+    }
+
+    #[test]
+    fn flags_de_thread_e_saida() {
+        use super::{exit, thread, vm};
+        assert_eq!(
+            (
+                thread::CONFIGURE_IPC_BUFFER,
+                thread::CONFIGURE_EXCEPTION,
+                thread::CONFIGURE_TLS
+            ),
+            (1, 2, 4)
+        );
+        assert_eq!(thread::CONFIGURE_ALL, 0b111);
+        assert_eq!((thread::SELF, vm::SELF), (0, 0));
+        assert_eq!(
+            (exit::GROUP, exit::ALL_FLAGS, exit::PANIC_CODE),
+            (1, 1, 0x7061_6E69)
+        );
+        assert_eq!(
+            (exit::CAUSE_EXITED, exit::CAUSE_FAULTED, exit::CAUSE_KILLED),
+            (1, 2, 3)
+        );
     }
 
     #[test]

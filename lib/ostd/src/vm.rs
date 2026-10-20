@@ -8,6 +8,12 @@ use kabi::{Error, Handle, Syscall};
 use crate::cap::raw;
 use crate::sys::syscall;
 
+/// `aspace = SELF` em [`map`] e [`unmap`]: o espaço da thread que chama,
+/// sem capability (ADR 0039, item 2; o `kabi::vm::SELF`, zero).
+/// `vm_protect` ainda exige o handle.
+pub const SELF: Handle = Handle::from_raw(0);
+const _: () = assert!(kabi::vm::SELF == 0);
+
 /// `vm_map`: mapeia `len` bytes de `object` a partir de `offset` em `va`
 /// do espaço `aspace`, com `flags` (`kabi::vm::WRITE` ou `EXEC`).
 ///
