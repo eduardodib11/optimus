@@ -122,6 +122,22 @@ const TESTS: &[Test] = &[
         name: "thread.pilha_com_guarda",
         run: threads_guarda,
     },
+    Test {
+        name: "sync.mutex_contador",
+        run: sync_mutex,
+    },
+    Test {
+        name: "sync.condvar_produtor_consumidor",
+        run: sync_condvar,
+    },
+    Test {
+        name: "sync.once_uma_vez",
+        run: sync_once,
+    },
+    Test {
+        name: "sync.rwlock",
+        run: sync_rwlock,
+    },
     #[cfg(utest_falha)]
     Test {
         name: "proposital",
@@ -567,6 +583,230 @@ fn threads_alocacao(_: &Ctx) -> Outcome {
     let after = ostd::alloc::mapped_segments();
     if after > segments + 2 {
         return Err("segmentos demais depois de soltar tudo");
+    }
+    Ok(())
+}
+
+/// T-336: 4 threads incrementam um contador sob `Mutex` 10⁶ vezes no total,
+/// sem perda; a principal também disputa a trava.
+fn sync_mutex(_: &Ctx) -> Outcome {
+    use alloc::sync::Arc;
+    use ostd::sync::Mutex;
+    const THREADS: u64 = 4;
+    const TOTAL: u64 = 1_000_000;
+    let counter = Arc::new(Mutex::new(0u64));
+    let hs: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let c = Arc::clone(&counter);
+            ostd::thread::spawn(move || {
+                for _ in 0..TOTAL / THREADS {
+                    *c.lock() += 1;
+                }
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().map_err(|_| "thread do contador falhou")?;
+    }
+    if *counter.lock() != TOTAL {
+        return Err("incrementos perdidos");
+    }
+    // `try_lock` com a trava tomada falha; livre, funciona.
+    let g = counter.lock();
+    if counter.try_lock().is_some() {
+        return Err("try_lock com a trava tomada");
+    }
+    drop(g);
+    if counter.try_lock().is_none() {
+        return Err("try_lock com a trava livre");
+    }
+    Ok(())
+}
+
+/// T-336: dois produtores e dois consumidores numa fila limitada (capacidade
+/// 4) com duas `Condvar`; cada item chega uma só vez.
+fn sync_condvar(_: &Ctx) -> Outcome {
+    use alloc::collections::VecDeque;
+    use alloc::sync::Arc;
+    use ostd::sync::{Condvar, Mutex};
+    struct Queue {
+        items: Mutex<(VecDeque<u32>, bool)>,
+        not_empty: Condvar,
+        not_full: Condvar,
+    }
+    const PRODUCERS: u32 = 2;
+    const PER: u32 = 20_000;
+    let q = Arc::new(Queue {
+        items: Mutex::new((VecDeque::new(), false)),
+        not_empty: Condvar::new(),
+        not_full: Condvar::new(),
+    });
+    let consumers: Vec<_> = (0..2)
+        .map(|_| {
+            let q = Arc::clone(&q);
+            ostd::thread::spawn(move || {
+                let mut got = Vec::new();
+                loop {
+                    let mut g = q.items.lock();
+                    while g.0.is_empty() && !g.1 {
+                        g = q.not_empty.wait(g);
+                    }
+                    let Some(v) = g.0.pop_front() else { break };
+                    drop(g);
+                    q.not_full.notify_one();
+                    got.push(v);
+                }
+                got
+            })
+        })
+        .collect();
+    let producers: Vec<_> = (0..PRODUCERS)
+        .map(|p| {
+            let q = Arc::clone(&q);
+            ostd::thread::spawn(move || {
+                for i in 0..PER {
+                    let g = q.items.lock();
+                    let mut g = q.not_full.wait_while(g, |s| s.0.len() >= 4);
+                    g.0.push_back(p * PER + i);
+                    drop(g);
+                    q.not_empty.notify_one();
+                }
+            })
+        })
+        .collect();
+    for h in producers {
+        h.join().map_err(|_| "produtor falhou")?;
+    }
+    q.items.lock().1 = true;
+    q.not_empty.notify_all();
+    let mut seen = alloc::vec![0u8; (PRODUCERS * PER) as usize];
+    for h in consumers {
+        for v in h.join().map_err(|_| "consumidor falhou")? {
+            let slot = seen.get_mut(v as usize).ok_or("item fora da faixa")?;
+            *slot += 1;
+        }
+    }
+    if seen.iter().any(|&n| n != 1) {
+        return Err("item perdido ou repetido");
+    }
+    Ok(())
+}
+
+/// T-336: 4 threads disputam `call_once` e `OnceLock::get_or_init`: a
+/// inicialização roda uma vez e todas veem o resultado pronto.
+fn sync_once(_: &Ctx) -> Outcome {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use ostd::sync::{Once, OnceLock};
+    struct Shared {
+        once: Once,
+        cell: OnceLock<u64>,
+        runs: AtomicU32,
+        done: AtomicU32,
+    }
+    let s = Arc::new(Shared {
+        once: Once::new(),
+        cell: OnceLock::new(),
+        runs: AtomicU32::new(0),
+        done: AtomicU32::new(0),
+    });
+    let hs: Vec<_> = (0..4)
+        .map(|_| {
+            let s = Arc::clone(&s);
+            ostd::thread::spawn(move || {
+                s.once.call_once(|| {
+                    // Demora, para as outras chegarem e esperarem.
+                    for _ in 0..5 {
+                        ostd::thread::yield_now();
+                    }
+                    s.runs.fetch_add(1, Ordering::Relaxed);
+                    s.done.store(1, Ordering::Relaxed);
+                });
+                let seen_done = s.done.load(Ordering::Relaxed);
+                let v = *s.cell.get_or_init(|| {
+                    s.runs.fetch_add(100, Ordering::Relaxed);
+                    7
+                });
+                seen_done == 1 && v == 7
+            })
+        })
+        .collect();
+    for h in hs {
+        if h.join() != Ok(true) {
+            return Err("thread viu a inicialização incompleta");
+        }
+    }
+    if s.runs.load(Ordering::Relaxed) != 101 || !s.once.is_completed() {
+        return Err("a inicialização não rodou exatamente uma vez");
+    }
+    Ok(())
+}
+
+/// T-336: leitores ao mesmo tempo (um espera o outro dentro da seção) e
+/// escritor exclusivo (invariante entre duas palavras nunca quebrada).
+fn sync_rwlock(_: &Ctx) -> Outcome {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use ostd::sync::RwLock;
+    // Leitores simultâneos: 3 leitores só saem quando os 3 estão dentro.
+    let lock = Arc::new(RwLock::new(5u64));
+    let inside = Arc::new(AtomicU32::new(0));
+    let hs: Vec<_> = (0..3)
+        .map(|_| {
+            let (l, n) = (Arc::clone(&lock), Arc::clone(&inside));
+            ostd::thread::spawn(move || {
+                let g = l.read();
+                n.fetch_add(1, Ordering::SeqCst);
+                let mut spins = 0u64;
+                while n.load(Ordering::SeqCst) < 3 {
+                    spins += 1;
+                    if spins > 50_000_000 {
+                        return false;
+                    }
+                    ostd::thread::yield_now();
+                }
+                *g == 5
+            })
+        })
+        .collect();
+    for h in hs {
+        if h.join() != Ok(true) {
+            return Err("leitores não ficaram juntos na seção");
+        }
+    }
+    // Escritores exclusivos: (a, b) muda sempre junto; leitores veem a == b.
+    let pair = Arc::new(RwLock::new((0u64, 0u64)));
+    let mut hs = Vec::new();
+    for w in 0..2 {
+        let p = Arc::clone(&pair);
+        hs.push(ostd::thread::spawn(move || {
+            for _ in 0..5_000 {
+                let mut g = p.write();
+                g.0 += 1;
+                if w == 0 {
+                    ostd::thread::yield_now();
+                }
+                g.1 += 1;
+            }
+            true
+        }));
+    }
+    for _ in 0..2 {
+        let p = Arc::clone(&pair);
+        hs.push(ostd::thread::spawn(move || {
+            (0..10_000).all(|_| {
+                let g = p.read();
+                g.0 == g.1
+            })
+        }));
+    }
+    for h in hs {
+        if h.join() != Ok(true) {
+            return Err("leitor viu a invariante quebrada");
+        }
+    }
+    if *pair.read() != (10_000, 10_000) {
+        return Err("escritas perdidas");
     }
     Ok(())
 }

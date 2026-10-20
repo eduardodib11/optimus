@@ -433,3 +433,13 @@ desenho:
 - **Fim de thread.** Sem notificação de morte (T-348), `join` espera uma flag
   do bloco que a thread grava num bloco de assembly sem pilha; thread que morre
   por falta ou pânico não é juntável até a T-348.
+
+## Notas da implementação (T-336, 2026-10-20)
+
+- **Sem envenenamento.** `panic = abort` (item 5) torna o envenenamento
+  inalcançável; `Mutex::lock`, `RwLock::read`/`write` devolvem a guarda
+  direta, sem `Result`. Se um dia houver desenrolamento, a API muda junto.
+- **Escolhas.** `Mutex` com os estados 0/1/2; `Condvar` por contador de
+  sequência (sem perda de sinal; despertar espúrio permitido); `RwLock` que
+  prefere escritores; `Once` e `OnceLock`. Esperas sem prazo até a T-338.
+- **`unsafe`.** `lib/ostd/src/sync` = 28 (usa 18).
