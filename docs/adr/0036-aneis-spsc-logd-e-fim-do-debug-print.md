@@ -1,6 +1,6 @@
 # ADR 0036: Anéis SPSC, log estruturado, `logd` e fim do `DEBUG_PRINT`
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.7, 7.1, 7.3, 14.2 e 17.3; backlog do M3, T-309
 - Relaciona-se com: ADR 0007 (anéis SPSC), ADR 0033 (OIDL), ADR 0034
@@ -123,7 +123,7 @@ interface Log {
   dois lados, sem `EXEC`; o `logd` guarda a primeira cópia, entrega a
   segunda e a capability `SIGNAL` com badge. O `logd` identifica o
   cliente pelo badge do `Endpoint` (ADR 0034) e chama
-  `Supervisor.name_of(id)` no `svcmgr` (item adicional ao ADR 0034) para
+  `Supervisor.name_of(id)` no `svcmgr` (já definido na ADR 0034) para
   obter o nome. **Um anel por serviço** (segundo `register` do mesmo
   serviço devolve o mesmo anel ou `Busy`); no máximo 64 anéis.
 - `query`: devolve as últimas linhas desde `since_seq`, filtradas por
@@ -188,12 +188,18 @@ interface Log {
   política é **sobrescrever o mais antigo** (o kernel nunca espera nem
   confia no consumidor). Por isso o anel do kernel é de **leitura**
   para o `logd` (`READ|MAP`), que guarda sua posição fora do anel e
-  detecta perda comparando `seq` do registro e `tail`
-  (seqlock: reler `tail` depois de ler o registro; se o registro foi
-  coberto, descarta e conta).
+  detecta perda comparando essa posição com o `tail`: depois de ler um
+  registro, relê o `tail`; se `tail − posição > data_len`, o registro foi
+  coberto por escritas novas, e o `logd` descarta o que leu, conta a perda
+  e avança a posição para `tail − data_len` (alinhada ao próximo registro
+  válido). O registro do item 2 não tem `seq`; a posição faz esse papel.
 - Despertar: `obj_bind_notify(debuglog, ntfy, bits)` (ADR 0035
-  estendido ao `DebugLog`) sinaliza quando o anel passa de vazio a não
-  vazio (no máximo uma vez por milissegundo).
+  estendido ao `DebugLog`) sinaliza a **cada registro** escrito, com um
+  OR na `Notification`. O `logd` só lê o anel, então o kernel não conhece
+  o `head` e não sabe se o anel está vazio; um limite de sinais por
+  milissegundo perderia o último sinal de uma rajada, porque o kernel não
+  tem tick para reenviá-lo. O custo é pequeno: fora dos testes o kernel
+  registra pouco.
 - O kernel **continua** escrevendo na serial (necessário para pânico e
   boot). O `logd` **não** reimprime linhas do kernel na serial; só as
   guarda para consulta.
@@ -254,15 +260,34 @@ no produtor; anel MPSC; qualquer outro `kind` além de log.
 
 1. **Resolvidas aqui:** layout do anel, protocolo de despertar, política
    de overflow, formato do registro, substituição do `DEBUG_PRINT`.
-2. **Decisão de Eduardo:** novo `ObjectType::DebugLog` para a capability
-   de `debug_write` (a 14.2 só diz "cap de debug"; a 6.1 não tem o tipo).
-3. **Decisão de Eduardo:** `ntfy_signal` passar a **mascarar** os bits
-   pelo badge quando o badge é diferente de zero, no lugar do OR atual
-   (mudança de semântica já testada em T-209).
-4. **Decisão de Eduardo:** `query` restrito a uma lista de leitores
+2. **Decidido (2026-10-20):** novo `ObjectType::DebugLog` para a
+   capability de `debug_write`. Funciona igual no x86 e no ARM, o que uma
+   porta de E/S não faria.
+3. **Decidido (2026-10-20):** `ntfy_signal` passa a **mascarar** os bits
+   pelo badge quando o badge é diferente de zero, no lugar do OR atual.
+   Um produtor deixa de poder levantar os bits dos outros anéis; a
+   mudança ajusta o teste da T-209.
+4. **Decidido (2026-10-20):** `query` restrito a uma lista de leitores
    (`rescue`, `svcmgr`) no M3.
-5. **Decisão de Eduardo:** política "descartar novos" com marcas-d'água
-   para os serviços e "sobrescrever" só para o kernel.
-6. **Dependência:** a ADR 0034 ganha `Supervisor.name_of(id: u32)
-   -> result<string<31>, SvcError>`, restrito a quem tem `kernel:`-pool
-   ou o papel de `logd` no manifesto.
+5. **Decidido (2026-10-20):** política "descartar novos" com
+   marcas-d'água para os serviços e "sobrescrever" só para o kernel, que
+   nunca espera nem confia no consumidor.
+6. **Sem dependência nova:** a ADR 0034 já define
+   `Supervisor.name_of(id: u32) -> result<string<31>, SvcError>`,
+   restrito aos serviços que o manifesto do `svcmgr` marca como
+   consumidores de nomes (o `logd`).
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- O anel do kernel sinaliza a Notification a cada registro, no lugar de
+  "vazio para não vazio, no máximo uma vez por milissegundo".
+- A perda no anel do kernel é detectada pela posição do `logd` contra o
+  `tail` (`tail − posição > data_len`), e não por `seq`, que o registro
+  não tem.
+- A dependência de `Supervisor.name_of` sai: a ADR 0034 já o define.
+- `ntfy_signal` mascarar pelo badge fica decidido (ajusta o teste da
+  T-209).
+- As decisões da seção final foram registradas como decididas.

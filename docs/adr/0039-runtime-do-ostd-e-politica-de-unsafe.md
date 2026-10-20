@@ -1,6 +1,6 @@
 # ADR 0039: Runtime do `ostd`: alocador, TLS, aleatoriedade e política de `unsafe`
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.5, 7.1, 17.1 e 17.3; backlog do M3, T-312
 - Relaciona-se com: ADR 0002 (Rust estável, assembly só em `arch`), ADR 0003
@@ -57,8 +57,11 @@ crates = ["boot/optboot", "kernel/okernel", "lib/ostd", "lib/oalloc"]
   `lib/ostd/src/lib.rs` continua `#![deny(unsafe_code)]`. O restante da
   `ostd` (e todos os serviços) continua `#![forbid(unsafe_code)]`.
 - Todo bloco `unsafe` leva `// SAFETY:` e revisão por duas pessoas (17.1).
-  Módulos de `unsafe` têm teste sob **Miri** (job noturno de nightly,
-  16.4) no host. Por isso o núcleo do alocador é uma **crate separada**,
+  Os testes da `lib/oalloc` rodam sob **Miri** (nightly) no host, só nos
+  PRs que mudam essa crate. O job noturno de Miri da 16.4 não existe no
+  CI de hoje e fica para depois: criá-lo gasta minutos de Actions, e
+  Eduardo decidiu não criar esse job agora. Por isso o núcleo do alocador é
+  uma **crate separada**,
   `lib/oalloc` (`no_std`, sem syscalls, genérica sobre um `PageSource`),
   testável no host; a cola com o kernel (`ostd::alloc`) é pequena.
 - Os serviços não ganham `unsafe`. `#[global_allocator]` fica em
@@ -77,8 +80,13 @@ Estilo mimalloc, escrito do zero:
 - **Páginas:** cada segmento tem 32 páginas de 64 KiB; a primeira guarda o
   cabeçalho do segmento (dono, contadores, mapa de páginas). Dado o
   ponteiro, `ptr & !(2 MiB − 1)` acha o segmento.
-- **Classes de tamanho:** 8 a 8 KiB com 4 classes por duplicação (perda
-  ≤ 12,5%). Acima disso e até 512 KiB: blocos de múltiplas páginas de 64
+- **Classes de tamanho:** de 8 a 8 KiB. Até 64 bytes as classes são
+  lineares, de 8 em 8 (8, 16, 24, ..., 64); acima de 64 há 4 classes por
+  duplicação (degraus de 25%). A perda por arredondamento é de no máximo
+  0,25/1,25 = 20% (perda ≤ 20%); 12,5% exigiria 8 classes por duplicação.
+  Abaixo de 64 bytes não cabem 4 classes por duplicação com alinhamento
+  de 8, daí as classes lineares. Acima disso e até 512 KiB: blocos de
+  múltiplas páginas de 64
   KiB dentro de um segmento; acima: segmento próprio (múltiplos de 2 MiB).
 - **Heap por thread:** páginas por classe com lista livre local (`free`),
   `local_free` (liberado pelo dono) e `thread_free` (pilha atômica que
@@ -98,20 +106,31 @@ Estilo mimalloc, escrito do zero:
   threads sem vazamento nem corrupção; fragmentação medida em carga
   sintética e registrada.
 
-O `PageSource` real precisa de três handles do processo: cota, o próprio
-`AddressSpace` e (para criar objetos) o direito `CREATE`. Eles vêm do
-descritor de partida (ADR 0034, `CapDesc.kind` quota/aspace) e são
-guardados em `ostd::rt::Env` antes da primeira alocação; `entry!` chama
+O `PageSource` real precisa da cota do processo, com o direito `CREATE`
+para criar objetos, e do espaço de endereços. A cota vem do descritor de
+partida (ADR 0034): o `PageSource` a acha pelo `CapDesc` com `kind = 2` e
+`index = 0xFFFF`, e a guarda em `ostd::rt::Env` antes da primeira
+alocação. O espaço de endereços não precisa de handle: `vm_map` e
+`vm_unmap` aceitam `aspace = 0` como "o espaço de endereços da thread que
+chama", no mesmo espírito do `thread = 0` do item 3, e nenhum serviço
+guarda capability do próprio `AddressSpace` (o mesmo ciclo que o
+`thread = 0` evita); `entry!` chama
 `rt::init` (o `root` e o `hello` recebem os handles direto em `Start`).
 Alocar antes de `rt::init` é um erro de programação e aborta.
 
 ### 3. TLS por `FS_BASE`
 
 - **Kernel (T-333):** `Thread` guarda `fs_base: u64`. A troca de contexto o
-  salva e restaura (`WRFSBASE`/`RDFSBASE` se `CPUID.7.0:EBX[0]` e o kernel
-  ligar `CR4.FSGSBASE`; senão `WRMSR` em `IA32_FS_BASE`). `GS_BASE` de
-  usuário continua zero e fora da ABI (o kernel usa GS para o estado por
-  CPU).
+  salva e restaura com `WRMSR` em `IA32_FS_BASE`, gravando **apenas
+  quando o valor muda** entre a thread que sai e a que entra. No M3 o
+  kernel **não liga `CR4.FSGSBASE`**: com o bit ligado, o usuário ganharia
+  na hora `WRFSBASE`, `WRGSBASE` e as duas leituras, e um processo poderia
+  gravar o `GS_BASE`, que o kernel não salva por thread; o valor vazaria
+  para a próxima thread (de outro processo) depois do `swapgs`. `GS_BASE`
+  de usuário continua zero e fora da ABI (o kernel usa GS para o estado
+  por CPU). O custo do `WRMSR` entra no bench de troca de contexto em KVM
+  (hoje 385 ns). Se um dia o bit for ligado, o kernel passa a salvar e
+  restaurar também o `GS_BASE` de usuário.
 - **ABI, sem syscall nova:** `kabi::thread::CONFIGURE_TLS = 1 << 2` em
   `thread_configure`. O valor vai em `r10` (o mesmo registrador do buffer
   de IPC; por isso `CONFIGURE_TLS` não pode vir junto de
@@ -137,7 +156,7 @@ Alocar antes de `rt::init` é um erro de programação e aborta.
 
 ### 4. Aleatoriedade
 
-- **Kernel:** `sys_info(classe 4)` devolve três palavras (24 bytes)
+- **Kernel:** `sys_info(classe 5)` devolve três palavras (24 bytes)
   aleatórias criptográficas, sem capability, a qualquer processo.
   Implementação: DRBG baseado em BLAKE3 em modo chaveado (`optcrypt`), com
   chave inicial `BLAKE3(rng_seed ‖ "okernel-drbg")`, reaplicada a cada
@@ -149,13 +168,15 @@ Alocar antes de `rt::init` é um erro de programação e aborta.
   bytes (para chaves e nonces); `fast()` é um xoshiro256++ por thread
   semeado uma vez por `secure_fill`, **não** criptográfico (índice de
   tabela hash, sorteio de endereço). `HashMap` usa SipHash-1-3 com chave
-  de 128 bits tirada de `fast()` por mapa.
+  de 128 bits tirada de `fast()` por mapa. Premissa registrada: como
+  `fast()` não é criptográfico, isso resiste a HashDoS enquanto ninguém
+  observa saídas do xoshiro; é suficiente para o M3.
 - **Falha da entropia:** `NotSupported` não derruba o programa. O `ostd`
   usa uma mistura de `clock_get`, endereços de pilha e `tid` com
   `log` de nível `warn` na primeira vez, e marca `rand::is_degraded()`;
   serviços que fazem criptografia checam essa marca e se recusam a
   iniciar.
-- **O que não é:** `sys_info(4)` não é um gerador de volume; o consumo
+- **O que não é:** `sys_info(5)` não é um gerador de volume; o consumo
   grande usa o DRBG do usuário semeado por ele.
 
 ### 5. Panic, abort e fim do processo
@@ -165,9 +186,16 @@ Alocar antes de `rt::init` é um erro de programação e aborta.
   o **processo**, não só a thread: `thread_exit(código, flags)` ganha
   `flags` em `rsi` com `EXIT_GROUP = 1`, que equivale a o processo se
   destruir (`cap_delete` com `DESTROY` no próprio `CapSpace`, ADR 0035,
-  sem exigir o direito porque é auto-encerramento). `cause = Exited`,
+  sem exigir o direito porque é auto-encerramento). O `EXIT_GROUP` usa o
+  `CapSpace` ao qual a thread está ligada, **sem handle**: o processo não
+  guarda capability do próprio `CapSpace`. `cause = Exited`,
   `código = 0x7061_6E69` (`"pani"`) no pânico; o `svcmgr` lê isso e
   registra `error`.
+- **`thread_exit` passa a ler o código.** Hoje o argumento é ignorado: o
+  `ostd` manda zeros (`lib/ostd/src/thread.rs`) e `exit_current()` não lê
+  código nenhum (`kthread.rs`). A T-333 (ou a tarefa do `EXIT_GROUP`) faz
+  o kernel ler o código em `rdi` e levá-lo ao registro de morte da ADR
+  0035 (`code` de `Exited`); sem isso o `svcmgr` nunca vê o `"pani"`.
 - `handle_alloc_error`, liberação dupla e canary violado chamam o mesmo
   caminho (`ostd::process::abort(motivo)`).
 
@@ -189,9 +217,12 @@ Alocar antes de `rt::init` é um erro de programação e aborta.
 - **TLS ELF padrão (`PT_TLS`, `#[thread_local]`):** exigiria nightly (ADR
   0002) e suporte do carregador ao segmento; ficaria para quando o Rust
   estável permitir.
-- **TLS por `WRFSBASE` direto no usuário, sem syscall:** mais rápido, mas
-  exige `CR4.FSGSBASE`, que nem todo hardware/emulador oferece; fica como
-  otimização futura, sobre o mesmo bloco de thread.
+- **TLS por `WRFSBASE` direto no usuário, sem syscall, e troca de
+  contexto com `RDFSBASE`/`WRFSBASE`:** mais rápido, mas exige
+  `CR4.FSGSBASE`, que nem todo hardware/emulador oferece, e abre ao
+  usuário o `WRGSBASE`, que vazaria `GS_BASE` entre threads (item 3).
+  Fica como otimização futura, sobre o mesmo bloco de thread, e só com o
+  kernel salvando também o `GS_BASE` de usuário.
 - **Entropia distribuída pelo `root` (semente por processo):** evita uma
   syscall mas coloca o `root` (TCB) no caminho de toda semente, não serve
   ao `root` e ao `hello`, que nascem antes, e a semente não se renova.
@@ -205,12 +236,16 @@ Alocar antes de `rt::init` é um erro de programação e aborta.
 ## Consequências
 
 - `kabi`: `thread::CONFIGURE_TLS`, `thread = 0` como "eu mesmo",
-  `exit::GROUP`, classe 4 de `sys_info`. O kernel muda em `kthread.rs`,
+  `exit::GROUP`, classe 5 de `sys_info`, e `aspace = 0` em
+  `vm_map`/`vm_unmap` como "o espaço da thread que chama". O kernel muda em
+  `kthread.rs`,
   `thread.rs` e `sys.rs` (T-333, mais o DRBG).
 - `unsafe-allowlist.toml` e `xtask check_unsafe` mudam em conjunto com a
   aprovação desta ADR (T-312 diz: "ADR aceita e allowlist atualizado
   conforme a decisão"). Esta ADR **não** os altera.
-- Nova crate `lib/oalloc`; o workspace e o CI de unsafe/Miri a incluem.
+- Nova crate `lib/oalloc`; o workspace e a checagem de `unsafe` a
+  incluem. Os testes dela sob Miri rodam só nos PRs que a alteram; o job
+  noturno fica para depois.
 - A janela de 16 TiB e o sorteio de endereços dão ao heap 23 bits de
   entropia; o ASLR da pilha, do código (PIE) e do `mmap` continua
   pendente.
@@ -231,16 +266,48 @@ usuário; `GS` de usuário; SIMD no `ostd`; mapeamento de arquivos;
 
 1. **Resolvidas aqui:** desenho do alocador, TLS sem `#[thread_local]`,
    fonte de entropia, mecanismo e contagem de `unsafe` fora de `arch/`.
-2. **Decisão de Eduardo:** orçamento de `unsafe` por módulo na
+2. **Decidido (2026-10-20):** orçamento de `unsafe` por módulo na
    `unsafe-allowlist.toml` e a crate `lib/oalloc` (altera a regra do
-   `xtask check`).
-3. **Decisão de Eduardo:** `sys_info(classe 4)` público para entropia, em
-   vez de distribuição pelo `root`, e o uso de BLAKE3 chaveado como DRBG
-   no kernel (alternativa: ChaCha20 quando a `optcrypt` o tiver).
-4. **Decisão de Eduardo:** `thread = 0` como "eu mesmo" em
+   `xtask check`; a mudança é da T-334).
+3. **Decidido (2026-10-20):** `sys_info(classe 5)` público para
+   entropia, em vez de distribuição pelo `root`, e o uso de BLAKE3
+   chaveado como DRBG no kernel. ChaCha20 só se a `optcrypt` o ganhar por
+   outro motivo.
+4. **Decidido (2026-10-20):** `thread = 0` como "eu mesmo" em
    `thread_configure` e `EXIT_GROUP` em `thread_exit` (dois acréscimos de
-   ABI).
-5. **Decisão de Eduardo:** serviços que dependem de criptografia recusam
-   iniciar com entropia degradada.
+   ABI), com o código de saída chegando ao registro de morte da ADR 0035.
+5. **Decidido (2026-10-20):** serviços que dependem de criptografia
+   recusam iniciar com entropia degradada.
+6. **Decidido (2026-10-20):** `CR4.FSGSBASE` não é ligado no M3; a troca
+   usa `WRMSR` só quando o valor muda (item 3).
+7. **Decidido (2026-10-20):** Miri roda os testes da `lib/oalloc` só nos
+   PRs que mudam essa crate. O job noturno fica para depois, e não se
+   cria agora.
 6. **Pendente:** ASLR de usuário (pilha, código, `mmap`) segue aberto;
    esta ADR dá a fonte de entropia e o heap aleatório, nada mais.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- A entropia passa a ser a classe 5 de `sys_info` (antes classe 4),
+  incluindo a seção Consequências.
+- `CR4.FSGSBASE` não é ligado no M3: a troca de contexto usa
+  `WRMSR IA32_FS_BASE`, só quando o valor muda; se o bit for ligado um
+  dia, o kernel também salva e restaura o `GS_BASE` de usuário. A seção
+  Alternativas foi ajustada.
+- Classes de tamanho lineares de 8 em 8 até 64 bytes e 4 por duplicação
+  acima, com perda de no máximo 20% (antes "12,5%").
+- `thread_exit` passa a ler o código em `rdi` e levá-lo ao registro de
+  morte da ADR 0035.
+- O `EXIT_GROUP` usa o `CapSpace` ao qual a thread está ligada, sem
+  handle.
+- `vm_map` e `vm_unmap` aceitam `aspace = 0` como o espaço da thread que
+  chama.
+- O `PageSource` acha a cota pelo `CapDesc` com `kind = 2` e
+  `index = 0xFFFF` (ADR 0034).
+- Miri: testes da `lib/oalloc` só nos PRs que mudam a crate; o job
+  noturno fica para depois.
+- Registrada a premissa do SipHash com chave de `fast()`.
+- As decisões da seção final foram registradas como decididas.
