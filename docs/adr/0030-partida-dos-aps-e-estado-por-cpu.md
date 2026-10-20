@@ -1,6 +1,6 @@
 # ADR 0030: Partida dos APs e estado por CPU
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 5.1, 5.2, 6.4, 6.5, 6.8 e 6.9; backlog do M3, T-303
 - Relaciona-se com: ADR 0009 (kernel não preemptível), ADR 0010 (SMP),
@@ -71,12 +71,16 @@ primeiros campos mantêm os deslocamentos que o assembly já usa:
 | `gs:[24]` | `cpu_id: u32`, `apic_id: u32` | ids lógico e de APIC |
 | depois | `gdt`, `tss` | GDT e TSS desta CPU (item 4) |
 | | `idle_rsp` | substitui `IDLE_RSP` |
-| | `sched` | fila e estado do escalonador desta CPU (ADR 0032) |
-| | `timer_armed` | substitui `ARMED` de `ktime.rs` |
-| | `ipi` | caixa de pedidos de IPI e de shootdown (ADR 0031) |
-| | `held_locks` | pilha de classes de trava, só em debug (ADR 0031) |
-| | `switch_prev` | thread que acabou de sair da CPU (ADR 0032) |
-| | `panic_dump` | registradores salvos no congelamento (ADR 0031) |
+| | `timer_armed`, `timer_stats` | substitui `ARMED` de `ktime.rs`; disparos |
+| | `mailbox` | caixa de pedidos de IPI e de shootdown, com `need_resched` (ADR 0031) |
+| | `held` | pilha de classes de trava, só consultada em debug (ADR 0031) |
+| | `thread`, `panic_dump` | thread que roda e registradores salvos no congelamento (ADR 0031) |
+| | `online`, `borrows` | CPU pronta; empréstimos abertos (debug) |
+| | caches de frames e de objetos | só desta CPU, sem trava (T-328) |
+
+O escalonador de cada CPU **não** mora na `PerCpu`: é um `Sched` por CPU em
+`kthread::SCHEDS[cpu_id]` (o do BSP é estático), com `switch_prev` dentro
+dele e os resumos atômicos `CUR_PRIO` e `NR_READY` ao lado (ADR 0032).
 
 - O BSP usa a instância estática que já existe (ampliada), porque exceções
   podem chegar antes do alocador; os APs recebem a sua do buddy, no mapa
@@ -99,8 +103,9 @@ primeiros campos mantêm os deslocamentos que o assembly já usa:
   não pode atravessar uma chamada que troque de contexto (`schedule`,
   `block_until`, `handoff`, `preempt`, `exit_current`): a thread pode voltar
   em outra CPU (ADR 0032). O acesso é por função de vida curta
-  (`with_percpu(|p| ...)`) e, em debug, `schedule` confere que nenhum
-  empréstimo está aberto (contador na própria `PerCpu`).
+  (`percpu::with(|p| ...)`) e, em debug, `schedule` confere que nenhum
+  empréstimo da `PerCpu` nem dos caches por CPU está aberto (contador na
+  própria `PerCpu`).
 
 ### 3. Trampolim e INIT-SIPI-SIPI
 
@@ -115,7 +120,12 @@ primeiros campos mantêm os deslocamentos que o assembly já usa:
   do PML4 do kernel (a metade alta, a mesma de todos os espaços) e tem na
   entrada 0 a identidade só das páginas do trampolim: código `R+X`,
   parâmetros `R` e `NX`, nada mais. W^X vale: o BSP escreve o trampolim
-  pelo mapa direto (`RW`, `NX`) e o AP o executa pela identidade.
+  pelo mapa direto (`RW`, `NX`) e o AP o executa pela identidade. Os
+  descritores da GDT do trampolim já nascem com o bit de acessado ligado: o
+  salto para o código de 64 bits carrega o CS com a paginação ligada, e a
+  CPU gravaria esse bit na página de parâmetros, que a identidade mapeia só
+  para leitura (com `CR0.WP`, um `#PF` sem IDT: falta tripla no AP, vista em
+  KVM).
 - **Sequência do AP** (assembly em `arch/x86_64/ap.S`, cópia posicionável
   instalada pelo BSP):
   1. modo real: `cli`, carrega uma GDT mínima dos parâmetros e liga
@@ -133,7 +143,9 @@ primeiros campos mantêm os deslocamentos que o assembly já usa:
   24–31 e depois `ICR_LOW`, esperando o bit 12 (entrega pendente) zerar
   antes de cada escrita. Sequência: INIT, 10 ms, SIPI, 200 µs, segundo SIPI
   se o AP ainda não deu sinal, e espera de até 100 ms por
-  `PerCpu::online`. Tempos medidos pelo relógio de `ktime` (a partida vem
+  `PerCpu::online`. O AP que não responde, ou que o teste de TSC (item 5)
+  recusa, recebe outro INIT para voltar a esperar SIPI sem rodar com
+  parâmetros velhos. Tempos medidos pelo relógio de `ktime` (a partida vem
   depois de `ktime::init`).
 - **Uma CPU por vez.** O BSP liga os APs em série, reaproveitando a página
   de parâmetros; o AP que não responde no prazo fica fora (aviso no log,
@@ -144,35 +156,39 @@ primeiros campos mantêm os deslocamentos que o assembly já usa:
 
 Na ordem, com IF=0 o tempo todo:
 
-1. GDT e TSS da própria `PerCpu` (`lgdt`, `ltr`): a GDT é por CPU porque o
-   descritor da TSS tem base própria e bit de ocupada; a IDT é **uma só**,
-   imutável depois do boot, carregada com `lidt` em cada CPU.
-2. `CR0`, `CR4` e `EFER` com os mesmos bits do BSP (`harden_cpu`: `WP`,
-   `SMEP`, `SMAP`, `UMIP`, `NXE`, `OSXSAVE`), `XCR0` igual ao do BSP e o
-   mesmo PAT. A CPU que não tiver um recurso que o BSP ligou, ou que pedir
-   área de XSAVE de outro tamanho (`fpu::area_bytes` é global), fica fora.
-3. `GS_BASE = percpu`, `KERNEL_GS_BASE = 0`; `STAR`, `LSTAR`, `FMASK` e
-   `EFER.SCE` como no BSP; `TSC_AUX = cpu_id`.
+1. GDT, TSS e `GS_BASE` da própria `PerCpu` (`PerCpu::install`: `lgdt`,
+   `ltr`, `GS_BASE = percpu`, `KERNEL_GS_BASE = 0`): a GDT é por CPU porque
+   o descritor da TSS tem base própria e bit de ocupada. Depois, `lidt`: a
+   IDT é **uma só**, imutável depois do boot, carregada em cada CPU.
+2. `CR0`, `CR4` e `EFER` com os mesmos bits do BSP (`cpustate::apply`: `WP`,
+   `SMEP`, `SMAP`, `UMIP`, `NXE`, `OSXSAVE`), `XCR0` igual ao do BSP, o
+   mesmo PAT, `TSC_ADJUST` do BSP e `TSC_AUX = cpu_id`. A CPU que não tiver
+   um recurso que o BSP ligou, ou que pedir área de XSAVE de outro tamanho
+   (`fpu::area_bytes` é global), para em `hlt` e fica fora, com aviso.
+3. `STAR`, `LSTAR`, `FMASK` e `EFER.SCE` como no BSP (`syscall::init`).
 4. APIC local no mesmo modo do BSP (x2APIC em todos ou em nenhum), vetor
-   espúrio e timer mascarado; o 8259 só o BSP mascara.
-5. Relógio (item 5).
-6. Liga o bit da CPU em `ONLINE` (máscara atômica de 256 bits), marca
-   `PerCpu::online` e entra no laço ocioso do escalonador (ADR 0032).
+   espúrio e timer mascarado; o 8259 só o BSP mascara. Sem o modo do BSP, a
+   CPU fica fora.
+5. Sinal ao BSP (`PerCpu::online`) e teste de salto do TSC com ele (item 5).
+6. O BSP, depois de aceitar o AP no teste, liga o bit da CPU em `ONLINE`
+   (máscara atômica de 256 bits); o AP entra no laço ocioso do escalonador
+   (ADR 0032).
 
 ### 5. TSC e timer por CPU
 
 - O relógio monotônico (seção 6.8) continua sendo o TSC calibrado no BSP;
   todas as CPUs usam o mesmo `TSC_MULT`.
 - Com `IA32_TSC_ADJUST` (CPUID 7, `EBX[1]`), o AP grava nele o valor do
-  BSP antes de qualquer leitura. Em seguida BSP e AP rodam o teste de
+  BSP antes de qualquer leitura do TSC. Em seguida BSP e AP rodam o teste de
   salto: 10⁴ rodadas em que cada um lê o último TSC publicado pelo outro e o
   próprio, sob uma trava; um valor próprio menor que o publicado é salto.
   Salto acima de 1 µs (meta do T-321) é corrigido uma vez por
-  `TSC_ADJUST`; persistindo, o AP fica fora. Assim, duas leituras ordenadas
+  `TSC_ADJUST` (soma o atraso medido, uma única vez, e mede de novo);
+  persistindo, o AP fica fora. Assim, duas leituras ordenadas
   por memória compartilhada nunca andam para trás entre CPUs, que é o que
   `clock_get` promete.
 - Sem TSC invariante (CPUID `0x8000_0007`, `EDX[8]`), como no TCG, o teste
-  de salto decide sozinho e o kernel avisa no log.
+  de salto decide sozinho e o kernel só avisa no log.
 - O timer em modo deadline já é por CPU no hardware; `ARMED` vai para a
   `PerCpu`. No modo one-shot (TCG), os APs usam a frequência do timer do
   APIC calibrada no BSP (mesmo barramento).
@@ -187,7 +203,9 @@ Na ordem, com IF=0 o tempo todo:
 - O `FS_BASE` do usuário é estado **da thread**: salvo e restaurado na troca
   de contexto (`wrmsr` só quando muda) e definido por syscall. Qual syscall
   e qual registrador fica com a ADR 0039 (T-333); esta ADR só fixa que o
-  valor mora na `Thread` e não na `PerCpu`.
+  valor mora na `Thread` e não na `PerCpu`. A ADR 0039 fixou a ABI
+  (`CONFIGURE_TLS` em `thread_configure`); o salvamento e a restauração na
+  troca de contexto entram na T-333 e ainda não existem no código.
 
 ## Alternativas
 
@@ -251,3 +269,17 @@ Na ordem, com IF=0 o tempo todo:
   lacuna 12), e PSCI fica para o porte ARM.
 - Não há decisão sobre hotplug de CPU (bit `Online Capable`); fica fora do
   M3.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- A tabela da `PerCpu` espelha o código: `mailbox`, `held`, `thread`,
+  caches por CPU; o escalonador fica em `kthread::SCHEDS`, não na `PerCpu`.
+- O acesso é por `percpu::with`, e a conferência em debug inclui os caches.
+- A GDT do trampolim já nasce com o bit de acessado (correção do #62).
+- O AP recusado ou mudo recebe outro INIT.
+- A ordem do `ap_main` segue o código, e quem liga o bit em `ONLINE` é o BSP.
+- A correção do TSC soma o atraso medido uma única vez.
+- O `FS_BASE` por thread fica marcado como T-333, ainda não implementado.

@@ -110,7 +110,8 @@ O `PageSource` real precisa da cota do processo, com o direito `CREATE`
 para criar objetos, e do espaço de endereços. A cota vem do descritor de
 partida (ADR 0034): o `PageSource` a acha pelo `CapDesc` com `kind = 2` e
 `index = 0xFFFF`, e a guarda em `ostd::rt::Env` antes da primeira
-alocação. O espaço de endereços não precisa de handle: `vm_map` e
+alocação. Essa cota é o `mem:quota` obrigatório e único do manifesto. O
+espaço de endereços não precisa de handle: `vm_map` e
 `vm_unmap` aceitam `aspace = 0` como "o espaço de endereços da thread que
 chama", no mesmo espírito do `thread = 0` do item 3, e nenhum serviço
 guarda capability do próprio `AddressSpace` (o mesmo ciclo que o
@@ -190,10 +191,13 @@ Alocar antes de `rt::init` é um erro de programação e aborta.
   `CapSpace` ao qual a thread está ligada, **sem handle**: o processo não
   guarda capability do próprio `CapSpace`. `cause = Exited`,
   `código = 0x7061_6E69` (`"pani"`) no pânico; o `svcmgr` lê isso e
-  registra `error`.
+  registra `error`. O `EXIT_GROUP` grava a causa do processo na própria
+  chamada, e as mortes `Killed` das outras threads não a sobrescrevem
+  (ADR 0035, item 2).
 - **`thread_exit` passa a ler o código.** Hoje o argumento é ignorado: o
   `ostd` manda zeros (`lib/ostd/src/thread.rs`) e `exit_current()` não lê
-  código nenhum (`kthread.rs`). A T-333 (ou a tarefa do `EXIT_GROUP`) faz
+  código nenhum (`kthread.rs`). A T-333 (dono sugerido do `EXIT_GROUP`, de `thread = 0` e de
+  `aspace = 0`) faz
   o kernel ler o código em `rdi` e levá-lo ao registro de morte da ADR
   0035 (`code` de `Exited`); sem isso o `svcmgr` nunca vê o `"pani"`.
 - `handle_alloc_error`, liberação dupla e canary violado chamam o mesmo
@@ -239,7 +243,8 @@ Alocar antes de `rt::init` é um erro de programação e aborta.
   `exit::GROUP`, classe 5 de `sys_info`, e `aspace = 0` em
   `vm_map`/`vm_unmap` como "o espaço da thread que chama". O kernel muda em
   `kthread.rs`,
-  `thread.rs` e `sys.rs` (T-333, mais o DRBG).
+  `thread.rs` e `sys.rs` (T-333; o DRBG e a classe 5 de `sys_info` são da
+  T-337, dono sugerido).
 - `unsafe-allowlist.toml` e `xtask check_unsafe` mudam em conjunto com a
   aprovação desta ADR (T-312 diz: "ADR aceita e allowlist atualizado
   conforme a decisão"). Esta ADR **não** os altera.
@@ -283,7 +288,7 @@ usuário; `GS` de usuário; SIMD no `ostd`; mapeamento de arquivos;
 7. **Decidido (2026-10-20):** Miri roda os testes da `lib/oalloc` só nos
    PRs que mudam essa crate. O job noturno fica para depois, e não se
    cria agora.
-6. **Pendente:** ASLR de usuário (pilha, código, `mmap`) segue aberto;
+8. **Pendente:** ASLR de usuário (pilha, código, `mmap`) segue aberto;
    esta ADR dá a fonte de entropia e o heap aleatório, nada mais.
 
 ## Revisão de 2026-10-20
@@ -311,3 +316,12 @@ Mudanças em relação à proposta:
   noturno fica para depois.
 - Registrada a premissa do SipHash com chave de `fast()`.
 - As decisões da seção final foram registradas como decididas.
+
+### Revisão geral
+
+- A lacuna "Pendente: ASLR de usuário" passa a ser a 8 (havia dois 6).
+- O `EXIT_GROUP` grava a causa do processo na chamada, sem ser
+  sobrescrito pelas mortes `Killed` das outras threads.
+- O dono sugerido de `EXIT_GROUP`, `thread = 0` e `aspace = 0` é a T-333;
+  o do DRBG e da classe 5 de `sys_info` é a T-337.
+- A cota do processo é o `mem:quota` obrigatório do manifesto.

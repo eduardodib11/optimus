@@ -3,7 +3,8 @@
 - Status: aceita
 - Data: 2026-10-09
 - Origem: SDD v1.0, seção 3; seções 4.3, 12.5, 14.3 e 14.4
-- Relaciona-se com: ADR 0003 (tudo do zero), ADR 0007 (IPC), ADR 0019 (IA)
+- Relaciona-se com: ADR 0003 (tudo do zero), ADR 0007 (IPC), ADR 0019 (IA),
+  ADR 0034 (manifesto e descoberta)
 
 ## Contexto
 
@@ -41,3 +42,9 @@ ferramentas, com descrição e classe de risco. Manter os dois à mão diverge.
 - Uma interface nova vira ferramenta da IA sem código extra, mas só com
   classe de risco declarada e revisada.
 - Mudanças incompatíveis exigem versão maior e convivência das duas versões.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- Acrescentada a ADR 0034 em "Relaciona-se com".

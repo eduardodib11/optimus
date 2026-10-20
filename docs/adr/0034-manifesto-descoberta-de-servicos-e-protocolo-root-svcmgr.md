@@ -30,8 +30,9 @@ Estado do código: o `root` carrega o `hello` do bootfs pelo `ostd::process`
 ### 1. Quem faz o quê
 
 - **`root`** (TCB): único processo que recebe do kernel as capabilities
-  iniciais (cota raiz, bootfs, e as que vierem: capability de debug, ADR
-  0036; interrupções). Cria processos e divide cotas **somente** a pedido do
+  iniciais (cota raiz, bootfs, e as que vierem pela tabela de handles de
+  partida do kernel: `DebugLog` e anel do kernel, ADR 0036; `Interrupt`s de
+  pressão, ADR 0038). Cria processos e divide cotas **somente** a pedido do
   `svcmgr`. Fala OIDL, interface `optimus.root.Root@1`, num `Endpoint` que
   ele mesmo cria.
 - **`svcmgr`** (TCB): lê os manifestos, monta o grafo, pede ao `root` os
@@ -42,9 +43,10 @@ Estado do código: o `root` carrega o `hello` do bootfs pelo `ostd::process`
   no protocolo, ver abaixo) qualquer mensagem com outro badge. Como o
   `svcmgr` é o único que tem capability para esse endpoint, o badge é só
   defesa em profundidade.
-- **Prioridade.** O `root` e o `svcmgr` rodam numa prioridade fixa acima
-  da faixa dos serviços (1 a 199): 200, constante em `services/root`.
-  Assim a supervisão não espera um serviço que fique girando.
+- **Prioridade.** O compilador aceita prioridade de 1 a 199 no M3, e a
+  faixa de serviços da ADR 0008 é 128 a 199. O `root` e o `svcmgr` rodam em
+  200 (constante em `services/root`), na faixa de drivers (200 a 239), por
+  exceção: assim a supervisão não espera um serviço que fique girando.
 
 ### 2. Partida do svcmgr
 
@@ -52,8 +54,11 @@ O `root` lê `svc/svcmgr` do bootfs, cria o processo e, no `CapSpace` dele,
 coloca: o endpoint do `root` (badge 1), um `MemoryObject` do bootfs só com
 `READ|MAP`, uma cota de partida (fixa, 8 MiB no M3; constante em
 `services/root`), e as capabilities de origem do kernel (**kernel pool**)
-na ordem em que o `root` as recebeu. O `svcmgr` descobre os handles por um
-descritor (item 5). A partir daí o `root` só fica em `ipc_recv` no seu
+na ordem em que o `root` as recebeu. O `svcmgr` descobre esses handles
+pela tabela de handles de partida que o kernel entregou ao `root` (ADR
+0036, item 5), repassada com os mesmos índices e os handles já postos no
+`CapSpace` dele (layout na T-355). Não é o descritor do item 6, que vai do
+`svcmgr` ao serviço. A partir daí o `root` só fica em `ipc_recv` no seu
 endpoint.
 
 ### 3. Interface `optimus.root.Root@1`
@@ -76,7 +81,8 @@ enum RootError : u8 { AccessDenied, NoSuchBinary, QuotaExceeded, Busy, Io }
   `svcmgr`); o `root` nunca devolve mais do que o pool tem.
 - `spawn` carrega o ELF `binary` (nome OBFS), cria `CapSpace`
   (com `max_threads`, ADR 0035), `AddressSpace`, pilha, thread e
-  `SchedContext` com `priority`, **sem iniciar**. Devolve o `CapSpace`
+  `SchedContext` com `priority` e orçamento igual ao período (sem limite de
+  CPU no M3, ver a decisão 8), **sem iniciar**. Devolve o `CapSpace`
   (`MANAGE|BIND|DESTROY`) e a `Thread` (`READ_STATE|SUSPEND|BIND`, sem
   `START`; direitos de ciclo de vida da ADR 0035) como
   capabilities da resposta (2 de no máximo 4) e o `child` que o `root`
@@ -90,7 +96,7 @@ enum RootError : u8 { AccessDenied, NoSuchBinary, QuotaExceeded, Busy, Io }
   do item 5). O `svcmgr` só chama `start` depois de entregar as caps.
 - `reap` libera as estruturas do `root` de um filho morto.
 - O `root` valida que `binary` existe no bootfs e que o `hash BLAKE3` da
-  entrada confere (`obfs::verify`) antes de mapear.
+  entrada confere (`obfs::Entry::verify`) antes de mapear.
 
 ### 4. Manifesto binário (`OMAN` v1)
 
@@ -103,7 +109,7 @@ externo permitido pelo SDD 16.2 (ferramenta de host, `cargo-vet`); a
 saída é binária, determinística (mesma entrada, mesmos bytes) e vai no
 bootfs como `manifest/<nome>.oman`. O mesmo compilador recebe **todos** os
 manifestos, verifica o grafo acíclico, os nomes, os limites e recusa o
-build se algo falhar (4.3: "grafo acíclico verificado no build").
+build se algo falhar (7.2: "grafo acíclico verificado no build").
 
 Layout (tudo little-endian; referências a texto são `{off: u32, len: u32}`
 a partir do início do arquivo; textos UTF-8 na região de cadeias, alinhada
@@ -146,7 +152,9 @@ Registro de provide (16 bytes)
   8  name   ref  "pacote.Interface", ex.: "optimus.log.Log"
 ```
 
-Limites: arquivo ≤ 4096 bytes; `needs_n + provides_n ≤ 94`, para que o
+Limites: corpo (tudo menos a assinatura) ≤ 4096 bytes e `total_len` ≤ 4096
++ 3456 com `sig_alg = 1` (a assinatura híbrida da ADR 0018 tem 3373
+bytes); `needs_n + provides_n ≤ 94`, para que o
 descritor de partida (item 6) caiba com o canal de controle e a cota; campos
 reservados DEVEM ser zero (o leitor
 recusa, para a v2 poder usá-los); toda `ref` dentro do arquivo; `total_len`
@@ -157,11 +165,11 @@ leitor é um alvo de fuzzing, 17.3), inclusive a ausência de ciclo.
 
 | Entrada TOML | `kind` | Capability entregue | Emitida por |
 |---|---|---|---|
-| `svc:optimus.log.Log@1` (ou `.2` = menor mínima) | 1 | `Endpoint` com `SEND`, badge = id do cliente | `svcmgr` (derivado do endpoint do provedor) |
-| `mem:quota:32MiB` | 2 | `MemoryQuota` com `CREATE|SPLIT` e esse orçamento | `root`, pedido pelo `svcmgr` |
+| `svc:optimus.log.Log@1` (ou `.2` = menor mínima) | 1 | `Endpoint` com `SEND`, badge do cliente (item 8) | `svcmgr` (derivado do endpoint do provedor) |
+| `mem:quota:32MiB` | 2 | `MemoryQuota` com `CREATE|SPLIT` e esse orçamento; é a cota do processo, **obrigatória e única** (o `mkmanifest` recusa zero ou mais de uma) | `root`, pedido pelo `svcmgr` |
 | `dev:net/*` | 3 | MMIO, `Interrupt` e `DmaDomain` do padrão | `devmgr` (**não existe no M3**) |
 | `fs:<dir>[:ro|:rw]` | 4 | `Endpoint` de diretório (ADR 0011) | `storaged`/`optfs` (**fora do M3**) |
-| `kernel:debug`, `kernel:mem-pressure` | 5 | capability de origem do kernel (`DebugLog`, `Interrupt` de pressão; ADRs 0036 e 0038) | `root` (do kernel pool) |
+| `kernel:debug`, `kernel:mem-pressure` | 5 | capability de origem do kernel (`DebugLog`, `Interrupt` de pressão; ADRs 0036 e 0038) | `root` (do kernel pool, entregue pela tabela de partida da ADR 0036) |
 
 Não há apelidos: cada coisa tem um nome só. Os nomes `log:write` e
 `time:read` do exemplo do SDD (14.4) viram `svc:optimus.log.Log@1` e
@@ -202,13 +210,16 @@ interface Control {      // só para quem o manifesto autoriza (memd no M3)
     kill(process: u32, reason: u8) -> result<(), SvcError>;
 }
 struct CapDesc { kind: u8, index: u16, handle: u32, name_hash: u32 }
+// kind: 0 canal de controle, 1 a 5 como em `needs`, 6 provide
 struct Boot { caps: vec<CapDesc, 96>, generation: u16 }
 enum SvcError : u8 { NotInManifest, NotRunning, VersionTooOld, Busy }
 ```
 
 `CapDesc.handle` é o handle já presente no `CapSpace` do filho
-(`index` = posição em `needs`/`provides`, ou `0xFFFF` para a cota do
-processo); `name_hash` = `interface_id` da ADR 0033. Um `CapDesc` tem
+(`index` = posição em `needs` para `kind` 1 a 5 e em `provides` para
+`kind` 6; `kind` 0 usa `index` 0; a cota do processo é o `mem:quota` de
+`needs`, descrito com `kind` 2 e `index` `0xFFFF`); `name_hash` =
+`interface_id` da ADR 0033. Um `CapDesc` tem
 12 bytes pelo layout da ADR 0033 (`kind` em 0, `index` em 2, `handle`
 em 4, `name_hash` em 8). O manifesto aceita até 64 `needs` e 32
 `provides`, com `needs + provides ≤ 94`; somados o canal de controle e a
@@ -234,7 +245,10 @@ grafo; serviços independentes sobem em paralelo. Um serviço está
 
 `badge` do cliente = `(generation << 32) | id`, `id` = índice do serviço no
 conjunto de manifestos compilado, `generation` = 16 bits que contam
-reinícios do cliente. O provedor lê o badge de `ipc_recv` e o repassa ao
+reinícios do cliente. O provedor usa `id = badge & 0xFFFF_FFFF` (é o que
+`name_of` recebe e o que a ADR 0038 chama de id do processo) e a
+`generation` para reconhecer uma instância velha. O provedor lê o badge
+de `ipc_recv` e o repassa ao
 método gerado como `Context`; o provedor decide autorização por `id`.
 
 ### 9. Reinício e revogação
@@ -263,7 +277,8 @@ processo (`reap`, `spawn`) e repete o item 6; os clientes chamam
   assinaturas, a feature `trusted-bootfs` sai, o `mkmanifest sign` passa
   a preencher `sig_off/sig_len/sig_alg = 1` (assinatura sobre o BLAKE3 do
   arquivo sem a cauda de assinatura), e o `svcmgr` recusa `sig_alg = 0`.
-  O formato já reserva o espaço, então não muda de versão.
+  O formato já reserva o espaço e o teto de `total_len` já o prevê, então a
+  promoção não muda a versão.
 - **Limite honesto:** no M3 "assinado" significa "íntegro dentro de um
   bootfs verificado"; não há identificação do autor por manifesto e não
   há revogação de chave. Um bootfs adulterado antes do `optboot` conferir
@@ -286,7 +301,7 @@ processo (`reap`, `spawn`) e repete o item 6; os clientes chamam
 ## Consequências
 
 - `svcmgr` e `root` ficam pequenos e com contratos OIDL; ambos são TCB
-  (revisão dupla, seção 17.2).
+  (revisão dupla, seção 17.1, e do responsável de segurança, seção 17.2).
 - Os endpoints de um serviço saem da cota dele; a ABI de `cap_mint` com
   destino (ADR 0029) basta para entregar cota e capabilities.
 - `kabi` não muda; `ostd` ganha o cliente `Supervisor` e `idl/` ganha
@@ -313,9 +328,21 @@ boot (15.4); atualização de manifesto em execução; `ipc_rate` aplicado
    cota fixa de 8 MiB do `svcmgr` não cresce com o número de serviços.
 5. **Decidido (2026-10-20):** faixa de prioridade aceita pelo compilador
    de 1 a 199 no M3 (200+ para drivers e 240+ para tempo real só com
-   flag). O `root` e o `svcmgr` rodam em 200.
+   flag). O `root` e o `svcmgr` rodam em 200, na faixa de drivers da ADR
+   0008, por exceção.
 6. **Decidido (2026-10-20):** `ipc_rate` fica no formato, sem imposição no
    M3 (ADR 0035).
+7. **Decidido (2026-10-20):** o corpo do manifesto tem até 4096 bytes e
+   `total_len` até 4096 + 3456 com `sig_alg = 1`, para caber a assinatura
+   híbrida da ADR 0018 (3373 bytes). A promoção não muda a versão do
+   formato.
+8. **Decidido (2026-10-20):** no M3 todo serviço roda com orçamento de CPU
+   igual ao período do `SchedContext` (sem limite de CPU além da
+   prioridade). O manifesto e o `Root.spawn` não ganham orçamento nem
+   período; isso fica para depois do M3.
+9. **Decidido (2026-10-20):** as capabilities de origem do kernel chegam
+   ao `root` pela tabela de handles de partida da ADR 0036 (item 5), e o
+   `root` a repassa ao `svcmgr` (item 2).
 
 ## Revisão de 2026-10-20
 
@@ -335,3 +362,18 @@ Mudanças em relação à proposta:
 - As decisões da seção final foram registradas como decididas.
 - `name_of` continua como está; a ADR 0036 deixa de pedi-lo como item
   adicional.
+
+### Revisão geral
+
+- A prioridade 200 do `root` e do `svcmgr` fica registrada como exceção na
+  faixa de drivers da ADR 0008.
+- O item 2 remete à tabela de handles de partida da ADR 0036 (antes
+  apontava para o "item 5" por engano).
+- O item 3 usa `obfs::Entry::verify`, e a citação do grafo acíclico passa
+  para a seção 7.2 do SDD; a revisão dupla cita as seções 17.1 e 17.2.
+- Os limites do manifesto separam o corpo (4096 bytes) de `total_len`
+  (4096 + 3456 com assinatura).
+- O `CapDesc` ganha `kind` 0 (canal de controle) e 6 (provide); a cota do
+  processo é o `mem:quota` obrigatório e único.
+- O badge do cliente é o do item 8; `name_of` recebe `badge & 0xFFFF_FFFF`.
+- `Root.spawn` cria o `SchedContext` com orçamento igual ao período.

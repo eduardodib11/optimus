@@ -61,9 +61,10 @@ tipo        = "u8".."u64" | "i8".."i64" | "bool" | id
 - `oneway` marca um método sem resposta (vira `ipc_send`) e não tem `->`.
   Todo outro método DEVE declarar `-> result<T, E>`.
 - `@tool` é obrigatório em todo método exposto à IA e não afeta o fio.
-- `handle<T>` só aparece como parâmetro ou como campo da estrutura que é
-  diretamente o tipo de topo do resultado; nunca em `struct` aninhada nem
-  em `vec`. `T` é uma interface do mesmo pacote ou de outro
+- `handle<T>` só aparece como parâmetro, como o tipo de topo do resultado
+  ou como campo da estrutura que é diretamente o tipo de topo do
+  resultado; nunca em `struct` aninhada (inclusive uma `struct` usada como
+  parâmetro) nem em `vec`. `T` é uma interface do mesmo pacote ou de outro
   (`optimus.fs.File`) ou um tipo de objeto do kernel pré-declarado em
   `optimus.kernel`: `MemoryObject`, `Notification`, `Endpoint`, `Reply`,
   `MemoryQuota`, `CapSpace`, `AddressSpace`, `Thread`, `SchedContext`.
@@ -186,6 +187,11 @@ struct DirEntry { name: string<255>, kind: EntryKind, size: u64, modified: Times
 struct DirPage  { entries: vec<DirEntry, 8>, next: u64 }
 enum EntryKind : u8 { File, Dir, Link }
 enum FsError : u8 { NotFound, NotDirectory, Io }
+flags OpenFlags : u8 { Read = 1, Write = 2, Create = 4 }
+
+interface File {
+    size() -> result<u64, FsError>;
+}
 
 interface Directory {
     @tool(risk = R0, desc = "Lista o conteúdo de uma pasta")
@@ -209,11 +215,11 @@ tornam o caminho relativo, e 1024 sobra.
 BLAKE3 de referência; o teste do `oidlc` DEVE refazer a conta). Todas as
 palavras abaixo são `u64` little-endian.
 
-`trash("/a/b")`: método 1.
+`trash("a/b")`: método 1 (o caminho é relativo à capability de diretório).
 - rótulo `0xA17C_D8BB_0000_0001`, `info.words = 2`.
-- corpo (16 bytes): cabeça `desloc = 8` (u32), `len = 4` (u32); cauda
-  `2f 61 2f 62 00 00 00 00`.
-- palavras: `0x0000_0004_0000_0008`, `0x0000_0000_622f_612f`.
+- corpo (16 bytes): cabeça `desloc = 8` (u32), `len = 3` (u32); cauda
+  `61 2f 62 00 00 00 00 00`.
+- palavras: `0x0000_0003_0000_0008`, `0x0000_0000_0062_2f61`.
 
 Resposta `Err(NotDirectory)` (valor 1 do enum de `u8`):
 - rótulo `0x4000_0000_0000_0000`, `info.words = 1`, palavra
@@ -221,11 +227,11 @@ Resposta `Err(NotDirectory)` (valor 1 do enum de `u8`):
 
 Resposta `Ok(())` de `trash`: rótulo `0`, `info.words = 0`.
 
-`list("/d", 0)`: método 0.
+`list("d", 0)`: método 0.
 - rótulo `0xA17C_D8BB_0000_0000`, `info.words = 3`.
-- cabeça (16 bytes): `path = {desloc 16, len 2}`, `cursor = 0`; cauda
-  `2f 64` + 6 zeros.
-- palavras: `0x0000_0002_0000_0010`, `0x0`, `0x0000_0000_0000_642f`.
+- cabeça (16 bytes): `path = {desloc 16, len 1}`, `cursor = 0`; cauda
+  `64` + 7 zeros.
+- palavras: `0x0000_0001_0000_0010`, `0x0`, `0x0000_0000_0000_0064`.
 
 Resposta `Ok(DirPage{ entries: [ {name:"ab", kind:File, size:300,
 modified:1_700_000_000_000_000_000} ], next: 0 })`, 56 bytes, vai no buffer
@@ -234,7 +240,7 @@ modified:1_700_000_000_000_000_000} ], next: 0 })`, 56 bytes, vai no buffer
 w0 0x0000_0001_0000_0010   entries = {desloc 16, count 1}
 w1 0x0000_0000_0000_0000   next = 0
 w2 0x0000_0002_0000_0030   entrada 0: name = {desloc 48, len 2}
-w3 0x0000_0000_0000_0001   kind = File (u8), enchimento
+w3 0x0000_0000_0000_0000   kind = File (0, u8), enchimento
 w4 0x0000_0000_0000_012c   size = 300
 w5 0x1797_9cfe_362a_0000   modified
 w6 0x0000_0000_0000_6261   cauda: "ab" + zeros
@@ -248,8 +254,11 @@ então chama o método do trait; o badge chega ao método como `Context`.
 O cliente gerado devolve `Result<T, CallError<E>>` com `CallError` =
 `Remote(E)` | `Protocol(ProtoError)` | `Kernel(kabi::Error)`. Nenhum
 `panic!` na decodificação: tudo é `Result` (17.1). Sem alocação no
-caminho de códigos gerados cujos limites são estáticos (os tipos usam
-`heapless`-style próprios do `oidl-rt`).
+caminho de códigos gerados cujos limites são estáticos. A decodificação é
+sem cópia (ADR 0012): `string` e `vec` chegam ao método como visões
+emprestadas do buffer de IPC (`&str` e um iterador de elementos já
+validados). Os tipos de capacidade fixa, no estilo `heapless`, do
+`oidl-rt` servem só para montar pedidos e respostas.
 
 ### 8. Evolução (semver)
 
@@ -325,3 +334,15 @@ Mudanças em relação à proposta:
 - O `oidlc` recusa método com mais de 4 `handle` (novo teste).
 - `optimus.core` fica decidido como arquivo `idl/optimus.core.oidl`.
 - As decisões da seção final foram registradas como decididas.
+
+### Revisão geral
+
+- A regra de `handle<T>` ganha "o tipo de topo do resultado" e passa a
+  dizer que a `struct` usada como parâmetro conta como aninhada.
+- O exemplo do item 5 declara `OpenFlags` e `File`.
+- Os vetores dourados usam caminhos relativos (`"a/b"` e `"d"`), com
+  `len`, cauda e palavras recalculados; o `interface_id` não muda.
+- A seção 7 diz que a decodificação é sem cópia, com visões emprestadas
+  do buffer, como pede a ADR 0012.
+- No vetor da resposta de `list`, `kind = File` vale 0, o primeiro valor
+  do enum.

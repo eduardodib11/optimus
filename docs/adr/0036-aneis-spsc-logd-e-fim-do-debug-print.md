@@ -69,11 +69,13 @@ Páginas 1..: dados (data_len bytes)
   depender do conteúdo do anel.
 - `Notification`: um por consumidor, com um bit por anel. O consumidor
   entrega ao produtor uma capability `SIGNAL` com o **badge** do bit
-  daquele anel (`cap_mint`). Como `ntfy_signal` faz `bits | badge`, o
-  produtor pode acordar o consumidor, mas não impedir o bit correto de
-  subir; bits extras são tratados como despertar espúrio (o consumidor
-  varre todos os anéis). Mudar `ntfy_signal` para mascarar pelo badge
-  seria mais forte (decisão de Eduardo, abaixo).
+  daquele anel (`cap_mint`). `ntfy_signal` passa a sinalizar `bits &
+  badge` quando o badge é diferente de zero, e `bits` quando é zero
+  (hoje faz `bits | badge`, sys.rs). O produtor chama com `bits = !0`, o
+  que sobe exatamente o bit do anel dele e nenhum outro; `bits = 0` com
+  badge diferente de zero não sinaliza nada e dá `InvalidArgument`, como
+  hoje com `bits | badge == 0`. O consumidor ainda varre todos os anéis
+  ao acordar (decisão 3, abaixo).
 - Marcas-d'água do produtor (`kind` log): acima de 7/8 cheio, omite
   `Debug` e `Trace` (conta em `shed`); acima de 15/16, só `Error` passa.
   Assim `Error` quase sempre cabe.
@@ -119,12 +121,13 @@ interface Log {
 ```
 
 - `register`: cria o anel (`MemoryObject` da cota do `logd`, `ring_pages`
-  entre 4 e 256, padrão 16 + 1 de cabeçalho), `READ|WRITE|MAP` para os
+  = páginas de dados, potência de 2 entre 4 e 256, padrão 16, mais a
+  página de cabeçalho), `READ|WRITE|MAP` para os
   dois lados, sem `EXEC`; o `logd` guarda a primeira cópia, entrega a
   segunda e a capability `SIGNAL` com badge. O `logd` identifica o
-  cliente pelo badge do `Endpoint` (ADR 0034) e chama
-  `Supervisor.name_of(id)` no `svcmgr` (já definido na ADR 0034) para
-  obter o nome. **Um anel por serviço** (segundo `register` do mesmo
+  cliente pelo badge do `Endpoint` (ADR 0034, item 8) e chama
+  `Supervisor.name_of(id)`, com `id = badge & 0xFFFF_FFFF`, no `svcmgr`
+  (já definido na ADR 0034) para obter o nome. **Um anel por serviço** (segundo `register` do mesmo
   serviço devolve o mesmo anel ou `Busy`); no máximo 64 anéis.
 - `query`: devolve as últimas linhas desde `since_seq`, filtradas por
   serviço (vazio = todos) e nível; `lost` conta as linhas descartadas no
@@ -142,7 +145,10 @@ interface Log {
   registros em linhas, dá `seq`, guarda em **rotação em memória** por
   serviço (padrão 256 KiB de linhas por serviço, 4 MiB no total; a mais
   antiga cai) e escreve a linha na serial (via `debug_write`, item 5) com
-  prefixo `<nível> [<serviço>] mensagem k=v`.
+  prefixo `<nível> [<serviço>] mensagem k=v`. Como `debug_write` aceita até
+  256 bytes e a linha pode passar disso (mensagem de até 512 bytes mais
+  campos), o `logd` a quebra em pedaços de até 256 bytes cortados em
+  fronteira de caractere, cada um numa chamada.
 - **Sem persistência** no M3: `/data/log` depende do OptFS (7.3). O
   consumidor persistente virá depois sem mudar o protocolo.
 - Descartes viram linhas sintéticas de nível `warn` do próprio `logd`
@@ -157,10 +163,14 @@ interface Log {
 
 - Novo tipo de objeto do kernel `DebugLog` (`ObjectType = 15`; `Timer`
   é 14, ADR 0035). Só o kernel o cria, no boot (como `Interrupt`; `obj_create`
-  o recusa) e o entrega ao `root` entre as capabilities iniciais (na
-  extensão do pacote de `rdx`/`rdi` da ADR 0029, ou por uma segunda
-  mensagem de partida; a definir no T-355). Direitos: `WRITE`
-  (`debug_write`), `READ` (mapear o anel do kernel, item 6) e `BIND`.
+  o recusa) e o entrega ao `root` pela **tabela de handles de partida**: o kernel
+  entrega ao `root` um `MemoryObject` somente leitura com a tabela, e os
+  handles dela já estão postos no `CapSpace` do `root`. A tabela cobre a
+  `DebugLog`, o `MemoryObject` do anel do kernel (item 6) e os
+  `Interrupt`s de pressão da ADR 0038. O registrador que leva o handle da
+  tabela e o layout dela ficam para a T-355 (a ADR 0029 já usa `rdx` para o
+  bootfs e a thread). Direitos da `DebugLog`: `WRITE` (`debug_write`) e
+  `BIND`.
 - **`debug_write(log, ptr, len, nível)`** (syscall 0, já na tabela):
   `rdi` handle, `rsi` ponteiro, `rdx` bytes (≤ 256), `r10` nível (1 a 5).
   Exige `WRITE`. O kernel escreve `nível [badge hex] texto` no log do
@@ -182,12 +192,15 @@ interface Log {
 
 ### 6. Log do kernel para o `logd`
 
-- O kernel mantém um anel próprio (`MemoryObject` de 64 KiB, alocado no
-  boot e cobrado de uma cota do kernel) com os mesmos registros do item 2
+- O kernel mantém um anel próprio (`MemoryObject` de 17 páginas: 64 KiB
+  de dados, `data_len = 65536`, mais a página de cabeçalho; alocado no boot
+  e cobrado de uma cota do kernel) com os mesmos registros do item 2
   e `tid = 0xFFFF`. O produtor é "o kernel" sob o lock do `klog`; a
   política é **sobrescrever o mais antigo** (o kernel nunca espera nem
   confia no consumidor). Por isso o anel do kernel é de **leitura**
-  para o `logd` (`READ|MAP`), que guarda sua posição fora do anel e
+  para o `logd` (o `MemoryObject` do anel chega com `READ|MAP`, ao lado da
+  `DebugLog` na tabela de partida; `vm_map` exige um `MemoryObject`), que
+  guarda sua posição fora do anel e
   detecta perda comparando essa posição com o `tail`: depois de ler um
   registro, relê o `tail`; se `tail − posição > data_len`, o registro foi
   coberto por escritas novas, e o `logd` descarta o que leu, conta a perda
@@ -199,7 +212,12 @@ interface Log {
   o `head` e não sabe se o anel está vazio; um limite de sinais por
   milissegundo perderia o último sinal de uma rajada, porque o kernel não
   tem tick para reenviá-lo. O custo é pequeno: fora dos testes o kernel
-  registra pouco.
+  registra pouco. Quem registra pode estar com qualquer trava na mão, ou em
+  NMI, `#MC` ou pânico (o `klog` é a última folha, fora das classes de
+  travas, e esses contextos não tomam travas, ADR 0031). Por isso o
+  registro só marca um bit pendente no `DebugLog`; a sinalização da
+  `Notification` roda num ponto sem travas (volta ao usuário, `ipi::poll`
+  ou entrada no ocioso), e uma rajada de registros acumula num só sinal.
 - O kernel **continua** escrevendo na serial (necessário para pânico e
   boot). O `logd` **não** reimprime linhas do kernel na serial; só as
   guarda para consulta.
@@ -240,6 +258,8 @@ interface Log {
 - A ABI ganha o tipo `DebugLog` (15) e o uso de `debug_write` (syscall 0,
   sem número novo); `kabi` ganha `debug::{MAX_BYTES, ...}` e `ring::{
   Header, Record}` (layout compartilhado por `ostd` e `logd`).
+- `ntfy_signal` muda de semântica (máscara pelo badge, item 1): a 14.2 do
+  SDD e o teste da T-209 mudam junto.
 - O texto de log nunca passa por alocação no `ostd::log`: formata numa
   pilha de até 512 bytes e copia para o anel.
 - O sistema tem dois destinos de serial: o kernel (direto) e o `logd`
@@ -266,13 +286,20 @@ no produtor; anel MPSC; qualquer outro `kind` além de log.
 3. **Decidido (2026-10-20):** `ntfy_signal` passa a **mascarar** os bits
    pelo badge quando o badge é diferente de zero, no lugar do OR atual.
    Um produtor deixa de poder levantar os bits dos outros anéis; a
-   mudança ajusta o teste da T-209.
+   mudança ajusta o teste da T-209 (backlog do M2, fora de `m3.md`) (dono
+   sugerido: T-355).
 4. **Decidido (2026-10-20):** `query` restrito a uma lista de leitores
    (`rescue`, `svcmgr`) no M3.
 5. **Decidido (2026-10-20):** política "descartar novos" com
    marcas-d'água para os serviços e "sobrescrever" só para o kernel, que
    nunca espera nem confia no consumidor.
-6. **Sem dependência nova:** a ADR 0034 já define
+6. **Decidido (2026-10-20):** o kernel entrega ao `root` um `MemoryObject`
+   somente leitura com a tabela de handles de partida (`DebugLog`,
+   `MemoryObject` do anel do kernel e `Interrupt`s de pressão), com os
+   handles já no `CapSpace` do `root`. O anel do kernel é um
+   `MemoryObject` entregue junto com a `DebugLog`. O registrador e o
+   layout ficam para a T-355.
+7. **Sem dependência nova:** a ADR 0034 já define
    `Supervisor.name_of(id: u32) -> result<string<31>, SvcError>`,
    restrito aos serviços que o manifesto do `svcmgr` marca como
    consumidores de nomes (o `logd`).
@@ -291,3 +318,15 @@ Mudanças em relação à proposta:
 - `ntfy_signal` mascarar pelo badge fica decidido (ajusta o teste da
   T-209).
 - As decisões da seção final foram registradas como decididas.
+
+### Revisão geral
+
+- `ntfy_signal` com máscara: o item 1 descreve a semântica nova (`bits &
+  badge`, o produtor passa `!0`) em vez de tratá-la como pendente.
+- `ring_pages` é potência de 2 e conta só páginas de dados; o anel do
+  kernel tem 64 KiB de dados mais a página de cabeçalho.
+- O `name_of` recebe `badge & 0xFFFF_FFFF` (badge da ADR 0034, item 8).
+- O `logd` quebra a linha em pedaços de até 256 bytes para o `debug_write`.
+- A entrega da `DebugLog` e do anel do kernel ao `root` passa a ser a
+  tabela de handles de partida (decisão 6).
+- A sinalização do anel do kernel é diferida a um ponto sem travas.

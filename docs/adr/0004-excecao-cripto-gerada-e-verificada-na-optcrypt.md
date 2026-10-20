@@ -42,3 +42,13 @@ NIST e em testes de tempo constante (dudect) no CI, com cobertura ≥ 80%.
   exceção exige ADR nova.
 - Mudanças na `optcrypt` exigem revisão dedicada do responsável de segurança.
 - Atualizar uma primitiva significa regerar e readaptar o código verificado.
+- Provisório: até chegar o código verificado, a `optcrypt` usa o BLAKE3 de
+  referência escrito à mão (M3). A substituição é obrigatória antes da
+  primeira imagem distribuída.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- Registrado que a `optcrypt` usa hoje um BLAKE3 de referência escrito à mão,
+-   como solução provisória, a ser substituída por código verificado.

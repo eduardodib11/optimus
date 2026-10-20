@@ -49,9 +49,14 @@ de `thread_exit`; `Faulted`: `code` é o vetor da exceção e `aux` o
 endereço que faltou (a mesma informação da mensagem de falta, `kabi::
 fault`); `Killed`: `code` zero. O `CapSpace` guarda o mesmo registro do
 processo: a **primeira** morte anormal (`Faulted` ou `Killed`), ou, se
-todas foram normais, a da última thread.
+todas foram normais, a da última thread. Exceção: `EXIT_GROUP` e
+`cap_delete(DESTROY)` gravam a causa do processo na própria chamada
+(`Exited` com o código dado, e `Killed`, respectivamente) e nenhuma morte
+posterior, como a `Killed` das outras threads, a sobrescreve.
 
-Leitura: `sys_info(classe = 2 /*EXIT*/, handle)` devolve `[cause, code,
+Leitura: `sys_info(classe = 2 /*EXIT*/, handle)` (em `sys_info`, `rsi`
+é o argumento da classe: o handle na classe 2 e zero nas demais, ADR 0032,
+item 4) devolve `[cause, code,
 aux]`; `cause = 0` significa "ainda vivo". Exige `READ_STATE` na `Thread`
 ou `MANAGE` no `CapSpace`. As classes de `sys_info` ficam reservadas
 assim: 0 = versão da ABI (reservada), 1 = CPUs (já existe, ADR 0032,
@@ -85,9 +90,12 @@ Regras:
    a syscall voltar. Assim nenhum evento se perde entre `thread_start` e
    `obj_bind_notify`. O evento sinaliza uma vez por ligação.
 4. O kernel sinaliza a partir do caminho de morte (com IF=0, como o
-   `Interrupt`): lock do objeto, depois a notificação, depois a fila do
-   escalonador (ordem da 6.9). Sem alocação: a ligação guarda o `Arc` da
-   `Notification` e os bits dentro do objeto.
+   `Interrupt`). Como o objeto (por exemplo `Thread.binding`) e a
+   `Notification` são da mesma classe `Objeto`, "uma por vez" (ADR 0031),
+   o kernel lê e clona sob a trava do objeto o `Arc` da `Notification` e
+   os bits, solta a trava e só então sinaliza (como `Interrupt::ack`); a
+   fila do escalonador vem depois (ordem da 6.9). Sem alocação: a ligação
+   guarda o `Arc` e os bits dentro do objeto.
 5. Para `Thread` a leitura do registro (item 2) devolve valor definitivo
    assim que o bit é sinalizado: o registro é escrito antes do sinal.
 
@@ -96,9 +104,11 @@ Regras:
 `cap_delete(handle, flags)`: `flags` (`rsi`) ganha `DESTROY = 1`; zero
 é o comportamento atual (apagar só a capability). Requer o direito novo
 `DESTROY` (bit 21) **na própria capability**; `Rights::ALL` passa a
-`(1 << 22) - 1`. `obj_create` não concede `DESTROY` por padrão e
-`thread_start`/`ostd::process` não o dão ao próprio filho; quem cria o
-processo (o `root`) o põe só na capability que entrega ao `svcmgr`.
+`(1 << 22) - 1`. Como `cap_mint` só reduz direitos, `obj_create` concede
+`DESTROY` ao criador em `CapSpace`, `Thread` e `Endpoint` (direitos
+padrão desses tipos). `ostd::process` deriva, com `cap_mint`, cópias sem
+`DESTROY` para tudo que entrega ao filho; o `root` mantém o direito só na
+cópia que entrega ao `svcmgr`.
 
 Efeito por tipo:
 - `CapSpace`: o processo é encerrado. Todas as threads ligadas passam a
@@ -110,6 +120,11 @@ Efeito por tipo:
   `Reply` pendentes (o chamador que esperava resposta recebe
   `PeerClosed`). A capability do próprio `CapSpace` guardada dentro dele
   não impede nada: a destruição é explícita, não por contagem.
+  Uma thread `Killed` que esperava em `ipc_call` não está em fila: o
+  `Reply` dela passa a marcar "chamador morto". Quando o servidor responde,
+  a resposta é descartada e o servidor segue com o próprio `SchedContext`
+  (a doação da ADR 0032 se desfaz sem acordar ninguém), o que mantém o
+  invariante I5 da ADR 0032. A T-348 testa o caso.
 - `Thread`: encerra aquela thread (`Killed`).
 - `Endpoint`: destrói o objeto; quem espera recebe `PeerClosed`.
 - Outros tipos: `NotSupported`.
@@ -159,7 +174,10 @@ para threads criadas pelo próprio processo (`ostd::thread::spawn`).
   toma o lock da fila da CPU dona (IRQ-safe, ADR 0031). O estado do
   `Timer` (prazo, período, ligação) é protegido **só** pelo lock da fila;
   o lock do objeto não é usado nele, para não inverter a ordem
-  objeto → fila (6.9) no tratador.
+  objeto → fila (6.9) no tratador. A fila de timers tem classe própria na
+  tabela de travas da ADR 0031 (folha logo depois de `Fila`). O tratador
+  remove os vencidos sob a trava, solta e só então sinaliza as
+  `Notification`s.
 - **Cancelamento e destruição:** apagar a última capability desarma e
   tira o nó da fila antes de liberar a memória. Teste: nenhuma
   referência pendurada depois de `cap_delete` concorrente com o disparo.
@@ -270,3 +288,18 @@ Mudanças em relação à proposta:
   0036 e 0038 não colidem, com a ordem de implementação e o teste de
   `kabi` atualizado em cada PR.
 - As decisões da seção final foram registradas como decididas.
+
+### Revisão geral
+
+- `obj_create` concede `DESTROY` ao criador de `CapSpace`, `Thread` e
+  `Endpoint`, e o `root` deriva as cópias sem ele (antes o direito era
+  impossível de derivar).
+- O item 3.4 manda clonar a ligação sob a trava do objeto e sinalizar
+  depois de soltá-la, pela ordem de travas da ADR 0031.
+- A fila de timers remete à classe própria da ADR 0031, com a regra
+  "remover, soltar, sinalizar".
+- A causa do processo gravada por `EXIT_GROUP` e `DESTROY` na chamada não
+  é sobrescrita pelas mortes `Killed` posteriores.
+- O encerramento forçado trata o chamador morto em `ipc_call` (doação de
+  `SchedContext`).
+- O argumento de `sys_info` (`rsi`) fica documentado para a classe 2.

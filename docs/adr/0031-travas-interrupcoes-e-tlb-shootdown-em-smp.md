@@ -1,12 +1,12 @@
 # ADR 0031: Travas, interrupções e TLB shootdown em SMP
 
-- Status: proposta (aguarda aprovação de Eduardo)
+- Status: aceita (aprovada por Eduardo em 2026-10-20)
 - Data: 2026-10-11
 - Origem: SDD v1.0, seções 6.4, 6.5, 6.8 e 6.9; backlog do M3, T-304
   (lacuna 10)
 - Relaciona-se com: ADR 0009 (kernel não preemptível), ADR 0010 (SMP),
   ADR 0028 (trava `CDT`), ADR 0030 (estado por CPU), ADR 0032 (escalonador
-  SMP), T-313, T-314, T-315, T-322, T-326
+  SMP), ADR 0035 (fila de timers), T-313, T-314, T-315, T-322, T-326
 
 ## Contexto
 
@@ -38,7 +38,10 @@ para sempre.
 ### 1. Ticket spinlock
 
 - `SpinLock<T>` passa a ser um ticket lock com dois contadores `AtomicU32`,
-  `next` e `serving`, e uma classe fixa (`SpinLock::new(classe, valor)`).
+  `next` e `serving`, e uma classe fixa (`SpinLock::with_class(classe,
+  valor)`; `with_key(classe, chave, valor)` acrescenta a chave de desempate
+  das filas por CPU). `SpinLock::new(valor)` só existe nos testes de host,
+  com a classe `Unchecked`, fora da verificação.
   - `lock`: `t = next.fetch_add(1, Relaxed)`; gira até
     `serving.load(Acquire) == t`, com `spin_loop()` e **atendendo a caixa
     de IPIs a cada volta** (item 5).
@@ -56,7 +59,7 @@ para sempre.
 ### 2. Travas e interrupções
 
 - **Toda trava é tomada com IF=0.** Como o kernel inteiro roda assim, não
-  há variante "irqsave" separada: em debug, `lock` confere IF=0 e entra em
+  existe variante "irqsave" (nenhuma trava é "IRQ-safe" por outro meio): em debug, `lock` confere IF=0 e entra em
   pânico se não for. O código que roda com IF=1 (o laço ocioso entre `sti;
   hlt`, o retorno ao usuário) não toma travas; o ocioso desliga as
   interrupções antes de olhar a fila.
@@ -66,8 +69,10 @@ para sempre.
 - NMI e `#MC` nunca tomam travas: usam a pilha IST, acham a `PerCpu` pelo
   topo dela (ADR 0030) e só leem e escrevem atômicas.
 - IRQs de dispositivo vão todas para a CPU 0 no M3 (destino do MSI e do
-  IOAPIC); `irq_ack` funciona de qualquer CPU. Distribuir IRQs fica para
-  quando houver driver que precise.
+  IOAPIC); `irq_ack` funciona de qualquer CPU. Ainda não há código de
+  IOAPIC ou MSI no kernel, então esta regra é uma intenção que a primeira
+  IRQ de dispositivo vai cumprir. Distribuir IRQs fica para quando houver
+  driver que precise.
 
 ### 3. Ordem global de travas
 
@@ -81,17 +86,30 @@ Cada trava pertence a uma classe com nível. Só se toma uma trava de nível
 | 3 | `Objeto` | filas de `Endpoint`, `Reply.caller` e `Reply.donation`, `Notification`, `Interrupt.line`, baldes de futex (ADR 0032), `Thread.binding`, `kirq::LINES`, `kcap::ROOT` | uma por vez |
 | 4 | `IpcSlot` | `Thread.ipc` | depois do objeto |
 | 5 | `AddressSpace` | `SharedAddressSpace` | uma por vez |
-| 6 | `Fila` | fila de prontas de cada CPU (ADR 0032) | duas só em ordem crescente de id lógico de CPU |
-| 7 | `FolhaSched` | `Thread.sched`, `Thread.donated`, orçamento do `SchedContext` (ADR 0032) | folha |
+| 6 | `Fila`, depois `FilaTimers` | fila de prontas de cada CPU (ADR 0032), depois a fila de `Timer`s de cada CPU (ADR 0035, T-349) | duas `Fila` só em ordem crescente de id lógico de CPU; `FilaTimers` é folha |
+| 7 | `FolhaSched` | `Thread.sched` (o `SchedContext` dela e o doado, `Thread.donated`) | folha |
 | 8 | `TabelasKernel` | `kvm::STACK_SLOTS`, depois `kmem::KERNEL_PT` | nessa ordem |
 | 9 | `Alocador` | `kheap::HEAP`, depois `kmem::FRAMES` | nessa ordem |
-| 10 | `Diagnóstico` | `kthread::DEBUG_LOG`, `kfault::LAST`, registro do escalonador | folha |
+| 10 | `Diagnóstico` | `kthread::DEBUG_LOG`, `kfault::LAST`, `platform::PLATFORM`, `ksmp::tsc::LAST`, `ksmp::start::AP_JOB` | folha |
+
+A tabela completa e atual está em `docs/kernel/ordem-de-travas.md`. O
+registro de eventos do escalonador mora dentro da `Sched` de cada CPU e não
+tem trava própria. O orçamento do `SchedContext` (`remaining`, `replenish_at`
+e `active`) também não tem: são atômicas soltas (ver a limitação na ADR 0032,
+item 1).
+
+**Fila de timers por CPU (emenda de 2026-10-20, ADR 0035).** A classe
+`FilaTimers` entra logo depois de `Fila`, como folha: nada se toma com ela
+na mão. O tratador do timer remove os `Timer`s vencidos sob essa trava,
+**solta a trava** e só então sinaliza a `Notification` de cada um (classe
+objeto, nível menor, que não poderia ser tomada com a fila de timers na
+mão). Rearmar de outra CPU toma a trava da CPU dona, sempre com IF=0.
 
 - É a ordem da seção 6.9 com a `CDT` da ADR 0028 na frente, a fila de cada
   CPU no lugar da "fila do escalonador" e os níveis que o código já tem
   depois dela (o escalonador reserva memória com a fila na mão, então o
   alocador vem depois; tabelas do kernel alocam frames).
-- O cache de frames por CPU (T-328) não tem trava: só a própria CPU o
+- Os caches de frames e de objetos por CPU (T-328) não têm trava: só a própria CPU o
   usa, com IF=0 e sem trocar de contexto no meio.
 - O `MemoryObject` não tem trava hoje. Quando ganhar uma (commit sob
   demanda, ADR 0038), ela é da classe objeto e vem **antes** do
@@ -130,18 +148,20 @@ Cada trava pertence a uma classe com nível. Só se toma uma trava de nível
     quem pede espera o fim, há no máximo um por CPU;
   - `call_req`: função remota pedida a esta CPU (`fn(u64)`, argumento e
     flag de feito).
-- **Atendimento** (`ipi::poll()`): se `pending` for zero, volta (uma
-  carga). Senão zera `pending` e trata TLB (item 7), função remota e
-  `RESCHED` (liga `need_resched` da ADR 0032). O atendimento não toma
+- **Atendimento** (`ksmp::ipi::poll()`): se `pending` for zero, volta (uma
+  carga). Senão `Mailbox::poll` zera `pending`, roda a função remota e
+  liga `need_resched` (ADR 0032) para `RESCHED`, e `poll` trata TLB
+  (`ksmp::tlb::serve`, item 7). O atendimento não toma
   trava, não espera e não manda IPI.
 - `ipi::poll()` roda no tratador dos vetores `0xF0`–`0xF2`, **em toda volta
   de espera ativa** (trava, ack, `on_cpu` da ADR 0032), em todo ponto de
   preempção das operações fatiadas (ADR 0009) e antes de entrar no ocioso.
   O IPI que chega depois de a caixa ter sido atendida por sondagem acha a
   caixa vazia e só faz o EOI.
-- A função remota (`smp::call_on(cpu, f, arg)`) é síncrona e restrita:
-  `f` não toma trava, não espera e não manda IPI (MSRs, testes de IPI do
-  T-322 e, no futuro, o `powerd`).
+- A função remota (`ksmp::ipi::call_on(cpu, f, arg)`) é síncrona e
+  restrita: `f` não toma trava, não espera e não manda IPI (MSRs, testes de
+  IPI do T-322 e, no futuro, o `powerd`). O destino tem 100 ms para
+  atender, senão pânico.
 
 ### 6. Regras contra deadlock
 
@@ -161,13 +181,15 @@ Cada trava pertence a uma classe com nível. Só se toma uma trava de nível
 
 Estado:
 
-- `AddressSpace.active`: máscara atômica de 256 bits com as CPUs que têm
-  o `CR3` deste espaço carregado **agora**. Sem PCID, trocar de `CR3`
-  descarta as traduções do espaço anterior, então só essas CPUs podem ter
-  traduções velhas.
-- Troca de espaço na CPU `c` (no escalonador): `novo.active.set(c)` (RMW
-  `SeqCst`, que no x86 é barreira completa), **depois** `mov cr3`; e só
-  depois `antigo.active.clear(c)`.
+- `LOADED[c]`: a raiz (`CR3`) que a CPU `c` carregou por último, uma palavra
+  atômica por CPU (a "máscara `active`" é espalhada: a CPU `c` pertence a
+  `X` quando `LOADED[c]` é a raiz de `X`). Sem PCID, trocar de `CR3`
+  descarta as traduções do espaço anterior, então só as CPUs com a raiz de
+  `X` carregada **agora** podem ter traduções velhas.
+- Troca de espaço na CPU `c` (`kvm::load_root`): `note_root(nova)` grava
+  `LOADED[c]` com `swap(SeqCst)`, que no x86 é barreira completa,
+  **depois** `mov cr3`. Não há `clear`: uma CPU que ficou ociosa com a raiz
+  velha continua alvo, o que é conservador e correto.
 
 Protocolo (CPU `I` muda o espaço `X`, que ela tranca):
 
@@ -176,13 +198,15 @@ Protocolo (CPU `I` muda o espaço `X`, que ela tranca):
    vão para uma lista local e **não** são liberados ainda.
 2. Invalida localmente se `X` está no `CR3` de `I` (`invlpg` por página ou
    recarga do `CR3`).
-3. `fence(SeqCst)`; alvos = `X.active` menos `I`. Sem alvos, vai ao
-   passo 6.
+3. `fence(SeqCst)`; alvos = as CPUs ligadas, menos `I`, com `LOADED[c]`
+   igual à raiz de `X` (para o kernel, todas). Sem alvos, vai ao passo 6.
 4. Preenche `I.tlb_req` (raiz de `X`, páginas ou "tudo", `acks` = número de
    alvos); para cada alvo `t`, liga o bit `I` em `t.tlb_inbox`, liga `TLB`
    em `t.pending` e manda o vetor `0xF2`.
 5. Gira até `acks == 0`, atendendo a própria caixa a cada volta. Passados
-   100 ms sem todos os acks, pânico ("CPU n não respondeu ao shootdown").
+   100 ms sem todos os acks (1 s sob TCG, onde uma vCPU pode ficar sem
+   rodar no host por mais tempo), pânico, com o diagnóstico de cada alvo
+   que não respondeu.
 6. Solta a trava de `X`, libera os frames do lote e só então volta ao
    usuário.
 
@@ -192,22 +216,24 @@ pedido é do kernel, invalida as páginas (ou tudo); depois decrementa
 `acks` de `i` com `Release`. Se `t` já trocou de espaço, não há o que
 invalidar e só confirma.
 
-- Por que basta: se `t` carregou `X` antes da mudança, o bit dela está na
-  máscara lida no passo 3 e ela recebe o pedido; se carregou depois, o
+- Por que basta: se `t` carregou `X` antes da mudança, a raiz dela está
+  em `LOADED` quando o passo 3 a lê e ela recebe o pedido; se carregou depois, o
   passeio de páginas já vê as PTEs novas. O par barreira-RMW da troca e
   `fence` do passo 3 impede que as duas coisas falhem juntas.
-- **Agrupado:** um `vm_unmap` ou `vm_protect` faz uma rodada por fatia
-  (ADR 0009), não uma por página; rodadas de CPUs diferentes andam em
-  paralelo, cada uma no seu `tlb_req`.
-- **Só quando tira direito:** `vm_unmap` e `vm_protect` que retira escrita
-  ou execução fazem shootdown; `vm_map` em página vazia e `vm_protect` que
-  amplia, não. Uma tradução velha mais restrita pode dar falta espúria: o
-  tratador de faltas confere a PTE atual antes de mandar a falta ao
-  endpoint de exceções e, se o acesso já é permitido, só volta.
+- **Agrupado:** um `vm_unmap` ou `vm_protect` faz **uma rodada por
+  chamada**, não uma por página, com `Flush::All` acima de 32 páginas;
+  rodadas de CPUs diferentes andam em paralelo, cada uma no seu
+  `tlb_req`. As operações não são fatiadas (ver a lacuna sobre o teto de
+  50 µs, abaixo).
+- **Quando faz:** `vm_unmap` e `vm_protect` fazem sempre a rodada, mesmo
+  quando `vm_protect` só amplia, porque uma tradução velha mais restrita
+  daria falta espúria. Só `vm_map` em página vazia não faz. O tratador de
+  faltas não precisa conferir a PTE atual por causa disso.
 - **Metade do kernel:** `kmem::unmap` e `kmem::protect` usam o mesmo
   protocolo com alvos = todas as CPUs ligadas menos a atual. É raro (pilhas
-  de threads mortas, MMIO no boot); o `kvm` acumula pilhas devolvidas e as
-  desmonta em lote, com um shootdown por lote.
+  de threads mortas, MMIO no boot). Cada pilha de kernel devolvida faz um
+  shootdown, para a pilha toda (até 32 páginas), e só depois seus frames
+  voltam ao buddy.
 - **PCID fica desligado no M3.** Com PCID, a máscara deixaria de ser "quem
   tem o `CR3` agora" e passaria a ser "quem pode ter traduções com esta
   etiqueta", com geração por espaço (`tlb_gen`) e cache de etiquetas por
@@ -221,8 +247,8 @@ invalidar e só confirma.
   - **Por quê:** a metade alta é a mesma em todo espaço, então as traduções do kernel podem sobreviver à troca de `CR3`. Sem isso, cada troca de processo jogava fora também as traduções do kernel.
   - **O que o protocolo já cobria:** uma tradução global só sai com `invlpg` ou desligando o PGE.
     - O shootdown do kernel já usa `invlpg` por página e `flush_tlb_all` (PGE desligado e religado) para "tudo".
-    - Os alvos do kernel já são todas as CPUs ligadas, e não a máscara `active`, então a premissa "trocar `CR3` limpa a TLB" nunca valeu para ele.
-    - O `Shootdown.tla` não muda.
+    - Os alvos do kernel já são todas as CPUs ligadas, e não as raízes em `LOADED`, então a premissa "trocar `CR3` limpa a TLB" nunca valeu para ele.
+    - Nenhum modelo TLA+ muda (não há `Shootdown.tla`).
   - **Testes:**
     - `mm.folhas_do_kernel_globais`;
     - `smp.shootdown_do_kernel_sem_traducao_velha`, que agora exercita traduções que atravessam a troca de `CR3`.
@@ -305,13 +331,14 @@ que a ADR 0028 deixou abertas, só com medição e ADR própria.
   todas; uma thread em outra CPU lê uma página, a primeira faz `vm_unmap` e
   a segunda recebe falta, 10⁵ vezes sem leitura velha; shootdown com a
   outra CPU girando numa trava que quem pede segura (o caso da lacuna 10).
-- TLA+ (T-313): um módulo novo, `Shootdown.tla`, com N CPUs, travas, IF=0,
-  a máscara `active`, TLBs por CPU e liberação de frames. Invariantes:
-  nenhuma CPU traduz para um frame já liberado (`NoStaleTranslation`) e,
-  com justiça fraca, todo shootdown termina (`ShootdownCompletes`), sem
-  deadlock. Mutações que o TLC deve acusar: tirar a sondagem da espera de
-  trava (deadlock), limpar o bit de `active` antes de trocar o `CR3` e
-  liberar o frame antes dos acks.
+- TLA+ (T-313): o protocolo de invalidação por CPU com acks (fila `pend`,
+  `Ack`, liberar só depois dos acks) está modelado em `CapRevoke.tla` para
+  os caches de handles, e as filas e o IPI de reescalonar em `Ipc.tla`
+  (`docs/spec/tla/README.md`). Não existe um módulo `Shootdown.tla` para a
+  TLB: a propriedade "nenhuma CPU traduz para um frame já liberado" é
+  coberta pelos testes de kernel (T-326, abaixo) e fica como tarefa de
+  acompanhamento modelar a TLB (`LOADED`, `note_root` antes do `CR3`,
+  liberação depois dos acks).
 - Estresse (T-329): 30 min em `-smp 4` com a verificação de ordem ligada.
 
 ### Lacunas do SDD
@@ -322,12 +349,41 @@ que a ADR 0028 deixou abertas, só com medição e ADR própria.
 - O SDD não diz como o kernel com IF=0 (ADR 0009) atende IPIs; a regra de
   sondagem nas esperas é desta ADR.
 - A 6.9 fala em shootdown "agrupado" sem dizer agrupado como, nem quando
-  os frames voltam ao alocador; aqui é por fatia, com frames liberados
-  depois dos acks.
-- A 6.4 manda usar PCID "para evitar flush de TLB"; esta ADR adia o PCID
-  até haver medição. **Eduardo precisa decidir** se aceita o adiamento ou
-  se o PCID entra já no T-326.
+  os frames voltam ao alocador; aqui é uma rodada por
+  chamada, com frames liberados depois dos acks.
+- **Decidido (2026-10-20):** a 6.4 manda usar PCID "para evitar flush de
+  TLB"; o PCID fica adiado. As páginas globais do kernel (T-331) já
+  poupam as traduções do kernel na troca de `CR3`, e a troca de contexto
+  foi medida em 385 ns em KVM com 4 CPUs, abaixo da meta de 2 µs que
+  serviria de gatilho. Eduardo confirma no PR.
+- **Decidido (2026-10-20):** `vm_unmap` e `vm_protect` fazem uma rodada por
+  chamada, sem fatiar, e cada pilha de kernel devolvida faz o seu
+  shootdown. **Lacuna conhecida:** o teto de 50 µs da ADR 0009 para um
+  `vm_unmap` de faixa muito grande depende de fatiar a operação com uma
+  rodada por fatia; fica como tarefa de acompanhamento, sem mudança de
+  código nesta ADR. Eduardo confirma no PR.
 - A 6.5 diz que o pânico "congela as CPUs", sem dizer o que fazer com dois
   pânicos simultâneos nem o que se registra de cada CPU.
 - A 6.8 não diz para qual CPU vão as IRQs de dispositivo; no M3, todas
   para a CPU 0.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação à proposta:
+
+- Status passa a aceita.
+- O construtor do `SpinLock` é `with_class`/`with_key`; `new` só nos testes.
+- Fica explícito que não existe variante "irqsave".
+- A tabela de travas ganha `FilaTimers` (emenda da ADR 0035), perde o
+  orçamento do `SchedContext` e o registro do escalonador, e lista as
+  travas folha reais do nível 10.
+- O estado do shootdown é `LOADED[c]` com `note_root`, não uma máscara
+  `active` por espaço; o prazo é 1 s sob TCG, com diagnóstico por alvo.
+- `vm_unmap` e `vm_protect` fazem sempre uma rodada por chamada, sem fatiar;
+  o tratador de faltas não confere a PTE; cada pilha de kernel faz o seu
+  shootdown.
+- `call_on` e o atendimento da caixa têm os nomes e o prazo do código.
+- A regra de IRQs na CPU 0 é marcada como intenção, sem código de IOAPIC.
+- `Shootdown.tla` não existe: o texto cita `CapRevoke.tla` e `Ipc.tla` e
+  deixa a modelagem da TLB como tarefa de acompanhamento.
+- Decididos: PCID adiado, rodada por chamada e shootdown por pilha.

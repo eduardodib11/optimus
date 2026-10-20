@@ -25,7 +25,7 @@ Para `ipc_call`, `ipc_send`, `ipc_recv` e `ipc_reply_recv` no x86-64:
 | `rax` | número da syscall | status |
 | `rdi` | handle do endpoint ou reply | badge do remetente |
 | `rsi` | rótulo | rótulo |
-| `rdx` | info: palavras (3 bits), caps (3 bits), flags | info |
+| `rdx` | info: palavras (bits 0-2), caps (3-5), flags (6-15), palavras no buffer de IPC (16-24, até 504) | info |
 | `r10` | prazo em ns monotônicos (0 = sem prazo) | não usado |
 | `r8`, `r9`, `r12`–`r15` | palavras 0 a 5 | palavras 0 a 5 |
 
@@ -45,3 +45,10 @@ transferir capability nunca é o caminho rápido.
 - Seis palavras nas duas arquiteturas, como diz a 6.7.
 - `kabi` ganha o formato do campo info e `IPC_BUFFER_WORDS` passa a 504.
 - A 14.1 do SDD é atualizada na próxima revisão do documento.
+
+## Revisão de 2026-10-20
+
+Mudanças em relação ao texto anterior:
+
+- A tabela do campo `info` inclui as palavras no buffer de IPC (bits 16-24),
+-   como já está em `kabi::ipc`.
