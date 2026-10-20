@@ -62,8 +62,8 @@ jobs:
         if: always()
         run: |
           for f in $(git ls-files --others --exclude-standard docs/bench); do
-            cat "$f" >> "$GITHUB_STEP_SUMMARY"
-            echo >> "$GITHUB_STEP_SUMMARY"
+            # No log também: o artefato e o resumo exigem o navegador.
+            { cat "$f"; echo; } | tee -a "$GITHUB_STEP_SUMMARY"
           done
       - uses: actions/upload-artifact@v4
         if: always()
