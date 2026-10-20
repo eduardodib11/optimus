@@ -42,6 +42,11 @@ pub const TESTS: &[Test] = &[
 const REVOKE_CAPS: usize = 100_000;
 /// Maior fatia aceita com KVM ou em hardware real (aceite do T-204).
 const SLICE_LIMIT_NS: u64 = 50_000;
+/// Fatias acima do limite aceitas numa VM com KVM, por mil: o host também
+/// tira a vCPU do ar no meio de uma fatia (visto num runner do GitHub
+/// Actions, KVM aninhado: maior de 54 µs com p99 de 8 µs). Em hardware
+/// real, nenhuma.
+const KVM_OVER_PER_MILLE: usize = 1;
 /// Tolerância no TCG do QEMU, que emula a CPU cerca de 8 vezes mais devagar
 /// neste código: p99 das fatias até 10 vezes o limite (500 µs). Lá a maior
 /// fatia só é registrada: o TSC segue o relógio do host, e uma preempção do
@@ -166,20 +171,29 @@ fn revogacao_fatiada() -> Outcome {
     slices.sort_unstable();
     let (max, p99) = (slices[count - 1], slices[count * 99 / 100]);
     let tcg = cpu::under_tcg();
+    let vm = cpu::hypervisor().is_some();
+    let over = slices
+        .iter()
+        .filter(|&&ns| u64::from(ns) > SLICE_LIMIT_NS)
+        .count();
     info!(
         "ktest: · revogação de {total} caps em {count} fatias de {REVOKE_SLICE_BUDGET} passos: \
-         maior {max} ns, p99 {p99} ns, mediana {} ns, total {} µs ({})",
+         maior {max} ns, p99 {p99} ns, mediana {} ns, total {} µs, {over} acima de 50 µs ({})",
         slices[count / 2],
         elapsed / 1000,
         if tcg {
             "TCG: exige p99 ≤ 500 µs, maior só registrada"
+        } else if vm {
+            "KVM: exige no máximo 1 por mil acima de 50 µs"
         } else {
-            "KVM/hardware: exige maior ≤ 50 µs"
+            "hardware: exige maior ≤ 50 µs"
         }
     );
     ensure!(count >= total / REVOKE_SLICE_BUDGET as usize);
     if tcg {
         ensure!(u64::from(p99) <= TCG_P99_LIMIT_NS);
+    } else if vm {
+        ensure!(over * 1000 <= count * KVM_OVER_PER_MILLE);
     } else {
         ensure!(u64::from(max) <= SLICE_LIMIT_NS);
     }
