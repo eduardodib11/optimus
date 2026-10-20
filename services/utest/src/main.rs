@@ -606,7 +606,10 @@ fn threads_alocacao(_: &Ctx) -> Outcome {
     let again: Vec<Vec<u8>> = (0..1000).map(|_| alloc::vec![1u8; 4000]).collect();
     drop(again);
     let after = ostd::alloc::mapped_segments();
-    if after > segments + 2 {
+    // Com as classes até 32 KiB (T-337) o crescimento dos `Vec` de `keep`
+    // (8, 16, 32 KiB) passa a deixar uma página por classe em vez de páginas
+    // inteiras que voltam logo: um segmento a mais fica retido.
+    if after > segments + 3 {
         return Err("segmentos demais depois de soltar tudo");
     }
     Ok(())

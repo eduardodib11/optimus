@@ -132,17 +132,33 @@ fn workload() -> Live {
 /// Bytes que o bloco custa sob cada política (inclui a sobra no fim da
 /// página, repartida entre os blocos dela).
 fn cost_current(size: usize, align: usize) -> usize {
-    match plan(size, align) {
-        Plan::Small(c) => per_block_in_page(class_size(c), PAGE_SIZE),
-        Plan::Large(n) => n * PAGE_SIZE,
-        Plan::Huge(n) => n * crate::SEGMENT_SIZE,
-        Plan::Fail => 0,
-    }
+    cost_plan(plan(size, align))
 }
 
 /// Custo de um bloco de `c` bytes numa página de `page` bytes.
 fn per_block_in_page(c: usize, page: usize) -> usize {
     page / (page / c)
+}
+
+/// Custo na tabela anterior à decisão de 2026-10-20: classes só até 8 KiB,
+/// acima disso páginas de 64 KiB inteiras.
+fn cost_classes_8k(size: usize, align: usize) -> usize {
+    if size <= 8 << 10 {
+        return cost_current(size, align);
+    }
+    match plan(size, align) {
+        Plan::Small(_) | Plan::Large(_) => size.div_ceil(PAGE_SIZE) * PAGE_SIZE,
+        other => cost_plan(other),
+    }
+}
+
+fn cost_plan(p: Plan) -> usize {
+    match p {
+        Plan::Small(c) => per_block_in_page(class_size(c), PAGE_SIZE),
+        Plan::Large(n) => n * PAGE_SIZE,
+        Plan::Huge(n) => n * crate::SEGMENT_SIZE,
+        Plan::Fail => 0,
+    }
 }
 
 /// Classes de 4 por duplicação, como as atuais, acima de 8 KiB.
@@ -162,17 +178,6 @@ fn extended_class(size: usize, max: usize) -> Option<usize> {
     }
 }
 
-/// Opção 2: classes até 32 KiB em páginas de 64 KiB.
-fn cost_classes_32k(size: usize, align: usize) -> usize {
-    if size <= MAX_SMALL {
-        return cost_current(size, align);
-    }
-    extended_class(size, 32 << 10).map_or_else(
-        || cost_current(size, align),
-        |c| per_block_in_page(c, PAGE_SIZE),
-    )
-}
-
 /// Opção 3: páginas médias de 512 KiB com classes de 8 a 64 KiB.
 fn cost_medium_pages(size: usize, align: usize) -> usize {
     if size <= MAX_SMALL {
@@ -189,7 +194,7 @@ struct Band {
     blocks: usize,
     requested: usize,
     current: usize,
-    classes_32k: usize,
+    classes_8k: usize,
     medium: usize,
 }
 
@@ -254,14 +259,14 @@ fn colecoes_fragmentacao() {
         b.blocks += 1;
         b.requested += size;
         b.current += cost_current(size, align);
-        b.classes_32k += cost_classes_32k(size, align);
+        b.classes_8k += cost_classes_8k(size, align);
         b.medium += cost_medium_pages(size, align);
     }
     let total = bands.iter().fold(Band::default(), |a, b| Band {
         blocks: a.blocks + b.blocks,
         requested: a.requested + b.requested,
         current: a.current + b.current,
-        classes_32k: a.classes_32k + b.classes_32k,
+        classes_8k: a.classes_8k + b.classes_8k,
         medium: a.medium + b.medium,
     });
     println!(
@@ -277,7 +282,7 @@ fn colecoes_fragmentacao() {
         (st.live_bytes as f64 / total.requested as f64 - 1.0) * 100.0,
     );
     println!(
-        "| Faixa | Blocos | Pedido (KiB) | Atual (KiB) | Perda | Classes até 32 KiB (KiB) | Perda | Páginas médias (KiB) | Perda |"
+        "| Faixa | Blocos | Pedido (KiB) | Classes até 8 KiB (KiB) | Perda | Atual: até 32 KiB (KiB) | Perda | Páginas médias (KiB) | Perda |"
     );
     println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
     let pct = |cost: usize, req: usize| {
@@ -292,10 +297,10 @@ fn colecoes_fragmentacao() {
             "| {name} | {} | {} | {} | {:.1}% | {} | {:.1}% | {} | {:.1}% |",
             b.blocks,
             b.requested / 1024,
+            b.classes_8k / 1024,
+            pct(b.classes_8k, b.requested),
             b.current / 1024,
             pct(b.current, b.requested),
-            b.classes_32k / 1024,
-            pct(b.classes_32k, b.requested),
             b.medium / 1024,
             pct(b.medium, b.requested),
         );
