@@ -113,6 +113,8 @@ extern "sysv64" fn kernel_main(info: &'static BootInfo) -> ! {
             panic!("pânico de teste proposital (test=panic)")
         }
         Some("fuzz") => kfuzz::run(cmdline),
+        // Testes de usuário (T-332): o `utest` no lugar do `root`.
+        Some("user") => kroot::run_named("utest"),
         _ => kroot::run(),
     }
     kheap::log_stats();
