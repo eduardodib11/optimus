@@ -417,6 +417,7 @@ desenho:
   thread alvo (`WRITE_STATE`) e `cspace = aspace = 0`, o alvo inativo passa a
   rodar no `CapSpace` e no `AddressSpace` de quem chama. Quem chama já tem
   poder sobre os dois, então nada novo é concedido.
+  Aceita por Eduardo em 2026-10-20 como exceção ao item 3 (PR #68).
 - **`thread_local!`.** O índice do slot vem de um contador global, atribuído no
   primeiro acesso, e não da posição de um descritor em `.ostd_tls_desc`; o
   `user.ld` não mudou. Contrato igual (tabela de slots no bloco, valor criado
