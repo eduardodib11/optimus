@@ -31,7 +31,7 @@ use crate::{
 /// contagem de segmentos vivos. Fora do Miri o conteúdo vem sujo
 /// (0xA5), para que nenhum teste dependa de memória zerada; no Miri fica
 /// por inicializar, e o Miri acusa qualquer leitura antes da escrita.
-struct HostSource {
+pub(crate) struct HostSource {
     /// Endereço do início da faixa → (segmentos, ponteiro original).
     spans: Mutex<BTreeMap<usize, (usize, SendPtr)>>,
     live: AtomicUsize,
@@ -40,7 +40,7 @@ struct HostSource {
 }
 
 impl HostSource {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_limit(usize::MAX)
     }
 
@@ -94,6 +94,9 @@ unsafe impl PageSource for HostSource {
         base
     }
 
+    /// # Safety
+    ///
+    /// O contrato de `PageSource::free_segments`.
     unsafe fn free_segments(&self, base: *mut u8, count: usize) {
         let was = self.spans.lock().unwrap().remove(&base.addr());
         let Some((n, original)) = was else {
@@ -111,7 +114,7 @@ unsafe impl PageSource for HostSource {
         spans
             .range(..=addr)
             .next_back()
-            .is_some_and(|(&base, &(count, _))| addr < base + count * SEGMENT_SIZE)
+            .is_some_and(|(&base, _)| addr < base + SEGMENT_SIZE)
     }
 
     fn seed(&self) -> u64 {
@@ -136,26 +139,26 @@ impl Drop for HostSource {
 }
 
 /// xorshift64*: bom o bastante para carga de teste.
-struct Rng(u64);
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
     }
 
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.next() >> 11) as usize % n
     }
 
     /// Tamanho com distribuição log-uniforme em `[lo, hi]`.
-    fn log_uniform(&mut self, lo: usize, hi: usize) -> usize {
+    pub(crate) fn log_uniform(&mut self, lo: usize, hi: usize) -> usize {
         let (a, b) = ((lo as f64).ln(), (hi as f64).ln());
         let u = (self.next() >> 11) as f64 / (1u64 << 53) as f64;
         ((a + (b - a) * u).exp() as usize).clamp(lo, hi)
@@ -404,6 +407,43 @@ fn blocos_grandes_e_enormes_voltam_ao_segmento_e_a_fonte() {
     );
     release(&mut heap, &large);
     heap.trim();
+    assert_eq!(global.source().live(), 0);
+}
+
+#[test]
+fn ponteiro_interior_no_segundo_segmento_de_bloco_enorme_e_recusado() {
+    let global = Global::new(HostSource::new());
+    let mut heap = Heap::new(&global);
+    let mut rng = Rng::new(31);
+    let huge = block(&mut heap, &mut rng, 3 * SEGMENT_SIZE - PAGE_SIZE, 8);
+    // O início do bloco é a página 1 do primeiro segmento.
+    let base = huge.ptr.0.wrapping_sub(PAGE_SIZE);
+    // Um usuário que lê o cabeçalho (o `canary` está lá) e grava uma cópia no
+    // início do 2º segmento forja um cabeçalho que o `locate` aceitaria se
+    // lesse esse segmento como se fosse o primeiro de um bloco.
+    // SAFETY: as duas faixas são do bloco enorme de 3 segmentos (do teste),
+    // não se sobrepõem e a cópia cabe nele.
+    unsafe {
+        base.copy_to_nonoverlapping(base.wrapping_add(SEGMENT_SIZE), PAGE_SIZE);
+    }
+    for offset in [PAGE_SIZE, 5 * PAGE_SIZE, SEGMENT_SIZE - 8] {
+        let interior = base.wrapping_add(SEGMENT_SIZE + offset);
+        assert!(!global.source().owns(interior.addr()));
+        expect_fault(Fault::ForeignPointer, || {
+            // SAFETY: o teste libera um ponteiro alheio de propósito; o
+            // alocador tem de recusá-lo sem tocar o segmento.
+            unsafe { heap.free(interior) };
+        });
+    }
+    // O 3º segmento também.
+    expect_fault(Fault::ForeignPointer, || {
+        // SAFETY: como acima.
+        unsafe { heap.free(base.wrapping_add(2 * SEGMENT_SIZE + PAGE_SIZE)) };
+    });
+    // O bloco continua válido e se libera normalmente (a cópia forjada
+    // sobrescreveu o padrão dele, então não há o que conferir).
+    // SAFETY: bloco enorme entregue por `alloc`, liberado uma vez.
+    unsafe { heap.free(huge.ptr.0) };
     assert_eq!(global.source().live(), 0);
 }
 

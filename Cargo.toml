@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oalloc", "lib/obfs", "lib/oelf", "lib/optcrypt", "lib/ostd", "services/hello", "services/root", "services/utest", "fuzz/okfuzz", "tools/mkobfs"]
+members = ["xtask", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oalloc", "lib/obfs", "lib/ocoll", "lib/oelf", "lib/optcrypt", "lib/ostd", "services/hello", "services/root", "services/utest", "fuzz/okfuzz", "tools/mkobfs"]
 # Só o xtask roda no host (os testes das bibliotecas também); as demais crates
 # são compiladas por `cargo xtask build`.
 default-members = ["xtask"]
@@ -25,6 +25,17 @@ panic = "abort"
 # O bootfs guarda o `utest` no heap do kernel e come a cota dos testes de
 # usuário; sem informação de depuração ele fica pequeno (T-336).
 [profile.dev.package.utest]
+debug = 0
+
+# Idem para as bibliotecas de usuário: cada binário do bootfs leva a
+# informação de depuração delas e a cota do `root` paga a cópia (T-337).
+[profile.dev.package.ostd]
+debug = 0
+
+[profile.dev.package.ocoll]
+debug = 0
+
+[profile.dev.package.oalloc]
 debug = 0
 
 [profile.release]

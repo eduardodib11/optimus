@@ -1,0 +1,13 @@
+[package]
+name = "ocoll"
+description = "Coleções, UTF-8 e PRNG do Optimus: no_std, sem unsafe, testável no host (base do ostd::collections)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

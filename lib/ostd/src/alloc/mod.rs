@@ -60,17 +60,35 @@ use crate::{cap, rt, vm};
 /// executável (`0x20_0000`), do buffer de IPC e dos mapeamentos do `root`
 /// (abaixo de 4 GiB) e da pilha (`0x7fff_ffff_0000`).
 const WINDOW_BASE: u64 = 0x0000_1000_0000_0000;
-/// Tamanho da janela: 16 TiB.
+/// Tamanho da janela: 16 TiB (2²³ segmentos de 2 MiB).
 const WINDOW_SIZE: u64 = 1 << 44;
+/// Segmentos que o processo pode ter ao mesmo tempo (512 GiB): o "heap" é
+/// uma faixa deste tamanho, posta num lugar sorteado da janela.
+const HEAP_SLOTS: u64 = 1 << 18;
+/// Posições possíveis do início da faixa do heap: 2²³ − 2¹⁸ (≈ 22,96 bits).
+const SLIDE_SLOTS: u64 = (WINDOW_SIZE / SEGMENT_SIZE as u64) - HEAP_SLOTS;
+
+/// Quantos blocos de vários segmentos (acima de ~1,9 MiB) o alocador
+/// acompanha ao mesmo tempo para recusar ponteiros interiores nos segmentos
+/// seguintes; passando disso o pedido falha (devolve nulo).
+const MULTI: usize = 256;
 
 /// Quantas faixas devolvidas a [`KernelSource`] guarda para reaproveitar.
 const FREE_RANGES: usize = 64;
 
 /// Estado dos endereços da janela, sempre sob a trava da [`KernelSource`].
 struct Ranges {
-    /// Primeiro endereço nunca entregue: tudo de `WINDOW_BASE` até aqui já
-    /// foi reservado alguma vez.
+    /// Início da faixa do heap, sorteado na primeira reserva (0 = ainda não).
+    base: u64,
+    /// Fim (exclusivo) da faixa do heap.
+    limit: u64,
+    /// Primeiro endereço nunca entregue: tudo de `base` até aqui já foi
+    /// reservado alguma vez.
     next: u64,
+    /// Faixas `(início, tamanho)` entregues de vários segmentos. Só o
+    /// primeiro segmento delas tem cabeçalho; `owns` recusa os outros.
+    multi: [(u64, u64); MULTI],
+    multi_len: usize,
     /// Faixas `(início, tamanho)` devolvidas e ainda sem dono, prontas para
     /// reaproveitar. As `len` primeiras entradas valem.
     free: [(u64, u64); FREE_RANGES],
@@ -80,15 +98,53 @@ struct Ranges {
 impl Ranges {
     const fn new() -> Self {
         Self {
-            next: WINDOW_BASE,
+            base: 0,
+            limit: 0,
+            next: 0,
+            multi: [(0, 0); MULTI],
+            multi_len: 0,
             free: [(0, 0); FREE_RANGES],
             len: 0,
         }
     }
 
+    /// Sorteia o início da faixa do heap (ADR 0039, item 2: 23 bits de
+    /// entropia no endereço do heap). Sem entropia do kernel a semente vem
+    /// da mistura de reserva (`rand::is_degraded`), e o sorteio segue.
+    fn ensure_base(&mut self) {
+        if self.base == 0 {
+            let slot = crate::rand::stream_u64() % SLIDE_SLOTS;
+            self.base = WINDOW_BASE + slot * SEGMENT_SIZE as u64;
+            self.limit = self.base + HEAP_SLOTS * SEGMENT_SIZE as u64;
+            self.next = self.base;
+        }
+    }
+
+    /// Registra a faixa de vários segmentos `[start, start + len)`; `false`
+    /// se a tabela está cheia.
+    fn track_multi(&mut self, start: u64, len: u64) -> bool {
+        if len <= SEGMENT_SIZE as u64 {
+            return true;
+        }
+        if self.multi_len == MULTI {
+            return false;
+        }
+        self.multi[self.multi_len] = (start, len);
+        self.multi_len += 1;
+        true
+    }
+
+    fn untrack_multi(&mut self, start: u64) {
+        if let Some(i) = (0..self.multi_len).find(|&i| self.multi[i].0 == start) {
+            self.multi_len -= 1;
+            self.multi[i] = self.multi[self.multi_len];
+        }
+    }
+
     /// Reserva `len` bytes: primeiro numa faixa devolvida (a primeira que
-    /// couber), senão avançando `next`. `None` se a janela acabou.
+    /// couber), senão avançando `next`. `None` se a faixa do heap acabou.
     fn reserve(&mut self, len: u64) -> Option<u64> {
+        self.ensure_base();
         for i in 0..self.len {
             let (start, size) = self.free[i];
             if size >= len {
@@ -101,10 +157,7 @@ impl Ranges {
                 return Some(start);
             }
         }
-        let end = self
-            .next
-            .checked_add(len)
-            .filter(|&e| e <= WINDOW_BASE + WINDOW_SIZE)?;
+        let end = self.next.checked_add(len).filter(|&e| e <= self.limit)?;
         let start = self.next;
         self.next = end;
         Some(start)
@@ -172,26 +225,33 @@ impl Ranges {
         }
     }
 
-    /// `addr` está numa faixa entregue e ainda não devolvida?
+    /// `addr` está no primeiro segmento de uma faixa entregue e ainda não
+    /// devolvida? Os segmentos seguintes de um bloco enorme não valem: o
+    /// início deles é dado do usuário, não cabeçalho (achado da T-334).
     fn owns(&self, addr: u64) -> bool {
-        (WINDOW_BASE..self.next).contains(&addr)
+        (self.base..self.next).contains(&addr)
             && !self.free[..self.len]
                 .iter()
                 .any(|&(s, l)| (s..s + l).contains(&addr))
+            && !self.multi[..self.multi_len]
+                .iter()
+                .any(|&(s, l)| (s + SEGMENT_SIZE as u64..s + l).contains(&addr))
     }
 }
 
 /// De onde o alocador tira segmentos: `MemoryObject` mapeado numa janela.
 ///
-/// Os endereços saem de `WINDOW_BASE` para cima, mas as faixas devolvidas por
-/// `free_segments` são reaproveitadas antes de avançar (uma lista de
+/// O endereço do primeiro segmento é sorteado na janela de 16 TiB (2²³
+/// posições de 2 MiB menos a faixa de 512 GiB que o heap ocupa, ≈ 23 bits;
+/// ADR 0039, item 2) e os seguintes avançam dali, mas as faixas devolvidas
+/// por `free_segments` são reaproveitadas antes de avançar (uma lista de
 /// `FREE_RANGES` faixas, sem alocar), então um serviço que aloca e libera um
-/// bloco enorme em laço não gasta a janela. O sorteio com 23 bits de
-/// entropia (ADR 0039, item 2) precisa do `sys_info` de entropia da T-337,
-/// que ainda não existe; quando existir, o sorteio troca a escolha da faixa,
-/// com nova tentativa se `vm_map` achar a faixa ocupada. Até lá, a janela dá
-/// 8 milhões de mapeamentos de 2 MiB por processo; se a lista de faixas
-/// livres lotar, a faixa devolvida se perde e a janela gasta mais depressa.
+/// bloco enorme em laço não gasta a faixa. O sorteio usa a semente do
+/// processo ([`crate::rand::process_seed`]); sem entropia do kernel é a
+/// mistura de reserva, e [`crate::rand::is_degraded`] avisa. Se a lista de
+/// faixas livres lotar, a faixa devolvida se perde e a faixa do heap gasta
+/// mais depressa. Os blocos de vários segmentos ficam numa tabela de
+/// `MULTI` entradas, para que `owns` recuse ponteiros interiores.
 ///
 /// A trava cobre a reserva, o mapeamento e a devolução inteiros, então
 /// `owns` nunca vê uma faixa reservada e ainda não mapeada: ela só conta como
@@ -223,6 +283,10 @@ unsafe impl PageSource for KernelSource {
             let Some(va) = ranges.reserve(len) else {
                 return null_mut();
             };
+            if !ranges.track_multi(va, len) {
+                ranges.release(va, len);
+                return null_mut();
+            }
             let mapped = cap::create(env.quota, ObjectType::MemoryObject, len).and_then(|object| {
                 let mapped = vm::map(vm::SELF, object, va, 0, len, WRITE);
                 // A região guarda o objeto; sem ela o `vm_unmap` o destrói e
@@ -233,6 +297,7 @@ unsafe impl PageSource for KernelSource {
             if mapped.is_err() {
                 // Devolve a faixa se o mapeamento falhou (cota), para que
                 // pedidos que falham não gastem a janela.
+                ranges.untrack_multi(va);
                 ranges.release(va, len);
                 return null_mut();
             }
@@ -240,12 +305,16 @@ unsafe impl PageSource for KernelSource {
         })
     }
 
+    /// # Safety
+    ///
+    /// O contrato de [`PageSource::free_segments`].
     unsafe fn free_segments(&self, base: *mut u8, count: usize) {
         if rt::env().is_some() {
             let start = base.addr() as u64;
             let len = (count * SEGMENT_SIZE) as u64;
             self.ranges.with(|ranges| {
                 let _ = vm::unmap(vm::SELF, start, len);
+                ranges.untrack_multi(start);
                 ranges.release(start, len);
             });
         }
@@ -255,10 +324,11 @@ unsafe impl PageSource for KernelSource {
         self.ranges.with(|ranges| ranges.owns(addr as u64))
     }
 
-    /// Sem a entropia do kernel (T-337), o relógio dá uma semente fraca: o
-    /// endurecimento do `oalloc` fica fraco, mas nunca zero.
+    /// Um valor novo a cada chamada, do fluxo da semente do processo (da
+    /// entropia do kernel; fraca, mas nunca fixa, se ela faltar): o
+    /// `oalloc` o usa para o segredo do `Global` e para a chave de cada heap.
     fn seed(&self) -> u64 {
-        crate::time::now_ns()
+        crate::rand::stream_u64()
     }
 
     fn fault(&self, fault: Fault) -> ! {
@@ -331,6 +401,17 @@ pub fn stats() -> Stats {
     crate::tls::current().with_heap(|heap| heap.stats())
 }
 
+/// Faixa `[início, fim)` do heap do processo, sorteada na primeira
+/// alocação (diagnóstico e testes; ADR 0039, item 2). Os segmentos ficam
+/// sempre dentro dela.
+#[must_use]
+pub fn heap_range() -> (u64, u64) {
+    GLOBAL.source().ranges.with(|r| {
+        r.ensure_base();
+        (r.base, r.limit)
+    })
+}
+
 /// Segmentos de 2 MiB mapeados pelo processo todo (de todas as threads,
 /// inclusive os abandonados por quem saiu e ainda não adotados).
 #[must_use]
@@ -344,6 +425,9 @@ pub struct Allocator;
 // SAFETY: `alloc` devolve blocos do `oalloc` (alinhados e disjuntos) ou nulo,
 // e `dealloc` os devolve ao mesmo heap, com a trava tomada.
 unsafe impl GlobalAlloc for Allocator {
+    /// # Safety
+    ///
+    /// O contrato de [`GlobalAlloc::alloc`].
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if rt::env().is_none() {
             crate::debug::print("ostd: alocação antes de rt::init");
@@ -352,6 +436,9 @@ unsafe impl GlobalAlloc for Allocator {
         crate::tls::current().with_heap(|heap| heap.alloc(layout.size(), layout.align()))
     }
 
+    /// # Safety
+    ///
+    /// O contrato de [`GlobalAlloc::dealloc`].
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         // SAFETY: o contrato de `GlobalAlloc::dealloc` é o de `Heap::free`.
         crate::tls::current().with_heap(|heap| unsafe { heap.free(ptr) });

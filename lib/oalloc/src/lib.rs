@@ -79,6 +79,8 @@ mod heap;
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, not(miri)))]
+mod tests_colecoes;
 
 pub use heap::{Global, Heap, Stats};
 
@@ -142,11 +144,18 @@ pub unsafe trait PageSource: Sync {
     /// ainda não devolvida, e ninguém usa mais a faixa.
     unsafe fn free_segments(&self, base: *mut u8, count: usize);
 
-    /// O endereço está numa faixa que esta fonte deu e ainda não recebeu de
-    /// volta? Serve para recusar ponteiros alheios sem tocá-los.
+    /// O endereço está no **primeiro segmento** de uma faixa que esta fonte
+    /// deu e ainda não recebeu de volta? Serve para recusar ponteiros alheios
+    /// sem tocá-los. Os segmentos seguintes de uma faixa de vários segmentos
+    /// (bloco enorme) respondem `false`: o início deles é dado do usuário,
+    /// não um cabeçalho, e o alocador não pode lê-lo para julgar um ponteiro
+    /// interior (achado da revisão da T-334).
     fn owns(&self, addr: usize) -> bool;
 
     /// Semente para as chaves do endurecimento; 0 se não houver entropia.
+    /// É chamada uma vez por [`Heap::new`] (o primeiro valor dá o segredo do
+    /// [`Global`]; os seguintes, a parte da chave de cada heap), então uma
+    /// fonte com entropia deve devolver um valor novo a cada chamada.
     fn seed(&self) -> u64 {
         0
     }

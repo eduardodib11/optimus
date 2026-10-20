@@ -166,10 +166,10 @@ fn canary_for(segment_addr: usize, secret: usize) -> u64 {
 /// for início de bloco dela. Só lê campos que valem para qualquer thread
 /// (INV-R).
 fn block_index(page: *mut Page, addr: usize) -> Option<usize> {
-    // SAFETY: INV-R: `page` está num segmento vivo (conferido por `locate`
-    // ou vindo das listas do dono) e esses campos não mudam com blocos
-    // entregues.
     let (kind, bsize, recip, cap) =
+        // SAFETY: INV-R: `page` está num segmento vivo (conferido por `locate`
+        // ou vindo das listas do dono) e esses campos não mudam com blocos
+        // entregues.
         unsafe { ((*page).kind, (*page).bsize, (*page).recip, (*page).cap) };
     let off = addr.wrapping_sub(page_start(page));
     if kind != KIND_SMALL {
@@ -325,7 +325,9 @@ impl<'g, S: PageSource> Heap<'g, S> {
             // Se outra thread chegou antes, vale o segredo dela.
             let _ = global.secret.compare_exchange(0, s, Relaxed, Relaxed);
         }
-        let key = mix(global.secret.load(Relaxed) ^ id.rotate_left(32));
+        let key = mix(global.secret.load(Relaxed)
+            ^ id.rotate_left(32)
+            ^ mix(global.source.seed() as usize));
         Self {
             global,
             id,
@@ -668,10 +670,10 @@ impl<S: PageSource> Heap<'_, S> {
             self.fault(Fault::ForeignPointer);
         }
         let expected = canary_for(seg.addr(), self.global.secret.load(Relaxed));
-        // SAFETY: `owns` garante que `addr` está num segmento vivo (INV-F),
-        // então o início do segmento, que é o cabeçalho ou, no meio de um
-        // bloco enorme, um pedaço dele, é legível; só lemos campos que não
-        // mudam (INV-R).
+        // SAFETY: `owns` só responde `true` no primeiro segmento de uma faixa
+        // viva (INV-F), então o início do segmento é um cabeçalho legível
+        // (nunca dado do usuário no meio de um bloco enorme); só lemos campos
+        // que não mudam (INV-R).
         unsafe {
             if (*seg).magic != MAGIC || (*seg).canary != expected {
                 self.fault(Fault::ForeignPointer);
@@ -1090,8 +1092,8 @@ impl<S: PageSource> Heap<'_, S> {
                 (*page).next = null_mut();
             }
             self.collect_page(page);
-            // SAFETY: INV-S.
             let (used, space, class) =
+                // SAFETY: INV-S.
                 unsafe { ((*page).used, has_space(page), usize::from((*page).class)) };
             if used == 0 {
                 if kind == KIND_HUGE {

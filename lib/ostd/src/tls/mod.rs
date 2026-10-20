@@ -352,6 +352,9 @@ pub struct LocalKey<T: 'static> {
     init: fn() -> T,
 }
 
+/// # Safety
+///
+/// `ptr` veio de `Box::into_raw` de um `Box<T>` e não foi liberado.
 unsafe fn drop_box<T>(ptr: usize) {
     // SAFETY: `ptr` veio de `Box::into_raw` de um `Box<T>` em `with`.
     drop(unsafe { Box::from_raw(core::ptr::with_exposed_provenance_mut::<T>(ptr)) });

@@ -58,6 +58,8 @@ pub fn init(env: Env) {
     }
     ENV_QUOTA.store(env.quota.raw(), Ordering::Relaxed);
     ENV_READY.store(true, Ordering::Release);
+    // A semente do `HashMap` (T-337): antes do primeiro mapa.
+    crate::rand::seed_collections();
 }
 
 /// Os handles registrados por [`init`], se já foram.

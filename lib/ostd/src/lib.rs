@@ -7,7 +7,7 @@
 //! ([`cap`]), memória ([`vm`]), threads ([`thread`]) e o IPC síncrono com
 //! o buffer de IPC ([`ipc`], T-208), o bloco da thread com `thread_local!` ([`tls`], T-335), e o carregador de executáveis do
 //! bootfs ([`process`], ADR 0029) e o alocador global ([`alloc`], T-334).
-//! `Mutex`/`Condvar`/`Once`/`RwLock` sobre futex ([`sync`], T-336); a entropia do kernel ([`rand`], T-337); clientes OIDL ficam para depois.
+//! `Mutex`/`Condvar`/`Once`/`RwLock` sobre futex ([`sync`], T-336); a aleatoriedade ([`rand`], T-337), as coleções ([`collections`]) e o UTF-8 ([`utf8`]); clientes OIDL ficam para depois.
 //!
 //! Só [`arch`] (a instrução `syscall`, o `_start` e o acesso à memória que o
 //! processo mapeou), [`alloc`] (a cola do `GlobalAlloc`), [`tls`] (o bloco da
@@ -26,6 +26,7 @@ extern crate alloc as alloc_crate;
 pub mod alloc;
 pub mod arch;
 pub mod cap;
+pub mod collections;
 pub mod ipc;
 pub mod process;
 pub mod rand;
@@ -34,7 +35,27 @@ pub mod sync;
 pub mod sys;
 pub mod thread;
 pub mod tls;
+pub mod utf8;
 pub mod vm;
+
+/// O que a `alloc` oferece, reexportado para os serviços não precisarem de
+/// `extern crate alloc` só para usar `Vec`, `String` e companhia (as coleções
+/// próprias estão em [`collections`]). O `ostd::alloc` é o alocador, não esta
+/// reexportação.
+pub use alloc_crate::{borrow, boxed, format, rc, string, vec};
+
+/// Os nomes mais usados, para `use ostd::prelude::*;`.
+pub mod prelude {
+    pub use alloc_crate::borrow::ToOwned;
+    pub use alloc_crate::boxed::Box;
+    pub use alloc_crate::rc::Rc;
+    pub use alloc_crate::string::{String, ToString};
+    pub use alloc_crate::sync::Arc;
+    pub use alloc_crate::vec::Vec;
+    pub use alloc_crate::{format, vec};
+
+    pub use crate::collections::{HashMap, HashSet, Queue, Ring};
+}
 
 /// Versão da biblioteca, exposta para diagnóstico.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -51,10 +72,7 @@ pub mod debug {
     pub fn print(text: &str) {
         let mut rest = text;
         while !rest.is_empty() {
-            let mut cut = rest.len().min(kabi::DEBUG_PRINT_MAX);
-            while !rest.is_char_boundary(cut) {
-                cut -= 1;
-            }
+            let cut = crate::utf8::floor_boundary(rest, kabi::DEBUG_PRINT_MAX);
             let (part, tail) = rest.split_at(cut);
             let _ = crate::sys::call(
                 kabi::DEBUG_PRINT,

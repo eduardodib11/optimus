@@ -477,3 +477,48 @@ acrescentou, sem mudar o desenho do item 4:
   deixa a semente zero nesse caso (o kernel já devolve `NotSupported`), ou a
   `BootInfo` ganha um campo com a fonte. Sob QEMU (`virtio-rng-pci`) e em
   hardware com `RDSEED`/`RDRAND` o caso não acontece.
+
+## Notas da implementação (T-337, ostd, 2026-10-20)
+
+O que a parte do `ostd` da T-337 fez diferente do texto acima ou acrescentou,
+sem mudar nenhuma decisão aceita:
+
+- **Crate `lib/ocoll`.** `HashMap`, `HashSet`, anel, UTF-8 e PRNG ficam numa
+  crate `no_std` sem `unsafe` e testável no host (o `ostd` tem `test = false`);
+  `ostd::collections` e `ostd::utf8` a reexportam. O `unsafe` do `ostd` não
+  muda. O anel é de capacidade fixa; a fila é a `VecDeque` do `alloc`.
+- **Chave do `HashMap`.** O item 4 diz "chave de 128 bits tirada de `fast()`
+  por mapa". Como o `RandomState::new()` mora no `ocoll`, que não conhece o
+  `ostd`, cada mapa deriva a chave de uma semente de 128 bits do processo
+  (`ocoll::seed_random_state`, dada por `rt::init` a partir de
+  `rand::process_seed`, que vem de `secure_fill`) e de um contador atômico,
+  por SplitMix. A premissa registrada é a mesma (ninguém observa a saída
+  do gerador, que não é criptográfico).
+- **Falha da entropia.** Em vez de `log::warn`, que ainda não existe, o
+  aviso sai por `debug::print` uma vez. A mistura de reserva é `clock_get`,
+  endereço da pilha, id da thread e um contador (`rand::mix_fill`, pública e
+  testável); só `process_seed` e `fast()` marcam `is_degraded()`. O alocador
+  também usa `process_seed`, então um kernel sem RNG não derruba nada.
+- **Sorteio do heap.** O endereço do heap tem ≈ 22,96 bits: o heap ocupa uma
+  faixa de 512 GiB (2¹⁸ segmentos) e o início dela é sorteado entre
+  2²³ − 2¹⁸ posições da janela de 16 TiB. Os segmentos seguintes avançam a
+  partir daí (a lista de faixas livres da T-334 continua valendo), então a
+  entropia é do endereço do heap, não de cada segmento. A chave de cada heap
+  (item 2, "endurecimento") passou a misturar uma palavra nova de
+  `PageSource::seed()`, chamada a cada `Heap::new`.
+- **Contrato do `PageSource::owns`.** Passa a valer só para o primeiro
+  segmento de uma faixa; os segmentos seguintes de um bloco enorme devolvem
+  `false`, para o `locate` nunca ler como cabeçalho o dado do usuário (achado
+  da revisão da T-334). O `KernelSource` acompanha até 256 blocos de vários
+  segmentos; acima disso o pedido enorme falha.
+- **`xtask check`.** `// SAFETY:` só vale no bloco de comentários
+  imediatamente acima do `unsafe`, e `unsafe fn` exige `# Safety` na
+  documentação.
+- **Orçamento.** `lib/oalloc` 64 → 74, só código de teste (ponteiro interior
+  e rastro de alocações da carga de coleções); nenhum outro teto mudou.
+- **Fragmentação.** A decisão sobre as classes de 8 a 64 KiB segue
+  pendente; a medição com coleções reais e a recomendação (classes até
+  32 KiB) estão em `docs/bench/2026-10-20-a28b3bc-fragmentacao.md`.
+- **Informação de depuração.** `ostd`, `oalloc` e `ocoll` compilam com
+  `debug = 0` no perfil `dev` (como o `utest`): o bootfs de depuração é
+  copiado para a cota do `root`, e os binários cresciam ~1,1 MiB.
