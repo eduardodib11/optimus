@@ -6,16 +6,21 @@
 //! ([`sys`]), invólucros seguros para depuração, tempo, capabilities
 //! ([`cap`]), memória ([`vm`]), threads ([`thread`]) e o IPC síncrono com
 //! o buffer de IPC ([`ipc`], T-208), e o carregador de executáveis do
-//! bootfs ([`process`], ADR 0029). Alocador, `Mutex`/`Condvar` sobre
-//! futex e clientes OIDL ficam para depois.
+//! bootfs ([`process`], ADR 0029) e o alocador global ([`alloc`], T-334).
+//! `Mutex`/`Condvar` sobre futex e clientes OIDL ficam para depois.
 //!
-//! Só [`arch`] usa `unsafe` (a instrução `syscall`, o `_start` e o acesso
-//! à memória que o processo mapeou), como a seção 17.1 permite ao "ostd
-//! baixo nível"; o resto da crate o proíbe.
+//! Só [`arch`] (a instrução `syscall`, o `_start` e o acesso à memória que o
+//! processo mapeou) e [`alloc`] (a cola do `GlobalAlloc`) usam `unsafe`,
+//! como a seção 17.1 permite ao "ostd baixo nível" e a ADR 0039 detalha; o
+//! resto da crate o proíbe. A lista de módulos com `unsafe` e o teto de
+//! blocos de cada um estão em `unsafe-allowlist.toml`, e o `cargo xtask
+//! check` os confere.
 
 #![no_std]
 #![deny(unsafe_code)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
+pub mod alloc;
 pub mod arch;
 pub mod cap;
 pub mod ipc;

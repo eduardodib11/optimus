@@ -11,12 +11,66 @@
 //! cria: o script de ligação `user.ld` desta crate junta numa seção própria
 //! (`.ostd_entry`) a seção de dados de todo símbolo chamado `OSTD_ENTRY` e
 //! confere que há exatamente um.
+//!
+//! O alocador global ([`crate::alloc`]) precisa da cota e do espaço de
+//! endereços do processo, que o kernel entrega nos valores de entrada em
+//! posições que variam de processo para processo (o `root` e o `utest`
+//! recebem a cota em `rdi` e o espaço em `rsi`; o `hello`, os dois juntos
+//! em `rsi`). Por isso a função principal chama [`init`] com esses handles
+//! antes da primeira alocação; alocar antes disso aborta o processo.
+
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use kabi::Handle;
 
 /// Valores iniciais que o kernel entregou à thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Start {
     /// `rdi`, `rsi` e `rdx` na entrada.
     pub args: [u64; 3],
+}
+
+/// Handles que o runtime guarda para si: de onde o alocador tira memória.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Env {
+    /// Cota de memória do processo (com o direito `CREATE`).
+    pub quota: Handle,
+    /// Espaço de endereços do próprio processo. A T-333 (ADR 0039) passa a
+    /// aceitar `aspace = 0` como "o espaço de quem chama" e este campo some.
+    pub aspace: Handle,
+}
+
+static ENV_QUOTA: AtomicU32 = AtomicU32::new(0);
+static ENV_ASPACE: AtomicU32 = AtomicU32::new(0);
+static ENV_READY: AtomicBool = AtomicBool::new(false);
+
+/// Registra os handles do runtime. Chame uma vez, no começo da função
+/// principal, antes de alocar.
+///
+/// # Panics
+///
+/// Se for chamada de novo com handles diferentes (os segmentos já mapeados
+/// seguem a cota antiga).
+pub fn init(env: Env) {
+    if ENV_READY.load(Ordering::Acquire) {
+        assert!(
+            self::env() == Some(env),
+            "rt::init chamada com outros handles"
+        );
+        return;
+    }
+    ENV_QUOTA.store(env.quota.raw(), Ordering::Relaxed);
+    ENV_ASPACE.store(env.aspace.raw(), Ordering::Relaxed);
+    ENV_READY.store(true, Ordering::Release);
+}
+
+/// Os handles registrados por [`init`], se já foram.
+#[must_use]
+pub fn env() -> Option<Env> {
+    ENV_READY.load(Ordering::Acquire).then(|| Env {
+        quota: Handle::from_raw(ENV_QUOTA.load(Ordering::Relaxed)),
+        aspace: Handle::from_raw(ENV_ASPACE.load(Ordering::Relaxed)),
+    })
 }
 
 /// Função principal de um processo.

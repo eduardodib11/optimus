@@ -1,0 +1,13 @@
+[package]
+name = "oalloc"
+description = "Núcleo do alocador do Optimus (estilo mimalloc): no_std, genérico sobre a fonte de páginas, testável no host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

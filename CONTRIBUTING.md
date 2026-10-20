@@ -25,6 +25,12 @@ git commit -s
   ferramentas de host, testes, fuzzing e benchmarks.
 - `#![forbid(unsafe_code)]` em toda crate, exceto as listadas em
   `unsafe-allowlist.toml`. Todo bloco `unsafe` tem comentário `// SAFETY:`.
+  Nas crates listadas, o `unsafe` só vale nos caminhos de `[unsafe_budget]`
+  (ADR 0039), cada um com teto de usos, `#![allow(unsafe_code)]` no arquivo
+  raiz e uma seção `# Unsafe` na documentação do módulo; o `cargo xtask check`
+  confere. Subir um teto é uma alteração visível, a revisar por duas pessoas.
+  Os testes da `lib/oalloc` rodam também sob Miri (job `miri` do CI), só nos
+  PRs que mudam essa crate.
 - Antes do PR: `cargo xtask check` e `cargo xtask test`.
 
 ## Definição de pronto

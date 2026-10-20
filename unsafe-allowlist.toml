@@ -1,8 +1,31 @@
-# Crates autorizadas a usar `unsafe` (SDD v1.0, seção 17.1).
-# Todas as outras DEVEM declarar `#![forbid(unsafe_code)]`; `cargo xtask check` verifica.
+# Política de `unsafe` (SDD v1.0, seção 17.1; ADR 0039, item 1).
+# `cargo xtask check` confere tudo isto.
+
+# Crates autorizadas a usar `unsafe`. Todas as outras DEVEM declarar
+# `#![forbid(unsafe_code)]`.
 crates = [
     "boot/optboot",
     "kernel/okernel",
-    # "ostd baixo nível" (seção 17.1): só `lib/ostd/src/arch/` (syscall e _start).
+    # "ostd baixo nível" (seção 17.1): só os módulos de [unsafe_budget]; a
+    # raiz continua com `#![deny(unsafe_code)]`.
     "lib/ostd",
+    # Núcleo do alocador (T-334): testável no host, sem syscalls.
+    "lib/oalloc",
 ]
+
+# Tetos de usos de `unsafe` (blocos, `impl`, `fn`, `trait`, `extern`) por
+# caminho. `unsafe` e `allow(unsafe_code)` fora destes caminhos, em
+# `lib/ostd/src/**` e nas crates daqui, são recusados. Cada caminho precisa
+# de `#![allow(unsafe_code)]` no arquivo raiz do módulo e de uma seção
+# `# Unsafe` na documentação dele. Subir um teto é uma alteração visível
+# deste arquivo (revisão por duas pessoas, 17.1).
+[unsafe_budget]
+"lib/ostd/src/arch" = 7    # syscall, _start e o acesso à memória mapeada
+"lib/ostd/src/alloc" = 8   # cola de GlobalAlloc e PageSource sobre lib/oalloc
+"lib/oalloc" = 64         # alocador (núcleo e testes)
+
+# Previstos pela ADR 0039 para quando os módulos existirem (o primeiro PR de
+# cada um acrescenta a linha, com o número que realmente usar):
+#   "lib/ostd/src/sync" = 12   # Mutex/Condvar/RwLock/Once (UnsafeCell) -- T-336
+#   "lib/ostd/src/tls"  = 10   # bloco da thread, destrutores            -- T-333/T-335
+#   "lib/ostd/src/ring" = 14   # anéis compartilhados (ADR 0036)

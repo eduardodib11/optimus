@@ -21,6 +21,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oalloc"
+version = "0.1.0"
+
+[[package]]
 name = "obfs"
 version = "0.1.0"
 dependencies = [
@@ -65,6 +69,7 @@ name = "ostd"
 version = "0.1.0"
 dependencies = [
  "kabi",
+ "oalloc",
  "oelf",
 ]
 
