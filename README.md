@@ -15,8 +15,9 @@ Requisitos no host: `rustup`, QEMU (`qemu-system-x86_64`) e OVMF.
 cargo xtask build    # compila kernel, optboot e bibliotecas
 cargo xtask image    # monta a ESP em target/esp
 cargo xtask run      # dá boot no QEMU com serial no terminal
-cargo xtask test     # unitários, smoke test de boot e testes de kernel no QEMU
+cargo xtask test     # unitários, smoke test de boot, testes de kernel e de usuário no QEMU
 cargo xtask test kernel  # só os testes de kernel (harness com isa-debug-exit)
+cargo xtask test user    # testes de usuário: o serviço utest do bootfs roda no anel 3 (--falha-proposital: inclui um teste que falha, o comando sai com erro)
 cargo xtask test smp     # testes de kernel, pânico SMP, 10⁶ alternâncias entre CPUs, 10⁵ shootdowns (release) e okfuzz de 20 s com -smp 2, 4 e 8 (--smp N: só N)
 cargo xtask fuzz       # okfuzz (um processo por CPU ligada; --smp N, --seconds S, --seed S)
 cargo xtask test stress  # estresse SMP no build de depuração, 30 min com -smp 4 (--smp N, --minutes M)

@@ -20,7 +20,7 @@ const BENCH_SCENARIO: Scenario = Scenario {
     markers: &["bench: ambiente", "bench: fim"],
     forbidden: &["FALHOU", "okernel: FALTA", "PÂNICO"],
     exit: Some(KERNEL_EXIT_OK),
-    ktest: false,
+    harness: None,
     screen: false,
     rounds: None,
     hello: false,

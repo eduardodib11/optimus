@@ -23,8 +23,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
       - name: Toolchain fixada em rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Testes unitários, smoke test de boot e testes de kernel no QEMU
+      - name: Testes unitários, smoke test de boot, testes de kernel e de usuário no QEMU
         run: cargo xtask test all
+      - name: Um teste de usuário que falha de propósito tem de derrubar o comando
+        run: |
+          if cargo xtask test user --falha-proposital; then
+            echo "o teste que falha de propósito passou" >&2
+            exit 1
+          fi
 
   smp:
     runs-on: ubuntu-24.04

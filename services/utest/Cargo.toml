@@ -1,0 +1,17 @@
+[package]
+name = "utest"
+description = "Harness de testes de usuário: roda os testes no anel 3 e escreve o relatório na serial (T-332)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "utest"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+
+[lints]
+workspace = true

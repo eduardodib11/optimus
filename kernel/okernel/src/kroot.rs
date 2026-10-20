@@ -297,12 +297,22 @@ fn read_only_copy(p: &Image, data: &[u8]) -> Result<Handle, &'static str> {
 ///
 /// O passo que falhou.
 pub fn load(image: &[u8]) -> Result<Process, &'static str> {
+    load_named(image, ROOT_NAME)
+}
+
+/// Como [`load`], com o serviço `name` do bootfs no lugar do `root`: ele
+/// recebe as mesmas capabilities iniciais (`test=user` inicia o `utest`).
+///
+/// # Errors
+///
+/// O passo que falhou.
+pub fn load_named(image: &[u8], name: &str) -> Result<Process, &'static str> {
     let fs = obfs::Image::parse(image).map_err(|_| "bootfs inválido")?;
-    let entry = fs.find(ROOT_NAME).ok_or("bootfs sem root")?;
+    let entry = fs.find(name).ok_or("bootfs sem o serviço")?;
     if !entry.verify() {
-        return Err("hash do root não confere");
+        return Err("hash do serviço não confere");
     }
-    let elf = oelf::Elf::parse_user(entry.data).map_err(|_| "ELF do root inválido")?;
+    let elf = oelf::Elf::parse_user(entry.data).map_err(|_| "ELF do serviço inválido")?;
     spawn(&elf, image)
 }
 
@@ -323,26 +333,32 @@ pub fn run_until_exit(thread: &Thread, limit_ns: u64) -> bool {
 
 /// Boot normal: inicia o `root` do bootfs e espera ele terminar.
 pub fn run() {
+    run_named(ROOT_NAME);
+}
+
+/// Inicia o serviço `name` do bootfs no lugar do `root` e espera ele
+/// terminar (`test=user`, T-332).
+pub fn run_named(name: &str) {
     let Some(image) = bootfs() else {
-        warn!("okernel: sem bootfs; root não iniciado");
+        warn!("okernel: sem bootfs; {name} não iniciado");
         return;
     };
-    let process = match load(image) {
+    let process = match load_named(image, name) {
         Ok(p) => p,
         Err(e) => {
-            error!("okernel: root não iniciado: {e}");
+            error!("okernel: {name} não iniciado: {e}");
             return;
         }
     };
     info!(
-        "okernel: root carregado do bootfs ({} KiB), iniciando no anel 3",
+        "okernel: {name} carregado do bootfs ({} KiB), iniciando no anel 3",
         image.len() >> 10
     );
     if run_until_exit(&process.thread, RUN_LIMIT_NS) {
-        info!("okernel: root terminou");
+        info!("okernel: {name} terminou");
     } else {
         error!(
-            "okernel: root não terminou em {} s",
+            "okernel: {name} não terminou em {} s",
             RUN_LIMIT_NS / 1_000_000_000
         );
     }

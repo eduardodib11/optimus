@@ -32,6 +32,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
     ("root", "services/root/src/main.rs", USER_TARGET),
     ("hello", "services/hello/src/main.rs", USER_TARGET),
+    ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
 
@@ -134,6 +135,9 @@ struct Options {
     seed: Option<u64>,
     /// Duração do `stress`, em minutos.
     minutes: u64,
+    /// `test user --falha-proposital`: compila o `utest` com o teste que
+    /// falha de propósito (T-332).
+    fail_on_purpose: bool,
 }
 
 impl Default for Options {
@@ -151,6 +155,7 @@ impl Default for Options {
             seconds: 60,
             seed: None,
             minutes: STRESS_MINUTES,
+            fail_on_purpose: false,
         }
     }
 }
@@ -194,6 +199,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     .map_err(|_| "--seed espera um número (decimal ou 0x…)")?;
                 opts.seed = Some(seed);
             }
+            "--falha-proposital" => opts.fail_on_purpose = true,
             "--rounds" => {
                 opts.rounds = Some(
                     value("--rounds")?
@@ -201,7 +207,7 @@ fn parse(args: &[String]) -> Result<Options> {
                         .map_err(|_| "--rounds espera um número")?,
                 );
             }
-            "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "fuzz" | "all" => {
+            "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -316,7 +322,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" | "okfuzz" => &["-C", "relocation-model=static"],
+        "root" | "hello" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -351,7 +357,12 @@ fn image(opts: &Options, cmdline: &str, rounds: Option<u64>) -> Result<PathBuf> 
 }
 
 /// Serviços do bootfs: (nome na imagem, binário de usuário).
-const BOOTFS: &[(&str, &str)] = &[("root", "root"), ("hello", "hello"), ("okfuzz", "okfuzz")];
+const BOOTFS: &[(&str, &str)] = &[
+    ("root", "root"),
+    ("hello", "hello"),
+    ("utest", "utest"),
+    ("okfuzz", "okfuzz"),
+];
 
 /// Monta o bootfs com `tools/mkobfs` a partir dos binários de usuário e,
 /// com `rounds`, a entrada `hello.rounds` que o `root` lê.
@@ -473,6 +484,15 @@ fn run(opts: &Options) -> Result {
     }
 }
 
+/// Harness de testes que escreve um relatório na serial.
+#[derive(Clone, Copy)]
+enum Harness {
+    /// `ktest`, dentro do kernel.
+    Kernel,
+    /// `utest`, serviço de usuário.
+    User,
+}
+
 /// Um boot de teste: linha de comando, o que a serial precisa (e não pode)
 /// mostrar e como o QEMU deve terminar.
 struct Scenario {
@@ -483,8 +503,9 @@ struct Scenario {
     /// `Some(código)`: o kernel desliga o QEMU com esse código. `None`: a CPU
     /// congela, e o xtask encerra o QEMU assim que todos os marcadores saem.
     exit: Option<i32>,
-    /// Confere e mostra o relatório do harness de testes de kernel (T-111).
-    ktest: bool,
+    /// Harness cujo relatório se confere e se mostra: `ktest` (kernel,
+    /// T-111) ou `utest` (usuário, T-332).
+    harness: Option<Harness>,
     /// Captura a tela pelo monitor do QEMU quando o pânico pedir e confere
     /// a tela de pânico (T-110).
     screen: bool,
@@ -503,7 +524,7 @@ const SCENARIOS: &[Scenario] = &[
         markers: BOOT_MARKERS,
         forbidden: &["okernel: FALTA", "PÂNICO"],
         exit: Some(KERNEL_EXIT_OK),
-        ktest: false,
+        harness: None,
         screen: false,
         rounds: Some(BOOT_ROUNDS),
         hello: true,
@@ -515,7 +536,7 @@ const SCENARIOS: &[Scenario] = &[
         markers: FAULT_MARKERS,
         forbidden: &["okernel: desligando"],
         exit: None,
-        ktest: false,
+        harness: None,
         screen: false,
         rounds: None,
         hello: false,
@@ -531,7 +552,7 @@ const PANIC_SCENARIO: Scenario = Scenario {
     markers: PANIC_MARKERS,
     forbidden: &["okernel: desligando", "okernel: FALTA"],
     exit: Some(KERNEL_EXIT_FAILURE),
-    ktest: false,
+    harness: None,
     screen: true,
     rounds: None,
     hello: false,
@@ -546,7 +567,7 @@ const KERNEL_SCENARIO: Scenario = Scenario {
     markers: &[KTEST_START, KTEST_END],
     forbidden: &["ktest: FALHOU", "okernel: FALTA", "PÂNICO"],
     exit: Some(KERNEL_EXIT_OK),
-    ktest: true,
+    harness: Some(Harness::Kernel),
     screen: false,
     rounds: Some(KTEST_ROUNDS),
     hello: false,
@@ -598,16 +619,36 @@ const HELLO_SCENARIO: Scenario = Scenario {
     markers: BOOT_MARKERS,
     forbidden: &["okernel: FALTA", "PÂNICO"],
     exit: Some(KERNEL_EXIT_OK),
-    ktest: false,
+    harness: None,
     screen: false,
     rounds: Some(HELLO_ROUNDS),
     hello: true,
     timeout: HELLO_TIMEOUT,
 };
+/// Testes de usuário (T-332, `cargo xtask test user`): o kernel inicia o
+/// serviço `utest` do bootfs no lugar do `root`, e ele escreve o relatório
+/// na serial. O kernel sai com 33 quando o `utest` termina; quem diz se os
+/// testes passaram é o relatório (`utest: fim: N ok, 0 falharam`).
+const USER_SCENARIO: Scenario = Scenario {
+    name: "testes de usuário",
+    cmdline: "test=user",
+    markers: &[UTEST_START, UTEST_END],
+    forbidden: &["utest: FALHOU", "ostd: pânico", "okernel: FALTA", "PÂNICO"],
+    exit: Some(KERNEL_EXIT_OK),
+    harness: Some(Harness::User),
+    screen: false,
+    rounds: None,
+    hello: false,
+    timeout: KTEST_TIMEOUT,
+};
+
 /// Primeira linha do harness: `ktest: início, N testes`.
 const KTEST_START: &str = "ktest: início, ";
 /// Última linha do harness: `ktest: fim: N ok, M falharam`.
 const KTEST_END: &str = "ktest: fim: ";
+/// Mesmo relatório do `utest`.
+const UTEST_START: &str = "utest: início, ";
+const UTEST_END: &str = "utest: fim: ";
 
 /// Dá boot em cada cenário e confere a serial com [`check_serial`]; com
 /// mais de um boot, confere também que o mapa direto mudou de lugar.
@@ -718,12 +759,10 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let serial = String::from_utf8_lossy(&raw);
     let result = check_serial(&serial, sc.markers, sc.forbidden)
         .and_then(|()| check_hello(&serial, sc))
-        .and_then(|()| {
-            if sc.ktest {
-                check_ktest(&serial)
-            } else {
-                Ok(())
-            }
+        .and_then(|()| match sc.harness {
+            Some(Harness::Kernel) => check_ktest(&serial),
+            Some(Harness::User) => check_utest(&serial),
+            None => Ok(()),
         })
         .and_then(|()| match (sc.screen, screen) {
             (false, _) => Ok(()),
@@ -741,11 +780,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
         });
     match result {
         Ok(()) => {
-            if sc.ktest {
-                for line in serial.lines().filter_map(|l| l.split_once("ktest: ")) {
-                    println!("  {}", line.1.trim_end());
-                }
-            }
+            show_report(&serial, sc.harness);
             println!("xtask: smoke test de boot ok ({})", sc.name);
             Ok(serial.into_owned())
         }
@@ -848,9 +883,31 @@ fn parse_ppm(bytes: &[u8]) -> Option<(usize, usize, &[u8])> {
         .then_some((width, height, pixels))
 }
 
-/// Confere o relatório do harness: ao menos um teste, todos anunciados
-/// rodaram e passaram.
+/// Mostra as linhas do relatório do harness.
+fn show_report(serial: &str, harness: Option<Harness>) {
+    let prefix = match harness {
+        Some(Harness::Kernel) => "ktest: ",
+        Some(Harness::User) => "utest: ",
+        None => return,
+    };
+    for line in serial.lines().filter_map(|l| l.split_once(prefix)) {
+        println!("  {}", line.1.trim_end());
+    }
+}
+
+/// Confere o relatório do harness de kernel (`ktest`).
 fn check_ktest(serial: &str) -> Result {
+    check_report(serial, "ktest", (KTEST_START, KTEST_END))
+}
+
+/// Confere o relatório do harness de usuário (`utest`, T-332).
+fn check_utest(serial: &str) -> Result {
+    check_report(serial, "utest", (UTEST_START, UTEST_END))
+}
+
+/// Confere o relatório de um harness (`ktest` ou `utest`): ao menos um
+/// teste, todos anunciados rodaram e passaram.
+fn check_report(serial: &str, harness: &str, (start, end): (&str, &str)) -> Result {
     let after = |prefix: &str| {
         serial
             .lines()
@@ -858,15 +915,16 @@ fn check_ktest(serial: &str) -> Result {
     };
     let number =
         |text: Option<&str>| -> Option<usize> { text?.split_whitespace().next()?.parse().ok() };
-    let announced = number(after(KTEST_START)).ok_or("sem a linha de início do ktest")?;
-    let end = after(KTEST_END).ok_or("sem a linha de fim do ktest")?;
-    let passed = number(Some(end)).ok_or("linha de fim do ktest ilegível")?;
-    let ok_lines = serial.lines().filter(|l| l.contains("ktest: ok ")).count();
+    let announced = number(after(start)).ok_or(format!("sem a linha de início do {harness}"))?;
+    let end = after(end).ok_or(format!("sem a linha de fim do {harness}"))?;
+    let passed = number(Some(end)).ok_or(format!("linha de fim do {harness} ilegível"))?;
+    let ok_prefix = format!("{harness}: ok ");
+    let ok_lines = serial.lines().filter(|l| l.contains(&ok_prefix)).count();
     if announced == 0 {
-        return Err("nenhum teste de kernel registrado".into());
+        return Err(format!("nenhum teste do {harness} registrado"));
     }
     if !end.ends_with(", 0 falharam") {
-        return Err(format!("testes de kernel falharam: {end}"));
+        return Err(format!("testes do {harness} falharam: {end}"));
     }
     if passed != announced || ok_lines != announced {
         return Err(format!(
@@ -937,6 +995,16 @@ fn test(opts: &Options) -> Result {
             ..opts.clone()
         };
         smoke(&release, &[HELLO_SCENARIO])?;
+    }
+    if matches!(opts.suite.as_str(), "user" | "all") && !opts.fail_on_purpose {
+        smoke(opts, &[USER_SCENARIO])?;
+    }
+    if opts.suite == "user" && opts.fail_on_purpose {
+        // Compila o `utest` com o teste que falha de propósito: o comando
+        // tem de terminar com erro (o CI confere que o código é ≠ 0).
+        build_with(opts, &[("UTEST_FALHA", "1")])?;
+        boot_scenario(opts, &USER_SCENARIO)?;
+        return Err("o teste que falha de propósito não derrubou o comando".into());
     }
     if matches!(opts.suite.as_str(), "fuzz" | "all") {
         // Rodada curta com semente fixa: breve o bastante para o CI, mas
@@ -1372,6 +1440,36 @@ mod tests {
         let opts = parse(&args(&["hello", "--rounds", "7"])).unwrap();
         assert_eq!((opts.suite.as_str(), opts.rounds), ("hello", Some(7)));
         assert!(parse(&args(&["--rounds", "x"])).is_err());
+    }
+
+    #[test]
+    fn utest_confere_o_relatorio() {
+        let ok = "info  utest: início, 2 testes\r\n\
+                  info  utest: ok a\r\n\
+                  info  utest: ok b\r\n\
+                  info  utest: fim: 2 ok, 0 falharam\r\n";
+        assert_eq!(check_utest(ok), Ok(()));
+        // Teste que falha: o relatório diz, e o `xtask` recusa.
+        let bad = "info  utest: início, 2 testes\r\n\
+                   info  utest: ok a\r\n\
+                   info  utest: FALHOU b: motivo\r\n\
+                   info  utest: fim: 1 ok, 1 falharam\r\n";
+        assert!(check_utest(bad).unwrap_err().contains("falharam"));
+        // Sem relatório (o `utest` morreu no meio): também recusa.
+        assert!(check_utest("info  utest: início, 1 testes\r\n").is_err());
+        assert!(check_utest("").is_err());
+        // Linha ok a menos do que o anunciado.
+        let short = "utest: início, 2 testes\nutest: ok a\nutest: fim: 2 ok, 0 falharam\n";
+        assert!(check_utest(short).is_err());
+        // O cenário também recusa a linha de falha, mesmo com o resto ok.
+        assert!(check_serial(bad, &[UTEST_START], USER_SCENARIO.forbidden).is_err());
+    }
+
+    #[test]
+    fn le_a_suite_user_com_falha_proposital() {
+        let opts = parse(&args(&["user", "--falha-proposital"])).unwrap();
+        assert_eq!((opts.suite.as_str(), opts.fail_on_purpose), ("user", true));
+        assert!(!parse(&args(&["user"])).unwrap().fail_on_purpose);
     }
 
     #[test]
