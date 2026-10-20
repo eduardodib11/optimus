@@ -24,7 +24,7 @@ use kabi::vm::{USER_END, USER_START};
 use kabi::{Error, Handle, ObjectType, Rights, Syscall};
 
 use crate::cap::space::Revoke;
-use crate::cap::{Cap, SharedCapSpace, xcdt};
+use crate::cap::{Cap, Object, SharedCapSpace, default_rights, xcdt};
 use crate::futex::FUTEXES;
 use crate::notify::Wait;
 use crate::sched::Params;
@@ -83,6 +83,9 @@ pub trait Env {
     /// as CPUs fora dela que rodam ou têm na fila uma thread sobre ele
     /// reavaliam quem roda. Volta sem esperar.
     fn affinity_changed(&mut self, _mask: CpuMask) {}
+    /// Põe `va` no `FS_BASE` desta CPU: `thread_configure` mudou o TLS da
+    /// própria thread, que o vê ao voltar da syscall (ADR 0039, item 3).
+    fn load_tls(&mut self, _va: u64) {}
 }
 
 fn handle(raw: u64) -> Result<Handle, Error> {
@@ -161,14 +164,12 @@ pub fn invoke(
             Ok([u64::from(h.raw()), 0, 0])
         }
         Syscall::VmMap => {
-            let (aspace, object) = {
-                let s = space.lock();
-                (s.get(handle(a[0])?)?.clone(), s.get(handle(a[1])?)?.clone())
-            };
+            let object = space.lock().get(handle(a[1])?)?.clone();
+            let aspace = aspace_of(space, a[0], env)?;
             vm_map(&aspace, &object, a[2], a[3], a[4], a[5]).map(|()| [0; 3])
         }
         Syscall::VmUnmap => {
-            let aspace = space.lock().get(handle(a[0])?)?.clone();
+            let aspace = aspace_of(space, a[0], env)?;
             vm_unmap(&aspace, a[1], a[2]).map(|()| [0; 3])
         }
         Syscall::VmProtect => {
@@ -210,9 +211,27 @@ pub fn invoke(
             t.bind_sched(Arc::clone(sc_obj))?;
             Ok([0; 3])
         }
-        Syscall::ThreadConfigure => thread_configure(space, a).map(|()| [0; 3]),
+        Syscall::ThreadConfigure => thread_configure(space, a, env).map(|()| [0; 3]),
         _ => invoke_sync(space, call, a, env),
     }
+}
+
+/// O espaço de `vm_map`/`vm_unmap`: a capability de `raw` ou, com
+/// [`kabi::vm::SELF`], o espaço da thread que chama, com os direitos que um
+/// `AddressSpace` recém-criado dá (`MAP` e `UNMAP`; ADR 0039, item 2).
+fn aspace_of(space: &SharedCapSpace, raw: u64, env: &dyn Env) -> Result<Cap, Error> {
+    if raw != kabi::vm::SELF {
+        return Ok(space.lock().get(handle(raw)?)?.clone());
+    }
+    let own = env
+        .current()
+        .and_then(|t| t.aspace())
+        .ok_or(Error::InvalidHandle)?;
+    Ok(Cap {
+        object: Object::AddressSpace(own),
+        rights: default_rights(ObjectType::AddressSpace),
+        badge: 0,
+    })
 }
 
 /// Máscara de afinidade de `sched_configure` (`r8`, ADR 0032, item 4): uma
@@ -252,16 +271,29 @@ fn mint(space: &Arc<SharedCapSpace>, a: [u64; 6]) -> Result<Values, Error> {
     Ok([u64::from(h.raw()), 0, 0])
 }
 
-/// `thread_configure(thread, cspace, aspace, buffer, exceção, flags)`
-/// (ADR 0029): confere tudo antes de mudar qualquer campo.
-fn thread_configure(space: &SharedCapSpace, a: [u64; 6]) -> Result<(), Error> {
-    use kabi::thread::{CONFIGURE_ALL, CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER};
+/// `thread_configure(thread, cspace, aspace, buffer ou TLS, exceção,
+/// flags)` (ADR 0029 e ADR 0039, item 3): confere tudo antes de mudar
+/// qualquer campo. `thread = SELF` é a própria, sem capability, e não liga
+/// `CapSpace` nem `AddressSpace`.
+fn thread_configure(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<(), Error> {
+    use kabi::thread::{CONFIGURE_ALL, CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER, CONFIGURE_TLS};
     let flags = a[5];
-    if flags & !CONFIGURE_ALL != 0 {
+    let buffer = flags & CONFIGURE_IPC_BUFFER != 0;
+    let tls = flags & CONFIGURE_TLS != 0;
+    // As duas usam `r10`.
+    if flags & !CONFIGURE_ALL != 0 || (buffer && tls) {
         return Err(Error::InvalidArgument);
     }
-    let thread = cap_with(space, a[0], Rights::WRITE_STATE)?;
-    let t = thread.object.as_thread()?;
+    let me = env.current();
+    let t = if a[0] == kabi::thread::SELF {
+        if a[1] != 0 || a[2] != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        me.clone().ok_or(Error::InvalidHandle)?
+    } else {
+        let thread = cap_with(space, a[0], Rights::WRITE_STATE)?;
+        Arc::clone(thread.object.as_thread()?)
+    };
     let bind = match (a[1], a[2]) {
         (0, 0) => None,
         (0, _) | (_, 0) => return Err(Error::InvalidArgument),
@@ -274,8 +306,7 @@ fn thread_configure(space: &SharedCapSpace, a: [u64; 6]) -> Result<(), Error> {
             ))
         }
     };
-    let buffer = flags & CONFIGURE_IPC_BUFFER != 0;
-    if buffer && !Thread::valid_ipc_buffer(a[3]) {
+    if (buffer && !Thread::valid_ipc_buffer(a[3])) || (tls && !Thread::valid_tls(a[3])) {
         return Err(Error::InvalidArgument);
     }
     let exception = if flags & CONFIGURE_EXCEPTION != 0 {
@@ -291,6 +322,12 @@ fn thread_configure(space: &SharedCapSpace, a: [u64; 6]) -> Result<(), Error> {
     }
     if let Some(h) = exception {
         t.set_exception_handler(h);
+    }
+    if tls {
+        t.set_tls(a[3])?;
+        if me.is_some_and(|m| Arc::ptr_eq(&m, &t)) {
+            env.load_tls(a[3]);
+        }
     }
     Ok(())
 }

@@ -36,6 +36,7 @@ struct Fake {
     current: Option<Arc<Thread>>,
     user: Vec<(u64, Vec<u8>)>,
     changed: Vec<CpuMask>,
+    tls_loads: Vec<u64>,
 }
 
 impl Env for Fake {
@@ -77,6 +78,9 @@ impl Env for Fake {
     }
     fn affinity_changed(&mut self, mask: CpuMask) {
         self.changed.push(mask);
+    }
+    fn load_tls(&mut self, va: u64) {
+        self.tls_loads.push(va);
     }
 }
 
@@ -491,5 +495,161 @@ fn thread_configure_confere_tudo_antes() {
         (thread.ipc_buffer(), thread.exception_handler()),
         (Some(buf), None)
     );
+    thread.set_state(crate::thread::RunState::Exited);
+}
+
+#[test]
+fn thread_configure_do_tls_e_da_propria_thread() {
+    use kabi::thread::{CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER, CONFIGURE_TLS, SELF};
+    use kabi::vm::USER_END;
+    platform::install(fake_platform(1000).1);
+    let (_root, space, q) = setup();
+    let me_h = create(&space, q, ObjectType::Thread);
+    let other_h = create(&space, q, ObjectType::Thread);
+    let me = Arc::clone(get(&space, me_h).object.as_thread().unwrap());
+    let other = Arc::clone(get(&space, other_h).object.as_thread().unwrap());
+    let mut env = Fake {
+        current: Some(Arc::clone(&me)),
+        ..Fake::default()
+    };
+    let conf =
+        |args: [u64; 6], env: &mut Fake| invoke(&space, Syscall::ThreadConfigure, args, 4, env);
+    let tls = 0x7000_1234;
+    // A própria, sem capability: vale na hora (`load_tls`).
+    assert_eq!(
+        conf([SELF, 0, 0, tls, 0, CONFIGURE_TLS], &mut env),
+        Ok([0; 3])
+    );
+    assert_eq!((me.tls(), env.tls_loads.as_slice()), (tls, &[tls][..]));
+    // Pela capability da própria thread também vale na hora.
+    assert_eq!(
+        conf([me_h, 0, 0, 0, 0, CONFIGURE_TLS], &mut env),
+        Ok([0; 3])
+    );
+    assert_eq!((me.tls(), env.tls_loads.as_slice()), (0, &[tls, 0][..]));
+    // Outra thread, pela capability: grava sem tocar o MSR desta CPU.
+    assert_eq!(
+        conf([other_h, 0, 0, tls, 0, CONFIGURE_TLS], &mut env),
+        Ok([0; 3])
+    );
+    assert_eq!((other.tls(), env.tls_loads.len()), (tls, 2));
+    // Recusas: nada muda.
+    for bad in [
+        USER_END,
+        0x0000_8000_0000_1000,
+        0xffff_8000_0000_0000,
+        u64::MAX,
+    ] {
+        assert_eq!(
+            conf([SELF, 0, 0, bad, 0, CONFIGURE_TLS], &mut env),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(
+            conf([other_h, 0, 0, bad, 0, CONFIGURE_TLS], &mut env),
+            Err(Error::InvalidArgument)
+        );
+    }
+    let both = CONFIGURE_TLS | CONFIGURE_IPC_BUFFER;
+    assert_eq!(
+        conf([SELF, 0, 0, 0x50_0000, 0, both], &mut env),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(
+        conf([SELF, 1, 1, tls, 0, CONFIGURE_TLS], &mut env),
+        Err(Error::InvalidArgument),
+        "thread = 0 não liga CapSpace nem AddressSpace"
+    );
+    assert_eq!(
+        conf([0x00ab_cdef, 0, 0, tls, 0, CONFIGURE_TLS], &mut env),
+        Err(Error::InvalidHandle)
+    );
+    let read = u64::from(Rights::READ_STATE.bits());
+    let [ro, ..] = call(&space, Syscall::CapMint, [other_h, read, 0, 0, 0, 0]).unwrap();
+    assert_eq!(
+        conf([ro, 0, 0, 0, 0, CONFIGURE_TLS], &mut env),
+        Err(Error::AccessDenied)
+    );
+    assert_eq!((me.tls(), other.tls(), env.tls_loads.len()), (0, tls, 2));
+    // Buffer e exceção na própria, sem capability.
+    let flags = CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION;
+    assert_eq!(
+        conf([SELF, 0, 0, 0x50_0000, 9, flags], &mut env),
+        Ok([0; 3])
+    );
+    assert_eq!(me.ipc_buffer(), Some(0x50_0000));
+    assert_eq!(me.exception_handler(), Some(Handle::from_raw(9)));
+    // Sem thread atual (o kernel), `thread = 0` não acha ninguém.
+    assert_eq!(
+        call(
+            &space,
+            Syscall::ThreadConfigure,
+            [SELF, 0, 0, tls, 0, CONFIGURE_TLS]
+        ),
+        Err(Error::InvalidHandle)
+    );
+}
+
+#[test]
+fn vm_map_e_unmap_no_proprio_espaco() {
+    use kabi::vm::SELF;
+    platform::install(fake_platform(1000).1);
+    let (_root, space, q) = setup();
+    let t = create(&space, q, ObjectType::Thread);
+    let cs = create(&space, q, ObjectType::CapSpace);
+    let a = create(&space, q, ObjectType::AddressSpace);
+    let [m, ..] = call(
+        &space,
+        Syscall::ObjCreate,
+        [q, ObjectType::MemoryObject.to_raw(), PAGE_SIZE, 0, 0, 0],
+    )
+    .unwrap();
+    let thread = Arc::clone(get(&space, t).object.as_thread().unwrap());
+    let va = 0x40_0000;
+    // Sem thread atual (ou sem espaço ligado), `aspace = 0` não acha nada.
+    assert_eq!(
+        call(&space, Syscall::VmMap, [SELF, m, va, 0, PAGE_SIZE, WRITE]),
+        Err(Error::InvalidHandle)
+    );
+    let mut env = Fake {
+        current: Some(Arc::clone(&thread)),
+        ..Fake::default()
+    };
+    let sys = |c, args: [u64; 6], env: &mut Fake| invoke(&space, c, args, 4, env);
+    assert_eq!(
+        sys(Syscall::VmMap, [SELF, m, va, 0, PAGE_SIZE, WRITE], &mut env),
+        Err(Error::InvalidHandle)
+    );
+    assert_eq!(
+        sys(Syscall::ThreadConfigure, [t, cs, a, 0, 0, 0], &mut env),
+        Ok([0; 3])
+    );
+    assert_eq!(
+        sys(Syscall::VmMap, [SELF, m, va, 0, PAGE_SIZE, WRITE], &mut env),
+        Ok([0; 3])
+    );
+    // O mapeamento está no espaço `a`: mapear lá de novo colide.
+    assert_eq!(
+        sys(Syscall::VmMap, [a, m, va, 0, PAGE_SIZE, WRITE], &mut env),
+        Err(Error::InvalidArgument)
+    );
+    let aspace = thread.aspace().unwrap();
+    assert!(aspace.lock().query(va).is_some());
+    assert_eq!(
+        sys(Syscall::VmUnmap, [SELF, va, PAGE_SIZE, 0, 0, 0], &mut env),
+        Ok([0; 3])
+    );
+    assert!(aspace.lock().query(va).is_none());
+    // Os direitos do objeto continuam valendo.
+    let read = u64::from((Rights::READ | Rights::MAP).bits());
+    let [m_ro, ..] = call(&space, Syscall::CapMint, [m, read, 0, 0, 0, 0]).unwrap();
+    assert_eq!(
+        sys(
+            Syscall::VmMap,
+            [SELF, m_ro, va, 0, PAGE_SIZE, WRITE],
+            &mut env
+        ),
+        Err(Error::AccessDenied)
+    );
+    drop(aspace);
     thread.set_state(crate::thread::RunState::Exited);
 }

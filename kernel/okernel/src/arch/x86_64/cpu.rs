@@ -162,6 +162,33 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     unsafe { asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nostack)) };
 }
 
+/// MSR `IA32_FS_BASE`: a base do segmento FS, o TLS do usuário (ADR 0039,
+/// item 3). O kernel não usa FS.
+pub const MSR_FS_BASE: u32 = 0xc000_0100;
+
+/// Põe `va` (o TLS da thread que vai rodar) em `IA32_FS_BASE`, só se a CPU
+/// tiver outro valor (ADR 0039, item 3).
+///
+/// Compara com o valor que está na CPU, lido com RDMSR, e não com o da
+/// thread que saiu: o usuário muda o `FS_BASE` sem o kernel saber ao
+/// carregar um seletor em FS (`mov fs, ax` zera a base em CPUs Intel e
+/// copia a do descritor, também zero, em todas), e esse valor vazaria para
+/// a próxima thread se a troca confiasse no campo da anterior.
+///
+/// Um `va` fora da metade de usuário (o `thread_configure` já os recusa)
+/// vira zero, porque o `WRMSR` com endereço não canônico daria #GP aqui.
+pub fn load_user_fs_base(va: u64) {
+    let va = if va < kabi::vm::USER_END { va } else { 0 };
+    // SAFETY: `IA32_FS_BASE` existe em toda CPU x86-64; o valor é
+    // canônico (metade baixa) e o kernel não usa FS, então só o usuário o
+    // vê.
+    unsafe {
+        if rdmsr(MSR_FS_BASE) != va {
+            wrmsr(MSR_FS_BASE, va);
+        }
+    }
+}
+
 /// Lê o contador de tempo (TSC).
 pub fn rdtsc() -> u64 {
     // SAFETY: RDTSC só lê o contador; o kernel não liga CR4.TSD.

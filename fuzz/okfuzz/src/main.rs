@@ -78,6 +78,11 @@ fn noise(mut rng: Rng, until: u64) {
                 fuzzer::wild(&mut rng),
                 fuzzer::wild(&mut rng),
             ];
+            // `aspace = 0` é o próprio espaço (ADR 0039): um `vm_unmap` ao
+            // acaso nele derrubaria o fuzzer (código e pilha).
+            if nr == Syscall::VmUnmap as u64 && args[0] == ostd::kabi::vm::SELF {
+                continue;
+            }
             let _ = ostd::sys::call(nr, args);
             count += 1;
         }

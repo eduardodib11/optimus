@@ -9,7 +9,8 @@
  * 0x80000000 = depuração dos testes (kabi::DEBUG_PRINT),
  * 18 = ipc_send, 19 = ipc_recv, 20 = ipc_call, 21 = ipc_reply_recv,
  * 23 = ntfy_wait, 25 = obj_bind_notify, 26 = irq_ack, 27 = clock_get,
- * 28 = yield, 29 = futex_wait, 30 = futex_wake, 33 = thread_exit.
+ * 28 = yield, 29 = futex_wait, 30 = futex_wake, 33 = thread_exit
+ * (rdi = código, rsi = flags: zero), 10 = thread_configure.
  */
 
 .section .rodata.user_test, "a"
@@ -43,6 +44,7 @@ user_alternate:
     syscall
     dec r13
     jnz 1b
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -59,6 +61,7 @@ user_spin:
     syscall
     cmp rdx, r12
     jb 1b
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -86,6 +89,7 @@ user_irq_wait:
     mov eax, 26
     syscall
     mov qword ptr [r14 + 24], rax
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -144,6 +148,7 @@ user_mutex:
     inc r15
     cmp r15, r14
     jb 1b
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -216,6 +221,7 @@ user_ipc_server:
 9:
     mov rcx, [rsp]
     mov [rcx], rax
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -287,6 +293,7 @@ user_ipc_client:
 9:
     mov rcx, [rsp + 8]
     mov [rcx], rax
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -318,6 +325,7 @@ user_ipc_send_cap:
     syscall
     mov [rbp + 24], rax
 1:
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -350,6 +358,7 @@ user_ipc_recv:
     mov [rbp + 40], rdx
     mov eax, dword ptr [rbp]
     mov [rbp + 48], rax
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -382,6 +391,7 @@ user_fault:
     mov rax, qword ptr [0]
 1:
     mov qword ptr [rsi], 2
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -397,6 +407,7 @@ user_fault_read:
     mov rax, qword ptr [rdi]
     mov qword ptr [rsi + 8], rax
     mov qword ptr [rsi], 2
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -447,6 +458,7 @@ user_fault_handler:
     syscall
     mov [rbp + 72], rax
 1:
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -493,6 +505,7 @@ user_bench_ipc_client:
     mov rcx, [rsp]
     mov qword ptr [rcx], -1
 9:
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -530,6 +543,7 @@ user_bench_ipc_server:
     mov eax, 18
     syscall
 9:
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -562,6 +576,7 @@ user_bench_yield:
 2:
     dec rbx
     jnz 1b
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -606,6 +621,7 @@ user_pingpong:
     syscall
     dec r14
     jnz 1b
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -623,6 +639,7 @@ user_wait_cpu:
     mov qword ptr [r12 + 8], rdx
     rdtscp
     mov qword ptr [r12 + 16], rcx
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -638,6 +655,7 @@ user_spin_flag:
     pause
     cmp qword ptr [rdi], 0
     je 1b
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -691,6 +709,7 @@ user_tlb_reader:
     mov qword ptr [rsi + 8], r12
     jmp 1b
 9:
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -790,6 +809,7 @@ user_cap_churn:
 81: inc qword ptr [r12 + 24]
     ret
 9:  mov qword ptr [r12], rax
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2
@@ -822,6 +842,77 @@ user_where:
 2:  pause
     cmp qword ptr [r12 + 16], 0
     je 1b
+    xor esi, esi              /* thread_exit sem flags */
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_tls(rdi = TLS, rsi = voltas | modo << 32, rdx = página RW)
+ *
+ * T-333: a página do TLS começa com o próprio endereço (o ponteiro para si
+ * do ABI x86-64), então fs:[0] tem de ser igual a rdi em toda volta. Modo,
+ * bit 0: a thread fixa o próprio TLS (thread_configure(0, 0, 0, rdi, 0,
+ * CONFIGURE_TLS)); sem ele, o kernel já o fixou antes da partida. Bit 1: em
+ * vez de ler, a cada volta carrega o seletor de dados do usuário em FS, o
+ * que zera o FS_BASE da CPU sem o kernel saber, e cede a CPU assim. Grava: [0] status
+ * do thread_configure (0 sem o bit 0), [8] leituras erradas, [16] voltas,
+ * [24] CPU da última volta (TSC_AUX), [32] e [40] status de thread_exit
+ * com EXIT_GROUP e com flag desconhecida; sai com o código = voltas. */
+.global user_tls
+user_tls:
+    mov r12, rdi
+    mov r13d, esi
+    mov r15, rsi
+    shr r15, 32
+    mov r14, rdx
+    xor eax, eax
+    test r15, 1
+    jz 1f
+    xor edi, edi
+    xor esi, esi
+    xor edx, edx
+    mov r10, r12
+    xor r8d, r8d
+    mov r9d, 4
+    mov eax, 10
+    syscall
+1:
+    mov qword ptr [r14], rax
+    xor ebx, ebx
+    xor ebp, ebp
+2:
+    test r15, 2
+    jz 3f
+    mov eax, 0x23
+    mov fs, ax
+    jmp 4f
+3:
+    mov rax, qword ptr fs:[0]
+    cmp rax, r12
+    je 4f
+    inc rbx
+4:
+    inc rbp
+    mov eax, 28
+    syscall
+    cmp rbp, r13
+    jb 2b
+    mov qword ptr [r14 + 8], rbx
+    mov qword ptr [r14 + 16], rbp
+    rdtscp
+    mov qword ptr [r14 + 24], rcx
+    xor edi, edi
+    mov esi, 1
+    mov eax, 33
+    syscall
+    mov qword ptr [r14 + 32], rax
+    xor edi, edi
+    mov esi, 2
+    mov eax, 33
+    syscall
+    mov qword ptr [r14 + 40], rax
+    mov rdi, rbp
+    xor esi, esi              /* thread_exit sem flags */
     mov eax, 33
     syscall
     ud2

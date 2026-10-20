@@ -12,12 +12,13 @@
 //! (`.ostd_entry`) a seção de dados de todo símbolo chamado `OSTD_ENTRY` e
 //! confere que há exatamente um.
 //!
-//! O alocador global ([`crate::alloc`]) precisa da cota e do espaço de
-//! endereços do processo, que o kernel entrega nos valores de entrada em
-//! posições que variam de processo para processo (o `root` e o `utest`
-//! recebem a cota em `rdi` e o espaço em `rsi`; o `hello`, os dois juntos
-//! em `rsi`). Por isso a função principal chama [`init`] com esses handles
-//! antes da primeira alocação; alocar antes disso aborta o processo.
+//! O alocador global ([`crate::alloc`]) precisa da cota do processo, que o
+//! kernel entrega nos valores de entrada em posições que variam de processo
+//! para processo (o `root` e o `utest` recebem a cota em `rdi`; o `hello`,
+//! junto com o espaço em `rsi`). Por isso a função principal chama [`init`]
+//! com esse handle antes da primeira alocação; alocar antes disso aborta o
+//! processo. O espaço de endereços não precisa de handle: o alocador mapeia
+//! com `aspace = 0`, o espaço de quem chama (ADR 0039, item 2).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -35,13 +36,9 @@ pub struct Start {
 pub struct Env {
     /// Cota de memória do processo (com o direito `CREATE`).
     pub quota: Handle,
-    /// Espaço de endereços do próprio processo. A T-333 (ADR 0039) passa a
-    /// aceitar `aspace = 0` como "o espaço de quem chama" e este campo some.
-    pub aspace: Handle,
 }
 
 static ENV_QUOTA: AtomicU32 = AtomicU32::new(0);
-static ENV_ASPACE: AtomicU32 = AtomicU32::new(0);
 static ENV_READY: AtomicBool = AtomicBool::new(false);
 
 /// Registra os handles do runtime. Chame uma vez, no começo da função
@@ -60,7 +57,6 @@ pub fn init(env: Env) {
         return;
     }
     ENV_QUOTA.store(env.quota.raw(), Ordering::Relaxed);
-    ENV_ASPACE.store(env.aspace.raw(), Ordering::Relaxed);
     ENV_READY.store(true, Ordering::Release);
 }
 
@@ -69,7 +65,6 @@ pub fn init(env: Env) {
 pub fn env() -> Option<Env> {
     ENV_READY.load(Ordering::Acquire).then(|| Env {
         quota: Handle::from_raw(ENV_QUOTA.load(Ordering::Relaxed)),
-        aspace: Handle::from_raw(ENV_ASPACE.load(Ordering::Relaxed)),
     })
 }
 
@@ -104,5 +99,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     if let Some(at) = info.location() {
         crate::debug::print(at.file());
     }
-    crate::thread::exit()
+    // O pânico encerra o processo (ADR 0039, item 5); enquanto o kernel não
+    // tem `EXIT_GROUP` (T-348), encerra só a thread, com o mesmo código.
+    let _ = crate::thread::exit_group(kabi::exit::PANIC_CODE);
+    crate::thread::exit_with(kabi::exit::PANIC_CODE)
 }

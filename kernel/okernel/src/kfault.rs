@@ -67,6 +67,7 @@ pub fn user_exception(frame: &TrapFrame, cr2: u64) {
         return;
     };
     let thread = Arc::as_ptr(&me).addr();
+    me.record_death(kabi::exit::CAUSE_FAULTED, fault.vector, fault.addr);
     // `exit_current` nunca volta: nada pode ficar vivo nesta pilha.
     drop(me);
     let (name, what) = exception_name(fault.vector);

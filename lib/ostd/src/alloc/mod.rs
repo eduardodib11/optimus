@@ -226,7 +226,7 @@ unsafe impl PageSource for KernelSource {
                 return null_mut();
             };
             let mapped = cap::create(env.quota, ObjectType::MemoryObject, len).and_then(|object| {
-                let mapped = vm::map(env.aspace, object, va, 0, len, WRITE);
+                let mapped = vm::map(vm::SELF, object, va, 0, len, WRITE);
                 // A região guarda o objeto; sem ela o `vm_unmap` o destrói e
                 // devolve a cota, então o handle não faz mais falta.
                 let _ = cap::delete(object);
@@ -243,11 +243,11 @@ unsafe impl PageSource for KernelSource {
     }
 
     unsafe fn free_segments(&self, base: *mut u8, count: usize) {
-        if let Some(env) = rt::env() {
+        if rt::env().is_some() {
             let start = base.addr() as u64;
             let len = (count * SEGMENT_SIZE) as u64;
             self.ranges.with(|ranges| {
-                let _ = vm::unmap(env.aspace, start, len);
+                let _ = vm::unmap(vm::SELF, start, len);
                 ranges.release(start, len);
             });
         }
