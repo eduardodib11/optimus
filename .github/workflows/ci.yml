@@ -59,15 +59,15 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: A lib/oalloc mudou neste PR?
+      - name: O oalloc, a toolchain ou este workflow mudaram neste PR?
         id: changed
         run: |
           base="origin/${{ github.base_ref }}"
-          if git diff --name-only "$base"...HEAD | grep -q '^lib/oalloc/'; then
+          if git diff --name-only "$base"...HEAD | grep -Eq '^(lib/oalloc/|Cargo\.lock|rust-toolchain\.toml|\.github/workflows/ci\.yml)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "lib/oalloc não mudou: Miri não roda."
+            echo "Nada que afete o oalloc mudou: Miri não roda."
           fi
       - name: Nightly com Miri (único uso de nightly no CI; data fixada)
         if: steps.changed.outputs.run == 'true'

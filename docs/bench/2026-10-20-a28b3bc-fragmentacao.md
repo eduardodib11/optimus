@@ -57,3 +57,11 @@ As classes de tamanho param em 8 KiB, então um pedido de 8 KiB a 64 KiB ocupa u
 3. Páginas médias de 512 KiB para a faixa de 8 a 64 KiB.
 
 A recomendação é decidir com uma carga real (T-337, coleções) em vez de agora; o `oalloc` já separa a tabela de classes (`class.rs`), então trocar é local.
+
+## Pendências de revisão para a T-337
+
+Achados da revisão que ficam para depois, junto da T-337 (coleções, strings e aleatoriedade):
+
+- **Ponteiro interior no 2º segmento de um bloco enorme.** O cabeçalho do segmento é achado por `ptr & !(2 MiB - 1)`; um ponteiro interior no segundo segmento de um bloco enorme (de vários segmentos) cai num "cabeçalho" que é dado do usuário. O `owns` só confere a janela. Resolver ao ter a entropia (sorteio de endereços) e um mapa de segmentos de blocos enormes.
+- **Janela de `SAFETY:`.** O `xtask` aceita o comentário até 8 linhas antes do `unsafe` (sem outro `unsafe` no meio); apertar para o comentário imediatamente acima.
+- **`unsafe fn` sem `# Safety`.** A política exige `// SAFETY:` em blocos e `impl`, mas não a seção `# Safety` na documentação de `unsafe fn`; acrescentar ao `xtask` junto com o `clippy::missing_safety_doc`.

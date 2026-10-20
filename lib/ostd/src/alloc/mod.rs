@@ -48,7 +48,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use kabi::ObjectType;
 use kabi::vm::WRITE;
@@ -65,22 +65,147 @@ const WINDOW_BASE: u64 = 0x0000_1000_0000_0000;
 /// Tamanho da janela: 16 TiB.
 const WINDOW_SIZE: u64 = 1 << 44;
 
+/// Quantas faixas devolvidas a [`KernelSource`] guarda para reaproveitar.
+const FREE_RANGES: usize = 64;
+
+/// Estado dos endereços da janela, sempre sob a trava da [`KernelSource`].
+struct Ranges {
+    /// Primeiro endereço nunca entregue: tudo de `WINDOW_BASE` até aqui já
+    /// foi reservado alguma vez.
+    next: u64,
+    /// Faixas `(início, tamanho)` devolvidas e ainda sem dono, prontas para
+    /// reaproveitar. As `len` primeiras entradas valem.
+    free: [(u64, u64); FREE_RANGES],
+    len: usize,
+}
+
+impl Ranges {
+    const fn new() -> Self {
+        Self {
+            next: WINDOW_BASE,
+            free: [(0, 0); FREE_RANGES],
+            len: 0,
+        }
+    }
+
+    /// Reserva `len` bytes: primeiro numa faixa devolvida (a primeira que
+    /// couber), senão avançando `next`. `None` se a janela acabou.
+    fn reserve(&mut self, len: u64) -> Option<u64> {
+        for i in 0..self.len {
+            let (start, size) = self.free[i];
+            if size >= len {
+                if size == len {
+                    self.len -= 1;
+                    self.free[i] = self.free[self.len];
+                } else {
+                    self.free[i] = (start + len, size - len);
+                }
+                return Some(start);
+            }
+        }
+        let end = self
+            .next
+            .checked_add(len)
+            .filter(|&e| e <= WINDOW_BASE + WINDOW_SIZE)?;
+        let start = self.next;
+        self.next = end;
+        Some(start)
+    }
+
+    /// Devolve a faixa `[start, start + len)`: junta com a vizinha livre, ou
+    /// recua `next` se ela é a última da janela, ou ocupa uma entrada livre.
+    /// Com a lista cheia a faixa se perde (o endereço não volta a ser
+    /// entregue), e `owns` continua a dar `true` para ela; é o caso aceito
+    /// de esgotar a janela mais cedo, só depois de 64 faixas soltas e
+    /// separadas ao mesmo tempo.
+    fn release(&mut self, start: u64, len: u64) {
+        let end = start + len;
+        if end == self.next {
+            self.next = start;
+            // A faixa livre que agora toca `next` também recua.
+            while let Some(i) =
+                (0..self.len).find(|&i| self.free[i].0 + self.free[i].1 == self.next)
+            {
+                self.next = self.free[i].0;
+                self.len -= 1;
+                self.free[i] = self.free[self.len];
+            }
+            return;
+        }
+        for i in 0..self.len {
+            let (s, l) = self.free[i];
+            if s + l == start {
+                self.free[i].1 += len;
+                self.merge_after(i);
+                return;
+            }
+            if end == s {
+                self.free[i] = (start, l + len);
+                self.merge_before(i);
+                return;
+            }
+        }
+        if self.len < FREE_RANGES {
+            self.free[self.len] = (start, len);
+            self.len += 1;
+        }
+    }
+
+    /// Depois de crescer a entrada `i` para a direita, absorve a que começa
+    /// onde ela termina.
+    fn merge_after(&mut self, i: usize) {
+        let end = self.free[i].0 + self.free[i].1;
+        if let Some(j) = (0..self.len).find(|&j| j != i && self.free[j].0 == end) {
+            self.free[i].1 += self.free[j].1;
+            self.len -= 1;
+            self.free[j] = self.free[self.len];
+        }
+    }
+
+    /// Depois de crescer a entrada `i` para a esquerda, absorve a que termina
+    /// onde ela começa.
+    fn merge_before(&mut self, i: usize) {
+        let start = self.free[i].0;
+        if let Some(j) = (0..self.len).find(|&j| j != i && self.free[j].0 + self.free[j].1 == start)
+        {
+            self.free[j].1 += self.free[i].1;
+            self.len -= 1;
+            self.free[i] = self.free[self.len];
+        }
+    }
+
+    /// `addr` está numa faixa entregue e ainda não devolvida?
+    fn owns(&self, addr: u64) -> bool {
+        (WINDOW_BASE..self.next).contains(&addr)
+            && !self.free[..self.len]
+                .iter()
+                .any(|&(s, l)| (s..s + l).contains(&addr))
+    }
+}
+
 /// De onde o alocador tira segmentos: `MemoryObject` mapeado numa janela.
 ///
-/// Os endereços saem em ordem, de `WINDOW_BASE` para cima, sem reuso: o
-/// sorteio com 23 bits de entropia (ADR 0039, item 2) precisa do `sys_info`
-/// de entropia da T-337, que ainda não existe. Quando existir, o sorteio
-/// troca o contador, com nova tentativa se `vm_map` achar a faixa ocupada, e
-/// a janela volta a poder ser reaproveitada. Até lá, a janela dá 8 milhões de
-/// mapeamentos de 2 MiB por processo.
+/// Os endereços saem de `WINDOW_BASE` para cima, mas as faixas devolvidas por
+/// `free_segments` são reaproveitadas antes de avançar (uma lista de
+/// `FREE_RANGES` faixas, sem alocar), então um serviço que aloca e libera um
+/// bloco enorme em laço não gasta a janela. O sorteio com 23 bits de
+/// entropia (ADR 0039, item 2) precisa do `sys_info` de entropia da T-337,
+/// que ainda não existe; quando existir, o sorteio troca a escolha da faixa,
+/// com nova tentativa se `vm_map` achar a faixa ocupada. Até lá, a janela dá
+/// 8 milhões de mapeamentos de 2 MiB por processo; se a lista de faixas
+/// livres lotar, a faixa devolvida se perde e a janela gasta mais depressa.
+///
+/// A trava cobre a reserva, o mapeamento e a devolução inteiros, então
+/// `owns` nunca vê uma faixa reservada e ainda não mapeada: ela só conta como
+/// "do alocador" depois de mapeada e até o `free_segments`.
 pub struct KernelSource {
-    next: AtomicU64,
+    ranges: Locked<Ranges>,
 }
 
 impl KernelSource {
     const fn new() -> Self {
         Self {
-            next: AtomicU64::new(WINDOW_BASE),
+            ranges: Locked::new(Ranges::new()),
         }
     }
 }
@@ -96,45 +221,40 @@ unsafe impl PageSource for KernelSource {
             return null_mut();
         };
         let len = len as u64;
-        let reserved = self
-            .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                n.checked_add(len)
-                    .filter(|&end| end <= WINDOW_BASE + WINDOW_SIZE)
+        self.ranges.with(|ranges| {
+            let Some(va) = ranges.reserve(len) else {
+                return null_mut();
+            };
+            let mapped = cap::create(env.quota, ObjectType::MemoryObject, len).and_then(|object| {
+                let mapped = vm::map(env.aspace, object, va, 0, len, WRITE);
+                // A região guarda o objeto; sem ela o `vm_unmap` o destrói e
+                // devolve a cota, então o handle não faz mais falta.
+                let _ = cap::delete(object);
+                mapped
             });
-        let Ok(va) = reserved else {
-            return null_mut();
-        };
-        let mapped = cap::create(env.quota, ObjectType::MemoryObject, len).and_then(|object| {
-            let mapped = vm::map(env.aspace, object, va, 0, len, WRITE);
-            // A região guarda o objeto; sem ela o `vm_unmap` o destrói e
-            // devolve a cota, então o handle não faz mais falta.
-            let _ = cap::delete(object);
-            mapped
-        });
-        if mapped.is_err() {
-            // Devolve a faixa reservada se ninguém reservou depois dela, para
-            // que pedidos que falham (cota) não gastem a janela.
-            let _ = self
-                .next
-                .compare_exchange(va + len, va, Ordering::Relaxed, Ordering::Relaxed);
-            return null_mut();
-        }
-        core::ptr::with_exposed_provenance_mut(usize::try_from(va).unwrap_or(0))
+            if mapped.is_err() {
+                // Devolve a faixa se o mapeamento falhou (cota), para que
+                // pedidos que falham não gastem a janela.
+                ranges.release(va, len);
+                return null_mut();
+            }
+            core::ptr::with_exposed_provenance_mut(usize::try_from(va).unwrap_or(0))
+        })
     }
 
     unsafe fn free_segments(&self, base: *mut u8, count: usize) {
         if let Some(env) = rt::env() {
-            let _ = vm::unmap(
-                env.aspace,
-                base.addr() as u64,
-                (count * SEGMENT_SIZE) as u64,
-            );
+            let start = base.addr() as u64;
+            let len = (count * SEGMENT_SIZE) as u64;
+            self.ranges.with(|ranges| {
+                let _ = vm::unmap(env.aspace, start, len);
+                ranges.release(start, len);
+            });
         }
     }
 
     fn owns(&self, addr: usize) -> bool {
-        (WINDOW_BASE..self.next.load(Ordering::Relaxed)).contains(&(addr as u64))
+        self.ranges.with(|ranges| ranges.owns(addr as u64))
     }
 
     /// Sem a entropia do kernel (T-337), o relógio dá uma semente fraca: o
@@ -144,10 +264,19 @@ unsafe impl PageSource for KernelSource {
     }
 
     fn fault(&self, fault: Fault) -> ! {
+        // A thread morre possivelmente com a trava do heap tomada. Sem isto,
+        // as outras girariam para sempre nela: `Locked::with` encerra quem
+        // achar o alocador envenenado. O `abort` do processo todo vem com o
+        // `EXIT_GROUP` (T-333, ADR 0039 item 5).
+        POISONED.store(true, Ordering::Release);
         crate::debug::print_fmt(format_args!("ostd: alocador: {fault}"));
         crate::thread::exit()
     }
 }
+
+/// Ligado por `fault` antes de a thread morrer com a trava tomada: quem
+/// encontrar o alocador envenenado em `Locked::with` encerra a thread.
+static POISONED: AtomicBool = AtomicBool::new(false);
 
 /// Valor protegido por um spinlock.
 struct Locked<T> {
@@ -168,11 +297,17 @@ impl<T> Locked<T> {
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        if POISONED.load(Ordering::Acquire) {
+            crate::thread::exit();
+        }
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            if POISONED.load(Ordering::Acquire) {
+                crate::thread::exit();
+            }
             core::hint::spin_loop();
         }
         // SAFETY: a trava está tomada até o `store` abaixo.

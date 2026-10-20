@@ -144,8 +144,10 @@ fn take_strings(line: &str, out: &mut Vec<String>) -> std::result::Result<bool, 
 enum Tok {
     Ident(String),
     Punct(char),
-    /// Literal (texto, caractere ou número): conteúdo descartado.
+    /// Literal (caractere ou número): conteúdo descartado.
     Lit,
+    /// Literal de texto; guarda só se o conteúdo tem `.rs`.
+    Str(bool),
 }
 
 struct Comment {
@@ -157,6 +159,7 @@ struct Comment {
 
 /// O que interessa de um arquivo `.rs`.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // cada flag é um fato independente do arquivo
 pub struct Scan {
     /// Linha e se precisa de `// SAFETY:` (bloco ou `impl`) de cada `unsafe`.
     uses: Vec<(usize, bool)>,
@@ -166,6 +169,13 @@ pub struct Scan {
     inner_allow: bool,
     /// Há `#![deny(unsafe_code)]` ou `#![forbid(unsafe_code)]`.
     inner_deny: bool,
+    /// Há `#![forbid(unsafe_code)]` (atributo interno, fora de comentários e
+    /// strings).
+    pub inner_forbid: bool,
+    /// Linha de cada `#[path ...]`, que esconderia arquivos da varredura.
+    path_attrs: Vec<usize>,
+    /// Linha de cada `include!` que menciona um arquivo `.rs`.
+    includes: Vec<usize>,
     /// Há uma seção `# Unsafe` nos comentários de documentação internos.
     unsafe_doc: bool,
     /// Linhas dos comentários com `SAFETY:`.
@@ -220,8 +230,9 @@ fn tokenize(src: &str) -> (Vec<(Tok, usize)>, Vec<Comment>) {
                 text: chars[start..end].iter().collect(),
             });
         } else if c == '"' {
+            let start = i + 1;
             i = skip_string(&chars, i + 1, &mut line);
-            toks.push((Tok::Lit, line));
+            toks.push((Tok::Str(has_rs(&chars[start..i])), line));
         } else if c == '\'' {
             // Caractere (`'x'`, `'\n'`) ou lifetime (`'a`).
             if next == Some('\\') {
@@ -248,11 +259,13 @@ fn tokenize(src: &str) -> (Vec<(Tok, usize)>, Vec<Comment>) {
             let raw = matches!(ident.as_str(), "r" | "br" | "cr");
             let hashes = chars[i..].iter().take_while(|&&h| h == '#').count();
             if raw && chars.get(i + hashes) == Some(&'"') {
-                i = skip_raw_string(&chars, i + hashes + 1, hashes, &mut line);
-                toks.push((Tok::Lit, line));
+                let start = i + hashes + 1;
+                i = skip_raw_string(&chars, start, hashes, &mut line);
+                toks.push((Tok::Str(has_rs(&chars[start..i.min(chars.len())])), line));
             } else if matches!(ident.as_str(), "b" | "c") && chars.get(i) == Some(&'"') {
+                let start = i + 1;
                 i = skip_string(&chars, i + 1, &mut line);
-                toks.push((Tok::Lit, line));
+                toks.push((Tok::Str(has_rs(&chars[start..i])), line));
             } else {
                 toks.push((Tok::Ident(ident), line));
             }
@@ -267,6 +280,11 @@ fn tokenize(src: &str) -> (Vec<(Tok, usize)>, Vec<Comment>) {
         }
     }
     (toks, comments)
+}
+
+/// O texto (de uma string) contém `.rs`?
+fn has_rs(text: &[char]) -> bool {
+    text.windows(3).any(|w| w == ['.', 'r', 's'])
 }
 
 /// Pula o corpo de uma string que já abriu; devolve o índice depois do `"`.
@@ -316,6 +334,31 @@ pub fn scan(src: &str) -> Scan {
             let needs_safety =
                 matches!(toks.get(k + 1), Some((Tok::Punct('{'), _))) || ident(k + 1, "impl");
             out.uses.push((*line, needs_safety));
+        } else if name == "path"
+            && k >= 2
+            && toks[k - 1].0 == Tok::Punct('[')
+            && toks[k - 2].0 == Tok::Punct('#')
+        {
+            out.path_attrs.push(*line);
+        } else if name == "include" && matches!(toks.get(k + 1), Some((Tok::Punct('!'), _))) {
+            // Procura uma string com `.rs` até fechar o parêntese de abertura.
+            let mut depth = 0_usize;
+            for (t, _) in &toks[k + 2..] {
+                match t {
+                    Tok::Punct('(' | '[' | '{') => depth += 1,
+                    Tok::Punct(')' | ']' | '}') => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Tok::Str(true) => {
+                        out.includes.push(*line);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
         } else if name == "unsafe_code" {
             // Procura, para trás, o começo do atributo (`[`) e o que o abre.
             let open = toks[..k]
@@ -335,6 +378,7 @@ pub fn scan(src: &str) -> Scan {
                 out.inner_allow |= inner;
             } else if words(&["deny", "forbid"]) {
                 out.inner_deny |= inner;
+                out.inner_forbid |= inner && words(&["forbid"]);
             }
         }
     }
@@ -428,6 +472,16 @@ fn check_files<'a>(
     let mut used: BTreeMap<&str, usize> =
         allow.budget.iter().map(|(k, _)| (k.as_str(), 0)).collect();
     for (&path, sc) in scans {
+        for line in &sc.path_attrs {
+            problems.push(format!(
+                "{path}:{line}: `#[path]` esconde arquivos da varredura de `unsafe`; use módulos comuns"
+            ));
+        }
+        for line in &sc.includes {
+            problems.push(format!(
+                "{path}:{line}: `include!` de arquivo `.rs` esconde código da varredura de `unsafe`"
+            ));
+        }
         let Some(key) = budget_of(allow, path) else {
             for (line, _) in &sc.uses {
                 problems.push(format!(
@@ -556,7 +610,7 @@ pub fn check(crate_roots: &[&str]) -> Result {
     for file in crate_roots {
         let dir = file.split("/src/").next().unwrap_or(file);
         let src = fs::read_to_string(root().join(file)).map_err(|e| e.to_string())?;
-        if !allow.crates.iter().any(|c| c == dir) && !src.contains("#![forbid(unsafe_code)]") {
+        if !allow.crates.iter().any(|c| c == dir) && !scan(&src).inner_forbid {
             return Err(format!(
                 "{file}: falta #![forbid(unsafe_code)] (ou inclua {dir} em unsafe-allowlist.toml)"
             ));
@@ -748,6 +802,43 @@ unsafe fn real() {}
         // `deny` e `forbid` valem em qualquer lugar.
         let extra = [file("lib/ostd/src/sync.rs", "#![forbid(unsafe_code)]\n")];
         check_sources(&allow(), &tree(&extra)).unwrap();
+    }
+
+    #[test]
+    fn path_e_include_de_rs_sao_recusados() {
+        for (src, what) in [
+            ("#[path = \"x.rs\"]\nmod m;\n", "#[path]"),
+            ("include!(\"x.rs\");\n", "include!"),
+            ("include!(concat!(env!(\"D\"), \"/x.rs\"));\n", "include!"),
+        ] {
+            let extra = [file("lib/ostd/src/sync.rs", src)];
+            let err = check_sources(&allow(), &tree(&extra)).unwrap_err();
+            assert!(err.contains("lib/ostd/src/sync.rs:1"), "{src}: {err}");
+            assert!(err.contains(what), "{src}: {err}");
+        }
+        // Em comentário ou string, ou `include_str!`, não conta.
+        let extra = [file(
+            "lib/ostd/src/sync.rs",
+            "// #[path = \"x.rs\"]\nconst S: &str = \"include!(\\\"x.rs\\\")\";\nconst T: &str = include_str!(\"x.txt\");\n",
+        )];
+        check_sources(&allow(), &tree(&extra)).unwrap();
+        // Também dentro de um caminho do orçamento.
+        let extra = [file(
+            "lib/oalloc/src/heap.rs",
+            "#[path = \"y.rs\"]\nmod m;\n",
+        )];
+        assert!(check_sources(&allow(), &tree(&extra)).is_err());
+    }
+
+    #[test]
+    fn forbid_so_conta_como_atributo() {
+        assert!(scan("#![forbid(unsafe_code)]\n").inner_forbid);
+        assert!(scan("#![forbid(unsafe_code)]").inner_forbid);
+        assert!(!scan("// #![forbid(unsafe_code)]\n").inner_forbid);
+        assert!(!scan("/* #![forbid(unsafe_code)] */\n").inner_forbid);
+        assert!(!scan("const S: &str = \"#![forbid(unsafe_code)]\";\n").inner_forbid);
+        assert!(!scan("#![deny(unsafe_code)]\n").inner_forbid);
+        assert!(!scan("#[forbid(unsafe_code)]\nfn f() {}\n").inner_forbid);
     }
 
     #[test]

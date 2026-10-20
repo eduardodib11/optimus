@@ -86,6 +86,10 @@ const TESTS: &[Test] = &[
         name: "alloc.sem_memoria",
         run: alocador_sem_memoria,
     },
+    Test {
+        name: "alloc.janela_reaproveitada",
+        run: alocador_reaproveita_janela,
+    },
     #[cfg(utest_falha)]
     Test {
         name: "proposital",
@@ -198,6 +202,23 @@ fn alocador_sem_memoria(_: &Ctx) -> Outcome {
     w.try_reserve_exact(1000)
         .map_err(|_| "alocação pequena falhou depois do erro")?;
     w.push(1);
+    Ok(())
+}
+
+/// Blocos enormes alocados e liberados em laço reaproveitam a mesma faixa da
+/// janela de endereços, em vez de avançar por ela.
+fn alocador_reaproveita_janela(_: &Ctx) -> Outcome {
+    let mut first = 0;
+    for i in 0..50 {
+        let mut big: Vec<u8> = Vec::with_capacity(3 << 20);
+        big.resize(3 << 20, 1);
+        let addr = big.as_ptr().addr();
+        if i == 0 {
+            first = addr;
+        } else if addr != first {
+            return Err("a faixa liberada não foi reaproveitada");
+        }
+    }
     Ok(())
 }
 

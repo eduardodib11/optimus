@@ -621,6 +621,9 @@ impl<'g, S: PageSource> Heap<'g, S> {
         // Blocos enormes que outras threads liberaram só voltam quando o
         // dono os recolhe; faz isso antes de mapear mais.
         self.reclaim(HUGE_LIST);
+        // Adotar segmentos abandonados devolve à fonte os que ficaram
+        // ociosos, o que pode abrir espaço para este.
+        self.adopt();
         let mut seg = self.new_segment(count);
         if seg.is_null() && self.reclaim(HUGE_LIST) {
             seg = self.new_segment(count);
@@ -945,6 +948,10 @@ impl<S: PageSource> Heap<'_, S> {
             // enormes que outras threads liberaram.
             self.reclaim(LARGE_LIST);
             self.reclaim(HUGE_LIST);
+            page = self.find_pages(n);
+        }
+        if page.is_null() && self.adopt() > 0 {
+            // Segmentos abandonados por heaps encerrados podem ter espaço.
             page = self.find_pages(n);
         }
         if page.is_null() {
