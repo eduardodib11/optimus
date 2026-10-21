@@ -687,7 +687,13 @@ fn rodadas_de_threads_que_saem_nao_acumulam_segmentos() {
     let mut rng = Rng::new(21);
     let mut worst = 0;
     let mut first = 0;
-    for round in 0..8u64 {
+    // Sob Miri, poucas rodadas e blocos: o padrão é o mesmo.
+    let (rounds, allocs, theirs_n, again_n) = if cfg!(miri) {
+        (3u64, 100usize, 50, 30)
+    } else {
+        (8, 3000, 2000, 1000)
+    };
+    for round in 0..rounds {
         main.collect(); // spawn
         let produced: Mutex<Vec<Block>> = Mutex::new(Vec::new());
         thread::scope(|s| {
@@ -697,7 +703,7 @@ fn rodadas_de_threads_que_saem_nao_acumulam_segmentos() {
                     let mut heap = Heap::new(global);
                     let mut rng = Rng::new(round * 16 + id as u64);
                     let mut kept = Vec::new();
-                    for i in 0..3000usize {
+                    for i in 0..allocs {
                         let size = 1 + rng.below(3000);
                         let b = block(&mut heap, &mut rng, size, 8);
                         if i % 8 == 0 {
@@ -715,7 +721,7 @@ fn rodadas_de_threads_que_saem_nao_acumulam_segmentos() {
             release(&mut main, &b);
         }
         // Blocos da principal que outra thread solta.
-        let theirs: Vec<Block> = (0..2000)
+        let theirs: Vec<Block> = (0..theirs_n)
             .map(|_| block(&mut main, &mut rng, 400, 8))
             .collect();
         thread::scope(|s| {
@@ -728,7 +734,7 @@ fn rodadas_de_threads_que_saem_nao_acumulam_segmentos() {
             });
         });
         // A principal volta a alocar (adota os segmentos que sobraram) e solta.
-        let again: Vec<Block> = (0..1000)
+        let again: Vec<Block> = (0..again_n)
             .map(|_| block(&mut main, &mut rng, 4000, 8))
             .collect();
         for b in &again {
