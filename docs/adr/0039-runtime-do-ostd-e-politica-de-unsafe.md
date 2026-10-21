@@ -429,6 +429,12 @@ desenho:
   trava só para os endereços da janela. A thread que sai roda os destrutores do
   `thread_local!` e devolve o heap; cada thread que aloca toma pelo menos um
   segmento de 2 MiB da cota.
+- **Recolhimento nas fronteiras de thread (2026-10-21).** Blocos liberados por
+  outra thread só saem da conta do dono quando ele os recolhe; um dono ocioso
+  (a principal esperando) segurava segmentos que nenhum outro heap adota, e
+  repetir a carga esgotava a cota. `thread::spawn` e `JoinHandle::join` agora
+  chamam `Heap::collect` no heap de quem chama. O desenho de abandono e adoção
+  não mudou.
 - **`unsafe`.** `lib/ostd/src/tls` = 23 (a ADR previa 10) e `arch` = 9.
 - **Fim de thread.** Sem notificação de morte (T-348), `join` espera uma flag
   do bloco que a thread grava num bloco de assembly sem pilha; thread que morre

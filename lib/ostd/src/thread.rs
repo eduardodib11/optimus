@@ -362,6 +362,9 @@ impl Builder {
         if (total as u64) + PAGE_SIZE > SLOT_BYTES {
             return Err(Error::InvalidArgument);
         }
+        // Antes de a nova thread pedir segmentos, devolve os que ficaram
+        // ociosos aqui (ver `alloc::collect`).
+        crate::alloc::collect();
         let slot = slot_take().ok_or(Error::QuotaExceeded)?;
         let base = SLOTS_BASE + slot as u64 * SLOT_BYTES;
         // O mapeamento começa depois da guarda, que nunca é mapeada.
@@ -506,6 +509,9 @@ impl<T> JoinHandle<T> {
         };
         // A thread já não toca na região (`exit_signalling`).
         drop(self.region.take());
+        // A thread pode ter liberado blocos nossos: recolhe-os agora, para os
+        // segmentos voltarem à fonte (ver `alloc::collect`).
+        crate::alloc::collect();
         self.packet.take().ok_or(code)
     }
 }
