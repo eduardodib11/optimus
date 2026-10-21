@@ -116,6 +116,10 @@ const TESTS: &[Test] = &[
         run: threads_alocacao,
     },
     Test {
+        name: "thread.alocacao_repetida",
+        run: threads_alocacao_repetida,
+    },
+    Test {
         name: "thread.buffer_de_ipc_proprio",
         run: threads_buffer_ipc,
     },
@@ -611,6 +615,24 @@ fn threads_alocacao(_: &Ctx) -> Outcome {
     // inteiras que voltam logo: um segmento a mais fica retido.
     if after > segments + 3 {
         return Err("segmentos demais depois de soltar tudo");
+    }
+    Ok(())
+}
+
+/// A carga de `thread.alocacao_concorrente` 5 vezes seguidas no mesmo
+/// processo: toda rodada tem de dar certo e os segmentos mapeados não podem
+/// crescer com as rodadas. Cada rodada já confere `+3` sobre o início dela
+/// (os segmentos presos na principal por uma página de classe cada); aqui o
+/// teto vale para o total desde o começo, então um vazamento por rodada (antes
+/// do T-335 de 2026-10-21: 1 → 4 → 10 segmentos e a cota de 28 MiB esgotada
+/// na 2ª rodada) aparece. Cinco rodadas cabem na cota porque nada se acumula.
+fn threads_alocacao_repetida(ctx: &Ctx) -> Outcome {
+    let base = ostd::alloc::mapped_segments();
+    for _ in 0..5 {
+        threads_alocacao(ctx)?;
+        if ostd::alloc::mapped_segments() > base + 3 {
+            return Err("segmentos crescem a cada rodada");
+        }
     }
     Ok(())
 }

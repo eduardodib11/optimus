@@ -673,6 +673,84 @@ fn adocao_reaproveita_o_segmento_abandonado() {
     release(&mut second, &other);
 }
 
+/// Carga repetida do utest `thread.alocacao_repetida` (T-335, 2026-10-21): a
+/// cada rodada, threads alocam e guardam blocos, saem (heaps abandonados com
+/// blocos vivos), a principal solta os blocos (remotamente, em segmentos sem
+/// dono) e uma thread solta blocos da principal. A principal só aloca pouco;
+/// o recolhimento acontece nas fronteiras do ciclo de vida das threads
+/// (`collect` no `spawn` e no `join` do `ostd`). Com isso os segmentos que o
+/// dono ocioso segura voltam à fonte, e o total não cresce com as rodadas.
+#[test]
+fn rodadas_de_threads_que_saem_nao_acumulam_segmentos() {
+    let global = Global::new(HostSource::new());
+    let mut main = Heap::new(&global);
+    let mut rng = Rng::new(21);
+    let mut worst = 0;
+    let mut first = 0;
+    for round in 0..8u64 {
+        main.collect(); // spawn
+        let produced: Mutex<Vec<Block>> = Mutex::new(Vec::new());
+        thread::scope(|s| {
+            for id in 0..THREADS {
+                let (global, produced) = (&global, &produced);
+                s.spawn(move || {
+                    let mut heap = Heap::new(global);
+                    let mut rng = Rng::new(round * 16 + id as u64);
+                    let mut kept = Vec::new();
+                    for i in 0..3000usize {
+                        let size = 1 + rng.below(3000);
+                        let b = block(&mut heap, &mut rng, size, 8);
+                        if i % 8 == 0 {
+                            kept.push(b);
+                        } else {
+                            release(&mut heap, &b);
+                        }
+                    }
+                    produced.lock().unwrap().extend(kept);
+                });
+            }
+        });
+        main.collect(); // join
+        for b in produced.into_inner().unwrap() {
+            release(&mut main, &b);
+        }
+        // Blocos da principal que outra thread solta.
+        let theirs: Vec<Block> = (0..2000)
+            .map(|_| block(&mut main, &mut rng, 400, 8))
+            .collect();
+        thread::scope(|s| {
+            let global = &global;
+            s.spawn(move || {
+                let mut other = Heap::new(global);
+                for b in &theirs {
+                    release(&mut other, b);
+                }
+            });
+        });
+        // A principal volta a alocar (adota os segmentos que sobraram) e solta.
+        let again: Vec<Block> = (0..1000)
+            .map(|_| block(&mut main, &mut rng, 4000, 8))
+            .collect();
+        for b in &again {
+            release(&mut main, b);
+        }
+        main.collect(); // join
+        if round == 0 {
+            first = global.mapped_segments();
+        }
+        worst = worst.max(global.mapped_segments());
+    }
+    println!("oalloc: 1ª rodada {first}, pior caso {worst} segmentos em 8 rodadas");
+    assert!(
+        worst <= first,
+        "segmentos acumulados: {worst} > {first} da 1ª rodada"
+    );
+    main.trim();
+    drop(main);
+    assert_eq!(global.mapped_segments(), 0);
+    assert_eq!(global.source().live(), 0);
+}
+
 // ---- aceite da T-334 ----
 
 /// Alocações por thread: 4 × 250 000 = 10⁶.

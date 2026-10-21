@@ -401,6 +401,20 @@ pub fn stats() -> Stats {
     crate::tls::current().with_heap(|heap| heap.stats())
 }
 
+/// Recolhe no heap da thread o que outras threads liberaram e devolve à fonte
+/// os segmentos que ficaram vazios (T-335, 2026-10-21).
+///
+/// Um bloco liberado por outra thread só sai da conta do dono quando ele o
+/// recolhe, e quem recolhe é a alocação que precisa de espaço. Uma thread que
+/// não aloca muito (a principal, que só espera as outras) ficava com
+/// segmentos "cheios" de blocos já livres, que nenhum outro heap pode usar, e
+/// as threads seguintes mapeavam segmentos novos até esgotar a cota. As
+/// fronteiras do ciclo de vida das threads (`join`) são o ponto em que o
+/// dono sabe que as demais pararam de liberar.
+pub(crate) fn collect() {
+    crate::tls::current().with_heap(oalloc::Heap::collect);
+}
+
 /// Faixa `[início, fim)` do heap do processo, sorteada na primeira
 /// alocação (diagnóstico e testes; ADR 0039, item 2). Os segmentos ficam
 /// sempre dentro dela.
