@@ -6,7 +6,7 @@ use core::ptr::{null, null_mut};
 
 use kabi::boot::{Framebuffer, MemKind, MemRegion, PixelFormat};
 
-use crate::arch::x86_64::{HwRng, hw_random, rdtsc};
+use crate::arch::x86_64::{HwRng, hw_random};
 use crate::{BootServices, Error, Guid, Status, SystemTable, efi};
 
 /// Tipo de memória UEFI da faixa do SO (`0x8000_0000` em diante) que o optboot
@@ -153,8 +153,9 @@ pub enum Entropy {
     Efi(Option<HwRng>),
     /// Só a CPU.
     Cpu(HwRng),
-    /// Nenhuma fonte boa: só variação do TSC. Fraca; o kernel precisa reforçar.
-    TscOnly,
+    /// Nenhuma fonte: a semente fica toda zero e o kernel não cria DRBG
+    /// (`sys_info` classe 5 devolve `NotSupported`; ADR 0039, item 4).
+    None,
 }
 
 impl core::fmt::Display for Entropy {
@@ -163,7 +164,7 @@ impl core::fmt::Display for Entropy {
             Self::Efi(None) => f.write_str("EFI_RNG_PROTOCOL"),
             Self::Efi(Some(hw)) => write!(f, "EFI_RNG_PROTOCOL + {hw:?}"),
             Self::Cpu(hw) => write!(f, "{hw:?}"),
-            Self::TscOnly => f.write_str("TSC (fraca)"),
+            Self::None => f.write_str("nenhuma (semente deixada zero)"),
         }
     }
 }
@@ -186,12 +187,11 @@ pub fn entropy(bs: &BootServices, seed: &mut [u8]) -> Entropy {
     match (efi_ok, hw_ok) {
         (true, hw) => Entropy::Efi(hw),
         (false, Some(hw)) => Entropy::Cpu(hw),
+        // Sem fonte boa a semente fica toda zero: uma semente fraca e não
+        // zero seria tomada pelo kernel como boa (ADR 0039, item 4).
         (false, None) => {
-            for s in seed.iter_mut() {
-                let t = rdtsc();
-                *s ^= (t ^ (t >> 7) ^ (t >> 13)).to_le_bytes()[0];
-            }
-            Entropy::TscOnly
+            seed.fill(0);
+            Entropy::None
         }
     }
 }

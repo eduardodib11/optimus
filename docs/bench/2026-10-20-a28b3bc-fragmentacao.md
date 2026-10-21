@@ -86,3 +86,20 @@ Heap real no fim: 21 120 blocos vivos, 8,59 MiB pedidos, 12,05 MiB em blocos (pe
 **Leitura.** Só 63 blocos (0,3% deles) estão na faixa de 8 a 64 KiB, mas custam 33% de tudo o que o alocador entrega (4 032 de 12 349 KiB) e quase todo o desperdício de arredondamento da carga: 2,3 MiB dos 3,5 MiB perdidos. Os `Vec` e `String` que dobram a capacidade (8, 16, 32, 64 KiB) pagam uma página de 64 KiB inteira, e as tabelas do `HashMap` (40 B por balde, 2ⁿ baldes) caem na mesma faixa a partir de 256 baldes. Abaixo de 8 KiB a perda fica em torno de 8 a 10%, e a faixa de 64 a 512 KiB perde 18,6% por arredondar para páginas de 64 KiB, o que nenhuma das duas opções muda.
 
 **Recomendação (para Eduardo decidir).** A opção 2, classes até 32 KiB: derruba a perda total de 40% para 21%, mexe só em `class.rs` (e na capacidade de uma página: 2 a 6 blocos) e não toca o formato do segmento. A opção 3 chega a 16%, mas pede um novo tipo de página no segmento (mapa de páginas, `settle`, adoção e `trim` aprendem de duas granularidades), para ganhar 5 pontos a mais numa faixa que a opção 2 já reduziu de 137% para 39%. A opção 1 (manter) só se justifica se os serviços do M3 não crescerem coleções acima de 8 KiB; esta carga mostra que um `HashMap` com cerca de 200 entradas já cruza essa linha. Nada foi alterado na tabela de classes.
+
+## Decisão (2026-10-20)
+
+Eduardo decidiu pela opção 2 (classes até 32 KiB, páginas de 64 KiB). A tabela passou de 36 para 44 classes: 8 em 8 até 64 B e 4 por duplicação até 32 KiB, o que acrescenta 10240, 12288, 14336, 16384, 20480, 24576, 28672 e 32768 B. Uma página guarda 2 a 8 blocos dessas classes; `MAX_SMALL` agora é 32 KiB e o limiar dos blocos grandes (512 KiB) não mudou.
+
+Medição depois da mudança (mesmo comando, `cargo test -p oalloc --release colecoes -- --nocapture`; a carga e o rastro são os mesmos, 120 821 alocações, 21 120 blocos vivos). Heap real: 8,59 MiB pedidos, 10,36 MiB em blocos (perda de arredondamento **20,6%**, antes 40,3%), 24,0 MiB mapeados (antes 26,0). A tabela abaixo troca a coluna "Atual" pela comparação entre a tabela antiga (classes até 8 KiB, calculada) e a nova:
+
+| Faixa | Blocos | Pedido (KiB) | Classes até 8 KiB (KiB) | Perda | Agora: até 32 KiB (KiB) | Perda | Páginas médias (KiB) | Perda |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| até 64 B | 16789 | 586 | 634 | 8,2% | 634 | 8,2% | 634 | 8,2% |
+| 65 B a 8 KiB | 4235 | 467 | 515 | 10,3% | 515 | 10,3% | 515 | 10,3% |
+| 8 a 64 KiB | 63 | 1701 | 4032 | 137,0% | 2359 | 38,7% | 1922 | 13,0% |
+| 64 a 512 KiB | 33 | 6041 | 7168 | 18,6% | 7168 | 18,6% | 7168 | 18,6% |
+| > 512 KiB | 0 | 0 | 0 | 0,0% | 0 | 0,0% | 0 | 0,0% |
+| **Total** | 21120 | 8796 | 12349 | **40,4%** | 10677 | **21,4%** | 10240 | **16,4%** |
+
+O resultado confere com a previsão da seção anterior (40,4% para 21,4%). A coluna "Páginas médias" passou de 15,8% para 16,4% só porque a base dela agora já usa as classes de 8 a 32 KiB em páginas de 64 KiB, e não mais em páginas de 512 KiB. As seções acima descrevem a tabela de 8 KiB e valem como medição de antes da mudança.

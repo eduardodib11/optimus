@@ -477,6 +477,11 @@ acrescentou, sem mudar o desenho do item 4:
   deixa a semente zero nesse caso (o kernel já devolve `NotSupported`), ou a
   `BootInfo` ganha um campo com a fonte. Sob QEMU (`virtio-rng-pci`) e em
   hardware com `RDSEED`/`RDRAND` o caso não acontece.
+  *Resolvida (2026-10-20, decidido por Eduardo):* o `optboot` deixa a
+  semente toda zero quando não há `EFI_RNG_PROTOCOL` nem `RDSEED`/`RDRAND`
+  (o TSC não é mais misturado em nenhum caso) e registra "semente deixada
+  zero"; o kernel não cria o DRBG e a classe 5 devolve `NotSupported`, como
+  o item 4 supõe.
 
 ## Notas da implementação (T-337, ostd, 2026-10-20)
 
@@ -519,6 +524,11 @@ sem mudar nenhuma decisão aceita:
 - **Fragmentação.** A decisão sobre as classes de 8 a 64 KiB segue
   pendente; a medição com coleções reais e a recomendação (classes até
   32 KiB) estão em `docs/bench/2026-10-20-a28b3bc-fragmentacao.md`.
+  *Resolvida (2026-10-20, decidido por Eduardo):* o `oalloc` passou a ter
+  44 classes, até 32 KiB (`MAX_SMALL` = 32 KiB), em páginas de 64 KiB com 2 a
+  8 blocos nas classes acima de 8 KiB; de 32 KiB a 512 KiB o bloco segue
+  sendo de páginas inteiras. O texto do item 2 ("de 8 a 8 KiB") fica como
+  foi aceito. Perda de arredondamento da carga de coleções: 40,4% → 21,4%.
 - **Informação de depuração.** `ostd`, `oalloc` e `ocoll` compilam com
   `debug = 0` no perfil `dev` (como o `utest`): o bootfs de depuração é
   copiado para a cota do `root`, e os binários cresciam ~1,1 MiB.

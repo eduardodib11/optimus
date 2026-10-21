@@ -11,7 +11,7 @@
 //!   cabeçalho do segmento. Cada segmento tem 32 **páginas** de 64 KiB; a
 //!   página 0 guarda o cabeçalho (dono, mapa de páginas, bitmaps).
 //! - **Classes de tamanho** (módulo `class`): de 8 em 8 até 64 bytes, depois
-//!   4 por duplicação até 8 KiB. De 8 KiB a 512 KiB, o bloco é um conjunto
+//!   4 por duplicação até 32 KiB. De 32 KiB a 512 KiB, o bloco é um conjunto
 //!   de páginas contíguas; acima disso, segmento próprio.
 //! - **Heap por thread** ([`Heap`]): cada página de uma classe tem a lista
 //!   `free` (o que a alocação consome), a `local_free` (o que o dono liberou)
@@ -93,7 +93,7 @@ pub const PAGE_SIZE: usize = 64 << 10;
 /// Páginas por segmento (a primeira guarda o cabeçalho).
 pub const PAGES_PER_SEGMENT: usize = SEGMENT_SIZE / PAGE_SIZE;
 /// Maior pedido atendido por uma classe de tamanho.
-pub const MAX_SMALL: usize = 8 << 10;
+pub const MAX_SMALL: usize = 32 << 10;
 /// Maior pedido atendido por páginas de um segmento; acima, segmento próprio.
 pub const MAX_LARGE: usize = 512 << 10;
 /// Maior alinhamento atendido.

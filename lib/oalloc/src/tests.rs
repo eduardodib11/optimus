@@ -257,7 +257,7 @@ fn expect_fault(expected: Fault, f: impl FnOnce()) {
 // ---- classes e plano ----
 
 #[test]
-fn classes_cobrem_de_8_bytes_a_8_kib() {
+fn classes_cobrem_de_8_bytes_a_32_kib() {
     assert_eq!(NUM_CLASSES, class_of(MAX_SMALL) + 1);
     assert_eq!(class_size(0), 8);
     assert_eq!(class_size(7), 64);
@@ -316,7 +316,8 @@ fn plano_do_pedido() {
         }),
         128
     );
-    assert_eq!(plan(1, 16384), Plan::Large(1));
+    assert_eq!(plan(1, 16384), Plan::Small(class_of(16384)));
+    assert_eq!(plan(1, 32768), Plan::Small(NUM_CLASSES - 1));
     assert_eq!(plan(1, PAGE_SIZE), Plan::Large(1));
     assert_eq!(plan(1, 2 * PAGE_SIZE), Plan::Fail);
     assert_eq!(plan(1, 3), Plan::Fail);
@@ -351,7 +352,10 @@ fn blocos_vivos_nao_se_sobrepoem_e_guardam_o_padrao() {
     let mut heap = Heap::new(&global);
     let mut rng = Rng::new(1);
     let mut live = Vec::new();
-    for size in (1..=300).chain([511, 512, 513, 1000, 4096, 8191, 8192, 8193, 70_000, 524_288]) {
+    for size in (1..=300).chain([
+        511, 512, 513, 1000, 4096, 8191, 8192, 8193, 20_000, 32_767, 32_768, 32_769, 70_000,
+        524_288,
+    ]) {
         live.push(block(&mut heap, &mut rng, size, 8));
     }
     let mut ranges: Vec<(usize, usize)> = live
@@ -377,8 +381,10 @@ fn alinhamentos() {
     let mut heap = Heap::new(&global);
     let mut rng = Rng::new(2);
     let mut live = Vec::new();
-    for align in [1, 2, 4, 8, 16, 32, 64, 128, 4096, 8192, 16384, PAGE_SIZE] {
-        for size in [1, 7, 8, 24, 100, 5000, 8192, 9000, 600_000] {
+    for align in [
+        1, 2, 4, 8, 16, 32, 64, 128, 4096, 8192, 16384, 32768, PAGE_SIZE,
+    ] {
+        for size in [1, 7, 8, 24, 100, 5000, 8192, 9000, 32768, 40_000, 600_000] {
             live.push(block(&mut heap, &mut rng, size, align));
         }
     }
