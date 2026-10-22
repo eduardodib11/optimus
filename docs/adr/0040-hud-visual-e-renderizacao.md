@@ -1,6 +1,6 @@
 # ADR 0040: HUD do Optimus: identidade visual, widgets e renderização
 
-- Status: proposta
+- Status: aceita (aprovada por Eduardo em 2026-10-22)
 - Data: 2026-10-22
 - Origem: protótipo visual aprovado por Eduardo em 2026-10-22 (versão 7,
   HTML/CSS/SVG, fora do repositório); SDD v1.0
@@ -96,8 +96,8 @@ ADR traduz o desenho em decisões para o compositor do Optimus.
 - Texto e paleta ficam em arquivo de tema do `hud`, para permitir variantes
   (por exemplo, azul e vermelho do Optimus Prime) sem mudar o código.
 
-## Decisões a aprovar
+## Decisões aprovadas
 
-1. Aceitar a paleta e o layout acima como padrão do HUD.
-2. Aceitar a meta de 10% de um núcleo a 1080p/60.
-3. Aceitar a divisão em M-HUD1, M-HUD2 e M-HUD3 para o backlog.
+1. Paleta e layout acima como padrão do HUD.
+2. Meta de até 10% de um núcleo a 1080p/60.
+3. Divisão do trabalho em M-HUD1, M-HUD2 e M-HUD3 no backlog.
