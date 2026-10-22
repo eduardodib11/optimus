@@ -35,12 +35,19 @@ ADR traduz o desenho em decisões para o compositor do Optimus.
    outras resoluções (sem versão de celular no M-HUD1):
    - vidro frontal, sem inclinação e sem perspectiva: o painel é um
      retângulo reto com um reflexo diagonal suave;
-   - **núcleo** circular no centro (cerca de 900 px), que é o rosto da IA;
+   - **núcleo** circular no centro, que é o rosto da IA, recuado no fundo:
+     desenhado a cerca de 80% do tamanho (720 px), mais escuro e levemente
+     suavizado, com extrusão em degraus sob o disco e uma sombra de piso
+     elíptica, para parecer um objeto 3D distante;
    - cada janela e botão é desenhado como uma **caixa 3D**: face frontal de
      vidro, lateral e base visíveis por deslocamento fixo em degraus
      (5, 10 e 14 px) em tons mais escuros, e um fio de luz no topo; ao
      passar o mouse, a caixa avança (os degraus crescem);
-   - colunas de janelas de vidro ao redor: Sistema (data, hora, usuário,
+   - as janelas ficam em primeiro plano, flutuando ao redor e à frente do
+     núcleo (parte delas sobrepõe a borda do núcleo), com profundidade em três
+     planos (fundo: núcleo; meio: dock; frente: janelas) e um leve balanço
+     vertical de 7 px, em ciclos de 6 s defasados;
+   - janelas de vidro: Sistema (data, hora, usuário,
      rede), Notificações, Análise do sistema, Ações da IA, Arquivos, CPU/GPU,
      Rede ao longo do tempo e a fala da IA;
    - dock curvo inferior com Arquivos, Navegador, Ferramentas, Optimus,
