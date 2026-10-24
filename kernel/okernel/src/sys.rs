@@ -30,6 +30,7 @@ use crate::notify::Wait;
 use crate::process::{self, Record};
 use crate::sched::Params;
 use crate::thread::Thread;
+use crate::timer;
 use crate::vm::{vm_map, vm_protect, vm_unmap};
 
 /// Valores devolvidos em `rdx`, `r10` e `r8`.
@@ -91,6 +92,15 @@ pub trait Env {
     /// noutra CPU, essa CPU recebe a IPI de reescalonar e a traz ao kernel,
     /// onde ela morre. Volta sem esperar.
     fn kick(&mut self, _t: &Thread) {}
+    /// Id lógico da CPU que faz a syscall (a dona dos `Timer`s que ela
+    /// arma, ADR 0035, item 6).
+    fn cpu(&self) -> u32 {
+        0
+    }
+    /// A fila de timers desta CPU ganhou um primeiro prazo mais cedo: o
+    /// timer de hardware tem de disparar até `deadline` (modo deadline, sem
+    /// tick). Volta sem esperar.
+    fn timer_armed(&mut self, _deadline: u64) {}
 }
 
 fn handle(raw: u64) -> Result<Handle, Error> {
@@ -283,15 +293,21 @@ pub fn exit_info(space: &SharedCapSpace, raw: u64) -> Result<Values, Error> {
 }
 
 /// `obj_bind_notify(obj, ntfy, bits, a3, a4, a5)` (ADR 0035, item 3): exige
-/// `BIND` em `obj` e `SIGNAL` em `ntfy`; `a3` a `a5` têm de ser zero.
+/// `BIND` em `obj` e `SIGNAL` em `ntfy`; `a3` a `a5` têm de ser zero, fora
+/// do `Timer`.
 /// `Interrupt`: `bits` é o número do bit (como antes) e a linha só se liga
 /// uma vez. `Thread` e `CapSpace`: `bits` é a máscara sinalizada quando a
 /// thread ou o processo morre; ligar de novo troca a ligação, `bits = 0`
 /// desliga, e ligar depois da morte sinaliza já (o evento é nível).
+/// `Timer` (item 6): `a3` prazo, `a4` período e `a5` flags ([`timer::parse`]).
 fn bind_notify(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<Values, Error> {
     let obj = cap_with(space, a[0], Rights::BIND)?;
     let ntfy = cap_with(space, a[1], Rights::SIGNAL)?;
     let ntfy = Arc::clone(ntfy.object.as_notification()?);
+    if let Object::Timer(t) = &obj.object {
+        arm_timer(t.as_ref(), ntfy, a, env)?;
+        return Ok([0; 3]);
+    }
     if a[3..].iter().any(|&w| w != 0) {
         return Err(Error::InvalidArgument);
     }
@@ -316,6 +332,42 @@ fn bind_notify(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result
     }
     env.preempt();
     Ok([0; 3])
+}
+
+/// `obj_bind_notify` sobre um `Timer` (ADR 0035, item 6): arma na CPU de
+/// quem chama, rearma (trocando ligação, prazo e período) ou desarma. Prazo
+/// vencido sinaliza antes de voltar. As ligações trocadas são soltas aqui,
+/// sem trava nenhuma na mão.
+fn arm_timer(
+    t: core::pin::Pin<&timer::Timer>,
+    ntfy: Arc<crate::notify::Notification>,
+    a: [u64; 6],
+    env: &mut dyn Env,
+) -> Result<(), Error> {
+    let now = env.now();
+    let Some((deadline, period)) = timer::parse(now, a[2], a[3], a[4], a[5])? else {
+        drop(t.get_ref().disarm());
+        return Ok(());
+    };
+    let armed = t.arm(timer::Arm {
+        cpu: env.cpu(),
+        now,
+        deadline,
+        period,
+        binding: (ntfy, a[2]),
+    });
+    if let Some(at) = armed.earlier {
+        env.timer_armed(at);
+    }
+    drop(armed.old);
+    if let Some((ntfy, bits)) = armed.fire {
+        if let Some((thread, word)) = ntfy.signal(bits) {
+            env.wake(thread, word);
+        }
+        drop(ntfy);
+        env.preempt();
+    }
+    Ok(())
 }
 
 /// O espaço de `vm_map`/`vm_unmap`: a capability de `raw` ou, com

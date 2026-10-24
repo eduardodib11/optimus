@@ -13,6 +13,7 @@
 use alloc::sync::Arc;
 use core::fmt;
 use core::mem::size_of;
+use core::pin::Pin;
 
 use kabi::{Error, ObjectType, Rights};
 
@@ -24,6 +25,7 @@ use crate::platform;
 use crate::sched::SchedContext;
 use crate::sync::{LockClass, SpinLock};
 use crate::thread::Thread;
+use crate::timer::{self, Timer};
 use crate::vm::{AddressSpace, MemoryObject, SharedAddressSpace};
 
 /// `CapSpace` compartilhado, com a trava que a seção 6.9 põe à frente de
@@ -53,6 +55,9 @@ pub enum Object {
     Endpoint(Arc<Endpoint>),
     /// Resposta de uso único.
     Reply(Arc<Reply>),
+    /// Prazo ligável a uma notificação (ADR 0035, item 6); fixo na memória,
+    /// porque a fila de timers aponta para ele.
+    Timer(Pin<Arc<Timer>>),
 }
 
 impl fmt::Debug for Object {
@@ -68,6 +73,7 @@ impl fmt::Debug for Object {
             Self::Interrupt(i) => Arc::as_ptr(i).addr(),
             Self::Endpoint(e) => Arc::as_ptr(e).addr(),
             Self::Reply(r) => Arc::as_ptr(r).addr(),
+            Self::Timer(t) => core::ptr::from_ref::<Timer>(t).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -88,6 +94,7 @@ impl Object {
             Self::Interrupt(_) => ObjectType::Interrupt,
             Self::Endpoint(_) => ObjectType::Endpoint,
             Self::Reply(_) => ObjectType::Reply,
+            Self::Timer(_) => ObjectType::Timer,
         }
     }
 
@@ -105,6 +112,9 @@ impl Object {
             (Self::Interrupt(a), Self::Interrupt(b)) => Arc::ptr_eq(a, b),
             (Self::Endpoint(a), Self::Endpoint(b)) => Arc::ptr_eq(a, b),
             (Self::Reply(a), Self::Reply(b)) => Arc::ptr_eq(a, b),
+            (Self::Timer(a), Self::Timer(b)) => {
+                core::ptr::eq::<Timer>(&raw const **a, &raw const **b)
+            }
             _ => false,
         }
     }
@@ -230,6 +240,20 @@ impl Object {
     }
 }
 
+impl Object {
+    /// O `Timer`, se o objeto for um.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_timer(&self) -> Result<Pin<&Timer>, Error> {
+        match self {
+            Self::Timer(t) => Ok(t.as_ref()),
+            _ => Err(Error::WrongType),
+        }
+    }
+}
+
 /// Bytes que um `Arc<T>` ocupa no heap: dois contadores mais o valor.
 #[must_use]
 pub const fn object_bytes<T>() -> u64 {
@@ -272,6 +296,7 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
         ObjectType::IoPortRange => Rights::READ.bits() | Rights::WRITE.bits(),
         ObjectType::DmaDomain => Rights::MAP.bits(),
         ObjectType::Vcpu | ObjectType::Vm => Rights::RUN.bits() | Rights::MAP.bits(),
+        ObjectType::Timer => Rights::BIND.bits(),
     };
     match Rights::from_bits(bits) {
         Some(r) => r,
@@ -288,8 +313,9 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 /// da tabela são cobradas da mesma cota à medida que ela cresce);
 /// `AddressSpace`, zero (tabelas e regiões são cobradas ao mapear);
 /// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB; `Thread` e
-/// `SchedContext`, `Notification`, `Endpoint` e `Reply`, zero (o primeiro nasce sem
-/// configuração). `Interrupt` só o kernel cria (o `root` as recebe), e
+/// `SchedContext`, `Notification`, `Endpoint`, `Reply` e `Timer`, zero (o
+/// primeiro nasce sem configuração; o `Timer`, desarmado, e o criador recebe
+/// só `BIND`, ADR 0035, item 6). `Interrupt` só o kernel cria (o `root` as recebe), e
 /// `obj_create` a recusa com `NotSupported`.
 /// Os direitos sobre `quota`
 /// (`CREATE`, e `SPLIT` para cotas) são conferidos por quem chama, que tem a
@@ -315,6 +341,7 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
         | ObjectType::Notification
         | ObjectType::Endpoint
         | ObjectType::Reply
+        | ObjectType::Timer
             if args != 0 =>
         {
             Err(Error::InvalidArgument)
@@ -352,6 +379,7 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
         ObjectType::Notification => Ok(Object::Notification(Arc::new(Notification::new(quota)?))),
         ObjectType::Endpoint => Ok(Object::Endpoint(Arc::new(Endpoint::new(quota)?))),
         ObjectType::Reply => Ok(Object::Reply(Arc::new(Reply::new(quota)?))),
+        ObjectType::Timer => Ok(Object::Timer(Arc::pin(Timer::new(quota, &timer::QUEUES)?))),
         _ => Err(Error::NotSupported),
     }
 }

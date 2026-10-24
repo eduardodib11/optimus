@@ -355,3 +355,54 @@ deixava abertos, sem mudar nenhuma decisão:
   máscara) e religar dá `Busy`. Os itens 3.1 e 3.2 ("máscara", "ligar de
   novo a substitui") valem para `Thread` e `CapSpace`; alinhar o
   `Interrupt` fica como pendência (muda o contrato usado pelos drivers).
+
+## Notas da implementação (T-349, 2026-10-24)
+
+Item 6 implementado (`kernel/okernel/src/timer.rs`), com a classe
+`FilaTimers` da ADR 0031. Detalhes que o texto deixava abertos, sem mudar
+nenhuma decisão:
+
+- **CPU dona e rearme de outra CPU.** "A CPU dona é a que armou" vale a
+  cada armar: rearmar de outra CPU toma a trava da fila da dona (como o
+  item diz), tira o `Timer` de lá, marca a dona como `MOVING`, solta e o
+  liga na fila local, então ele **passa para a CPU que rearmou**. Nunca há
+  duas filas de timers na mão; um segundo rearme concorrente que acha
+  `MOVING` espera sem trava, atendendo IPIs. Desarmar não muda a dona.
+  Ficar na dona exigiria avisar a CPU dona (IPI) sempre que o prazo novo
+  fosse mais cedo que o programado nela; migrar deixa a programação do
+  timer de hardware sempre local. **Para o Eduardo confirmar:** a frase das
+  Consequências ("o `Timer` só muda de CPU se for desarmado e armado de
+  novo") pode ser lida como "rearme não migra"; aqui rearmar conta como
+  desarmar e armar de novo. Se a leitura for a outra, a mudança fica em
+  `Timer::arm` (ficar na fila da dona) mais um aviso à dona.
+- **Rearme único com prazo vencido** não migra nem entra na fila: sinaliza
+  antes de a syscall voltar e deixa o `Timer` desarmado (o periódico
+  vencido sinaliza e volta à fila local no próximo múltiplo).
+- **Desarme e argumentos.** `prazo = 0` desarma também com `RELATIVE`
+  (`RELATIVE` com deslocamento 0 não é "agora"). Flags e período são
+  conferidos mesmo ao desarmar (`InvalidArgument`). `RELATIVE` soma com
+  saturação. `obj_create(quota, Timer, arg0 ≠ 0)` dá `InvalidArgument`.
+- **Disparo concorrente.** Um disparo que o tratador já tirou da fila antes
+  de um rearme ou desarme (de outra CPU) chegar à trava ainda sinaliza os
+  bits antigos, talvez depois de o rearme ou desarme voltar. É a
+  consequência de "remover, soltar, sinalizar": o bit é idempotente, e quem
+  precisa distinguir confere o relógio. O `ostd::cap::disarm_timer` diz
+  isso.
+- **Destruição.** A fila não conta referência: o `Drop` (última capability
+  apagada, inclusive pelo esvaziamento do `CapSpace` de um processo
+  encerrado) tira o `Timer` da fila da dona sob a trava antes de a memória
+  voltar; a cota volta inteira. A ligação (o `Arc` da notificação) que o
+  tratador tirou é solta só depois de sinalizar, sem trava na mão.
+- **Prazo do timer da CPU.** `program_timer` toma o mínimo entre o prazo do
+  escalonador e de IPC e o primeiro `Timer` da fila local (atômico, lido sem
+  trava); `obj_bind_notify` que deixa um prazo mais cedo na fila local
+  antecipa o timer com `ktime::arm_by`, que só antecipa. O tratador dispara
+  os vencidos antes do balanceamento periódico.
+- **Precisão.** Sob TCG o atraso do prazo ao tratador é dominado pelo
+  despertar do `hlt` no QEMU (1 a 2 ms já na `main`, no
+  `time.timer_dispara_no_prazo`): o teste de 1000 timers exige a mediana
+  ≤ 1 ms sob TCG e só registra p99 e pior caso; com KVM exige p99
+  ≤ 100 µs. Não havia KVM para medir.
+- **`ostd`.** Só `cap::arm_timer` e `cap::disarm_timer` (e
+  `thread::Builder::affinity`, para os testes); `ostd::time::sleep` e os
+  prazos de espera são da T-338 (ADR 0039, nota da T-349).

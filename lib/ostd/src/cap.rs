@@ -1,7 +1,7 @@
 //! Capabilities e objetos do kernel (SDD v1.0, seções 6.1 e 6.2):
 //! `obj_create`, `cap_mint`, `cap_delete` (também com `DESTROY`),
-//! `cap_info`, `obj_bind_notify` e o registro de morte de `sys_info`
-//! (ADR 0035).
+//! `cap_info`, `obj_bind_notify` (também para armar um `Timer`) e o
+//! registro de morte de `sys_info` (ADR 0035).
 
 use kabi::{Badge, Error, Handle, ObjectType, Rights, Syscall};
 
@@ -83,6 +83,44 @@ pub fn destroy(h: Handle) -> Result<(), Error> {
 pub fn bind_notify(obj: Handle, ntfy: Handle, bits: u64) -> Result<(), Error> {
     let args = [raw(obj), raw(ntfy), bits, 0, 0, 0];
     syscall(Syscall::ObjBindNotify, args).map(drop)
+}
+
+/// Arma o `Timer` `timer` (ADR 0035, item 6; `obj_bind_notify` com prazo,
+/// período e flags): no prazo `deadline`, em ns do relógio de
+/// [`crate::time::now_ns`] (com [`kabi::timer::RELATIVE`] em `flags`, a
+/// partir de agora), sinaliza `bits` em `ntfy`. `period = 0` é disparo
+/// único; senão repete a cada `period` ns (pelo menos
+/// [`kabi::timer::MIN_PERIOD_NS`]), e atrasos de mais de um período dão um
+/// sinal só. Prazo vencido sinaliza antes de voltar. Armar de novo troca
+/// ligação, prazo e período, e o `Timer` passa para a CPU de quem arma;
+/// `bits = 0` ou `deadline = 0` desarma (ver [`disarm_timer`]).
+///
+/// # Errors
+///
+/// Os do kernel: `AccessDenied` sem `BIND` no `Timer` ou `SIGNAL` em
+/// `ntfy`, `InvalidArgument` para período abaixo do mínimo ou flags
+/// desconhecidas, `WrongType`.
+pub fn arm_timer(
+    timer: Handle,
+    ntfy: Handle,
+    bits: u64,
+    deadline: u64,
+    period: u64,
+    flags: u64,
+) -> Result<(), Error> {
+    let args = [raw(timer), raw(ntfy), bits, deadline, period, flags];
+    syscall(Syscall::ObjBindNotify, args).map(drop)
+}
+
+/// Desarma o `Timer` `timer` (o kernel ainda exige `SIGNAL` em `ntfy`). Um
+/// disparo que o kernel já tinha começado a entregar pode chegar a `ntfy`
+/// logo depois.
+///
+/// # Errors
+///
+/// Os de [`arm_timer`].
+pub fn disarm_timer(timer: Handle, ntfy: Handle) -> Result<(), Error> {
+    arm_timer(timer, ntfy, 0, 0, 0, 0)
 }
 
 /// Registro de morte (ADR 0035, item 2), de [`death`].

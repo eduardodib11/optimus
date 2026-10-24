@@ -44,6 +44,7 @@ use ostd::kabi::ipc::FLAG_NONBLOCK;
 use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::{Env, Start};
 
+mod timer;
 mod vida;
 
 ostd::entry!(main);
@@ -152,6 +153,30 @@ const TESTS: &[Test] = &[
     Test {
         name: "processo.partida_em_encerrado",
         run: vida::partida_em_processo_encerrado,
+    },
+    Test {
+        name: "timer.disparo_unico",
+        run: timer::disparo_unico,
+    },
+    Test {
+        name: "timer.periodico_e_desarme",
+        run: timer::periodico_e_desarme,
+    },
+    Test {
+        name: "timer.rearme_noutra_cpu",
+        run: timer::rearme_noutra_cpu,
+    },
+    Test {
+        name: "timer.destruido_armado",
+        run: timer::destruido_armado,
+    },
+    Test {
+        name: "timer.de_processo_encerrado",
+        run: vida::timer_de_processo_encerrado,
+    },
+    Test {
+        name: "timer.mil_de_uma_vez",
+        run: timer::mil_timers,
     },
     Test {
         name: "sync.mutex_contador",

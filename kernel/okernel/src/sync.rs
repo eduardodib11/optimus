@@ -45,6 +45,9 @@ pub enum LockClass {
     AddressSpace = 50,
     /// Nível 6: fila de prontas de uma CPU; duas só em ordem de id.
     RunQueue = 60,
+    /// Nível 6, depois da fila de prontas: a fila de `Timer`s de uma CPU
+    /// (ADR 0031, emenda da ADR 0035). Folha: nada se toma com ela na mão.
+    TimerQueue = 61,
     /// Nível 7: folha do escalonador (`Thread.sched`, com o
     /// `SchedContext` dela e o doado; orçamento do `SchedContext`).
     SchedLeaf = 70,
@@ -78,6 +81,7 @@ impl LockClass {
             Self::IpcSlot => "IpcSlot",
             Self::AddressSpace => "AddressSpace",
             Self::RunQueue => "Fila",
+            Self::TimerQueue => "FilaTimers",
             Self::SchedLeaf => "FolhaSched",
             Self::KernelStacks => "TabelasKernel(pilhas)",
             Self::KernelPageTables => "TabelasKernel(PT)",
@@ -95,6 +99,7 @@ impl LockClass {
             Self::IpcSlot,
             Self::AddressSpace,
             Self::RunQueue,
+            Self::TimerQueue,
             Self::SchedLeaf,
             Self::KernelStacks,
             Self::KernelPageTables,
@@ -108,12 +113,16 @@ impl LockClass {
     }
 }
 
-/// Pode tomar `next` (classe e chave) com `held` na mão?
+/// Pode tomar `next` (classe e chave) com `held` na mão? Com a fila de
+/// timers ([`LockClass::TimerQueue`], folha) na mão, nada.
 #[must_use]
 pub fn order_allows(held: (LockClass, u32), next: (LockClass, u32)) -> bool {
     let ((hc, hk), (nc, nk)) = (held, next);
     if hc == LockClass::Unchecked || nc == LockClass::Unchecked {
         return true;
+    }
+    if hc == LockClass::TimerQueue {
+        return false;
     }
     (nc as u8) > (hc as u8) || (nc == LockClass::RunQueue && hc == nc && nk > hk)
 }
@@ -312,6 +321,15 @@ pub fn install(hooks: &'static Hooks) {
 fn hooks() -> Option<&'static Hooks> {
     // SAFETY: só `install` grava o ponteiro, sempre com um `&'static Hooks`.
     unsafe { HOOKS.load(Ordering::Acquire).as_ref() }
+}
+
+/// Uma volta de espera sem trava na mão: atende a caixa de IPIs pelo gancho
+/// `relax`, como o giro de [`SpinLock::lock`] (ADR 0031, item 5).
+pub fn relax() {
+    core::hint::spin_loop();
+    if let Some(h) = hooks() {
+        (h.relax)();
+    }
 }
 
 /// Travas classificadas na mão desta CPU (0 sem ganchos).
