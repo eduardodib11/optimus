@@ -538,3 +538,29 @@ sem mudar nenhuma decisão aceita:
 - **Informação de depuração.** `ostd`, `oalloc` e `ocoll` compilam com
   `debug = 0` no perfil `dev` (como o `utest`): o bootfs de depuração é
   copiado para a cota do `root`, e os binários cresciam ~1,1 MiB.
+
+## Notas da implementação (T-348, 2026-10-23)
+
+- **`EXIT_GROUP`** feito como o item 5 manda: `thread_exit(código, GROUP)`
+  encerra o processo da thread (o `CapSpace` ligado a ela, sem handle nem
+  direito; ADR 0035, item 4), com causa `Exited` e o código, e as outras
+  threads morrem `Killed`. Flags desconhecidas junto com `GROUP` ainda dão
+  `InvalidArgument` antes de encerrar qualquer coisa.
+- **`ostd::process::abort(motivo)`**: escreve o motivo e sai com
+  `EXIT_GROUP` e `"pani"`. Usado pelo `panic_handler` e pelos caminhos de
+  falha do alocador (alocar antes de `rt::init`, corrupção detectada pelo
+  `oalloc`, alocador envenenado, alocar depois de devolver o heap), como o
+  item 5 previa. Se o kernel recusar (nunca, com flags válidas), encerra só
+  a thread.
+- **Fim de thread (item 6, T-335).** `join` espera o evento de morte do
+  objeto `Thread` (ADR 0035, item 3), que o kernel só sinaliza depois de a
+  thread deixar de executar código de usuário; saíram a flag de fim, o
+  código no bloco e o `arch::exit_signalling` (`lib/ostd/src/arch`: teto
+  9 → 8). `join` volta também de thread que faltou ou foi encerrada
+  (`join_status` dá o registro inteiro), e `JoinHandle` largado devolve a
+  região quando a thread morre (lista de órfãs recolhida em `spawn`, `join`
+  e no `Drop`). A função inicial que a thread não chegou a tomar é solta por
+  quem junta, depois da morte (o `# Unsafe` de `tls` registra a exceção).
+- **Limite.** A thread que morre por falta ou encerrada não devolve o heap
+  (o estado dele não é confiável); os segmentos com blocos dela ficam até o
+  fim do processo.

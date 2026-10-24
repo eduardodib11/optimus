@@ -65,6 +65,17 @@ Notas:
   `kmem::unmap_pages` largam `KernelPageTables` antes do shootdown e só
   depois liberam os frames.
 
+- Eventos de ciclo de vida (T-348, ADR 0035, item 3.4 e lacuna 6): o
+  estado do processo mora no `CapSpace` (nível 2) e o evento de morte da
+  thread, com o pedido de encerramento, em `Thread.binding` (nível 3). Na
+  morte, a thread toma `Thread.binding` (copia a ligação e a solta), depois
+  o `CapSpace` (desconta e copia a ligação do processo, e solta), e só
+  então sinaliza: notificação (3) e, por último, a fila do escalonador (6)
+  do despertar. As esperas de notificação e de futex se publicam no
+  `IpcSlot` (4) da thread com a trava do objeto (3) na mão; quem encerra
+  lê o slot, solta-o e só então toma a trava do objeto para tirar a thread
+  da fila.
+
 ## Pontos sem nenhuma trava
 
 Em debug, `ksync::assert_none_held` acusa pânico se a CPU tem qualquer
