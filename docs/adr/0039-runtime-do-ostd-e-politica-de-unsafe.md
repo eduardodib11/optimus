@@ -564,3 +564,20 @@ sem mudar nenhuma decisão aceita:
 - **Limite.** A thread que morre por falta ou encerrada não devolve o heap
   (o estado dele não é confiável); os segmentos com blocos dela ficam até o
   fim do processo.
+
+## Notas da implementação (T-349, 2026-10-24)
+
+- **`Timer` no `ostd`, só o mínimo.** O `ostd` não tinha `time::sleep`
+  para passar a usar o `Timer` (ADR 0035, item 6), então ganhou só
+  `cap::arm_timer(timer, ntfy, bits, prazo, período, flags)` e
+  `cap::disarm_timer(timer, ntfy)`, finos sobre `obj_bind_notify`. Faltam,
+  para a T-338: `Instant`/`Duration`, `sleep` (um `Timer` e uma
+  notificação por thread, ou um par por chamada, cobrados da cota do
+  processo) e prazos nas esperas (`Condvar::wait_timeout`, `join` com
+  prazo).
+- **`thread::Builder::affinity(mask)`** configura o `SchedContext` da
+  thread com `sched_configure_on` (ADR 0032, item 4). Os testes de `Timer`
+  do `utest` o usam para fixar threads em CPUs.
+- **`unsafe`.** Nenhum bloco novo no `ostd`; o `unsafe` do `Timer` é do
+  kernel (elos intrusivos numa `UnsafeCell`, seção `# Unsafe` de
+  `okernel::timer`).
