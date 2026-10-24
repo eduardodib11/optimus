@@ -79,7 +79,7 @@ abi_enum! {
 pub enum Syscall: u32, raw(n) => u64::from(n);
     DebugWrite = 0 => "`debug_write`: só com capability de debug.",
     CapMint = 1 => "`cap_mint`: cópia com direitos iguais ou menores e badge opcional, na própria tabela ou noutro `CapSpace` (ADR 0029).",
-    CapDelete = 2 => "`cap_delete`.",
+    CapDelete = 2 => "`cap_delete(handle, flags)`; com [`cap_delete::DESTROY`] também destrói o objeto (ADR 0035).",
     CapRevoke = 3 => "`cap_revoke`: apaga todos os descendentes.",
     CapInfo = 4 => "`cap_info`.",
     ObjCreate = 5 => "`obj_create(quota, tipo, args)`.",
@@ -102,14 +102,14 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     NtfySignal = 22 => "`ntfy_signal`.",
     NtfyWait = 23 => "`ntfy_wait`; `PeerClosed` se a notificação morre durante a espera.",
     NtfyPoll = 24 => "`ntfy_poll`.",
-    ObjBindNotify = 25 => "`obj_bind_notify`.",
+    ObjBindNotify = 25 => "`obj_bind_notify(obj, ntfy, bits, a3, a4, a5)`: `Interrupt`, e a morte de `Thread` e de `CapSpace` (ADR 0035).",
     IrqAck = 26 => "`irq_ack`.",
     ClockGet = 27 => "`clock_get`.",
     Yield = 28 => "`yield`.",
     FutexWait = 29 => "`futex_wait`.",
     FutexWake = 30 => "`futex_wake`.",
     DmaMap = 31 => "`dma_map` / `dma_unmap`, escolhidos por flag.",
-    SysInfo = 32 => "`sys_info`.",
+    SysInfo = 32 => "`sys_info(classe, arg)`: CPUs, morte (classe 2, handle em `rsi`) e entropia.",
     ThreadExit = 33 => "`thread_exit(código, flags)`: o código vai ao registro de morte (ADR 0035 e 0039).",
 }
 
@@ -231,12 +231,34 @@ pub mod thread {
         CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION | CONFIGURE_TLS | CONFIGURE_BIND_SELF;
 }
 
+/// Flags de `cap_delete(handle, flags)` (`rsi`; ADR 0035, item 4).
+pub mod cap_delete {
+    /// Além de apagar a capability, destrói o objeto; exige o direito
+    /// `Rights::DESTROY` nela. `CapSpace`: encerra o processo (todas as
+    /// threads ligadas a ele morrem como `Killed`, inclusive as bloqueadas e
+    /// as que rodam noutra CPU) e esvazia a tabela. `Thread`: encerra a
+    /// thread. `Endpoint`: fecha o objeto (quem espera e quem chegar depois
+    /// recebe `PeerClosed`). Outros tipos: `NotSupported`, sem apagar nada.
+    pub const DESTROY: u64 = 1;
+    /// Flags definidas; as demais são recusadas com `InvalidArgument`.
+    pub const ALL_FLAGS: u64 = DESTROY;
+}
+
 /// `thread_exit(código, flags)` (`rdi`, `rsi`; ADR 0035, item 2, e ADR
-/// 0039, item 5) e as causas do registro de morte de uma thread.
+/// 0039, item 5), as causas do registro de morte e a leitura dele.
+///
+/// `sys_info(`[`crate::sched::SYS_INFO_EXIT`]`, handle)` devolve `[causa,
+/// código, auxiliar]` de uma `Thread` (exige `READ_STATE`) ou do processo de
+/// um `CapSpace` (exige `MANAGE`); causa zero é "ainda vivo". O registro do
+/// processo é a primeira morte anormal das threads dele ou, se todas foram
+/// normais, a da última; `EXIT_GROUP` e `cap_delete(DESTROY)` gravam o dele
+/// na chamada (`Exited` com o código e `Killed`) e nada o sobrescreve.
 pub mod exit {
     /// Flag de `thread_exit`: encerra o processo inteiro (o `CapSpace` da
-    /// thread). Reservada: até o encerramento de processos da ADR 0035
-    /// (T-348), o kernel a recusa com `NotSupported` e a thread segue.
+    /// thread), como `cap_delete(DESTROY)` sobre ele sem exigir o direito:
+    /// as outras threads morrem como `Killed` e a causa do processo é
+    /// `Exited` com o código. A thread que chama nunca volta; sem `CapSpace`,
+    /// só ela termina.
     pub const GROUP: u64 = 1;
     /// Flags definidas; as demais são recusadas com `InvalidArgument` (a
     /// thread segue).
@@ -247,7 +269,8 @@ pub mod exit {
     pub const CAUSE_EXITED: u8 = 1;
     /// Causa: falta fatal; o código é o vetor e o auxiliar, o endereço.
     pub const CAUSE_FAULTED: u8 = 2;
-    /// Causa: encerrada por outra (`cap_delete` com `DESTROY`, T-348).
+    /// Causa: encerrada por outra (`cap_delete` com `DESTROY` ou
+    /// `EXIT_GROUP` de outra thread do processo).
     pub const CAUSE_KILLED: u8 = 3;
 }
 
@@ -350,6 +373,12 @@ mod tests {
             (exit::CAUSE_EXITED, exit::CAUSE_FAULTED, exit::CAUSE_KILLED),
             (1, 2, 3)
         );
+    }
+
+    #[test]
+    fn flags_de_cap_delete() {
+        assert_eq!((cap_delete::DESTROY, cap_delete::ALL_FLAGS), (1, 1));
+        assert_eq!(sched::SYS_INFO_EXIT, 2);
     }
 
     #[test]

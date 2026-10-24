@@ -505,6 +505,9 @@ pub fn start_on(thread: &Arc<Thread>, entry: &UserEntry, cpu: u32) -> Result<(),
     if thread.state() != RunState::Inactive {
         return Err(Error::Busy);
     }
+    let target = sched_of(cpu)
+        .filter(|_| usable(cpu as usize) && allowed(thread, cpu))
+        .ok_or(Error::InvalidArgument)?;
     let configured = thread
         .sched_context()
         .is_some_and(|sc| sc.params().is_some());
@@ -527,21 +530,32 @@ pub fn start_on(thread: &Arc<Thread>, entry: &UserEntry, cpu: u32) -> Result<(),
     // Abaixo do quadro: rbp, rbx, r12-r15 zerados e o retorno de
     // `switch_context` para o trampolim.
     let switch_at = frame_at - 7 * 8;
-    let target = sched_of(cpu)
-        .filter(|_| usable(cpu as usize) && allowed(thread, cpu))
-        .ok_or(Error::InvalidArgument)?;
+    // Daqui em diante a thread é desta partida (contra outra e contra o
+    // encerramento de uma inativa), e conta nas vivas do processo (ADR
+    // 0035, item 1); qualquer falha desfaz as duas coisas.
+    if !thread.claim_start() {
+        return Err(Error::Busy);
+    }
+    let space = thread.cspace();
+    if let Some(space) = &space
+        && let Err(e) = okernel::process::on_start(space, thread)
+    {
+        abandon_start(thread);
+        return Err(e);
+    }
     thread.set_cpu(cpu);
     let mut sched = target.lock();
     // Toda thread iniciada tem lugar reservado na espera: o escalonador
     // nunca aloca.
-    sched
-        .throttled
-        .try_reserve(1)
-        .map_err(|_| Error::QuotaExceeded)?;
-    sched
-        .timeouts
-        .try_reserve(1)
-        .map_err(|_| Error::QuotaExceeded)?;
+    let reserved = sched.throttled.try_reserve(1).is_ok() && sched.timeouts.try_reserve(1).is_ok();
+    if !reserved {
+        drop(sched);
+        if let Some(space) = &space {
+            okernel::process::undo_start(space, thread, &mut KernelEnv);
+        }
+        abandon_start(thread);
+        return Err(Error::QuotaExceeded);
+    }
     // SAFETY: a pilha de kernel da thread está mapeada (RW) e é só dela;
     // a thread nunca rodou, então nada mais a usa.
     unsafe {
@@ -562,6 +576,17 @@ pub fn start_on(thread: &Arc<Thread>, entry: &UserEntry, cpu: u32) -> Result<(),
         ksmp::ipi::resched(cpu as usize);
     }
     Ok(())
+}
+
+/// A partida de `t` falhou depois de [`Thread::claim_start`]: ela volta a
+/// inativa e, se o encerramento foi pedido nesse meio tempo, morre já (quem
+/// pediu a viu fora de `Inactive`).
+fn abandon_start(t: &Arc<Thread>) {
+    t.unclaim_start();
+    if t.kill_requested() && t.kill_inactive() {
+        t.record_death(kabi::exit::CAUSE_KILLED, 0, 0);
+        okernel::process::thread_died(t, &mut KernelEnv);
+    }
 }
 
 /// `f` sobre o `SchedContext` em que `t` roda e os parâmetros dele (os
@@ -910,6 +935,13 @@ fn trace_ran(s: &mut Sched, p: &Thread, now: u64) {
 /// Como [`schedule`], mas com `direct` como próxima (caminho rápido de
 /// IPC) se ela puder rodar já; senão, ela vai para a fila.
 fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
+    // Bloquear com o encerramento pedido dormiria para sempre: a atual
+    // segue (sem a espera) até morrer na volta ao usuário.
+    let why = if why == Why::Block && cancel_own_wait() {
+        Why::Yield
+    } else {
+        why
+    };
     let mut now = ktime::now_ns();
     let me = percpu::cpu_id();
     let mut s = this_sched().lock();
@@ -975,6 +1007,25 @@ fn schedule_to(why: Why, direct: Option<Arc<Thread>>) {
         return;
     }
     switch_away(s, prev, next);
+}
+
+/// A atual vai bloquear e o encerramento dela foi pedido (ADR 0035, item
+/// 4): tira a espera que ela publicou no slot. Verdadeiro se tirou; então
+/// ninguém mais a acorda e ela tem de seguir rodando. Falso também quando
+/// quem pediu o encerramento (ou um sinal) já a tirou da fila e a acorda.
+///
+/// Com o pedido em [`Thread::request_kill`], é o outro lado de um par:
+/// quem pede grava o pedido e depois lê o slot; a thread grava a espera no
+/// slot e depois lê o pedido, aqui. Um dos dois vê o outro.
+fn cancel_own_wait() -> bool {
+    if !okernel::thread::kills_pending() {
+        return false;
+    }
+    let Some(me) = current() else {
+        return false;
+    };
+    core::sync::atomic::fence(Ordering::SeqCst);
+    me.kill_requested() && okernel::ipc::cancel_any(&me)
 }
 
 /// O que a troca usa da próxima: lido com a trava da fila na mão, para a
@@ -1103,6 +1154,8 @@ fn finish_switch() {
 #[unsafe(no_mangle)]
 extern "sysv64" fn thread_first_run() {
     finish_switch();
+    // Encerrada antes de rodar: não chega ao usuário.
+    exit_if_killed();
 }
 
 /// Cede a CPU para a próxima pronta (do ocioso: roda as prontas).
@@ -1191,6 +1244,15 @@ pub fn handoff(to: Arc<Thread>, deadline: u64) {
 /// até aqui, e ninguém mais a pode acordar (saiu da fila e do `Reply`).
 pub fn switch_direct(to: Arc<Thread>) {
     debug_assert_eq!(to.cpu(), percpu::cpu_id(), "troca direta de outra CPU");
+    if cancel_own_wait() {
+        // Encerramento pedido: a atual não bloqueia (ver `schedule_to`).
+        if to.claim_wake() {
+            schedule_to(Why::Yield, Some(to));
+        } else {
+            schedule(Why::Yield);
+        }
+        return;
+    }
     if !to.claim_wake() {
         schedule(Why::Block);
     } else if let Err(to) = direct_switch(to) {
@@ -1386,6 +1448,13 @@ impl sys::Env for KernelEnv {
     fn load_tls(&mut self, va: u64) {
         cpu::load_user_fs_base(va);
     }
+
+    fn kick(&mut self, t: &Thread) {
+        let cpu = t.cpu();
+        if t.state() == RunState::Running && cpu != percpu::cpu_id() && usable(cpu as usize) {
+            ksmp::ipi::resched(cpu as usize);
+        }
+    }
 }
 
 /// Disparo do timer do APIC (com o EOI já feito), vindo do anel 3 ou do
@@ -1409,12 +1478,40 @@ pub fn trace_take() -> Vec<Event> {
     core::mem::take(&mut this_sched().lock().trace)
 }
 
-/// A thread atual termina (por `thread_exit` ou por falta, com o registro
-/// de morte já gravado). Quem chama solta antes as referências que tiver na
-/// pilha: esta função nunca volta.
-pub fn exit_current() -> ! {
+/// A thread atual sai da CPU para sempre (o registro de morte já gravado e
+/// os eventos já sinalizados, por [`die`]). Quem chama solta antes as
+/// referências que tiver na pilha: esta função nunca volta.
+fn exit_current() -> ! {
     schedule(Why::Exit);
     unreachable!("thread terminada voltou a rodar");
+}
+
+/// A thread atual morre (ADR 0035, item 2): grava o registro de morte com
+/// `cause`, `code` e `aux` (ou `Killed`, se o encerramento foi pedido),
+/// sinaliza o evento dela e o do processo, se era a última viva, e sai da
+/// CPU. Quem chama solta antes as referências que tiver na pilha: esta
+/// função nunca volta.
+pub fn die(cause: u8, code: u64, aux: u64) -> ! {
+    if let Some(me) = current() {
+        if me.kill_requested() {
+            me.record_death(kabi::exit::CAUSE_KILLED, 0, 0);
+        } else {
+            me.record_death(cause, code, aux);
+        }
+        okernel::process::thread_died(&me, &mut KernelEnv);
+    }
+    exit_current()
+}
+
+/// Ponto de volta ao usuário (fim de syscall, de interrupção ou de falta
+/// vinda do anel 3, e a primeira entrada): a thread com o encerramento
+/// pedido morre aqui, como `Killed`, sem voltar ao usuário. Sem pedido
+/// nenhum no kernel, custa uma leitura.
+#[inline]
+pub fn exit_if_killed() {
+    if okernel::thread::kills_pending() && current().is_some_and(|me| me.kill_requested()) {
+        die(kabi::exit::CAUSE_KILLED, 0, 0);
+    }
 }
 
 /// Chamado por `syscall_entry` com o quadro do usuário. Devolve 1 se a
@@ -1427,6 +1524,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
     {
         kipc::syscall(frame, call);
         frame.rflags = syscall::user_rflags(frame.rflags);
+        exit_if_killed();
         crate::ksync::assert_none_held("volta ao usuário");
         return u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss));
     }
@@ -1443,6 +1541,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
         Err(e) => frame.rax = e.to_raw(),
     }
     frame.rflags = syscall::user_rflags(frame.rflags);
+    exit_if_killed();
     crate::ksync::assert_none_held("volta ao usuário");
     u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss))
 }
@@ -1471,27 +1570,34 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
 }
 
 /// `thread_exit(código, flags)` (ADR 0035, item 2, e ADR 0039, item 5): o
-/// código vai ao registro de morte da thread, com a causa `Exited`.
+/// código vai ao registro de morte da thread, com a causa `Exited`. Flags
+/// desconhecidas voltam `InvalidArgument` e a thread segue.
 ///
-/// `EXIT_GROUP` precisa do encerramento de processos da ADR 0035 (item 4,
-/// T-348): até lá volta `NotSupported` e a thread segue, como com flags
-/// desconhecidas (`InvalidArgument`).
+/// `EXIT_GROUP` encerra antes o processo da thread (o `CapSpace` dela, sem
+/// handle nem direito; ADR 0035, item 4): a causa do processo fica `Exited`
+/// com o código, e as outras threads morrem como `Killed`.
 fn thread_exit(code: u64, flags: u64) -> Result<Values, Error> {
     if flags & !kabi::exit::ALL_FLAGS != 0 {
         return Err(Error::InvalidArgument);
     }
-    if flags & kabi::exit::GROUP != 0 {
-        return Err(Error::NotSupported);
+    if flags & kabi::exit::GROUP != 0
+        && let Some(me) = current()
+        && let Some(space) = me.cspace()
+    {
+        okernel::process::destroy(
+            &space,
+            okernel::process::Record::exited(code),
+            Some(&me),
+            &mut KernelEnv,
+        );
     }
-    if let Some(me) = current() {
-        me.record_death(kabi::exit::CAUSE_EXITED, code, 0);
-    }
-    exit_current()
+    die(kabi::exit::CAUSE_EXITED, code, 0)
 }
 
 /// `sys_info(seletor, arg)` (ADR 0032, item 4): com
 /// [`kabi::sched::SYS_INFO_CPUS`], as CPUs ligadas e o total de ids lógicos
-/// da topologia; com [`kabi::sched::SYS_INFO_ENTROPY`] (ADR 0039, item 4),
+/// da topologia; com [`kabi::sched::SYS_INFO_EXIT`] (ADR 0035, item 2), o
+/// registro de morte da `Thread` ou do processo do `CapSpace` de `arg`; com [`kabi::sched::SYS_INFO_ENTROPY`] (ADR 0039, item 4),
 /// 24 bytes do DRBG desta CPU, sem capability, com `arg` zero.
 pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
     match selector {
@@ -1500,6 +1606,12 @@ pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
             ksmp::count().max(1) as u64,
             0,
         ]),
+        kabi::sched::SYS_INFO_EXIT => {
+            let space = current()
+                .and_then(|t| t.cspace())
+                .ok_or(Error::NotSupported)?;
+            sys::exit_info(&space, arg)
+        }
         kabi::sched::SYS_INFO_ENTROPY => {
             if arg != 0 {
                 return Err(Error::InvalidArgument);

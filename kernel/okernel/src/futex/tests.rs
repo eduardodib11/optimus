@@ -99,3 +99,24 @@ fn chaves_vizinhas_se_espalham_pelos_baldes() {
     assert!(used.iter().all(|&b| b < BUCKETS));
     assert_eq!(bucket_of(0x1234_5678), bucket_of(0x1234_5678));
 }
+
+/// O encerramento tira quem espera (T-348): a espera fica no slot de IPC,
+/// e `remove` só tira quem ainda está na fila.
+#[test]
+fn encerramento_tira_quem_espera() {
+    use crate::ipc::Blocked;
+    let table = FutexTable::new();
+    let t = threads(2);
+    for th in &t {
+        table.wait(0x1000, th, 7, || Some(7)).unwrap();
+        assert!(matches!(th.ipc().lock().blocked, Blocked::Futex(0x1000)));
+    }
+    assert!(table.remove(0x1000, &t[0]));
+    assert!(!table.remove(0x1000, &t[0]), "já saiu");
+    assert!(!table.remove(0x2000, &t[1]), "chave errada");
+    let mut woken = Vec::new();
+    assert_eq!(table.wake(0x1000, 9, &mut |th| woken.push(th)), 1);
+    assert!(Arc::ptr_eq(&woken[0], &t[1]));
+    assert!(matches!(t[1].ipc().lock().blocked, Blocked::None));
+    assert!(!table.remove(0x1000, &t[1]));
+}

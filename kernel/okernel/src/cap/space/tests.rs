@@ -98,7 +98,7 @@ fn obj_create_confere_tipo_e_direitos() {
         space.info(cs).unwrap(),
         CapInfo {
             object_type: ObjectType::CapSpace,
-            rights: Rights::MANAGE,
+            rights: Rights::MANAGE | Rights::BIND | Rights::DESTROY,
             badge: 0
         }
     );
@@ -125,8 +125,16 @@ fn obj_create_confere_tipo_e_direitos() {
         space.obj_create(no_create, ObjectType::CapSpace, 0),
         Err(Error::AccessDenied)
     );
+    // O argumento é o limite de threads vivas (ADR 0035, item 5).
+    let limited = space.obj_create(q, ObjectType::CapSpace, 3).unwrap();
+    let limit = space.get(limited).unwrap().object.clone();
+    let crate::cap::Object::CapSpace(limit) = limit else {
+        panic!("tipo")
+    };
+    assert_eq!(limit.lock().process().limit(), 3);
+    drop(limit);
     assert_eq!(
-        space.obj_create(q, ObjectType::CapSpace, 1),
+        space.obj_create(q, ObjectType::CapSpace, 1 << 32),
         Err(Error::InvalidArgument)
     );
     drop(space);

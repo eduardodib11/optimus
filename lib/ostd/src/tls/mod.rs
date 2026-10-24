@@ -5,8 +5,7 @@
 //! ABI x86-64 espera). Ele guarda o identificador da thread, o heap do
 //! `oalloc` dela, a tabela de valores do [`thread_local!`](crate::thread_local),
 //! o endpoint de exceções, o buffer de IPC (a última página, para o buffer
-//! ficar alinhado) e o que `spawn` e `join` trocam (a função inicial, a
-//! flag e o código de saída).
+//! ficar alinhado) e a função inicial que `spawn` entrega.
 //!
 //! A thread principal usa um bloco estático em `.bss`, ligado por
 //! [`init_main`] antes da função principal; as outras vivem no mesmo
@@ -27,11 +26,12 @@
 //!   mutabilidade interior (atômicos ou `UnsafeCell`) e só a thread dona
 //!   toca os `UnsafeCell` (o heap, os slots, a função inicial depois da
 //!   partida), com as exceções dos campos que `spawn` escreve **antes** de
-//!   iniciar a thread. `unsafe impl Sync` vale por isso.
+//!   iniciar a thread e da função inicial que quem junta solta **depois** do
+//!   evento de morte dela. `unsafe impl Sync` vale por isso.
 //! - **`current`:** `FS_BASE` aponta para um bloco que vive enquanto a thread
 //!   roda: o estático da principal, ou a região que `JoinHandle` só desmapeia
-//!   depois de ver a flag de fim, e a thread não toca nela depois dela
-//!   (`arch::exit_signalling`).
+//!   depois do evento de morte da thread no kernel (ADR 0035, T-348), que só
+//!   dispara quando ela já não executa código de usuário.
 //! - **Bloco zerado vale:** todo campo é válido com todos os bytes em zero
 //!   (inteiros, atômicos, `Option` de ponteiro, `MaybeUninit`), que é como o
 //!   kernel entrega as páginas e como `.bss` começa; `init_block` só
@@ -71,10 +71,6 @@ pub struct ThreadBlock {
     /// `fs:[0]`: o endereço do próprio bloco.
     self_ptr: *const ThreadBlock,
     tid: AtomicU64,
-    /// Flag de fim: a thread a põe em 1 no último ato (ver `join`).
-    done: AtomicU32,
-    /// Código de saída, gravado antes de `done`.
-    exit_code: AtomicU64,
     /// A thread nasceu de `spawn` (e tem quem a junte).
     joinable: AtomicBool,
     /// Handle do endpoint de exceções registrado (0 se nenhum).
@@ -103,23 +99,6 @@ impl ThreadBlock {
     #[must_use]
     pub fn addr(&self) -> u64 {
         core::ptr::from_ref(self).addr() as u64
-    }
-
-    /// A flag de fim, para `futex_wait` e `futex_wake`.
-    #[must_use]
-    pub fn done(&self) -> &AtomicU32 {
-        &self.done
-    }
-
-    /// Código de saída gravado pela thread.
-    #[must_use]
-    pub fn exit_code(&self) -> u64 {
-        self.exit_code.load(Ordering::Acquire)
-    }
-
-    /// Grava o código de saída (antes da flag de fim).
-    pub(crate) fn set_exit_code(&self, code: u64) {
-        self.exit_code.store(code, Ordering::Release);
     }
 
     /// A thread tem quem a junte.
@@ -151,10 +130,11 @@ impl ThreadBlock {
     }
 
     /// Tira a função inicial (a própria thread, uma vez; ou o criador, se
-    /// a partida falhou).
+    /// a partida falhou ou se a thread morreu antes de rodá-la).
     pub(crate) fn take_main(&self) -> Option<Main> {
         // SAFETY: um só lado por vez: o criador antes da partida (ou depois
-        // de ela falhar), a thread depois.
+        // de ela falhar, ou depois do evento de morte da thread), a thread
+        // entre a partida e a morte.
         unsafe { (*self.main.get()).take() }
     }
 
@@ -170,8 +150,7 @@ impl ThreadBlock {
             }
             1 => {}
             _ => {
-                crate::debug::print("ostd: alocação depois de a thread devolver o heap");
-                crate::thread::exit_raw(kabi::exit::PANIC_CODE);
+                crate::process::abort("ostd: alocação depois de a thread devolver o heap");
             }
         }
         // SAFETY: o estado 1 diz que o heap foi escrito; só a thread dona o

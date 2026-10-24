@@ -10,7 +10,7 @@ fn thread(quota: &Arc<MemoryQuota>) -> Arc<Thread> {
 #[test]
 fn sinal_sem_espera_fica_pendente_e_acumula() {
     let quota = MemoryQuota::root(1 << 20);
-    let n = Notification::new(&quota).unwrap();
+    let n = Arc::new(Notification::new(&quota).unwrap());
     assert!(quota.used() > 0);
     assert!(n.signal(0b01).is_none());
     assert!(n.signal(0b10).is_none());
@@ -27,7 +27,7 @@ fn sinal_sem_espera_fica_pendente_e_acumula() {
 #[test]
 fn espera_bloqueia_e_o_sinal_acorda_em_ordem() {
     let quota = MemoryQuota::root(1 << 20);
-    let n = Notification::new(&quota).unwrap();
+    let n = Arc::new(Notification::new(&quota).unwrap());
     let (a, b) = (thread(&quota), thread(&quota));
     assert_eq!(n.wait(&a), Ok(Wait::Blocked));
     assert_eq!(n.wait(&b), Ok(Wait::Blocked));
@@ -73,7 +73,7 @@ fn notificacao_destruida_acorda_com_peer_closed() {
     use core::sync::atomic::Ordering;
     let quota = MemoryQuota::root(1 << 20);
     let (fake, leaked) = platform(100);
-    let n = Notification::new(&quota).unwrap();
+    let n = Arc::new(Notification::new(&quota).unwrap());
     let t = Arc::new(Thread::new(&quota, leaked).unwrap());
     assert_eq!(n.wait(&t), Ok(Wait::Blocked));
     let before = fake.woken.load(Ordering::Relaxed);

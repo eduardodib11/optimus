@@ -1,5 +1,7 @@
 //! Capabilities e objetos do kernel (SDD v1.0, seções 6.1 e 6.2):
-//! `obj_create`, `cap_mint`, `cap_delete` e `cap_info`.
+//! `obj_create`, `cap_mint`, `cap_delete` (também com `DESTROY`),
+//! `cap_info`, `obj_bind_notify` e o registro de morte de `sys_info`
+//! (ADR 0035).
 
 use kabi::{Badge, Error, Handle, ObjectType, Rights, Syscall};
 
@@ -53,6 +55,62 @@ pub fn mint(
 /// `InvalidHandle` para handle sem capability.
 pub fn delete(h: Handle) -> Result<(), Error> {
     syscall(Syscall::CapDelete, [raw(h), 0, 0, 0, 0, 0]).map(drop)
+}
+
+/// `cap_delete` com `DESTROY` (ADR 0035, item 4): apaga a capability e
+/// destrói o objeto. `CapSpace`: encerra o processo (as threads dele morrem
+/// como `Killed` e a tabela é esvaziada); `Thread`: encerra a thread;
+/// `Endpoint`: quem espera nele, ou o usar depois, recebe `PeerClosed`.
+///
+/// # Errors
+///
+/// `AccessDenied` sem o direito `DESTROY`, `NotSupported` para os outros
+/// tipos (nos dois casos nada é apagado) e os de [`delete`].
+pub fn destroy(h: Handle) -> Result<(), Error> {
+    let args = [raw(h), kabi::cap_delete::DESTROY, 0, 0, 0, 0];
+    syscall(Syscall::CapDelete, args).map(drop)
+}
+
+/// `obj_bind_notify` (ADR 0035, item 3): o evento de `obj` sinaliza `bits`
+/// na notificação `ntfy`. `Thread` e `CapSpace`: o evento é a morte da
+/// thread ou do processo; ligar de novo troca a ligação, `bits = 0` desliga
+/// e ligar depois da morte sinaliza já. `Interrupt`: `bits` é o número do
+/// bit, e a linha só se liga uma vez.
+///
+/// # Errors
+///
+/// Os do kernel (`AccessDenied` sem `BIND` em `obj` ou `SIGNAL` em `ntfy`).
+pub fn bind_notify(obj: Handle, ntfy: Handle, bits: u64) -> Result<(), Error> {
+    let args = [raw(obj), raw(ntfy), bits, 0, 0, 0];
+    syscall(Syscall::ObjBindNotify, args).map(drop)
+}
+
+/// Registro de morte (ADR 0035, item 2), de [`death`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Death {
+    /// `kabi::exit::CAUSE_*`.
+    pub cause: u8,
+    /// `Exited`: o código de `thread_exit`; `Faulted`: o vetor.
+    pub code: u64,
+    /// `Faulted`: o endereço que faltou.
+    pub aux: u64,
+}
+
+/// `sys_info` com `SYS_INFO_EXIT`: o registro de morte da `Thread` (com
+/// `READ_STATE`) ou do processo do `CapSpace` (com `MANAGE`) de `h`;
+/// `None` enquanto vive.
+///
+/// # Errors
+///
+/// Os do kernel (`WrongType` para outros objetos).
+pub fn death(h: Handle) -> Result<Option<Death>, Error> {
+    let args = [kabi::sched::SYS_INFO_EXIT, raw(h), 0, 0, 0, 0];
+    let [cause, code, aux] = syscall(Syscall::SysInfo, args)?;
+    Ok((cause != 0).then_some(Death {
+        cause: u8::try_from(cause).unwrap_or(u8::MAX),
+        code,
+        aux,
+    }))
 }
 
 /// O que `cap_info` diz de uma capability.

@@ -96,7 +96,6 @@ pub fn cada_thread_ve_o_seu() -> Outcome {
         let limit = 60_000 * super::smp::MS + rounds * 2_000_000;
         let done = wait_with(limit, a != 0, || threads.iter().all(|(t, ..)| gone(t)));
         ensure!(done);
-        let not_supported = Error::NotSupported.to_raw();
         let invalid = Error::InvalidArgument.to_raw();
         for (i, ((t, _, cpu), &(tls, mode, _))) in threads.iter().zip(&plan).enumerate() {
             let page = DATA_VA + i as u64 * PAGE_SIZE;
@@ -106,7 +105,7 @@ pub fn cada_thread_ve_o_seu() -> Outcome {
                  {wrong} leituras erradas, última na cpu{seen}"
             );
             ensure!(status == STATUS_OK && done == rounds);
-            ensure!(group == not_supported && unknown == invalid);
+            ensure!(group == invalid && unknown == invalid);
             ensure!(t.tls() == tls && t.cpu() == *cpu);
             ensure!(t.death() == Some((CAUSE_EXITED, rounds, 0)));
             if mode & CLOBBER == 0 {

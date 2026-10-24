@@ -350,11 +350,12 @@ fn notificacao_de_longe(far: u32) -> Outcome {
 /// e apaga o endpoint depois de um atraso que varre de 0 a 1,9 ms, para
 /// cair antes da syscall, na janela de entrada na espera ou já com a
 /// thread parada. Devolve quantas voltas deram `PeerClosed` e quantas
-/// `InvalidHandle`.
+/// `InvalidHandle`. Um processo por volta: o que perdeu a última thread
+/// morreu e não começa outra (ADR 0035, item 1; T-348).
 pub(super) fn em_corrida(far: u32, rounds: u64) -> Result<(u64, u64), &'static str> {
-    let p = process(2)?;
     let (mut closed, mut invalid) = (0u64, 0u64);
     for round in 0..rounds {
+        let p = process(2)?;
         let (ep_h, ep) = create(&p, ObjectType::Endpoint)?;
         let (reply, _) = create(&p, ObjectType::Reply)?;
         drop(ep);

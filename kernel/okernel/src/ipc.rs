@@ -32,6 +32,8 @@ use kabi::{Badge, Error, Handle, MSG_MAX_CAPS, MSG_REG_WORDS};
 
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
+use crate::futex::FUTEXES;
+use crate::notify::Notification;
 use crate::sched::SchedContext;
 use crate::sync::{LockClass, SpinLock};
 use crate::thread::Thread;
@@ -80,6 +82,11 @@ pub enum Blocked {
     Recv(Weak<Endpoint>, Arc<Reply>, bool),
     /// Esperando a resposta guardada no `Reply` (`WaitReply`).
     Reply(Weak<Reply>),
+    /// Esperando numa `Notification` (`ntfy_wait`; T-348): fora do IPC, mas
+    /// publicado aqui para o encerramento achar a fila.
+    Notify(Weak<Notification>),
+    /// Esperando num futex, com a chave (`futex_wait`; T-348).
+    Futex(u64),
 }
 
 /// Estado de IPC de uma thread.
@@ -133,6 +140,9 @@ impl IpcSlot {
 struct Queues {
     senders: VecDeque<Arc<Thread>>,
     receivers: VecDeque<Arc<Thread>>,
+    /// Fechado por `cap_delete(DESTROY)` (ADR 0035, item 4): ninguém mais
+    /// entra nas filas.
+    closed: bool,
 }
 
 /// Ponto de IPC síncrono.
@@ -215,18 +225,52 @@ impl Endpoint {
     ///
     /// # Errors
     ///
-    /// [`Error::QuotaExceeded`] sem memória para a fila.
+    /// [`Error::QuotaExceeded`] sem memória para a fila;
+    /// [`Error::PeerClosed`] se o endpoint foi fechado.
     pub fn push_sender(&self, t: &Arc<Thread>) -> Result<(), Error> {
-        push(&mut self.queues.lock().senders, t)
+        let mut q = self.queues.lock();
+        if q.closed {
+            return Err(Error::PeerClosed);
+        }
+        push(&mut q.senders, t)
     }
 
     /// Põe `t` no fim da fila de receptores.
     ///
     /// # Errors
     ///
-    /// [`Error::QuotaExceeded`] sem memória para a fila.
+    /// [`Error::QuotaExceeded`] sem memória para a fila;
+    /// [`Error::PeerClosed`] se o endpoint foi fechado.
     pub fn push_receiver(&self, t: &Arc<Thread>) -> Result<(), Error> {
-        push(&mut self.queues.lock().receivers, t)
+        let mut q = self.queues.lock();
+        if q.closed {
+            return Err(Error::PeerClosed);
+        }
+        push(&mut q.receivers, t)
+    }
+
+    /// `cap_delete(DESTROY)` (ADR 0035, item 4): fecha o endpoint. Quem
+    /// espera nas filas acorda com `PeerClosed`, como na destruição, e quem
+    /// chegar depois recebe `PeerClosed` sem entrar.
+    pub fn close(&self) {
+        let (senders, receivers) = {
+            let mut q = self.queues.lock();
+            q.closed = true;
+            (
+                core::mem::take(&mut q.senders),
+                core::mem::take(&mut q.receivers),
+            )
+        };
+        let me = core::ptr::from_ref(self).cast();
+        for t in senders.into_iter().chain(receivers) {
+            close(t, me);
+        }
+    }
+
+    /// O endpoint foi fechado por [`close`](Self::close).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.queues.lock().closed
     }
 
     /// `Deliver` da spec `Ipc.tla`, num passo só sob a trava das filas:
@@ -242,7 +286,9 @@ impl Endpoint {
     ///
     /// # Errors
     ///
-    /// [`Error::QuotaExceeded`] sem memória para a fila; `mark` não roda.
+    /// [`Error::QuotaExceeded`] sem memória para a fila;
+    /// [`Error::PeerClosed`] se o endpoint foi fechado. Nos dois, `mark`
+    /// não roda.
     pub fn pop_receiver_or_push_sender(
         &self,
         t: &Arc<Thread>,
@@ -250,6 +296,9 @@ impl Endpoint {
         mark: impl FnOnce(),
     ) -> Result<Option<Arc<Thread>>, Error> {
         let mut q = self.queues.lock();
+        if q.closed {
+            return Err(Error::PeerClosed);
+        }
         if let Some(r) = q.receivers.pop_front() {
             return Ok(Some(r));
         }
@@ -266,7 +315,7 @@ impl Endpoint {
     ///
     /// # Errors
     ///
-    /// [`Error::QuotaExceeded`] sem memória para a fila; `mark` não roda.
+    /// Os de [`Endpoint::pop_receiver_or_push_sender`]; `mark` não roda.
     pub fn pop_sender_or_push_receiver(
         &self,
         t: &Arc<Thread>,
@@ -274,6 +323,9 @@ impl Endpoint {
         mark: impl FnOnce(),
     ) -> Result<Option<Arc<Thread>>, Error> {
         let mut q = self.queues.lock();
+        if q.closed {
+            return Err(Error::PeerClosed);
+        }
         if let Some(s) = q.senders.pop_front() {
             return Ok(Some(s));
         }
@@ -299,6 +351,9 @@ impl Endpoint {
         take: impl FnOnce(&Arc<Thread>) -> Option<T>,
     ) -> Option<(Arc<Thread>, T)> {
         let mut q = self.queues.lock();
+        if q.closed {
+            return None;
+        }
         let got = take(q.receivers.front()?)?;
         let r = q.receivers.pop_front()?;
         Some((r, got))
@@ -448,7 +503,7 @@ fn close(t: Arc<Thread>, object: *const ()) {
         let here = match &slot.blocked {
             Blocked::Send(ep) | Blocked::Recv(ep, ..) => ep.as_ptr().cast::<()>() == object,
             Blocked::Reply(reply) => reply.as_ptr().cast::<()>() == object,
-            Blocked::None => false,
+            Blocked::Notify(_) | Blocked::Futex(_) | Blocked::None => false,
         };
         if !here {
             return;
@@ -465,7 +520,9 @@ impl Drop for Endpoint {
     /// Ninguém mais pode enviar nem receber: quem espera nas filas acorda
     /// com `PeerClosed`.
     fn drop(&mut self) {
-        let Queues { senders, receivers } = core::mem::take(&mut *self.queues.lock());
+        let Queues {
+            senders, receivers, ..
+        } = core::mem::take(&mut *self.queues.lock());
         let me = core::ptr::from_ref(self).cast();
         for t in senders.into_iter().chain(receivers) {
             close(t, me);
@@ -486,33 +543,65 @@ impl Drop for Reply {
 
 /// Interrompe a espera de IPC de `t` com `why` (prazo vencido): tira-a da
 /// fila ou do `Reply` e solta a mensagem de saída. Falso se `t` não estava
-/// bloqueada por IPC (já foi atendida); quem chama a acorda se verdadeiro.
+/// bloqueada por IPC (já foi atendida, ou espera numa notificação ou num
+/// futex); quem chama a acorda se verdadeiro.
 pub fn cancel(t: &Arc<Thread>, why: Error) -> bool {
+    let (blocked, out) = {
+        let mut slot = t.ipc().lock();
+        if matches!(
+            slot.blocked,
+            Blocked::None | Blocked::Notify(_) | Blocked::Futex(_)
+        ) {
+            return false;
+        }
+        slot.result = Err(why);
+        (core::mem::take(&mut slot.blocked), slot.out.take())
+    };
+    unblock(t, blocked, out)
+}
+
+/// Interrompe qualquer espera de `t` publicada no slot (IPC, notificação
+/// ou futex) para o encerramento (ADR 0035, item 4): como [`cancel`] com
+/// `Cancelled`. Verdadeiro só se tirou `t` da fila em que estava; então
+/// ninguém mais a acorda, e quem chama a acorda. Falso: `t` não esperava,
+/// ou quem a tirou da fila (um sinal, um `futex_wake`) já a acorda.
+pub fn cancel_any(t: &Arc<Thread>) -> bool {
     let (blocked, out) = {
         let mut slot = t.ipc().lock();
         let blocked = core::mem::take(&mut slot.blocked);
         if matches!(blocked, Blocked::None) {
             return false;
         }
-        slot.result = Err(why);
+        slot.result = Err(Error::Cancelled);
         (blocked, slot.out.take())
     };
-    match blocked {
+    unblock(t, blocked, out)
+}
+
+/// Tira `t` do lugar em que esperava (`blocked`, já fora do slot).
+fn unblock(t: &Arc<Thread>, blocked: Blocked, out: Option<Outgoing>) -> bool {
+    let removed = match blocked {
         Blocked::Send(ep) | Blocked::Recv(ep, ..) => {
+            // Fora da fila (outra CPU já a tirou e a atende), segue a regra
+            // de sempre do prazo: quem chama a acorda.
             if let Some(ep) = ep.upgrade() {
                 ep.remove(t);
             }
+            true
         }
         Blocked::Reply(reply) => {
             if let Some(reply) = reply.upgrade() {
                 reply.remove(t);
             }
+            true
         }
-        Blocked::None => {}
-    }
+        Blocked::Notify(n) => n.upgrade().is_some_and(|n| n.remove(t)),
+        Blocked::Futex(key) => FUTEXES.remove(key, t),
+        Blocked::None => false,
+    };
     // O que a mensagem segura morre fora das travas.
     drop(out);
-    true
+    removed
 }
 
 #[cfg(test)]

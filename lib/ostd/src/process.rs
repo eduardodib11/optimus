@@ -15,6 +15,19 @@ use crate::cap::{create, delete, mint};
 use crate::thread;
 use crate::vm::{Mapping, map};
 
+/// Aborta o processo que chama (ADR 0039, item 5): escreve `reason` no
+/// registro de depuração e sai com `EXIT_GROUP` e o código de pânico
+/// (`kabi::exit::PANIC_CODE`), o que encerra as outras threads como
+/// `Killed`. Não roda destrutores nem devolve o heap: é o caminho do pânico
+/// e das falhas do alocador, em que o estado do processo não é confiável.
+/// Se o kernel recusar (nunca, com flags válidas), encerra só a thread com
+/// o mesmo código.
+pub fn abort(reason: &str) -> ! {
+    crate::debug::print(reason);
+    let _ = thread::exit_group(kabi::exit::PANIC_CODE);
+    thread::exit_raw(kabi::exit::PANIC_CODE)
+}
+
 /// Topo da pilha da thread inicial (o mesmo do `root`).
 pub const STACK_TOP: u64 = 0x0000_7fff_ffff_0000;
 /// Tamanho da pilha da thread inicial.

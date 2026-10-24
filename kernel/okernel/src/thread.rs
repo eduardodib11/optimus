@@ -15,7 +15,9 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 
 use kabi::vm::{PAGE_SIZE, USER_END, USER_START};
 use kabi::{Error, Handle};
@@ -23,6 +25,7 @@ use kabi::{Error, Handle};
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
 use crate::ipc::IpcSlot;
+use crate::notify::Notification;
 use crate::platform::{KERNEL_STACK_BYTES, KernelStack, Platform};
 use crate::sched::SchedContext;
 use crate::sync::{LockClass, SpinLock};
@@ -69,13 +72,45 @@ const FCW_INIT: u16 = 0x037f;
 /// MXCSR inicial: todas as exceções SIMD mascaradas.
 const MXCSR_INIT: u32 = 0x1f80;
 
-/// Onde a thread roda: tabelas de capabilities e de páginas.
+/// A ligação de um evento de ciclo de vida (ADR 0035, item 3): a
+/// notificação e os bits que ela recebe.
+pub type Event = (Arc<Notification>, u64);
+
+/// Onde a thread roda (tabelas de capabilities e de páginas) e o estado da
+/// morte dela (ADR 0035, itens 3 e 4), sob a trava `Thread.binding`.
 #[derive(Default)]
 pub struct Binding {
     /// `CapSpace` usado nas syscalls da thread.
     pub cspace: Option<Arc<SharedCapSpace>>,
     /// `AddressSpace` da thread.
     pub aspace: Option<Arc<SharedAddressSpace>>,
+    /// Ligação do evento de morte (`obj_bind_notify`).
+    event: Option<Event>,
+    /// A thread já morreu: o evento é nível, e ligar depois sinaliza já.
+    dead: bool,
+    /// Alguém pediu o encerramento ([`Thread::request_kill`]).
+    kill: bool,
+}
+
+/// Threads com encerramento pedido e ainda vivas, em todo o kernel: zero é
+/// o caso comum, e o caminho de volta ao usuário só olha a própria thread
+/// quando há alguma.
+static KILLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Há thread com encerramento pedido que ainda não morreu.
+#[must_use]
+#[inline]
+pub fn kills_pending() -> bool {
+    KILLS.load(Ordering::SeqCst) != 0
+}
+
+/// O que a morte de uma thread entrega a quem a registra
+/// ([`Thread::mark_dead`]).
+pub struct Death {
+    /// O evento a sinalizar, se ligado.
+    pub event: Option<Event>,
+    /// O `CapSpace` (processo) da thread, se ligada.
+    pub cspace: Option<Arc<SharedCapSpace>>,
 }
 
 /// `SchedContext`s de uma thread, sob uma trava só: o escalonador lê o
@@ -140,6 +175,11 @@ pub struct Thread {
     /// zero: viva), código e auxiliar. A causa é gravada por último.
     death_cause: AtomicU8,
     death: [AtomicU64; 2],
+    /// Cópia de `Binding::kill` lida sem trava (volta ao usuário e espera).
+    kill: AtomicBool,
+    /// A thread conta nas vivas do processo (`process::on_start`); muda só
+    /// com a trava do `CapSpace` dela.
+    counted: AtomicBool,
 }
 
 impl fmt::Debug for Thread {
@@ -190,6 +230,8 @@ impl Thread {
             fs_base: AtomicU64::new(0),
             death_cause: AtomicU8::new(0),
             death: [const { AtomicU64::new(0) }; 2],
+            kill: AtomicBool::new(false),
+            counted: AtomicBool::new(false),
         })
     }
 
@@ -331,10 +373,8 @@ impl Thread {
             return Err(Error::Busy);
         }
         self.root.store(aspace.lock().root().0, Ordering::Release);
-        *binding = Binding {
-            cspace: Some(cspace),
-            aspace: Some(aspace),
-        };
+        binding.cspace = Some(cspace);
+        binding.aspace = Some(aspace);
         Ok(())
     }
 
@@ -490,6 +530,109 @@ impl Thread {
         self.death[0].store(code, Ordering::Relaxed);
         self.death[1].store(aux, Ordering::Relaxed);
         self.death_cause.store(cause, Ordering::Release);
+    }
+
+    /// `thread_start` toma a thread: de `Inactive` a `Ready`, uma vez só
+    /// (contra outra partida e contra o encerramento de uma inativa).
+    #[must_use]
+    pub fn claim_start(&self) -> bool {
+        self.state
+            .compare_exchange(
+                RunState::Inactive as u8,
+                RunState::Ready as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Desfaz [`claim_start`](Self::claim_start): a partida falhou antes de
+    /// a thread entrar numa fila.
+    pub fn unclaim_start(&self) {
+        self.set_state(RunState::Inactive);
+    }
+
+    /// Pede o encerramento da thread (ADR 0035, item 4): ela morre como
+    /// `Killed` na próxima volta ao usuário, ao tentar bloquear ou, inativa,
+    /// já (quem pede chama [`kill_inactive`](Self::kill_inactive)). Falso se
+    /// ela já morreu ou o pedido já existia.
+    pub fn request_kill(&self) -> bool {
+        let mut b = self.binding.lock();
+        if b.dead || b.kill {
+            return false;
+        }
+        b.kill = true;
+        KILLS.fetch_add(1, Ordering::SeqCst);
+        self.kill.store(true, Ordering::SeqCst);
+        drop(b);
+        // Par com a espera (`ipc::cancel_any` e a conferência antes de
+        // bloquear): ou quem pede vê a espera publicada no slot, ou a thread
+        // vê o pedido depois de publicá-la.
+        fence(Ordering::SeqCst);
+        true
+    }
+
+    /// O encerramento foi pedido.
+    #[must_use]
+    #[inline]
+    pub fn kill_requested(&self) -> bool {
+        self.kill.load(Ordering::SeqCst)
+    }
+
+    /// Thread nunca iniciada e com encerramento pedido: passa a `Exited`,
+    /// para nenhuma partida a rodar. Falso se ela já foi iniciada.
+    #[must_use]
+    pub fn kill_inactive(&self) -> bool {
+        self.state
+            .compare_exchange(
+                RunState::Inactive as u8,
+                RunState::Exited as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Marca a morte, uma vez só (o registro já gravado), e devolve o
+    /// evento a sinalizar e o `CapSpace` da thread; `None` se ela já estava
+    /// morta.
+    pub fn mark_dead(&self) -> Option<Death> {
+        let mut b = self.binding.lock();
+        if b.dead {
+            return None;
+        }
+        b.dead = true;
+        if b.kill {
+            KILLS.fetch_sub(1, Ordering::SeqCst);
+        }
+        Some(Death {
+            event: b.event.take(),
+            cspace: b.cspace.clone(),
+        })
+    }
+
+    /// `obj_bind_notify` sobre a thread (ADR 0035, item 3): `event` passa a
+    /// ser a ligação (`None` desliga). Devolve o que sinalizar já (a thread
+    /// já morreu: o evento é nível e não fica guardado) e a ligação antiga,
+    /// para quem chama soltar sem a trava.
+    pub fn bind_death(&self, event: Option<Event>) -> (Option<Event>, Option<Event>) {
+        let mut b = self.binding.lock();
+        if b.dead {
+            return (event, b.event.take());
+        }
+        (None, core::mem::replace(&mut b.event, event))
+    }
+
+    /// A thread conta nas vivas do processo (com a trava do `CapSpace`).
+    #[must_use]
+    pub fn counted(&self) -> bool {
+        self.counted.load(Ordering::Relaxed)
+    }
+
+    /// Marca se a thread conta nas vivas do processo (com a trava do
+    /// `CapSpace`).
+    pub fn set_counted(&self, counted: bool) {
+        self.counted.store(counted, Ordering::Relaxed);
     }
 
     /// O registro de morte, `(causa, código, auxiliar)`, se a thread já

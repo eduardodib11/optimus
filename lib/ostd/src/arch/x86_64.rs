@@ -2,8 +2,6 @@
 
 use core::arch::{asm, global_asm};
 
-use kabi::Syscall;
-
 use crate::rt::Entry;
 
 /* Entrada do processo: zera o rbp (fim da cadeia de quadros), alinha a
@@ -109,38 +107,4 @@ pub fn thread_pointer() -> u64 {
         asm!("mov {}, fs:[0]", out(reg) ptr, options(nostack, readonly, preserves_flags));
     }
     ptr
-}
-
-/// Último ato de uma thread do `ostd` que outra vai juntar: grava 1 em
-/// `*flag`, acorda com `futex_wake` quem espera nela e chama `thread_exit`
-/// com `code`, tudo num bloco de assembly **sem tocar na pilha** nem na
-/// memória depois do primeiro `mov`. É o que deixa quem espera desmapear a
-/// pilha e o bloco da thread assim que vê a flag em 1: a thread só executa
-/// mais duas instruções `syscall` com registradores (T-335).
-pub fn exit_signalling(flag: &core::sync::atomic::AtomicU32, code: u64) -> ! {
-    // SAFETY: `flag` é uma palavra válida e gravável (um `AtomicU32`); o
-    // `mov` é um `store` de 4 bytes alinhado, atômico em x86-64. Os dois
-    // `syscall` seguem a convenção da ABI (número em `rax`, argumentos em
-    // `rdi` e `rsi`); `futex_wake` num endereço já desmapeado só dá erro, e
-    // `thread_exit` sem flags nunca volta (o `ud2` é só a rede de segurança).
-    // Nada acessa a pilha.
-    unsafe {
-        asm!(
-            "mov dword ptr [r12], 1",
-            "mov rdi, r12",
-            "mov esi, 1",
-            "mov eax, {wake}",
-            "syscall",
-            "mov rdi, r13",
-            "xor esi, esi",
-            "mov eax, {exit}",
-            "syscall",
-            "ud2",
-            in("r12") flag.as_ptr(),
-            in("r13") code,
-            wake = const Syscall::FutexWake as u32,
-            exit = const Syscall::ThreadExit as u32,
-            options(noreturn),
-        )
-    }
 }

@@ -28,6 +28,7 @@ use alloc::sync::Arc;
 
 use kabi::Error;
 
+use crate::ipc::Blocked;
 use crate::sync::{LockClass, SpinLock};
 use crate::thread::{RunState, Thread};
 
@@ -117,6 +118,8 @@ impl FutexTable {
             return Err(Error::WouldBlock);
         }
         t.waiters.try_reserve(1).map_err(|_| Error::QuotaExceeded)?;
+        // Publicada no slot, para o encerramento achar a fila (T-348).
+        thread.ipc().lock().blocked = Blocked::Futex(key);
         thread.set_state(RunState::Blocked);
         t.waiters.push_back((key, Arc::clone(thread)));
         t.stats.blocked += 1;
@@ -134,6 +137,7 @@ impl FutexTable {
             if t.waiters[i].0 == key
                 && let Some((_, thread)) = t.waiters.remove(i)
             {
+                thread.ipc().lock().blocked = Blocked::None;
                 wake(thread);
                 woken += 1;
             } else {
@@ -142,6 +146,19 @@ impl FutexTable {
         }
         t.stats.woken += woken;
         woken
+    }
+
+    /// Tira `thread` da fila de `key` (encerramento, ADR 0035, item 4);
+    /// falso se ela não estava (um `futex_wake` já a tirou e a acorda).
+    pub fn remove(&self, key: u64, thread: &Thread) -> bool {
+        let mut t = self.bucket(key).lock();
+        let at = t
+            .waiters
+            .iter()
+            .position(|(k, w)| *k == key && core::ptr::eq(Arc::as_ptr(w), thread));
+        let removed = at.and_then(|i| t.waiters.remove(i));
+        drop(t);
+        removed.is_some()
     }
 
     /// Threads esperando em `key`.

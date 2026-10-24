@@ -784,8 +784,9 @@ user_cap_churn:
     call 8f
     jmp 5f
 42: inc qword ptr [r12 + 40]
-5:  /* cap_delete(h1) */
+5:  /* cap_delete(h1), sem flags */
     mov rdi, r13
+    xor esi, esi
     mov eax, 2
     syscall
     test rax, rax
@@ -857,7 +858,8 @@ user_where:
  * que zera o FS_BASE da CPU sem o kernel saber, e cede a CPU assim. Grava: [0] status
  * do thread_configure (0 sem o bit 0), [8] leituras erradas, [16] voltas,
  * [24] CPU da última volta (TSC_AUX), [32] e [40] status de thread_exit
- * com EXIT_GROUP e com flag desconhecida; sai com o código = voltas. */
+ * com EXIT_GROUP mais uma flag desconhecida e só com ela (os dois
+ * recusados antes de encerrar qualquer coisa); sai com o código = voltas. */
 .global user_tls
 user_tls:
     mov r12, rdi
@@ -902,7 +904,7 @@ user_tls:
     rdtscp
     mov qword ptr [r14 + 24], rcx
     xor edi, edi
-    mov esi, 1
+    mov esi, 3
     mov eax, 33
     syscall
     mov qword ptr [r14 + 32], rax

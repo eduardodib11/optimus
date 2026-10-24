@@ -701,3 +701,89 @@ fn vm_map_e_unmap_no_proprio_espaco() {
     drop(aspace);
     thread.set_state(crate::thread::RunState::Exited);
 }
+
+/// Eventos de ciclo de vida pelas syscalls (T-348; ADR 0035, itens 2 a 4):
+/// `obj_bind_notify` sobre `Thread` e `CapSpace`, `sys_info` classe 2 e
+/// `cap_delete(DESTROY)`.
+#[test]
+fn ciclo_de_vida_por_handles() {
+    use kabi::cap_delete::DESTROY;
+    platform::install(fake_platform(1000).1);
+    let (_root, space, q) = setup();
+    let n = create(&space, q, ObjectType::Notification);
+    let t = create(&space, q, ObjectType::Thread);
+    let cs = create(&space, q, ObjectType::CapSpace);
+    let ep = create(&space, q, ObjectType::Endpoint);
+    let bind = |obj, bits, a3| call(&space, Syscall::ObjBindNotify, [obj, n, bits, a3, 0, 0]);
+    // a3..a5 reservados; sem BIND no objeto ou SIGNAL na notificação, nada.
+    assert_eq!(bind(t, 1, 1), Err(Error::InvalidArgument));
+    let no_bind = u64::from(Rights::READ_STATE.bits());
+    let [weak, ..] = call(&space, Syscall::CapMint, [t, no_bind, 0, 0, 0, 0]).unwrap();
+    assert_eq!(bind(weak, 1, 0), Err(Error::AccessDenied));
+    assert_eq!(
+        call(&space, Syscall::ObjBindNotify, [t, ep, 1, 0, 0, 0]),
+        Err(Error::AccessDenied)
+    );
+    assert_eq!(bind(n, 1, 0), Err(Error::AccessDenied));
+    assert_eq!(bind(t, 0b01, 0), Ok([0; 3]));
+    assert_eq!(bind(cs, 0b10, 0), Ok([0; 3]));
+    // sys_info classe 2: zeros enquanto vive; tipo e direitos conferidos.
+    assert_eq!(exit_info(&space, t), Ok([0; 3]));
+    assert_eq!(exit_info(&space, cs), Ok([0; 3]));
+    assert_eq!(exit_info(&space, n), Err(Error::WrongType));
+    assert_eq!(exit_info(&space, weak), Ok([0; 3]));
+    let [no_rights, ..] = call(&space, Syscall::CapMint, [t, 0, 0, 0, 0, 0]).unwrap();
+    assert_eq!(exit_info(&space, no_rights), Err(Error::AccessDenied));
+    // cap_delete: flags desconhecidas, DESTROY sem o direito, tipo sem
+    // encerramento: recusados sem apagar.
+    let del = |h, flags| call(&space, Syscall::CapDelete, [h, flags, 0, 0, 0, 0]);
+    assert_eq!(del(t, 2), Err(Error::InvalidArgument));
+    assert_eq!(del(weak, DESTROY), Err(Error::AccessDenied));
+    assert_eq!(del(n, DESTROY), Err(Error::NotSupported));
+    let all = u64::from(Rights::ALL.bits());
+    assert_eq!(del(q, DESTROY), Err(Error::NotSupported));
+    assert_eq!(exit_info(&space, weak), Ok([0; 3]), "weak não foi apagado");
+    let [t_copy, ..] = call(&space, Syscall::CapMint, [t, all, 0, 0, 0, 0]).unwrap();
+    // DESTROY da thread inativa: morre já como Killed; o handle se vai, a
+    // cópia fica e lê o registro.
+    assert_eq!(del(t, DESTROY), Ok([0; 3]));
+    assert_eq!(
+        call(&space, Syscall::CapInfo, [t, 0, 0, 0, 0, 0]),
+        Err(Error::InvalidHandle)
+    );
+    assert_eq!(
+        exit_info(&space, weak),
+        Ok([u64::from(kabi::exit::CAUSE_KILLED), 0, 0])
+    );
+    assert_eq!(
+        call(&space, Syscall::NtfyPoll, [n, 0, 0, 0, 0, 0]),
+        Ok([1, 0, 0])
+    );
+    // Ligar a uma thread morta sinaliza já.
+    assert_eq!(bind(t_copy, 0b100, 0), Ok([0; 3]));
+    assert_eq!(
+        call(&space, Syscall::NtfyPoll, [n, 0, 0, 0, 0, 0]),
+        Ok([4, 0, 0])
+    );
+    // DESTROY do processo sem threads: morre já.
+    let [cs_copy, ..] = call(&space, Syscall::CapMint, [cs, all, 0, 0, 0, 0]).unwrap();
+    assert_eq!(del(cs, DESTROY), Ok([0; 3]));
+    assert_eq!(
+        call(&space, Syscall::NtfyPoll, [n, 0, 0, 0, 0, 0]),
+        Ok([2, 0, 0])
+    );
+    assert_eq!(
+        exit_info(&space, cs_copy),
+        Ok([u64::from(kabi::exit::CAUSE_KILLED), 0, 0])
+    );
+    assert_eq!(bind(cs_copy, 0b1000, 0), Ok([0; 3]));
+    assert_eq!(
+        call(&space, Syscall::NtfyPoll, [n, 0, 0, 0, 0, 0]),
+        Ok([8, 0, 0])
+    );
+    // DESTROY do endpoint: as cópias recebem PeerClosed.
+    let [ep_copy, ..] = call(&space, Syscall::CapMint, [ep, all, 0, 0, 0, 0]).unwrap();
+    assert_eq!(del(ep, DESTROY), Ok([0; 3]));
+    let ep_obj = get(&space, ep_copy);
+    assert!(ep_obj.object.as_endpoint().unwrap().is_closed());
+}

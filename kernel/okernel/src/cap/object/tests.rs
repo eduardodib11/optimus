@@ -118,8 +118,14 @@ fn direitos_iniciais_da_tabela() {
     );
     assert_eq!(
         default_rights(ObjectType::Endpoint),
-        Rights::SEND | Rights::RECV | Rights::GRANT
+        Rights::SEND | Rights::RECV | Rights::GRANT | Rights::DESTROY
     );
+    // Processos e threads: ligar o evento de morte e encerrar (T-348).
+    assert_eq!(
+        default_rights(ObjectType::CapSpace),
+        Rights::MANAGE | Rights::BIND | Rights::DESTROY
+    );
+    assert!(default_rights(ObjectType::Thread).contains(Rights::BIND | Rights::DESTROY));
     for &ty in ObjectType::ALL {
         assert_ne!(default_rights(ty), Rights::NONE, "{ty:?}");
     }

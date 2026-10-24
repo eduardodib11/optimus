@@ -237,24 +237,35 @@ pub const fn object_bytes<T>() -> u64 {
 }
 
 /// Direitos da capability que `obj_create` entrega para cada tipo: os
-/// relevantes da tabela 6.1, de onde as cópias só podem reduzir.
+/// relevantes da tabela 6.1, de onde as cópias só podem reduzir. O criador
+/// de `CapSpace`, `Thread` e `Endpoint` recebe também `DESTROY`, e o de
+/// `CapSpace` e `Thread`, `BIND` (o evento de morte; ADR 0035, itens 3 e 4).
 #[must_use]
 pub const fn default_rights(ty: ObjectType) -> Rights {
     let bits = match ty {
         ObjectType::MemoryQuota => Rights::CREATE.bits() | Rights::SPLIT.bits(),
         ObjectType::AddressSpace => Rights::MAP.bits() | Rights::UNMAP.bits(),
-        ObjectType::CapSpace => Rights::MANAGE.bits(),
+        ObjectType::CapSpace => {
+            Rights::MANAGE.bits() | Rights::BIND.bits() | Rights::DESTROY.bits()
+        }
         ObjectType::Thread => {
             Rights::START.bits()
                 | Rights::SUSPEND.bits()
                 | Rights::READ_STATE.bits()
                 | Rights::WRITE_STATE.bits()
+                | Rights::BIND.bits()
+                | Rights::DESTROY.bits()
         }
         ObjectType::SchedContext => Rights::BIND.bits() | Rights::CONFIGURE.bits(),
         ObjectType::MemoryObject => {
             Rights::READ.bits() | Rights::WRITE.bits() | Rights::EXEC.bits() | Rights::MAP.bits()
         }
-        ObjectType::Endpoint => Rights::SEND.bits() | Rights::RECV.bits() | Rights::GRANT.bits(),
+        ObjectType::Endpoint => {
+            Rights::SEND.bits()
+                | Rights::RECV.bits()
+                | Rights::GRANT.bits()
+                | Rights::DESTROY.bits()
+        }
         ObjectType::Reply => Rights::SEND.bits(),
         ObjectType::Notification => Rights::SIGNAL.bits() | Rights::WAIT.bits(),
         ObjectType::Interrupt => Rights::ACK.bits() | Rights::BIND.bits(),
@@ -272,8 +283,9 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 /// `quota`.
 ///
 /// `args` por tipo: `MemoryQuota`, o orçamento da cota filha em bytes (que
-/// sai de `quota` junto com o tamanho do objeto); `CapSpace`, zero (as
-/// folhas da tabela são cobradas da mesma cota à medida que ela cresce);
+/// sai de `quota` junto com o tamanho do objeto); `CapSpace`, o limite de
+/// threads vivas do processo (0 = sem limite, ADR 0035, item 5; as folhas
+/// da tabela são cobradas da mesma cota à medida que ela cresce);
 /// `AddressSpace`, zero (tabelas e regiões são cobradas ao mapear);
 /// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB; `Thread` e
 /// `SchedContext`, `Notification`, `Endpoint` e `Reply`, zero (o primeiro nasce sem
@@ -299,8 +311,7 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
                 args, charge,
             ))))
         }
-        ObjectType::CapSpace
-        | ObjectType::AddressSpace
+        ObjectType::AddressSpace
         | ObjectType::Notification
         | ObjectType::Endpoint
         | ObjectType::Reply
@@ -308,10 +319,15 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
         {
             Err(Error::InvalidArgument)
         }
-        ObjectType::CapSpace => Ok(Object::CapSpace(Arc::new(SpinLock::with_class(
-            LockClass::CapSpace,
-            CapSpace::new(quota)?,
-        )))),
+        ObjectType::CapSpace => {
+            let limit = u32::try_from(args).map_err(|_| Error::InvalidArgument)?;
+            let mut table = CapSpace::new(quota)?;
+            table.process_mut().set_limit(limit);
+            Ok(Object::CapSpace(Arc::new(SpinLock::with_class(
+                LockClass::CapSpace,
+                table,
+            ))))
+        }
         ObjectType::AddressSpace => {
             let platform = platform::get().ok_or(Error::NotSupported)?;
             let space = AddressSpace::new(quota, platform)?;
