@@ -37,6 +37,11 @@ struct Fake {
     user: Vec<(u64, Vec<u8>)>,
     changed: Vec<CpuMask>,
     tls_loads: Vec<u64>,
+    /// Relógio de `now` e CPU de `cpu`.
+    clock: u64,
+    cpu: u32,
+    /// Prazos avisados por `timer_armed`.
+    armed: Vec<u64>,
 }
 
 impl Env for Fake {
@@ -54,7 +59,7 @@ impl Env for Fake {
         None
     }
     fn now(&self) -> u64 {
-        0
+        self.clock
     }
     fn block_until(&mut self, _deadline: u64) {}
     fn handoff(&mut self, to: Arc<Thread>, _deadline: u64) {
@@ -81,6 +86,12 @@ impl Env for Fake {
     }
     fn load_tls(&mut self, va: u64) {
         self.tls_loads.push(va);
+    }
+    fn cpu(&self) -> u32 {
+        self.cpu
+    }
+    fn timer_armed(&mut self, deadline: u64) {
+        self.armed.push(deadline);
     }
 }
 
@@ -786,4 +797,127 @@ fn ciclo_de_vida_por_handles() {
     assert_eq!(del(ep, DESTROY), Ok([0; 3]));
     let ep_obj = get(&space, ep_copy);
     assert!(ep_obj.object.as_endpoint().unwrap().is_closed());
+}
+
+/// `Timer` por handles (T-349; ADR 0035, item 6): `obj_create` com zero e
+/// só `BIND`, arme relativo e absoluto avisando o prazo novo da fila,
+/// prazo vencido sinalizando antes de voltar, recusas de período, flags e
+/// direitos, desarme por `bits = 0` e por `prazo = 0`, rearme noutra CPU e
+/// o `Timer` armado apagado devolvendo a cota.
+#[test]
+fn timer_por_handles() {
+    use kabi::timer::{MIN_PERIOD_NS, RELATIVE};
+    let (root, space, q) = setup();
+    let ty = ObjectType::Timer.to_raw();
+    assert_eq!(
+        call(&space, Syscall::ObjCreate, [q, ty, 1, 0, 0, 0]),
+        Err(Error::InvalidArgument)
+    );
+    let used = root.used();
+    let [t, ..] = call(&space, Syscall::ObjCreate, [q, ty, 0, 0, 0, 0]).unwrap();
+    let notification = ObjectType::Notification.to_raw();
+    let [n, ..] = call(&space, Syscall::ObjCreate, [q, notification, 0, 0, 0, 0]).unwrap();
+    let info = call(&space, Syscall::CapInfo, [t, 0, 0, 0, 0, 0]).unwrap();
+    assert_eq!(info, [ty, u64::from(Rights::BIND.bits()), 0]);
+    let ntfy = Arc::clone(
+        cap_with(&space, n, Rights::NONE)
+            .unwrap()
+            .object
+            .as_notification()
+            .unwrap(),
+    );
+    let armed = || armed_of(&space, t);
+    let bind = |env: &mut Fake, a: [u64; 4]| {
+        invoke(
+            &space,
+            Syscall::ObjBindNotify,
+            [t, n, a[0], a[1], a[2], a[3]],
+            4,
+            env,
+        )
+    };
+    let mut env = Fake {
+        clock: 1_000,
+        cpu: 2,
+        ..Fake::default()
+    };
+    // Relativo: prazo = agora + 5000, na fila da CPU 2, com o aviso.
+    bind(&mut env, [0b11, 5_000, 0, RELATIVE]).unwrap();
+    assert_eq!(armed(), Some((6_000, 0)));
+    assert_eq!(env.armed, [6_000]);
+    assert_eq!(cap_owner(&space, t), 2);
+    // Absoluto vencido: sinaliza antes de voltar e fica desarmado.
+    bind(&mut env, [0b100, 999, 0, 0]).unwrap();
+    assert_eq!((ntfy.poll(), armed()), (0b100, None));
+    assert!(env.preempts > 0);
+    // Recusas, sem mexer no arme.
+    for a in [
+        [1, 5_000, MIN_PERIOD_NS - 1, RELATIVE],
+        [1, 5_000, 1, 0],
+        [1, 5_000, 0, 2],
+        [1, 5_000, 0, 1 << 40],
+        [0, 0, 7, 0],
+    ] {
+        assert_eq!(bind(&mut env, a), Err(Error::InvalidArgument), "{a:?}");
+    }
+    // Periódico no mínimo, rearmado de outra CPU (migra), desarmado por
+    // `bits = 0` e por `prazo = 0`.
+    bind(&mut env, [1, 2_000, MIN_PERIOD_NS, 0]).unwrap();
+    assert_eq!(armed(), Some((2_000, MIN_PERIOD_NS)));
+    env.cpu = 3;
+    bind(&mut env, [1, 3_000, MIN_PERIOD_NS, 0]).unwrap();
+    assert_eq!(cap_owner(&space, t), 3);
+    bind(&mut env, [0, 3_000, MIN_PERIOD_NS, 0]).unwrap();
+    assert_eq!(armed(), None);
+    bind(&mut env, [1, 3_000, 0, 0]).unwrap();
+    bind(&mut env, [1, 0, 0, RELATIVE]).unwrap();
+    assert_eq!(armed(), None);
+    // Direitos: `BIND` no `Timer` e `SIGNAL` na notificação.
+    let none = u64::from(Rights::NONE.bits());
+    let [weak, ..] = call(&space, Syscall::CapMint, [t, none, 0, 0, 0, 0]).unwrap();
+    let wait = u64::from(Rights::WAIT.bits());
+    let [quiet, ..] = call(&space, Syscall::CapMint, [n, wait, 0, 0, 0, 0]).unwrap();
+    let mut env = Fake::default();
+    for (obj, nt) in [(weak, n), (t, quiet), (n, n)] {
+        assert_eq!(
+            invoke(
+                &space,
+                Syscall::ObjBindNotify,
+                [obj, nt, 1, 5, 0, 0],
+                4,
+                &mut env
+            ),
+            Err(Error::AccessDenied)
+        );
+    }
+    assert_eq!(
+        invoke(
+            &space,
+            Syscall::ObjBindNotify,
+            [q, n, 1, 5, 0, 0],
+            4,
+            &mut env
+        ),
+        Err(Error::AccessDenied)
+    );
+    // Apagado armado: sai da fila e a cota volta.
+    bind(&mut Fake::default(), [1, u64::MAX - 1, 0, 0]).unwrap();
+    for h in [weak, quiet, t] {
+        call(&space, Syscall::CapDelete, [h, 0, 0, 0, 0, 0]).unwrap();
+    }
+    drop(ntfy);
+    call(&space, Syscall::CapDelete, [n, 0, 0, 0, 0, 0]).unwrap();
+    assert_eq!(root.used(), used);
+}
+
+/// Prazo e período do `Timer` do handle `h`.
+fn armed_of(space: &SharedCapSpace, h: u64) -> Option<(u64, u64)> {
+    let cap = cap_with(space, h, Rights::NONE).unwrap();
+    cap.object.as_timer().unwrap().armed()
+}
+
+/// CPU dona do `Timer` do handle `h`.
+fn cap_owner(space: &SharedCapSpace, h: u64) -> u32 {
+    let cap = cap_with(space, h, Rights::NONE).unwrap();
+    cap.object.as_timer().unwrap().owner()
 }

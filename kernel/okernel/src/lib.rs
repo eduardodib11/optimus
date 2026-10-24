@@ -26,5 +26,6 @@ pub mod sync;
 pub mod sys;
 pub mod thread;
 pub mod time;
+pub mod timer;
 pub mod tlb;
 pub mod vm;

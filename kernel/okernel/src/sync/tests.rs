@@ -252,3 +252,47 @@ fn niveis_da_adr() {
         (LockClass::KernelStacks, 0)
     ));
 }
+
+/// A fila de timers (ADR 0031, emenda da ADR 0035) vem logo depois da fila
+/// de prontas, no mesmo nível, e é folha: nada se toma com ela na mão, nem
+/// outra fila de timers.
+#[test]
+fn fila_de_timers_e_folha() {
+    assert_eq!(LockClass::TimerQueue.level(), 6);
+    assert_eq!(LockClass::TimerQueue.name(), "FilaTimers");
+    assert!(order_allows(
+        (LockClass::RunQueue, 3),
+        (LockClass::TimerQueue, 0)
+    ));
+    assert!(order_allows(
+        (LockClass::Object, 0),
+        (LockClass::TimerQueue, 2)
+    ));
+    assert!(!order_allows(
+        (LockClass::TimerQueue, 0),
+        (LockClass::RunQueue, 1)
+    ));
+    for next in [
+        LockClass::TimerQueue,
+        LockClass::SchedLeaf,
+        LockClass::Heap,
+        LockClass::Diagnostic,
+    ] {
+        assert!(
+            !order_allows((LockClass::TimerQueue, 0), (next, 1)),
+            "{next:?}"
+        );
+    }
+    checked(|held| {
+        let t = SpinLock::with_key(LockClass::TimerQueue, 1, ());
+        let d = SpinLock::with_class(LockClass::Diagnostic, ());
+        let v = held.catch_violation(|| {
+            let _t = t.lock();
+            let _d = d.lock();
+        });
+        assert_eq!(
+            v.map(|v| (v.held, v.wanted)),
+            Some(((LockClass::TimerQueue, 1), (LockClass::Diagnostic, 0)))
+        );
+    });
+}
