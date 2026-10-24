@@ -15,21 +15,29 @@
 //!   um objeto `Thread`, ligado ao `CapSpace` e ao `AddressSpace` de quem criou
 //!   com `CONFIGURE_BIND_SELF` (nenhum serviço guarda capability de si).
 //!
-//! `join` espera a flag de fim do bloco por `futex_wait`. A thread a grava no
-//! último ato, num bloco de assembly sem pilha (`arch::exit_signalling`),
-//! depois de rodar os destrutores dos `thread_local!` e devolver o heap; só
-//! então `join` desmapeia a região e devolve o espaço. Os objetos do kernel
-//! (`Thread`, `SchedContext`) voltam à cota quando a thread termina de fato.
+//! `join` espera o evento de morte do objeto `Thread` (ADR 0035, T-348):
+//! liga-o a uma notificação própria (`obj_bind_notify`) e espera nela. O
+//! kernel só sinaliza depois de a thread deixar de executar código de
+//! usuário, saia ela por `thread_exit`, por falta fatal ou encerrada por
+//! outra; só então `join` desmapeia a região e devolve o espaço, e lê o
+//! registro de morte (`sys_info`, classe 2). A saída normal roda antes os
+//! destrutores dos `thread_local!` e devolve o heap. Os objetos do kernel
+//! (`Thread`, `SchedContext`) voltam à cota quando a thread termina de fato
+//! e a capability dela, guardada no [`JoinHandle`], é apagada.
 //!
-//! Limites enquanto a morte de thread não notifica ninguém (T-348): se a
-//! thread morre sem passar pelo fim normal (falta fatal, pânico), `join` não
-//! volta; e um [`JoinHandle`] largado sem `join` deixa a região da thread
-//! vazar (ela pode ainda estar rodando). `EXIT_GROUP` também é da T-348.
+//! Um [`JoinHandle`] largado sem `join` não espera: se a thread já morreu,
+//! a região volta já; senão vai para uma lista de órfãs, recolhida (as que
+//! já morreram) a cada [`spawn`], `join` ou `JoinHandle` largado.
+//!
+//! Limite: a thread que morre por falta ou encerrada não devolve o heap
+//! dela (o estado dele pode estar no meio de uma operação); os segmentos
+//! com blocos dela ficam presos até o fim do processo.
 
 #![allow(clippy::cast_possible_truncation, reason = "x86-64: 64 bits")]
 
 use alloc_crate::boxed::Box;
 use alloc_crate::sync::Arc;
+use alloc_crate::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -67,14 +75,9 @@ pub fn exit_with(code: u64) -> ! {
 }
 
 /// Como [`exit_with`], mas sem rodar destrutores nem devolver o heap: para
-/// pânico e falhas do alocador, em que o estado da thread não é confiável.
-/// Numa thread de [`spawn`] ainda publica o fim para quem espera no `join`.
+/// quando o estado da thread não é confiável. O fim chega a quem espera no
+/// `join` pelo evento de morte do kernel, como qualquer outro.
 pub fn exit_raw(code: u64) -> ! {
-    let block = tls::current();
-    if block.joinable() {
-        block.set_exit_code(code);
-        crate::arch::exit_signalling(block.done(), code)
-    }
     let _ = syscall(Syscall::ThreadExit, [code, 0, 0, 0, 0, 0]);
     // O kernel nunca volta de `thread_exit` sem flags.
     loop {
@@ -83,8 +86,10 @@ pub fn exit_raw(code: u64) -> ! {
 }
 
 /// `thread_exit` com `EXIT_GROUP`: encerra o processo inteiro com `code`
-/// (ADR 0039, item 5). Só volta com o erro do kernel: `NotSupported` até o
-/// encerramento de processos da T-348.
+/// (ADR 0039, item 5; ADR 0035, item 4): as outras threads morrem como
+/// `Killed` e a causa do processo fica `Exited` com `code`. Não roda
+/// destrutores. Só volta com o erro do kernel, numa thread sem processo
+/// (sem `CapSpace` ligado) nunca: aí só a thread termina.
 #[must_use]
 pub fn exit_group(code: u64) -> Error {
     match syscall(Syscall::ThreadExit, [code, kabi::exit::GROUP, 0, 0, 0, 0]) {
@@ -365,6 +370,7 @@ impl Builder {
         // Antes de a nova thread pedir segmentos, devolve os que ficaram
         // ociosos aqui (ver `alloc::collect`).
         crate::alloc::collect();
+        reap_orphans();
         let slot = slot_take().ok_or(Error::QuotaExceeded)?;
         let base = SLOTS_BASE + slot as u64 * SLOT_BYTES;
         // O mapeamento começa depois da guarda, que nunca é mapeada.
@@ -383,12 +389,16 @@ impl Builder {
         let theirs = Arc::clone(&packet);
         block.set_main(Box::new(move || theirs.set(f())));
         let top = base + PAGE_SIZE + stack as u64;
-        if let Err(e) = self.launch(quota, block, top) {
-            // A função nunca rodou: solta-a (e o `Arc` dela) já.
-            drop(block.take_main());
-            return Err(e);
-        }
+        let thread = match self.launch(quota, block, top) {
+            Ok(thread) => thread,
+            Err(e) => {
+                // A função nunca rodou: solta-a (e o `Arc` dela) já.
+                drop(block.take_main());
+                return Err(e);
+            }
+        };
         Ok(JoinHandle {
+            thread,
             region: Some(region),
             guard: base,
             stack,
@@ -397,8 +407,9 @@ impl Builder {
         })
     }
 
-    /// Cria o `Thread` e o `SchedContext`, configura e inicia.
-    fn launch(&self, quota: Handle, block: &ThreadBlock, top: u64) -> Result<(), Error> {
+    /// Cria o `Thread` e o `SchedContext`, configura e inicia; devolve a
+    /// capability da thread (para o `join` esperar a morte dela).
+    fn launch(&self, quota: Handle, block: &ThreadBlock, top: u64) -> Result<Handle, Error> {
         let thread = cap::create(quota, ObjectType::Thread, 0)?;
         let result = (|| {
             let sc = cap::create(quota, ObjectType::SchedContext, 0)?;
@@ -417,10 +428,10 @@ impl Builder {
             // de um `call`).
             start(thread, entry_point(), top - 8, [0; 3])
         })();
-        // Iniciada ou não, o `Thread` vive pela referência do kernel; a
-        // capability não faz mais falta.
-        let _ = cap::delete(thread);
-        result
+        if result.is_err() {
+            let _ = cap::delete(thread);
+        }
+        result.map(|()| thread)
     }
 }
 
@@ -462,9 +473,11 @@ pub fn id() -> u64 {
 
 /// Espera para juntar uma thread criada por [`spawn`].
 ///
-/// Largar o `JoinHandle` sem `join` solta a thread (ela segue), e a região
-/// dela vaza: ver o módulo.
+/// Largar o `JoinHandle` sem `join` solta a thread (ela segue); a região
+/// dela volta quando ela morrer (ver o módulo).
 pub struct JoinHandle<T> {
+    /// Capability do objeto `Thread` (`BIND` e `READ_STATE`).
+    thread: Handle,
     region: Option<Region>,
     guard: u64,
     stack: usize,
@@ -490,38 +503,182 @@ impl<T> JoinHandle<T> {
         self.block().map_or(0, ThreadBlock::id)
     }
 
+    /// A capability do objeto `Thread` (vale até o `join` ou o `Drop`), para
+    /// ligar o evento de morte a outra notificação ([`cap::bind_notify`]) ou
+    /// ler o registro de morte. Não a apague nem a destrua: `join` espera por
+    /// ela (para encerrar, [`kill`](Self::kill)).
+    #[must_use]
+    pub const fn handle(&self) -> Handle {
+        self.thread
+    }
+
+    /// Encerra a thread (ADR 0035, item 4): ela morre como `Killed` sem
+    /// voltar ao código dela (nem rodar destrutores), inclusive se espera
+    /// numa fila ou roda noutra CPU. Encerra uma cópia da capability; o
+    /// `join` segue valendo.
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel (`QuotaExceeded` sem espaço na tabela para a cópia).
+    pub fn kill(&self) -> Result<(), Error> {
+        let copy = cap::mint(self.thread, kabi::Rights::DESTROY, 0, None)?;
+        cap::destroy(copy).inspect_err(|_| {
+            let _ = cap::delete(copy);
+        })
+    }
+
     /// Espera a thread terminar, libera a pilha e o bloco dela e devolve o
-    /// resultado de `f`, ou `Err(código)` se ela saiu por `exit_with`, pânico
-    /// ou falha do alocador.
+    /// resultado de `f`, ou `Err(código)` se ela não voltou de `f`: o código
+    /// de `exit_with`, o vetor da falta fatal ou 0 se outra a encerrou (ver
+    /// [`join_status`](Self::join_status) para a causa).
     ///
     /// # Errors
     ///
     /// O código de saída, se `f` não voltou.
-    pub fn join(mut self) -> Result<T, u64> {
-        let code = {
-            let block = self.block().ok_or(0u64)?;
-            let done = block.done();
-            while done.load(Ordering::Acquire) == 0 {
-                let addr = core::ptr::from_ref(done).addr() as u64;
-                let _ = syscall(Syscall::FutexWait, [addr, 0, 0, 0, 0, 0]);
+    pub fn join(self) -> Result<T, u64> {
+        self.join_status().map_err(|d| d.code)
+    }
+
+    /// Como [`join`](Self::join), com o registro de morte inteiro (causa,
+    /// código e auxiliar; ADR 0035, item 2) se `f` não voltou.
+    ///
+    /// # Errors
+    ///
+    /// O registro de morte, se `f` não voltou.
+    pub fn join_status(mut self) -> Result<T, cap::Death> {
+        let death = wait_death(self.thread);
+        if let Some(region) = self.region.take() {
+            if death.is_some() {
+                reclaim(self.thread, region, self.stack);
+            } else {
+                // Capability perdida: a thread pode estar viva na região.
+                core::mem::forget(region);
             }
-            block.exit_code()
-        };
-        // A thread já não toca na região (`exit_signalling`).
-        drop(self.region.take());
+        }
+        let death = death.unwrap_or(cap::Death {
+            cause: 0,
+            code: 0,
+            aux: 0,
+        });
         // A thread pode ter liberado blocos nossos: recolhe-os agora, para os
         // segmentos voltarem à fonte (ver `alloc::collect`).
         crate::alloc::collect();
-        self.packet.take().ok_or(code)
+        reap_orphans();
+        self.packet.take().ok_or(death)
     }
 }
 
 impl<T> Drop for JoinHandle<T> {
     fn drop(&mut self) {
-        // Sem `join`: a thread pode estar rodando na região; deixa vazar.
-        if let Some(mut region) = self.region.take() {
-            core::mem::forget(region.map.take());
-            core::mem::forget(region);
+        let Some(region) = self.region.take() else {
+            return;
+        };
+        let orphan = Orphan {
+            thread: self.thread,
+            region,
+            stack: self.stack,
+        };
+        if orphan.dead() {
+            orphan.reclaim();
+        } else {
+            let mut list = ORPHANS.lock();
+            if list.try_reserve(1).is_ok() {
+                list.push(orphan);
+            } else {
+                // Sem memória para guardar: a região vaza (a thread pode
+                // estar rodando nela).
+                core::mem::forget(orphan);
+            }
         }
+        reap_orphans();
+    }
+}
+
+/// O registro de morte de `thread`, esperando por ele: pela notificação
+/// ligada ao evento de morte ou, sem cota para ela, cedendo a vez até a
+/// thread morrer. `None` se a capability não lê mais o registro (apagada
+/// por quem a recebeu de [`JoinHandle::handle`]).
+fn wait_death(thread: Handle) -> Option<cap::Death> {
+    let read = || cap::death(thread);
+    match read() {
+        Ok(Some(d)) => return Some(d),
+        Ok(None) => {}
+        Err(_) => return None,
+    }
+    if let Some(env) = crate::rt::env()
+        && let Ok(ntfy) = cap::create(env.quota, ObjectType::Notification, 0)
+    {
+        if cap::bind_notify(thread, ntfy, 1).is_ok() {
+            while syscall(Syscall::NtfyWait, [raw(ntfy), 0, 0, 0, 0, 0])
+                .is_ok_and(|[bits, ..]| bits & 1 == 0)
+            {}
+        }
+        // O kernel solta a notificação com a ligação, na morte da thread.
+        let _ = cap::delete(ntfy);
+    }
+    loop {
+        match read() {
+            Ok(Some(d)) => return Some(d),
+            Ok(None) => yield_now(),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Devolve o que era de uma thread morta: a função inicial (se ela morreu
+/// antes de rodá-la), a capability e a região.
+fn reclaim(thread: Handle, region: Region, stack: usize) {
+    if let Some(map) = region.map.as_ref() {
+        // Morta, a thread não toca mais no bloco: quem a junta é o dono.
+        drop(tls::block_in(map, stack).take_main());
+    }
+    let _ = cap::delete(thread);
+    drop(region);
+}
+
+/// Thread de um `JoinHandle` largado, ainda viva da última vez que se viu.
+struct Orphan {
+    thread: Handle,
+    region: Region,
+    stack: usize,
+}
+
+impl Orphan {
+    fn dead(&self) -> bool {
+        // Sem como ler (capability sumiu), fica guardada: liberar a região
+        // de uma thread que pode estar viva seria pior que vazá-la.
+        cap::death(self.thread).is_ok_and(|d| d.is_some())
+    }
+
+    fn reclaim(self) {
+        reclaim(self.thread, self.region, self.stack);
+    }
+}
+
+/// As órfãs (ver o módulo).
+static ORPHANS: crate::sync::Mutex<Vec<Orphan>> = crate::sync::Mutex::new(Vec::new());
+
+/// Devolve a região das órfãs que já morreram (fora da trava).
+fn reap_orphans() {
+    let dead: Vec<Orphan> = {
+        let Some(mut list) = ORPHANS.try_lock() else {
+            return;
+        };
+        if list.is_empty() {
+            return;
+        }
+        let mut dead = Vec::new();
+        let mut i = 0;
+        while i < list.len() {
+            if list[i].dead() && dead.try_reserve(1).is_ok() {
+                dead.push(list.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        dead
+    };
+    for orphan in dead {
+        orphan.reclaim();
     }
 }

@@ -303,3 +303,55 @@ Mudanças em relação à proposta:
 - O encerramento forçado trata o chamador morto em `ipc_call` (doação de
   `SchedContext`).
 - O argumento de `sys_info` (`rsi`) fica documentado para a classe 2.
+
+## Notas da implementação (T-348, 2026-10-23)
+
+Itens 1 a 5 implementados (o Timer é da T-349). Detalhes que o texto
+deixava abertos, sem mudar nenhuma decisão:
+
+- **Processo e travas.** `live_threads` não é atômico: o estado do
+  processo (vivas, limite, fase, registro, ligação e a lista das threads
+  vivas, para o encerramento as achar) fica no `CapSpace`, sob a trava dele
+  (nível 2). O evento da thread fica em `Thread.binding` (nível 3). Nenhuma
+  classe de trava nova; a regra do item 3.4 e da lacuna 6 entrou em
+  `docs/kernel/ordem-de-travas.md`.
+- **Ordem na morte.** A thread morta sai da conta do processo (sob a trava
+  do `CapSpace`) antes de o evento dela ser sinalizado, para quem o recebe
+  já poder iniciar outra dentro do limite (item 5); depois vem o evento do
+  processo, se ela era a última. O registro é gravado antes dos dois
+  (item 3.5).
+- **Encerramento (item 4).** A thread encerrada é marcada e morre ela mesma
+  no próximo retorno ao usuário ou ao tentar bloquear; a que espera numa
+  fila (IPC, notificação, futex) sai dela e acorda; a que roda noutra CPU
+  recebe a IPI de reescalonar; a inativa morre na hora. "Nenhuma thread
+  está pronta para rodar" depois do `DESTROY` vale no sentido de que
+  nenhuma volta ao código de usuário: uma encerrada pode ainda estar na
+  fila do escalonador, mas só para morrer no kernel, e o evento do
+  processo só dispara depois disso (o invariante do `svcmgr`). Uma thread
+  noutra CPU executa código de usuário até a IPI chegar, como o texto já
+  dizia. Uma encerrada sem orçamento (`Throttled`) só morre quando ele
+  volta.
+- **Chamador encerrado em `ipc_call`.** O `Reply` passa a não ter chamador
+  já no encerramento (o mesmo caminho do prazo vencido), e a doação de
+  `SchedContext` se desfaz ali, não na resposta; a resposta do servidor dá
+  `PeerClosed` e ele segue com o próprio `SchedContext`. Testado no
+  `utest` (`processo.encerrado_em_ipc_call`).
+- **`cap_delete`.** O `DESTROY` também apaga a capability usada. Para
+  tipos sem encerramento, `NotSupported` vem antes da conferência do
+  direito (nenhum outro tipo recebe `DESTROY`, então a conferência ao
+  contrário daria sempre `AccessDenied`). `Endpoint` destruído fecha as
+  filas: quem espera e quem usar uma cópia depois recebe `PeerClosed`.
+  Flags desconhecidas dão `InvalidArgument`.
+- **Partida em processo encerrado ou morto:** `thread_start` dá
+  `PeerClosed`. A morte do item 1 é definitiva: o processo que perdeu a
+  última thread não começa outra (o evento já disparou).
+- **Esvaziar a tabela** apaga as capabilities pela árvore de derivação,
+  32 por vez entre pontos de preempção; as que estão sendo revogadas por
+  outra CPU, ou que alguém de fora pôs na tabela depois, ficam até a
+  tabela morrer.
+- **`obj_create(quota, CapSpace, arg0)`**: `arg0` acima de `u32::MAX` dá
+  `InvalidArgument`.
+- **`Interrupt`** segue como antes da ADR: `bits` é o número do bit (não a
+  máscara) e religar dá `Busy`. Os itens 3.1 e 3.2 ("máscara", "ligar de
+  novo a substitui") valem para `Thread` e `CapSpace`; alinhar o
+  `Interrupt` fica como pendência (muda o contrato usado pelos drivers).

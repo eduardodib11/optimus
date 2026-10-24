@@ -85,6 +85,12 @@ impl CpuMask {
 /// Seletor desconhecido dá `NotSupported`.
 pub const SYS_INFO_CPUS: u64 = 1;
 
+/// Seletor de `sys_info(seletor, handle)`: registro de morte (ADR 0035,
+/// item 2) da `Thread` (com `READ_STATE`) ou do processo do `CapSpace` (com
+/// `MANAGE`) de `handle` (`rsi`): causa (`rdx`, zero se vivo), código (`r10`)
+/// e auxiliar (`r8`); ver [`crate::exit`].
+pub const SYS_INFO_EXIT: u64 = 2;
+
 /// Seletor de `sys_info(seletor, 0)`: entropia (ADR 0039, item 4). Devolve
 /// [`SYS_INFO_ENTROPY_BYTES`] bytes aleatórios criptográficos em `rdx`,
 /// `r10` e `r8` (little-endian, nessa ordem), sem capability. O argumento

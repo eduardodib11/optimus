@@ -19,8 +19,8 @@
 //! segmento de 2 MiB, não por alocação).
 //!
 //! Alocar antes de [`crate::rt::init`] é erro de programação e aborta o
-//! processo (hoje, encerra a thread, com uma linha no registro de depuração;
-//! o `abort` do processo vem com o `EXIT_GROUP` da T-333, ADR 0039 item 5).
+//! processo ([`crate::process::abort`]: `EXIT_GROUP` com o código de
+//! pânico, ADR 0039 item 5, com uma linha no registro de depuração).
 //! O mesmo vale para as falhas do endurecimento do `oalloc` (liberação
 //! dupla, ponteiro alheio, lista livre corrompida). Memória esgotada
 //! devolve nulo, e o `alloc` chama `handle_alloc_error`.
@@ -332,13 +332,13 @@ unsafe impl PageSource for KernelSource {
     }
 
     fn fault(&self, fault: Fault) -> ! {
-        // A thread morre possivelmente com a trava da janela tomada. Sem isto,
-        // as outras girariam para sempre nela: `Locked::with` encerra quem
-        // achar o alocador envenenado. O `abort` do processo todo vem com o
-        // `EXIT_GROUP` (T-333, ADR 0039 item 5).
+        // A thread sai possivelmente com a trava da janela tomada. O processo
+        // inteiro é abortado (ADR 0039, item 5), mas até o encerramento
+        // alcançar as outras threads elas girariam na trava: `Locked::with`
+        // aborta também quem achar o alocador envenenado.
         POISONED.store(true, Ordering::Release);
         crate::debug::print_fmt(format_args!("ostd: alocador: {fault}"));
-        crate::thread::exit_raw(kabi::exit::PANIC_CODE)
+        crate::process::abort("ostd: alocador corrompido")
     }
 }
 
@@ -366,7 +366,7 @@ impl<T> Locked<T> {
 
     fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         if POISONED.load(Ordering::Acquire) {
-            crate::thread::exit_raw(kabi::exit::PANIC_CODE);
+            crate::process::abort("ostd: alocador envenenado");
         }
         while self
             .locked
@@ -374,7 +374,7 @@ impl<T> Locked<T> {
             .is_err()
         {
             if POISONED.load(Ordering::Acquire) {
-                crate::thread::exit_raw(kabi::exit::PANIC_CODE);
+                crate::process::abort("ostd: alocador envenenado");
             }
             core::hint::spin_loop();
         }
@@ -444,8 +444,7 @@ unsafe impl GlobalAlloc for Allocator {
     /// O contrato de [`GlobalAlloc::alloc`].
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if rt::env().is_none() {
-            crate::debug::print("ostd: alocação antes de rt::init");
-            crate::thread::exit_raw(kabi::exit::PANIC_CODE);
+            crate::process::abort("ostd: alocação antes de rt::init");
         }
         crate::tls::current().with_heap(|heap| heap.alloc(layout.size(), layout.align()))
     }

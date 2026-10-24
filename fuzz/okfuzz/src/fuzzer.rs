@@ -3,7 +3,7 @@
 //! cada syscall.
 
 use ostd::kabi::ipc::{FLAG_NONBLOCK, MsgInfo, recv_target};
-use ostd::kabi::sched::{CpuMask, SYS_INFO_CPUS, SYS_INFO_ENTROPY};
+use ostd::kabi::sched::{CpuMask, SYS_INFO_CPUS, SYS_INFO_ENTROPY, SYS_INFO_EXIT};
 use ostd::kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use ostd::kabi::{Error, ObjectType, Rights, Syscall};
 
@@ -247,7 +247,16 @@ impl Fuzzer {
         let Some(h) = self.deletable() else {
             return;
         };
-        if syscall(Syscall::CapDelete, [u64::from(h), 0, 0, 0, 0, 0]).is_ok() {
+        // Às vezes com `DESTROY` (ADR 0035, item 4; T-348) ou flags lixo: o
+        // fuzzer só tem `CapSpace`s e `Thread`s sem threads rodando nem
+        // processo próprio no pool, então destruí-los não o derruba. Em erro
+        // nada é apagado.
+        let flags = match self.rng.below(8) {
+            0 | 1 => ostd::kabi::cap_delete::DESTROY,
+            2 => self.rng.next(),
+            _ => 0,
+        };
+        if syscall(Syscall::CapDelete, [u64::from(h), flags, 0, 0, 0, 0]).is_ok() {
             self.pool.remove(h);
         }
     }
@@ -429,9 +438,25 @@ impl Fuzzer {
                 }
             }
             _ => {
+                // Interrupção (bit), `Thread` e `CapSpace` (máscara, T-348),
+                // às vezes com a3 não zero; e o registro de morte.
                 let b = self.some_handle();
-                let _ = syscall(Syscall::ObjBindNotify, [h, b, self.rng.below(80), 0, 0, 0]);
+                let bits = if self.rng.chance(1, 2) {
+                    self.rng.below(80)
+                } else {
+                    self.rng.next()
+                };
+                let a3 = if self.rng.chance(1, 8) {
+                    self.rng.next()
+                } else {
+                    0
+                };
+                let _ = syscall(Syscall::ObjBindNotify, [h, b, bits, a3, 0, 0]);
                 let _ = syscall(Syscall::IrqAck, [h, 0, 0, 0, 0, 0]);
+                let _ = syscall(
+                    Syscall::SysInfo,
+                    [SYS_INFO_EXIT, self.some_handle(), 0, 0, 0, 0],
+                );
             }
         }
     }

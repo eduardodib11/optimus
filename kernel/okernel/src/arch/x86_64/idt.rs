@@ -233,6 +233,11 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
         } else if super::apic::dispatch(frame.vector) {
             crate::kthread::on_timer();
         }
+        if frame.cs & 3 == 3 {
+            // Volta ao usuário: a thread encerrada morre aqui (a IPI de
+            // reescalonar a traz de outra CPU, ADR 0035, item 4).
+            crate::kthread::exit_if_killed();
+        }
         crate::ksync::assert_none_held("fim de interrupção");
         return;
     }
@@ -264,6 +269,7 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
     );
     if frame.cs & 3 == 3 && kabi::fault::user_vector(frame.vector) {
         crate::kfault::user_exception(frame, control_registers()[1]);
+        crate::kthread::exit_if_killed();
         crate::ksync::assert_none_held("volta ao usuário");
         return;
     }

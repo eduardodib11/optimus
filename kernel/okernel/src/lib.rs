@@ -19,6 +19,7 @@ pub mod log;
 pub mod mm;
 pub mod notify;
 pub mod platform;
+pub mod process;
 pub mod rand;
 pub mod sched;
 pub mod sync;

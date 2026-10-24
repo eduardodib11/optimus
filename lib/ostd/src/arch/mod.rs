@@ -15,8 +15,6 @@
 //!   ligação).
 //! - **`thread_pointer`:** lê `fs:[0]`; só se chama com o `FS_BASE` já posto
 //!   num bloco de thread mapeado (a flag `tls::current` confere).
-//! - **`exit_signalling`:** assembly que não toca na pilha depois de
-//!   publicar a flag de fim (ver a função).
 //! - **`mem`:** o acesso à memória mapeada parte de um [`Mapping`]
 //!   (`crate::vm`), que mapeou a faixa no `new` e só desmapeia no `Drop`; o
 //!   empréstimo do `Mapping` impede um acesso mutável concorrente.
@@ -26,4 +24,4 @@
 pub(crate) mod mem;
 mod x86_64;
 
-pub use x86_64::{entry, exit_signalling, ipc, syscall, thread_pointer};
+pub use x86_64::{entry, ipc, syscall, thread_pointer};

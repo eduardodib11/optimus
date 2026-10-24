@@ -32,6 +32,7 @@ use kabi::{Badge, CAPSPACE_SLOTS_PER_LEVEL, Error, Handle, ObjectType, Rights};
 
 use super::object::{Object, default_rights, obj_create, object_bytes};
 use super::quota::{Charge, MemoryQuota};
+use crate::process::Process;
 use crate::sync::SpinLock;
 
 pub mod cdt;
@@ -132,6 +133,9 @@ pub struct CapSpace<const N: usize = CAPSPACE_SLOTS_PER_LEVEL, O: CapObject = Ob
     revoking: Option<u32>,
     /// Elos remotos, por índice de slot crescente (ADR 0028).
     xlinks: Vec<xlink::XLinks<N, O>>,
+    /// O processo que esta tabela representa (ADR 0035, item 1): threads
+    /// vivas, registro e evento de morte.
+    process: Process,
 }
 
 impl<const N: usize, O: CapObject> CapSpace<N, O> {
@@ -161,7 +165,35 @@ impl<const N: usize, O: CapObject> CapSpace<N, O> {
             live: 0,
             revoking: None,
             xlinks: Vec::new(),
+            process: Process::default(),
         })
+    }
+
+    /// O processo desta tabela (ADR 0035, item 1).
+    #[must_use]
+    pub const fn process(&self) -> &Process {
+        &self.process
+    }
+
+    /// O processo desta tabela, para mudar (com a trava da tabela).
+    pub const fn process_mut(&mut self) -> &mut Process {
+        &mut self.process
+    }
+
+    /// O handle da primeira capability viva a partir do índice `*cursor`
+    /// (fora o alvo de uma revogação em andamento), avançando o cursor para
+    /// depois dela: o encerramento do processo esvazia a tabela assim, um
+    /// slot por vez e sem a trava entre um e outro.
+    pub fn next_live(&self, cursor: &mut u32) -> Option<Handle> {
+        let start = (*cursor).max(1);
+        for index in start..self.fresh {
+            if self.slot(index).cap.is_some() && self.revoking != Some(index) {
+                *cursor = index + 1;
+                return Some(self.handle(index));
+            }
+        }
+        *cursor = self.fresh;
+        None
     }
 
     /// Capabilities vivas.

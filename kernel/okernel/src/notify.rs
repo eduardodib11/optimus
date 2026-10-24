@@ -32,6 +32,7 @@ use kabi::Error;
 
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota};
+use crate::ipc::Blocked;
 use crate::sync::{LockClass, SpinLock};
 use crate::thread::{RunState, Thread};
 
@@ -101,7 +102,24 @@ impl Notification {
             return None;
         }
         let thread = s.waiters.pop_front()?;
+        // Atendida: a espera sai do slot (a trava do slot vem depois da do
+        // objeto), e o encerramento já não a acha aqui.
+        thread.ipc().lock().blocked = Blocked::None;
         Some((thread, core::mem::take(&mut s.pending)))
+    }
+
+    /// Tira `t` da fila de espera (encerramento, ADR 0035, item 4); falso
+    /// se ela não estava (um sinal já a tirou e a acorda).
+    pub fn remove(&self, t: &Thread) -> bool {
+        let mut s = self.state.lock();
+        let at = s
+            .waiters
+            .iter()
+            .position(|w| core::ptr::eq(Arc::as_ptr(w), t));
+        let removed = at.and_then(|i| s.waiters.remove(i));
+        drop(s);
+        // A última referência pode ir aqui: solta sem a trava.
+        removed.is_some()
     }
 
     /// `ntfy_poll`: devolve e zera a palavra, sem bloquear.
@@ -110,18 +128,20 @@ impl Notification {
     }
 
     /// `ntfy_wait`: devolve e zera os bits pendentes ou põe `thread` na
-    /// fila, já como [`RunState::Blocked`].
+    /// fila, já como [`RunState::Blocked`], com a espera publicada no slot
+    /// dela (para o encerramento a achar, ADR 0035, item 4).
     ///
     /// # Errors
     ///
     /// [`Error::QuotaExceeded`] sem memória para a fila.
-    pub fn wait(&self, thread: &Arc<Thread>) -> Result<Wait, Error> {
+    pub fn wait(self: &Arc<Self>, thread: &Arc<Thread>) -> Result<Wait, Error> {
         let mut s = self.state.lock();
         if s.pending != 0 {
             return Ok(Wait::Ready(core::mem::take(&mut s.pending)));
         }
         s.waiters.try_reserve(1).map_err(|_| Error::QuotaExceeded)?;
         let _ = thread.take_wake_error();
+        thread.ipc().lock().blocked = Blocked::Notify(Arc::downgrade(self));
         thread.set_state(RunState::Blocked);
         s.waiters.push_back(Arc::clone(thread));
         Ok(Wait::Blocked)
@@ -134,6 +154,7 @@ impl Drop for Notification {
     fn drop(&mut self) {
         let waiters = core::mem::take(&mut self.state.lock().waiters);
         for t in waiters {
+            t.ipc().lock().blocked = Blocked::None;
             t.set_wake_error(Error::PeerClosed);
             t.platform().wake(t);
         }

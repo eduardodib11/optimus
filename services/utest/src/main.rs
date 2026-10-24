@@ -44,6 +44,8 @@ use ostd::kabi::ipc::FLAG_NONBLOCK;
 use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::{Env, Start};
 
+mod vida;
+
 ostd::entry!(main);
 
 /// Capabilities iniciais que os testes podem usar.
@@ -101,7 +103,7 @@ const TESTS: &[Test] = &[
     },
     Test {
         name: "thread.exit_recusa_flags",
-        run: exit_recusa_flags,
+        run: vida::exit_recusa_flags,
     },
     Test {
         name: "thread.cem_sem_vazar_cota",
@@ -126,6 +128,30 @@ const TESTS: &[Test] = &[
     Test {
         name: "thread.pilha_com_guarda",
         run: threads_guarda,
+    },
+    Test {
+        name: "thread.join_de_encerradas",
+        run: vida::join_de_encerradas,
+    },
+    Test {
+        name: "thread.largada_devolve_regiao",
+        run: vida::largada_devolve_regiao,
+    },
+    Test {
+        name: "processo.cem_criados_e_encerrados",
+        run: vida::cem_processos,
+    },
+    Test {
+        name: "processo.encerrado_em_ipc_call",
+        run: vida::encerrado_em_ipc_call,
+    },
+    Test {
+        name: "processo.limite_e_recusas",
+        run: vida::limite_e_recusas,
+    },
+    Test {
+        name: "processo.partida_em_encerrado",
+        run: vida::partida_em_processo_encerrado,
     },
     Test {
         name: "sync.mutex_contador",
@@ -375,21 +401,6 @@ fn vm_proprio_espaco(ctx: &Ctx) -> Outcome {
     })();
     let _ = delete(object);
     result
-}
-
-/// `thread_exit` com `EXIT_GROUP` volta `NotSupported` até a T-348, e com
-/// flag desconhecida, `InvalidArgument`; nos dois casos a thread segue.
-fn exit_recusa_flags(_: &Ctx) -> Outcome {
-    use ostd::kabi::Syscall;
-    if ostd::thread::exit_group(1) != Error::NotSupported {
-        return Err("EXIT_GROUP devia dar NotSupported");
-    }
-    if ostd::sys::syscall(Syscall::ThreadExit, [0, 2, 0, 0, 0, 0]).map(drop)
-        != Err(Error::InvalidArgument)
-    {
-        return Err("flag desconhecida devia dar InvalidArgument");
-    }
-    Ok(())
 }
 
 /// Quantas páginas a cota `quota` ainda cobre: cria `MemoryObject`s de uma
@@ -895,9 +906,11 @@ fn threads_buffer_ipc(_: &Ctx) -> Outcome {
 
 /// Recursão sem fim numa thread de pilha pequena cai na página de guarda: a
 /// falta chega ao endpoint de exceções da thread com o endereço dentro da
-/// guarda. A resposta encerra a thread (que nunca é juntada; sua região fica
-/// na cota filha, que é apagada em seguida).
+/// guarda. A resposta encerra a thread, e `join` volta com o registro de
+/// morte (`Faulted`, vetor 14, o endereço; T-348).
 fn threads_guarda(ctx: &Ctx) -> Outcome {
+    /// Vetor da falta de página.
+    const PAGE_FAULT_VECTOR: u64 = 14;
     use ostd::kabi::Rights;
     use ostd::kabi::fault::{PAGE_FAULT, WORD_ADDR};
     use ostd::thread::Builder;
@@ -935,12 +948,22 @@ fn threads_guarda(ctx: &Ctx) -> Outcome {
         Ok(_) => Err("mensagem de exceção inesperada"),
         Err(_) => Err("nenhuma exceção chegou"),
     };
-    // Qualquer rótulo diferente de RESUME encerra a thread.
+    // Qualquer rótulo diferente de RESUME encerra a thread, como `Faulted`.
     let _ = ipc::send(reply, &Message::new(1, &[]), 0);
-    // Sem `join`: a thread morreu pela falta e a região vaza (cota filha).
-    drop(h);
+    // `join` volta pelo evento de morte (T-348) e devolve a região.
+    let joined = match h.join_status() {
+        Err(d) if d.cause == ostd::kabi::exit::CAUSE_FAULTED && d.code == PAGE_FAULT_VECTOR => {
+            if (guard..guard + 4096).contains(&d.aux) {
+                Ok(())
+            } else {
+                Err("o registro de morte devia ter o endereço da guarda")
+            }
+        }
+        Err(_) => Err("join devia dar Faulted com a falta de página"),
+        Ok(_) => Err("join de quem faltou devia dar Err"),
+    };
     let _ = (delete(exc), delete(ep), delete(reply), delete(q));
-    verdict
+    verdict.and(joined)
 }
 
 /// T-337: a entropia do kernel (`sys_info` classe 5) muda a cada pedido,

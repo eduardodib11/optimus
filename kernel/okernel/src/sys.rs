@@ -27,6 +27,7 @@ use crate::cap::space::Revoke;
 use crate::cap::{Cap, Object, SharedCapSpace, default_rights, xcdt};
 use crate::futex::FUTEXES;
 use crate::notify::Wait;
+use crate::process::{self, Record};
 use crate::sched::Params;
 use crate::thread::Thread;
 use crate::vm::{vm_map, vm_protect, vm_unmap};
@@ -86,6 +87,10 @@ pub trait Env {
     /// Põe `va` no `FS_BASE` desta CPU: `thread_configure` mudou o TLS da
     /// própria thread, que o vê ao voltar da syscall (ADR 0039, item 3).
     fn load_tls(&mut self, _va: u64) {}
+    /// `t` teve o encerramento pedido (ADR 0035, item 4): se ela roda
+    /// noutra CPU, essa CPU recebe a IPI de reescalonar e a traz ao kernel,
+    /// onde ela morre. Volta sem esperar.
+    fn kick(&mut self, _t: &Thread) {}
 }
 
 fn handle(raw: u64) -> Result<Handle, Error> {
@@ -134,10 +139,7 @@ pub fn invoke(
 ) -> Result<Values, Error> {
     match call {
         Syscall::CapMint => mint(space, a),
-        Syscall::CapDelete => {
-            xcdt::delete(space, handle(a[0])?)?;
-            Ok([0; 3])
-        }
+        Syscall::CapDelete => cap_delete(space, a, env).map(|()| [0; 3]),
         Syscall::CapRevoke => {
             let h = handle(a[0])?;
             while xcdt::revoke(space, h, revoke_budget)? == Revoke::Continue {
@@ -214,6 +216,106 @@ pub fn invoke(
         Syscall::ThreadConfigure => thread_configure(space, a, env).map(|()| [0; 3]),
         _ => invoke_sync(space, call, a, env),
     }
+}
+
+/// `cap_delete(handle, flags)` (ADR 0035, item 4): sem flags, apaga a
+/// capability; com `DESTROY` (e o direito `DESTROY` nela), apaga e destrói
+/// o objeto: encerra o processo de um `CapSpace` ou uma `Thread`, fecha um
+/// `Endpoint`. Os outros tipos recusam sem apagar nada.
+fn cap_delete(space: &Arc<SharedCapSpace>, a: [u64; 6], env: &mut dyn Env) -> Result<(), Error> {
+    use kabi::cap_delete::{ALL_FLAGS, DESTROY};
+    let h = handle(a[0])?;
+    if a[1] & !ALL_FLAGS != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    if a[1] & DESTROY == 0 {
+        return xcdt::delete(space, h);
+    }
+    let cap = cap_with(space, a[0], Rights::NONE)?;
+    if !matches!(
+        cap.object,
+        Object::CapSpace(_) | Object::Thread(_) | Object::Endpoint(_)
+    ) {
+        return Err(Error::NotSupported);
+    }
+    if !cap.rights.contains(Rights::DESTROY) {
+        return Err(Error::AccessDenied);
+    }
+    xcdt::delete(space, h)?;
+    match &cap.object {
+        Object::CapSpace(target) => process::destroy(target, Record::killed(), None, env),
+        Object::Thread(t) => process::kill(t, env),
+        Object::Endpoint(ep) => ep.close(),
+        _ => {}
+    }
+    // A preempção: quem acordou pode ter prioridade maior.
+    env.preempt();
+    Ok(())
+}
+
+/// `sys_info(SYS_INFO_EXIT, handle)` (ADR 0035, item 2): `[causa, código,
+/// auxiliar]` da `Thread` (com `READ_STATE`) ou do processo do `CapSpace`
+/// (com `MANAGE`) de `raw`; zeros enquanto vive.
+///
+/// # Errors
+///
+/// [`Error::InvalidHandle`], [`Error::AccessDenied`] sem o direito e
+/// [`Error::WrongType`] para outro tipo de objeto.
+pub fn exit_info(space: &SharedCapSpace, raw: u64) -> Result<Values, Error> {
+    let cap = cap_with(space, raw, Rights::NONE)?;
+    let (need, record) = match &cap.object {
+        Object::Thread(t) => (
+            Rights::READ_STATE,
+            t.death()
+                .map_or(Record::default(), |(cause, code, aux)| Record {
+                    cause,
+                    code,
+                    aux,
+                }),
+        ),
+        Object::CapSpace(c) => (Rights::MANAGE, process::record(c)),
+        _ => return Err(Error::WrongType),
+    };
+    if !cap.rights.contains(need) {
+        return Err(Error::AccessDenied);
+    }
+    Ok(record.values())
+}
+
+/// `obj_bind_notify(obj, ntfy, bits, a3, a4, a5)` (ADR 0035, item 3): exige
+/// `BIND` em `obj` e `SIGNAL` em `ntfy`; `a3` a `a5` têm de ser zero.
+/// `Interrupt`: `bits` é o número do bit (como antes) e a linha só se liga
+/// uma vez. `Thread` e `CapSpace`: `bits` é a máscara sinalizada quando a
+/// thread ou o processo morre; ligar de novo troca a ligação, `bits = 0`
+/// desliga, e ligar depois da morte sinaliza já (o evento é nível).
+fn bind_notify(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<Values, Error> {
+    let obj = cap_with(space, a[0], Rights::BIND)?;
+    let ntfy = cap_with(space, a[1], Rights::SIGNAL)?;
+    let ntfy = Arc::clone(ntfy.object.as_notification()?);
+    if a[3..].iter().any(|&w| w != 0) {
+        return Err(Error::InvalidArgument);
+    }
+    let bits = a[2];
+    if let Object::Interrupt(irq) = &obj.object {
+        irq.bind(ntfy, bits)?;
+        return Ok([0; 3]);
+    }
+    let event = (bits != 0).then_some((ntfy, bits));
+    match &obj.object {
+        Object::Thread(t) => {
+            let (now, old) = t.bind_death(event);
+            drop(old);
+            if let Some((ntfy, bits)) = now
+                && let Some((thread, word)) = ntfy.signal(bits)
+            {
+                env.wake(thread, word);
+            }
+        }
+        Object::CapSpace(c) => process::bind(c, event, env),
+        _ => return Err(Error::WrongType),
+    }
+    env.preempt();
+    Ok([0; 3])
 }
 
 /// O espaço de `vm_map`/`vm_unmap`: a capability de `raw` ou, com
@@ -389,13 +491,7 @@ fn invoke_sync(
                 }
             }
         }
-        Syscall::ObjBindNotify => {
-            let obj = cap_with(space, a[0], Rights::BIND)?;
-            let ntfy = cap_with(space, a[1], Rights::SIGNAL)?;
-            let ntfy = Arc::clone(ntfy.object.as_notification()?);
-            obj.object.as_interrupt()?.bind(ntfy, a[2])?;
-            Ok([0; 3])
-        }
+        Syscall::ObjBindNotify => bind_notify(space, a, env),
         Syscall::IrqAck => {
             let cap = cap_with(space, a[0], Rights::ACK)?;
             if let Some((ntfy, bits)) = cap.object.as_interrupt()?.ack()

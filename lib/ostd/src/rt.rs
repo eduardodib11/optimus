@@ -103,8 +103,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     if let Some(at) = info.location() {
         crate::debug::print(at.file());
     }
-    // O pânico encerra o processo (ADR 0039, item 5); enquanto o kernel não
-    // tem `EXIT_GROUP` (T-348), encerra só a thread, com o mesmo código.
-    let _ = crate::thread::exit_group(kabi::exit::PANIC_CODE);
-    crate::thread::exit_raw(kabi::exit::PANIC_CODE)
+    // O pânico encerra o processo (ADR 0039, item 5).
+    crate::process::abort("ostd: processo abortado por pânico")
 }
