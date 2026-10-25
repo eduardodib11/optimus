@@ -7,7 +7,7 @@
 //! ([`cap`]), memória ([`vm`]), threads ([`thread`]) e o IPC síncrono com
 //! o buffer de IPC ([`ipc`], T-208), o bloco da thread com `thread_local!` ([`tls`], T-335), e o carregador de executáveis do
 //! bootfs ([`process`], ADR 0029) e o alocador global ([`alloc`], T-334).
-//! `Mutex`/`Condvar`/`Once`/`RwLock` sobre futex ([`sync`], T-336); a aleatoriedade ([`rand`], T-337), as coleções ([`collections`]) e o UTF-8 ([`utf8`]); clientes OIDL ficam para depois.
+//! `Mutex`/`Condvar`/`Once`/`RwLock` sobre futex ([`sync`], T-336), com prazos da T-338; o tempo ([`time`]: `Instant`, `Duration`, `sleep`); a aleatoriedade ([`rand`], T-337), as coleções ([`collections`]) e o UTF-8 ([`utf8`]); clientes OIDL ficam para depois.
 //!
 //! Só [`arch`] (a instrução `syscall`, o `_start` e o acesso à memória que o
 //! processo mapeou), [`alloc`] (a cola do `GlobalAlloc`), [`tls`] (o bloco da
@@ -34,6 +34,7 @@ pub mod rt;
 pub mod sync;
 pub mod sys;
 pub mod thread;
+pub mod time;
 pub mod tls;
 pub mod utf8;
 pub mod vm;
@@ -115,14 +116,5 @@ pub mod debug {
         if let Ok(text) = core::str::from_utf8(&line.buf[..line.len]) {
             print(text);
         }
-    }
-}
-
-/// Tempo.
-pub mod time {
-    /// Relógio monotônico em ns (`clock_get`).
-    #[must_use]
-    pub fn now_ns() -> u64 {
-        crate::sys::syscall(kabi::Syscall::ClockGet, [0; 6]).map_or(0, |v| v[0])
     }
 }
