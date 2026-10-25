@@ -44,6 +44,7 @@ use ostd::kabi::ipc::FLAG_NONBLOCK;
 use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::{Env, Start};
 
+mod tempo;
 mod timer;
 mod vida;
 
@@ -193,6 +194,38 @@ const TESTS: &[Test] = &[
     Test {
         name: "sync.rwlock",
         run: sync_rwlock,
+    },
+    Test {
+        name: "time.instant",
+        run: tempo::instant,
+    },
+    Test {
+        name: "time.sleep_curto",
+        run: tempo::sleep_curto,
+    },
+    Test {
+        name: "time.sleep_longo",
+        run: tempo::sleep_longo,
+    },
+    Test {
+        name: "time.sleep_em_threads",
+        run: tempo::sleep_em_threads,
+    },
+    Test {
+        name: "sync.condvar_estoura",
+        run: tempo::condvar_estoura,
+    },
+    Test {
+        name: "sync.condvar_acordada",
+        run: tempo::condvar_acordada,
+    },
+    Test {
+        name: "sync.condvar_sem_perda",
+        run: tempo::condvar_sem_perda,
+    },
+    Test {
+        name: "thread.join_com_prazo",
+        run: tempo::join_com_prazo,
     },
     Test {
         name: "rand.entropia_do_kernel",

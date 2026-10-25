@@ -579,6 +579,70 @@ impl<T> JoinHandle<T> {
         reap_orphans();
         self.packet.take().ok_or(death)
     }
+
+    /// Como [`join_status`](Self::join_status), com prazo: se a thread não
+    /// terminou em `dur`, devolve o próprio `JoinHandle` (nada foi
+    /// liberado) para juntar depois. Usa o `Timer` e a `Notification` da
+    /// thread que espera ([`crate::time`]) e liga o evento de morte a ela
+    /// durante a espera, desfazendo a ligação ao voltar.
+    ///
+    /// # Errors
+    ///
+    /// O próprio `JoinHandle`, se o prazo venceu.
+    #[allow(clippy::result_large_err, reason = "devolve o dono, como a std")]
+    pub fn join_timeout(self, dur: crate::time::Duration) -> Result<Result<T, cap::Death>, Self> {
+        let deadline = (crate::time::Instant::now() + dur).as_ns();
+        if !wait_death_until(self.thread, deadline) {
+            return Err(self);
+        }
+        Ok(self.join_status())
+    }
+}
+
+/// Espera até `deadline` (ns do kernel) o fim de `thread`: `true` se ela
+/// morreu (ou a capability já não lê o registro: `join` decide), `false`
+/// se o prazo venceu.
+fn wait_death_until(thread: Handle, deadline: u64) -> bool {
+    let dead = || !matches!(cap::death(thread), Ok(None));
+    if dead() {
+        return true;
+    }
+    let armed = crate::time::waiter().filter(|w| {
+        if cap::bind_notify(thread, w.ntfy, crate::time::DEATH).is_err() {
+            return false;
+        }
+        if w.arm(deadline) {
+            return true;
+        }
+        let _ = cap::bind_notify(thread, w.ntfy, 0);
+        false
+    });
+    let Some(w) = armed else {
+        // Sem objetos: cede a vez até a morte ou o prazo.
+        while !dead() {
+            if crate::time::now_ns() >= deadline {
+                return false;
+            }
+            yield_now();
+        }
+        return true;
+    };
+    let mut done = dead();
+    while !done {
+        let bits = w.wait();
+        // Os bits podem ser velhos: confere o registro e o relógio.
+        done = dead();
+        if !done && crate::time::now_ns() >= deadline {
+            break;
+        }
+        if bits == 0 && !done {
+            yield_now();
+        }
+    }
+    w.disarm();
+    let _ = cap::bind_notify(thread, w.ntfy, 0);
+    w.drain();
+    done
 }
 
 impl<T> Drop for JoinHandle<T> {

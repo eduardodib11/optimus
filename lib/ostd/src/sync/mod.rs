@@ -4,10 +4,17 @@
 //!
 //! Todas as travas são uma ou duas palavras de 32 bits atômicas; o kernel
 //! confere a palavra com a trava do balde na mão (`futex.rs`), então nenhum
-//! despertar se perde entre o teste e a espera. As esperas são sem prazo
-//! (o `futex_wait` não tem tempo-limite; os prazos são da T-338), e um
+//! despertar se perde entre o teste e a espera. As esperas
+//! comuns são sem prazo (o `futex_wait` do kernel não tem tempo-limite), e um
 //! `futex_wait` que o kernel recusa por a palavra já ter mudado volta
 //! como um despertar espúrio: todo laço relê a palavra.
+//!
+//! **Prazos (T-338).** [`Condvar::wait_timeout`] e companhia não esperam no
+//! futex: a thread espera na `Notification` dela (com o `Timer` da thread
+//! armado no prazo; ver [`crate::time`]) e fica numa lista do `Condvar`;
+//! `notify_one`/`notify_all` acordam também os que estão nela. Mutex com
+//! prazo (`lock_timeout`) não existe: o `unlock` teria de conhecer os
+//! esperadores com prazo, e o caminho rápido dele hoje é um `swap`.
 //!
 //! **Envenenamento: não há.** O perfil do `ostd` é `panic = abort` (ADR 0039,
 //! item 5): um pânico encerra o processo, nenhuma guarda é largada no meio
@@ -37,10 +44,13 @@ use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
+use core::time::Duration;
 
-use kabi::Syscall;
+use alloc_crate::vec::Vec;
+use kabi::{Handle, Syscall};
 
 use crate::sys::syscall;
+use crate::time::{self, EVENT};
 
 /// Espera enquanto `word` valer `expected` (ou até um despertar espúrio).
 fn futex_wait(word: &AtomicU32, expected: u32) {
@@ -191,6 +201,24 @@ impl<T> Drop for MutexGuard<'_, T> {
 pub struct Condvar {
     /// Contador de sequência: cada `notify` o incrementa.
     seq: AtomicU32,
+    /// `Notification`s das threads em espera com prazo (só dentro do
+    /// processo: os handles valem na tabela dele).
+    timed: Mutex<Vec<Handle>>,
+    /// Tamanho de `timed`, para o `notify` sem esperas com prazo não tomar
+    /// a trava.
+    timed_len: AtomicU32,
+}
+
+/// Resultado de uma espera com prazo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitTimeoutResult(bool);
+
+impl WaitTimeoutResult {
+    /// O prazo venceu sem que um `notify` acordasse a espera.
+    #[must_use]
+    pub const fn timed_out(self) -> bool {
+        self.0
+    }
 }
 
 impl Condvar {
@@ -199,6 +227,8 @@ impl Condvar {
     pub const fn new() -> Self {
         Self {
             seq: AtomicU32::new(0),
+            timed: Mutex::new(Vec::new()),
+            timed_len: AtomicU32::new(0),
         }
     }
 
@@ -230,16 +260,164 @@ impl Condvar {
         guard
     }
 
-    /// Acorda uma thread esperando.
+    /// Como [`wait`](Self::wait), com prazo: volta, com a trava tomada, num
+    /// `notify`, no fim de `dur` (o resultado diz `timed_out`) ou por um
+    /// despertar espúrio (que não conta como prazo vencido). Um `notify`
+    /// que chega junto com o prazo vale como `notify` (`timed_out` falso).
+    pub fn wait_timeout<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        dur: Duration,
+    ) -> (MutexGuard<'a, T>, WaitTimeoutResult) {
+        let deadline = (time::Instant::now() + dur).as_ns();
+        self.wait_until(guard, deadline)
+    }
+
+    /// Espera enquanto `condition` der `true`, até `dur` no total. O
+    /// resultado diz `timed_out` se a condição ainda valia no fim do prazo.
+    pub fn wait_timeout_while<'a, T, F>(
+        &self,
+        mut guard: MutexGuard<'a, T>,
+        dur: Duration,
+        mut condition: F,
+    ) -> (MutexGuard<'a, T>, WaitTimeoutResult)
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        let deadline = (time::Instant::now() + dur).as_ns();
+        loop {
+            if !condition(&mut guard) {
+                return (guard, WaitTimeoutResult(false));
+            }
+            if time::now_ns() >= deadline {
+                return (guard, WaitTimeoutResult(true));
+            }
+            guard = self.wait_until(guard, deadline).0;
+        }
+    }
+
+    /// Uma espera com prazo absoluto `deadline` (ns do relógio do kernel).
+    fn wait_until<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        deadline: u64,
+    ) -> (MutexGuard<'a, T>, WaitTimeoutResult) {
+        let seq = self.seq.load(Ordering::Relaxed);
+        let lock = guard.lock;
+        // Entra na lista e arma o `Timer` com a trava do usuário ainda
+        // tomada: um `notify` depois disto acha a thread na lista.
+        let waiter = time::waiter().filter(|w| {
+            if !self.register(w.ntfy) {
+                return false;
+            }
+            if w.arm(deadline) {
+                return true;
+            }
+            self.deregister(w.ntfy);
+            false
+        });
+        drop(guard);
+        let timed_out = match waiter {
+            Some(w) => self.block_timed(w, deadline),
+            None => {
+                // Plano B sem objetos: cede a vez até o contador mudar.
+                loop {
+                    if self.seq.load(Ordering::Acquire) != seq {
+                        break false;
+                    }
+                    if time::now_ns() >= deadline {
+                        break true;
+                    }
+                    crate::thread::yield_now();
+                }
+            }
+        };
+        (lock.lock(), WaitTimeoutResult(timed_out))
+    }
+
+    /// Espera na `Notification` da thread por `EVENT` ou pelo prazo.
+    fn block_timed(&self, w: time::Waiter, deadline: u64) -> bool {
+        let mut timed_out = false;
+        loop {
+            let bits = w.wait();
+            if bits & EVENT != 0 {
+                break;
+            }
+            if time::now_ns() >= deadline {
+                timed_out = true;
+                break;
+            }
+            // Bit velho do `Timer` (ou espera recusada): espera de novo.
+            if bits == 0 {
+                crate::thread::yield_now();
+            }
+        }
+        w.disarm();
+        // Quem já não está na lista foi acordado por um `notify` (que
+        // sinaliza com a trava da lista na mão): o sinal já chegou, e
+        // vale mais que o prazo.
+        if !self.deregister(w.ntfy) {
+            timed_out = false;
+        }
+        w.drain();
+        timed_out
+    }
+
+    /// Põe `h` na lista das esperas com prazo; `false` sem memória.
+    fn register(&self, h: Handle) -> bool {
+        let mut list = self.timed.lock();
+        if list.try_reserve(1).is_err() {
+            return false;
+        }
+        list.push(h);
+        self.timed_len.store(
+            u32::try_from(list.len()).unwrap_or(u32::MAX),
+            Ordering::SeqCst,
+        );
+        true
+    }
+
+    /// Tira `h` da lista; `false` se um `notify` já o tinha tirado.
+    fn deregister(&self, h: Handle) -> bool {
+        let mut list = self.timed.lock();
+        let found = list.iter().position(|x| *x == h).map(|i| list.remove(i));
+        self.timed_len.store(
+            u32::try_from(list.len()).unwrap_or(u32::MAX),
+            Ordering::SeqCst,
+        );
+        found.is_some()
+    }
+
+    /// Acorda até `n` esperas com prazo (as mais antigas primeiro).
+    fn wake_timed(&self, n: usize) {
+        if self.timed_len.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut list = self.timed.lock();
+        let k = n.min(list.len());
+        for h in list.drain(..k) {
+            let _ = crate::cap::ntfy_signal(h, EVENT);
+        }
+        self.timed_len.store(
+            u32::try_from(list.len()).unwrap_or(u32::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Acorda uma thread esperando (e uma das com prazo, se houver: uma
+    /// espera que vence junto com o `notify` não pode perdê-lo; o excesso
+    /// é um despertar espúrio).
     pub fn notify_one(&self) {
-        self.seq.fetch_add(1, Ordering::Release);
+        self.seq.fetch_add(1, Ordering::SeqCst);
         futex_wake(&self.seq, 1);
+        self.wake_timed(1);
     }
 
     /// Acorda todas as threads esperando.
     pub fn notify_all(&self) {
-        self.seq.fetch_add(1, Ordering::Release);
+        self.seq.fetch_add(1, Ordering::SeqCst);
         futex_wake(&self.seq, WAKE_ALL);
+        self.wake_timed(usize::MAX);
     }
 }
 

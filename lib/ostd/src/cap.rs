@@ -123,6 +123,38 @@ pub fn disarm_timer(timer: Handle, ntfy: Handle) -> Result<(), Error> {
     arm_timer(timer, ntfy, 0, 0, 0, 0)
 }
 
+/// `ntfy_signal`: faz OR de `bits` (mais o badge da capability) na
+/// notificação `ntfy`.
+///
+/// # Errors
+///
+/// Os do kernel (`AccessDenied` sem `SIGNAL`, `InvalidArgument` para
+/// `bits` e badge nulos).
+pub fn ntfy_signal(ntfy: Handle, bits: u64) -> Result<(), Error> {
+    syscall(Syscall::NtfySignal, [raw(ntfy), bits, 0, 0, 0, 0]).map(drop)
+}
+
+/// `ntfy_wait`: espera bits pendentes em `ntfy`, devolve-os e os zera.
+///
+/// # Errors
+///
+/// Os do kernel (`AccessDenied` sem `WAIT`, `PeerClosed` se a notificação
+/// morre durante a espera).
+pub fn ntfy_wait(ntfy: Handle) -> Result<u64, Error> {
+    let [bits, ..] = syscall(Syscall::NtfyWait, [raw(ntfy), 0, 0, 0, 0, 0])?;
+    Ok(bits)
+}
+
+/// `ntfy_poll`: como [`ntfy_wait`], sem bloquear (0 se nada pendente).
+///
+/// # Errors
+///
+/// Os do kernel (`AccessDenied` sem `WAIT`).
+pub fn ntfy_poll(ntfy: Handle) -> Result<u64, Error> {
+    let [bits, ..] = syscall(Syscall::NtfyPoll, [raw(ntfy), 0, 0, 0, 0, 0])?;
+    Ok(bits)
+}
+
 /// Registro de morte (ADR 0035, item 2), de [`death`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Death {

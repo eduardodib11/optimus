@@ -581,3 +581,46 @@ sem mudar nenhuma decisão aceita:
 - **`unsafe`.** Nenhum bloco novo no `ostd`; o `unsafe` do `Timer` é do
   kernel (elos intrusivos numa `UnsafeCell`, seção `# Unsafe` de
   `okernel::timer`).
+
+## Notas da implementação (T-338, 2026-10-25)
+
+- **`ostd::time`** (`lib/ostd/src/time.rs`): `Duration` é a do `core`;
+  `Instant` (ns do `clock_get`, com `+`, `-`, `elapsed`,
+  `checked_*`/`saturating_duration_since`; somas saturam, nunca entram em
+  pânico), `sleep` e `sleep_until`. O relógio não é "acochambrado" para ser
+  monotônico por thread: o do kernel já é entre CPUs.
+- **Um `Timer` e uma `Notification` por thread**, no `thread_local!` (o
+  "par por chamada" da nota da T-349 foi descartado: cada chamada criaria e
+  apagaria dois objetos). Criados na primeira espera com prazo, cobrados da
+  cota do processo e apagados no destrutor da thread. Thread encerrada à
+  força (`kill`, falta) não roda destrutores: o par dela fica até o fim do
+  processo. Sem cota, ou antes de `rt::init`, as esperas caem num laço de
+  `yield_now` até o prazo (correto, gasta CPU).
+- **Bits e bits velhos.** O `Timer` sinaliza o bit `TIMER`; o `notify` do
+  `Condvar`, `EVENT`; a morte da thread esperada, `DEATH`. Como um disparo
+  em curso pode chegar depois do desarme (ADR 0035, notas da T-349), nenhuma
+  espera confia só no bit: confere o relógio (`sleep`, prazos) ou o estado
+  (registro de morte) e espera de novo se o bit era velho.
+- **Prazo nas esperas: sem mudar o kernel.** O `futex_wait` não tem prazo
+  (`a2` a `a5` ignorados) e a thread bloqueada nele não espera em
+  `Notification`, então um `Timer` não a acorda. `Condvar::wait_timeout`,
+  `wait_timeout_while` e `JoinHandle::join_timeout` esperam na
+  `Notification` da thread. O `Condvar` ganhou uma lista (`Mutex<Vec<Handle>>`
+  mais um contador atômico, para o `notify` sem esperas com prazo não tomar
+  a trava) com as notificações dessas threads; `notify_one` acorda uma
+  espera no futex **e** uma da lista (uma que vence junto com o `notify` não
+  pode perdê-lo; o excesso é despertar espúrio, permitido) e `notify_all`
+  todas. A thread entra na lista e arma o `Timer` com a trava do usuário
+  ainda tomada, então nenhum `notify` se perde; quem acha que o `notify` já
+  a tirou da lista vale como acordada (`timed_out` falso). `Condvar` só
+  vale dentro de um processo (os handles da lista são da tabela dele).
+- **Fica de fora: `Mutex::lock_timeout`.** O `unlock` teria de conhecer os
+  esperadores com prazo (a fila no futex do kernel não os acorda por
+  tempo); isso custaria o `swap` do caminho rápido ou pediria prazo no
+  `futex_wait` do kernel (decisão de Eduardo, mudaria a ABI v1). `RwLock` e
+  `Once` também seguem sem prazo.
+- **`unsafe`.** Nenhum bloco novo (`sync` segue em 18 de 28). `cap` ganhou
+  `ntfy_signal`, `ntfy_wait` e `ntfy_poll`.
+- **Aceite.** `sleep(10 ms)`: o piso (10 ms) é rígido; o teto de 15 ms vale
+  para a melhor de 8 medidas, e cada medida tem teto de 2 s, a folga
+  declarada para TCG com várias vCPUs emuladas num host só.
