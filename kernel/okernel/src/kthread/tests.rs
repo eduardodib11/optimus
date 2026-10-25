@@ -25,6 +25,7 @@ mod smp;
 mod smp_ipc;
 mod smp_stress;
 mod sync;
+mod timer;
 mod tlb;
 mod tls;
 
@@ -113,6 +114,18 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "smp.shootdown_do_kernel_sem_traducao_velha",
         run: tlb::kernel_sem_traducao_velha,
+    },
+    Test {
+        name: "timer.mil_no_prazo",
+        run: timer::mil_no_prazo,
+    },
+    Test {
+        name: "timer.periodico_coalesce_e_desarme",
+        run: timer::periodico_coalesce_e_desarme,
+    },
+    Test {
+        name: "smp.timer_migra_e_morre_armado",
+        run: timer::migra_e_morre_armado,
     },
 ];
 

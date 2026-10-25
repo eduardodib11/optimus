@@ -64,6 +64,7 @@ const TYPES: &[ObjectType] = &[
     ObjectType::Interrupt,
     ObjectType::IoPortRange,
     ObjectType::DmaDomain,
+    ObjectType::Timer,
 ];
 
 fn syscall(nr: Syscall, args: [u64; 6]) -> Result<[u64; 3], Error> {
@@ -184,6 +185,7 @@ impl Fuzzer {
             10 => self.notify(),
             11 => self.futex(),
             12 | 13 => self.ipc(),
+            14 => self.timer(),
             _ => {
                 let _ = syscall(Syscall::ClockGet, [0; 6]);
             }
@@ -459,6 +461,54 @@ impl Fuzzer {
                 );
             }
         }
+    }
+
+    /// `obj_bind_notify` sobre um `Timer` (T-349): arma, rearma e desarma
+    /// com prazos relativos e absolutos (vencidos ou não), períodos (no
+    /// mínimo, longos e abaixo do mínimo) e flags lixo, às vezes num
+    /// `Timer` do pool e às vezes em qualquer handle. O período mínimo é
+    /// raro, para os disparos não tomarem a CPU emulada.
+    fn timer(&mut self) {
+        use ostd::kabi::timer::{MIN_PERIOD_NS, RELATIVE};
+        let t = match self.pool.of_type(&mut self.rng, ty8(ObjectType::Timer)) {
+            Some(raw) if self.rng.chance(3, 4) => u64::from(raw),
+            _ => self.some_handle(),
+        };
+        let n = match self
+            .pool
+            .of_type(&mut self.rng, ty8(ObjectType::Notification))
+        {
+            Some(raw) if self.rng.chance(3, 4) => u64::from(raw),
+            _ => self.some_handle(),
+        };
+        let bits = match self.rng.below(4) {
+            0 => 0,
+            1 => 1 << self.rng.below(64),
+            _ => self.rng.next(),
+        };
+        let flags = match self.rng.below(8) {
+            0..=3 => RELATIVE,
+            4..=6 => 0,
+            _ => self.rng.next(),
+        };
+        let deadline = match self.rng.below(6) {
+            0 => 0,
+            1 => 1, // vencido (absoluto) ou quase já (relativo)
+            2 => 1_000_000 * (1 + self.rng.below(50)),
+            3 => ostd::time::now_ns().wrapping_add(self.rng.below(100_000_000)),
+            _ => wild(&mut self.rng),
+        };
+        let period = match self.rng.below(16) {
+            0 => MIN_PERIOD_NS,
+            1 => MIN_PERIOD_NS - 1, // recusado
+            2..=4 => 1_000_000 * (1 + self.rng.below(100)),
+            5 => wild(&mut self.rng),
+            _ => 0,
+        };
+        let _ = syscall(
+            Syscall::ObjBindNotify,
+            [t, n, bits, deadline, period, flags],
+        );
     }
 
     fn futex(&mut self) {

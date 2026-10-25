@@ -17,6 +17,7 @@ trava).
 | 4 | `IpcSlot` | `thread::Thread.ipc` | depois do objeto |
 | 5 | `AddressSpace` | `SharedAddressSpace` (`cap::object`, `obj_create`) | uma por vez |
 | 6 | `RunQueue` | escalonador de cada CPU (`kthread::BSP_SCHED` e `kthread::SCHEDS`, chave = id da CPU, T-323) | duas só em ordem crescente de id; o despertar entre CPUs (T-324) toma a da CPU antiga e depois a do destino, nunca as duas juntas |
+| 6 | `TimerQueue` (`FilaTimers`, depois de `RunQueue`) | fila de `Timer`s de cada CPU (`timer::QUEUES`, chave = id da CPU, T-349) | folha: nada se toma com ela na mão, nem outra `FilaTimers` |
 | 7 | `SchedLeaf` | `thread::Thread.sched` (o `SchedContext` dela e o doado) | folha do escalonador |
 | 8 | `KernelStacks`, depois `KernelPageTables` | `kvm::STACK_SLOTS`, depois `kmem::KERNEL_PT` | nessa ordem |
 | 9 | `Heap`, depois `Frames` | `kheap::HEAP`, depois `kmem::FRAMES` | nessa ordem |
@@ -75,6 +76,20 @@ Notas:
   `IpcSlot` (4) da thread com a trava do objeto (3) na mão; quem encerra
   lê o slot, solta-o e só então toma a trava do objeto para tirar a thread
   da fila.
+
+- Fila de timers (T-349, ADR 0035, item 6, e emenda da ADR 0031): o
+  estado de cada `Timer` (prazo, período, ligação e elos) é protegido só
+  pela `FilaTimers` da CPU dona, nunca pela trava do objeto. Com ela na mão
+  só se mexe nos elos e se copia ou tira a ligação; "remover, soltar,
+  sinalizar": o tratador (`kthread::fire_timers`) tira um vencido por vez,
+  solta a fila e só então sinaliza a notificação (3) e acorda (6, `Fila`),
+  e a referência à notificação é solta depois disso. O escalonador lê o
+  primeiro prazo da fila por um atômico, sem tomar a `FilaTimers` com a
+  `Fila` na mão. Rearmar de outra CPU toma a fila da dona, tira o `Timer`,
+  marca a dona como `MOVING`, solta e só então toma a fila local: nunca há
+  duas `FilaTimers` na mão. Quem acha `MOVING` espera sem trava nenhuma
+  (`sync::relax`, que atende IPIs). O `Drop` do `Timer` toma a fila da dona
+  para desligá-lo e solta a ligação depois dela.
 
 ## Pontos sem nenhuma trava
 

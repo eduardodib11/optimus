@@ -636,3 +636,37 @@ pub fn partida_em_processo_encerrado(ctx: &Ctx) -> Outcome {
     let _ = delete(q);
     result
 }
+
+/// Um `Timer` periódico armado cuja única capability está num processo
+/// filho (T-349): segue disparando enquanto o filho vive e, encerrado o
+/// filho (a tabela é esvaziada), para de sinalizar, e a cota volta inteira.
+pub fn timer_de_processo_encerrado(ctx: &Ctx) -> Outcome {
+    use ostd::kabi::timer::RELATIVE;
+    let code = Code::new(ctx)?;
+    let q = child_quota(ctx, 1 << 20)?;
+    let before = quota_pages(q)?;
+    let n = create(ctx.quota, ObjectType::Notification, 0).map_err(|_| "create(ntfy)")?;
+    let result = (|| {
+        let mut kid = Kid::new(q, &code, 0)?;
+        let t = create(q, ObjectType::Timer, 0).map_err(|_| "create(Timer)")?;
+        cap::arm_timer(t, n, 1, 1_000_000, 1_000_000, RELATIVE).map_err(|_| "arm")?;
+        kid.give(t, Rights::BIND)?;
+        delete(t).map_err(|_| "delete")?;
+        for _ in 0..2 {
+            if ntfy_wait(n)? != 1 {
+                return Err("o Timer do filho devia seguir disparando");
+            }
+        }
+        kid.destroy()?;
+        drop(kid);
+        settle(2);
+        let _ = ntfy_poll(n)?;
+        settle(5);
+        if ntfy_poll(n)? != 0 {
+            return Err("o Timer do processo encerrado seguiu disparando");
+        }
+        back_to(q, before)
+    })();
+    let _ = (delete(n), delete(q));
+    result
+}

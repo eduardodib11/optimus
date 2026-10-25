@@ -102,7 +102,7 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     NtfySignal = 22 => "`ntfy_signal`.",
     NtfyWait = 23 => "`ntfy_wait`; `PeerClosed` se a notificação morre durante a espera.",
     NtfyPoll = 24 => "`ntfy_poll`.",
-    ObjBindNotify = 25 => "`obj_bind_notify(obj, ntfy, bits, a3, a4, a5)`: `Interrupt`, e a morte de `Thread` e de `CapSpace` (ADR 0035).",
+    ObjBindNotify = 25 => "`obj_bind_notify(obj, ntfy, bits, a3, a4, a5)`: `Interrupt`, a morte de `Thread` e de `CapSpace` e o vencimento de um `Timer` (`a3` prazo, `a4` período, `a5` flags de [`timer`]; ADR 0035).",
     IrqAck = 26 => "`irq_ack`.",
     ClockGet = 27 => "`clock_get`.",
     Yield = 28 => "`yield`.",
@@ -166,6 +166,7 @@ pub enum ObjectType: u32, raw(n) => u64::from(n);
     DmaDomain = 11 => "Domínio da IOMMU.",
     Vcpu = 12 => "CPU virtual (M14).",
     Vm = 13 => "Máquina virtual (M14).",
+    Timer = 14 => "Prazo ligável a bits de uma `Notification` (ADR 0035, item 6).",
 }
 
 /// Badge de 64 bits gravado no slot por `cap_mint` (seção 6.2).
@@ -274,6 +275,27 @@ pub mod exit {
     pub const CAUSE_KILLED: u8 = 3;
 }
 
+/// `Timer` (ADR 0035, item 6): `obj_create(quota, Timer, 0)` e
+/// `obj_bind_notify(timer, ntfy, bits, prazo, período, flags)` (`r10`, `r8`,
+/// `r9`).
+///
+/// `prazo` é em ns do relógio monotônico (o de `clock_get`); com
+/// [`RELATIVE`], é um deslocamento a partir de agora. `prazo = 0` ou
+/// `bits = 0` desarma. Prazo vencido sinaliza `bits` antes de a syscall
+/// voltar. `período = 0` é disparo único (o `Timer` fica desarmado depois);
+/// senão o `Timer` repete, com período de pelo menos [`MIN_PERIOD_NS`], e
+/// atrasos de mais de um período dão um sinal só (o próximo prazo é o
+/// primeiro múltiplo depois de agora). Armar de novo troca ligação, prazo e
+/// período, e o `Timer` passa para a CPU de quem armou.
+pub mod timer {
+    /// Flag: `prazo` é relativo a agora.
+    pub const RELATIVE: u64 = 1;
+    /// Flags definidas; as demais são recusadas com `InvalidArgument`.
+    pub const ALL_FLAGS: u64 = RELATIVE;
+    /// Menor período aceito (100 µs; o mesmo mínimo dos `SchedContext`s).
+    pub const MIN_PERIOD_NS: u64 = 100_000;
+}
+
 /// Rótulo de 64 bits de uma mensagem de IPC (seção 6.7).
 ///
 /// O significado do rótulo é do protocolo (OIDL); o kernel só o transporta.
@@ -304,7 +326,7 @@ mod tests {
     fn numeros_estaveis() {
         assert_eq!(SYSCALL_COUNT, 34);
         assert_eq!(Error::ALL.len(), 12);
-        assert_eq!(ObjectType::ALL.len(), 14);
+        assert_eq!(ObjectType::ALL.len(), 15);
         for (i, s) in Syscall::ALL.iter().enumerate() {
             assert_eq!(s.number() as usize, i);
         }
@@ -330,6 +352,7 @@ mod tests {
             (ObjectType::Endpoint.number(), ObjectType::Vm.number()),
             (6, 13)
         );
+        assert_eq!(ObjectType::Timer.number(), 14);
     }
 
     #[test]
@@ -349,7 +372,7 @@ mod tests {
         for raw in [STATUS_OK, 1, (-13i64).cast_unsigned(), u64::from(u32::MAX)] {
             assert_eq!(Error::try_from(raw), Err(UnknownValue(raw)));
         }
-        assert_eq!(ObjectType::try_from(14), Err(UnknownValue(14)));
+        assert_eq!(ObjectType::try_from(15), Err(UnknownValue(15)));
     }
 
     #[test]
@@ -379,6 +402,14 @@ mod tests {
     fn flags_de_cap_delete() {
         assert_eq!((cap_delete::DESTROY, cap_delete::ALL_FLAGS), (1, 1));
         assert_eq!(sched::SYS_INFO_EXIT, 2);
+    }
+
+    #[test]
+    fn constantes_do_timer() {
+        assert_eq!(
+            (timer::RELATIVE, timer::ALL_FLAGS, timer::MIN_PERIOD_NS),
+            (1, 1, 100_000)
+        );
     }
 
     #[test]

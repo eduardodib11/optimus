@@ -80,7 +80,7 @@ rights! {
     SUSPEND = 6 => "Suspender (`Thread`).",
     READ_STATE = 7 => "Ler registradores (`Thread`).",
     WRITE_STATE = 8 => "Escrever registradores (`Thread`).",
-    BIND = 9 => "Ligar (`SchedContext`, `Interrupt`) e ligar a morte a uma `Notification` (`Thread`, `CapSpace`; ADR 0035).",
+    BIND = 9 => "Ligar (`SchedContext`, `Interrupt`), ligar a morte a uma `Notification` (`Thread`, `CapSpace`) e armar, rearmar e desarmar (`Timer`; ADR 0035).",
     CONFIGURE = 10 => "Configurar (`SchedContext`).",
     READ = 11 => "Ler (`MemoryObject`, `IoPortRange`).",
     WRITE = 12 => "Escrever (`MemoryObject`, `IoPortRange`).",

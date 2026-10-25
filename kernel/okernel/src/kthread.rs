@@ -696,14 +696,16 @@ impl Until {
 }
 
 /// Arma o timer para o próximo evento: fim da fatia ou do orçamento da
-/// atual (`cur`, como quem chama já o leu), ou o primeiro
-/// reabastecimento.
+/// atual (`cur`, como quem chama já o leu), o primeiro reabastecimento, o
+/// primeiro prazo de IPC ou o primeiro `Timer` da fila desta CPU (ADR 0035,
+/// item 6; lido sem a trava dela).
 fn program_timer(s: &Sched, cur: Until) {
     let mut at = match cur {
         Until::Nothing => u64::MAX,
         Until::Slice => s.slice_end,
         Until::Budget(d) => s.slice_end.min(d),
     };
+    at = at.min(okernel::timer::QUEUES.first(s.id));
     for t in &s.throttled {
         if let Some(r) = with_sc(t, |sc, _| sc.budget().replenish_at) {
             at = at.min(r);
@@ -1455,14 +1457,102 @@ impl sys::Env for KernelEnv {
             ksmp::ipi::resched(cpu as usize);
         }
     }
+
+    fn cpu(&self) -> u32 {
+        percpu::cpu_id()
+    }
+
+    fn timer_armed(&mut self, deadline: u64) {
+        ktime::arm_by(deadline);
+    }
 }
 
 /// Disparo do timer do APIC (com o EOI já feito), vindo do anel 3 ou do
-/// ocioso: reavalia quem roda.
+/// ocioso: dispara os `Timer`s vencidos desta CPU e reavalia quem roda.
 pub fn on_timer() {
     ktime::timer_fired();
+    fire_timers();
     periodic_balance(ktime::now_ns());
     preempt();
+}
+
+/// Limites (ns) das faixas do histograma de atraso dos disparos de `Timer`;
+/// a última faixa é o resto.
+pub const TIMER_LATE_BOUNDS: [u64; 8] = [
+    10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000,
+];
+/// `Timer`s disparados desde o boot.
+static TIMER_FIRES: AtomicU64 = AtomicU64::new(0);
+/// Maior atraso de um disparo de `Timer` desde [`timer_stats_reset`], em
+/// ns: do prazo até o tratador o achar.
+static TIMER_LATE_MAX: AtomicU64 = AtomicU64::new(0);
+/// Histograma do atraso desde [`timer_stats_reset`] (faixas de
+/// [`TIMER_LATE_BOUNDS`]).
+static TIMER_LATE: [AtomicU64; TIMER_LATE_BOUNDS.len() + 1] =
+    [const { AtomicU64::new(0) }; TIMER_LATE_BOUNDS.len() + 1];
+
+/// Estatística dos disparos de `Timer` (testes).
+pub struct TimerStats {
+    /// Disparos desde o boot.
+    pub fires: u64,
+    /// Maior atraso (ns) desde [`timer_stats_reset`].
+    pub late_max: u64,
+    /// Disparos por faixa de atraso ([`TIMER_LATE_BOUNDS`]).
+    pub late: [u64; TIMER_LATE_BOUNDS.len() + 1],
+}
+
+impl TimerStats {
+    /// Menor limite de faixa que cobre a fração `num/den` dos disparos
+    /// contados (`u64::MAX` se só a última faixa cobre).
+    #[must_use]
+    pub fn quantile(&self, num: u64, den: u64) -> u64 {
+        let total: u64 = self.late.iter().sum();
+        let mut seen = 0;
+        for (i, n) in self.late.iter().enumerate() {
+            seen += n;
+            if seen * den >= total * num {
+                return TIMER_LATE_BOUNDS.get(i).copied().unwrap_or(u64::MAX);
+            }
+        }
+        u64::MAX
+    }
+}
+
+/// A estatística dos disparos de `Timer`.
+pub fn timer_stats() -> TimerStats {
+    TimerStats {
+        fires: TIMER_FIRES.load(Ordering::Relaxed),
+        late_max: TIMER_LATE_MAX.load(Ordering::Relaxed),
+        late: core::array::from_fn(|i| TIMER_LATE[i].load(Ordering::Relaxed)),
+    }
+}
+
+/// Zera o maior atraso e o histograma (testes).
+pub fn timer_stats_reset() {
+    TIMER_LATE_MAX.store(0, Ordering::Relaxed);
+    for b in &TIMER_LATE {
+        b.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Tira da fila desta CPU os `Timer`s vencidos (um por vez, com a trava
+/// dela) e, sem trava nenhuma, sinaliza cada um e acorda quem esperava
+/// (ADR 0031, emenda da `FilaTimers`). A referência à notificação de um
+/// disparo único é solta aqui, também sem trava.
+fn fire_timers() {
+    let me = percpu::cpu_id();
+    let now = ktime::now_ns();
+    while let Some(fired) = okernel::timer::QUEUES.expire(me, now) {
+        let late = now.saturating_sub(fired.deadline);
+        TIMER_FIRES.fetch_add(1, Ordering::Relaxed);
+        TIMER_LATE_MAX.fetch_max(late, Ordering::Relaxed);
+        let bucket = TIMER_LATE_BOUNDS.partition_point(|&b| b < late);
+        TIMER_LATE[bucket].fetch_add(1, Ordering::Relaxed);
+        let (ntfy, bits) = fired.binding;
+        if let Some((thread, word)) = ntfy.signal(bits) {
+            wake(thread, word);
+        }
+    }
 }
 
 /// Liga o registro de eventos do escalonador com espaço para `capacity`

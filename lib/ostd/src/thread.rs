@@ -293,6 +293,7 @@ pub struct Builder {
     priority: u8,
     quota: Option<Handle>,
     exception: Option<Handle>,
+    cpus: Option<CpuMask>,
 }
 
 impl Default for Builder {
@@ -311,6 +312,7 @@ impl Builder {
             priority: DEFAULT_PRIORITY,
             quota: None,
             exception: None,
+            cpus: None,
         }
     }
 
@@ -343,6 +345,14 @@ impl Builder {
     #[must_use]
     pub const fn exception_endpoint(mut self, ep: Handle) -> Self {
         self.exception = Some(ep);
+        self
+    }
+
+    /// CPUs em que a thread pode rodar (a máscara do `SchedContext` dela,
+    /// ADR 0032, item 4); todas, por omissão.
+    #[must_use]
+    pub const fn affinity(mut self, cpus: CpuMask) -> Self {
+        self.cpus = Some(cpus);
         self
     }
 
@@ -413,8 +423,11 @@ impl Builder {
         let thread = cap::create(quota, ObjectType::Thread, 0)?;
         let result = (|| {
             let sc = cap::create(quota, ObjectType::SchedContext, 0)?;
-            let bound = sched_configure(sc, PERIOD_NS, PERIOD_NS, self.priority)
-                .and_then(|()| sched_bind(sc, thread));
+            let configured = match &self.cpus {
+                Some(mask) => sched_configure_on(sc, PERIOD_NS, PERIOD_NS, self.priority, mask),
+                None => sched_configure(sc, PERIOD_NS, PERIOD_NS, self.priority),
+            };
+            let bound = configured.and_then(|()| sched_bind(sc, thread));
             // A thread guarda o `SchedContext`; a capability não faz falta.
             let _ = cap::delete(sc);
             bound?;
