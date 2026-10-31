@@ -98,6 +98,7 @@ dependencies = [
 name = "utest"
 version = "0.1.0"
 dependencies = [
+ "obfs",
  "ostd",
 ]
 

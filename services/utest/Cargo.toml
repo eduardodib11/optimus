@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 ostd = { path = "../../lib/ostd" }
+obfs = { path = "../../lib/obfs" }
 
 [lints]
 workspace = true

@@ -44,6 +44,7 @@ use ostd::kabi::ipc::FLAG_NONBLOCK;
 use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::{Env, Start};
 
+mod anel;
 mod tempo;
 mod timer;
 mod vida;
@@ -54,6 +55,8 @@ ostd::entry!(main);
 struct Ctx {
     /// Cota raiz.
     quota: Handle,
+    /// `MemoryObject` do bootfs (o `rdx` inicial, parte alta).
+    bootfs: Handle,
 }
 
 /// Bloco com alinhamento de página.
@@ -246,6 +249,18 @@ const TESTS: &[Test] = &[
     Test {
         name: "collections.ring_e_fila",
         run: colecoes_ring,
+    },
+    Test {
+        name: "ring.modelo",
+        run: anel::modelo,
+    },
+    Test {
+        name: "ring.par_que_mente",
+        run: anel::par_que_mente,
+    },
+    Test {
+        name: "ring.dois_processos",
+        run: anel::dois_processos,
     },
     Test {
         name: "utf8.bordas_e_decodificador",
@@ -1340,8 +1355,12 @@ fn proposital(_: &Ctx) -> Outcome {
 
 fn main(start: Start) -> ! {
     let handle = |raw: u64| Handle::from_raw(u32::try_from(raw).unwrap_or(0));
+    if start.args[2] & anel::CHILD_FLAG != 0 {
+        anel::child(&start);
+    }
     let ctx = Ctx {
         quota: handle(start.args[0]),
+        bootfs: ostd::kabi::split_handle_pair(start.args[2]).1,
     };
     ostd::rt::init(Env { quota: ctx.quota });
     ostd::debug::print_fmt(format_args!("utest: início, {} testes", TESTS.len()));
