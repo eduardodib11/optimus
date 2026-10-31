@@ -1,0 +1,13 @@
+[package]
+name = "ohud"
+description = "Núcleo de desenho do HUD do Optimus (ADR 0040, M-HUD1): moldura de vidro e núcleo; no_std, sem unsafe, testável no host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true
