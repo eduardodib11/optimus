@@ -629,6 +629,10 @@ const HELLO_SCENARIO: Scenario = Scenario {
     hello: true,
     timeout: HELLO_TIMEOUT,
 };
+/// Limite dos testes de usuário: o anel SPSC passa 10⁷ itens entre dois
+/// processos (T-339), 3,5 min em TCG com 2 CPUs.
+const USER_TIMEOUT: Duration = Duration::from_mins(15);
+
 /// Testes de usuário (T-332, `cargo xtask test user`): o kernel inicia o
 /// serviço `utest` do bootfs no lugar do `root`, e ele escreve o relatório
 /// na serial. O kernel sai com 33 quando o `utest` termina; quem diz se os
@@ -643,7 +647,7 @@ const USER_SCENARIO: Scenario = Scenario {
     screen: false,
     rounds: None,
     hello: false,
-    timeout: KTEST_TIMEOUT,
+    timeout: USER_TIMEOUT,
 };
 
 /// Primeira linha do harness: `ktest: início, N testes`.

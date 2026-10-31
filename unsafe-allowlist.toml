@@ -23,9 +23,9 @@ crates = [
 "lib/ostd/src/arch" = 8    # syscall, _start, memória mapeada e fs:[0] (T-335; a saída sem pilha saiu na T-348)
 "lib/ostd/src/alloc" = 8   # cola de GlobalAlloc e PageSource sobre lib/oalloc
 "lib/ostd/src/tls" = 23     # bloco da thread, thread_local!, Handoff (T-335)
+"lib/ostd/src/ring" = 4    # anéis SPSC compartilhados: cabeçalho atômico e cópia da carga útil (T-339)
 "lib/ostd/src/sync" = 28   # guardas (UnsafeCell), Send/Sync das travas e OnceLock (T-336)
 "lib/oalloc" = 74         # alocador (núcleo e testes; T-337: +4 no teste do ponteiro interior, +6 no rastro de coleções)
 
 # Previstos pela ADR 0039 para quando os módulos existirem (o primeiro PR de
 # cada um acrescenta a linha, com o número que realmente usar):
-#   "lib/ostd/src/ring" = 14   # anéis compartilhados (ADR 0036)
