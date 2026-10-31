@@ -1,0 +1,25 @@
+[package]
+name = "oidl-rt-fuzz"
+description = "Alvos de fuzz do lib/oidl-rt (ADR 0033). Fora da imagem: só ferramenta de fuzzing, nightly."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Crate própria, fora do workspace principal: `libfuzzer-sys` nunca entra na
+# imagem do sistema nem no `cargo xtask build`.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oidl-rt = { path = "../../lib/oidl-rt" }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
