@@ -1353,14 +1353,41 @@ fn proposital(_: &Ctx) -> Outcome {
     Err("falha proposital (UTEST_FALHA=1)")
 }
 
+/// Onde o utest lê a tabela de handles de partida (ADR 0036, item 5).
+const TABLE_VA: u64 = 0x5000_0000;
+
+/// Acha o bootfs na tabela de partida, lida por uma mapeação temporária
+/// (mesmo formato de `kabi::startup`, lido também pelo `root`).
+fn bootfs_from_table(aspace: Handle, table: Handle) -> Option<Handle> {
+    use ostd::kabi::startup::{ENTRY_BYTES, HEADER_BYTES, KIND_BOOTFS, MAGIC, MAX_ENTRIES};
+    use ostd::vm::Mapping;
+    let map = Mapping::new(aspace, table, TABLE_VA, ostd::kabi::vm::PAGE_SIZE, 0).ok()?;
+    let bytes = map.bytes();
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    if word(0) != Some(MAGIC) {
+        return None;
+    }
+    let count = (word(4)? as usize).min(MAX_ENTRIES);
+    (0..count).find_map(|i| {
+        let at = HEADER_BYTES + i * ENTRY_BYTES;
+        (word(at)? == KIND_BOOTFS)
+            .then(|| word(at + 4))
+            .flatten()
+            .map(Handle::from_raw)
+    })
+}
+
 fn main(start: Start) -> ! {
     let handle = |raw: u64| Handle::from_raw(u32::try_from(raw).unwrap_or(0));
     if start.args[2] & anel::CHILD_FLAG != 0 {
         anel::child(&start);
     }
+    let (_, table) = ostd::kabi::split_handle_pair(start.args[2]);
     let ctx = Ctx {
         quota: handle(start.args[0]),
-        bootfs: ostd::kabi::split_handle_pair(start.args[2]).1,
+        bootfs: bootfs_from_table(handle(start.args[1]), table).unwrap_or(table),
     };
     ostd::rt::init(Env { quota: ctx.quota });
     ostd::debug::print_fmt(format_args!("utest: início, {} testes", TESTS.len()));

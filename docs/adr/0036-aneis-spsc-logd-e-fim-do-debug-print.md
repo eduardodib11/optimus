@@ -330,3 +330,18 @@ Mudanças em relação à proposta:
 - A entrega da `DebugLog` e do anel do kernel ao `root` passa a ser a
   tabela de handles de partida (decisão 6).
 - A sinalização do anel do kernel é diferida a um ponto sem travas.
+
+## Revisão de 2026-11-04 (T-355, passos 2 e 3)
+
+- **Registrador:** `rdx` do `root` passa a ser `handle_pair(thread, tabela)`.
+  O bootfs deixa de vir em `rdx`; é encontrado na tabela. Não há registrador
+  novo, então a mudança de assembly em `arch/` não é necessária.
+- **Tabela de partida:** `MemoryObject` somente leitura de uma página
+  (`kabi::startup`). Cabeçalho: `u32` mágico `"OSTA"`, `u32` quantidade.
+  Entradas de 8 bytes: `u32` tipo (1 bootfs, 2 `DebugLog`, 3 linha de
+  pressão) e `u32` handle no `CapSpace` do `root`. No máximo 510 entradas.
+- **Conteúdo:** o bootfs, uma `DebugLog` (`WRITE | BIND`, badge 0) e as duas
+  linhas de `kpressure::create` (ADR 0038), todas criadas pelo kernel no
+  boot.
+- **Mapeamento do `root`:** `TABLE_VA = 0x5000_0000`, só leitura, mapeado só
+  para ler a tabela e liberado em seguida.

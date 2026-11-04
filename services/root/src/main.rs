@@ -31,6 +31,8 @@ ostd::entry!(main);
 const DEFAULT_ROUNDS: u64 = 1000;
 /// Onde o `root` mapeia o bootfs.
 const BOOTFS_VA: u64 = 0x4000_0000;
+/// Onde o `root` mapeia a tabela de handles de partida (ADR 0036, item 5).
+const TABLE_VA: u64 = 0x5000_0000;
 /// Faixa dos mapeamentos temporários do carregador.
 const SCRATCH_VA: u64 = 0x8000_0000;
 /// Cota do `hello`.
@@ -193,10 +195,42 @@ fn hello(b: Boot) -> Result<(), Error> {
     serve(b, ep, rounds, &mut buffer)
 }
 
+/// Acha o bootfs na tabela de handles de partida, lendo-a só por leitura.
+fn bootfs_from_table(aspace: Handle, table: Handle) -> Result<Handle, Error> {
+    use ostd::kabi::startup::{ENTRY_BYTES, HEADER_BYTES, KIND_BOOTFS, MAGIC, MAX_ENTRIES};
+    let map = Mapping::new(aspace, table, TABLE_VA, PAGE_SIZE, 0)?;
+    let bytes = map.bytes();
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    if word(0) != Some(MAGIC) {
+        return Err(Error::InvalidArgument);
+    }
+    let count = word(4).ok_or(Error::InvalidArgument)? as usize;
+    if count > MAX_ENTRIES {
+        return Err(Error::InvalidArgument);
+    }
+    for i in 0..count {
+        let at = HEADER_BYTES + i * ENTRY_BYTES;
+        if word(at) == Some(KIND_BOOTFS) {
+            let raw = word(at + 4).ok_or(Error::InvalidArgument)?;
+            return Ok(Handle::from_raw(raw));
+        }
+    }
+    Err(Error::InvalidArgument)
+}
+
 fn main(start: Start) -> ! {
     let [quota, aspace, rdx] = start.args;
-    let (thread, bootfs) = split_handle_pair(rdx);
+    let (thread, table) = split_handle_pair(rdx);
     let handle = |raw: u64| Handle::from_raw(u32::try_from(raw).unwrap_or(0));
+    let bootfs = match bootfs_from_table(handle(aspace), table) {
+        Ok(h) => h,
+        Err(e) => {
+            ostd::debug::print_fmt(format_args!("root: tabela de partida inválida: {e:?}"));
+            ostd::thread::exit()
+        }
+    };
     let boot = Boot {
         quota: handle(quota),
         aspace: handle(aspace),

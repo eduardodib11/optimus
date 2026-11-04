@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use kabi::boot::MemKind;
 use kabi::vm::{EXEC, PAGE_SIZE, WRITE};
 use kabi::{Handle, ObjectType, Rights, handle_pair};
-use okernel::cap::{Cap, SharedCapSpace};
+use okernel::cap::{Cap, Object, SharedCapSpace, default_rights};
 use okernel::sched::Params;
 use okernel::thread::{RunState, Thread};
 use okernel::vm::vm_map;
@@ -256,13 +256,14 @@ pub fn spawn(elf: &oelf::Elf<'_>, fs: &[u8]) -> Result<Process, &'static str> {
     let (quota, a) = (p.quota, p.aspace);
     let (t, thread) = new_thread(&p, ROOT_PRIORITY)?;
     let fs = read_only_copy(&p, fs)?;
+    let table = start_table(&p, fs)?;
     let entry = UserEntry {
         rip: elf.entry(),
         rsp: STACK_TOP,
         args: [
             u64::from(quota.raw()),
             u64::from(a.raw()),
-            handle_pair(t, fs),
+            handle_pair(t, table),
         ],
     };
     kthread::start(&thread, &entry).map_err(|_| "thread_start")?;
@@ -271,6 +272,66 @@ pub fn spawn(elf: &oelf::Elf<'_>, fs: &[u8]) -> Result<Process, &'static str> {
         thread,
         handles: [quota, a, t, fs],
     })
+}
+
+/// Monta a tabela de handles de partida (ADR 0036, item 5; T-355) em `p`: o
+/// bootfs, a `DebugLog` de depuração e as duas linhas de pressão de memória
+/// (ADR 0038). Devolve o handle da tabela, somente leitura, no `CapSpace` de
+/// `p`.
+///
+/// # Errors
+///
+/// O passo que falhou.
+fn start_table(p: &Image, fs: Handle) -> Result<Handle, &'static str> {
+    use kabi::startup::{
+        ENTRY_BYTES, HEADER_BYTES, KIND_BOOTFS, KIND_DEBUG_LOG, KIND_PRESSURE, MAGIC,
+    };
+    let mut entries: [(u32, u32); kabi::startup::MAX_ENTRIES] =
+        [(0, 0); kabi::startup::MAX_ENTRIES];
+    let mut n = 0;
+    let mut push = |kind: u32, handle: Handle| {
+        entries[n] = (kind, handle.raw());
+        n += 1;
+    };
+    push(KIND_BOOTFS, fs);
+    let log = {
+        let object = Object::DebugLog(Arc::new(okernel::cap::object::DebugLog));
+        let rights = kabi::Rights::WRITE | kabi::Rights::BIND;
+        p.cspace
+            .lock()
+            .insert(Cap {
+                object,
+                rights,
+                badge: 0,
+            })
+            .map_err(|_| "cap(DebugLog)")?
+    };
+    push(KIND_DEBUG_LOG, log);
+    let quota = kcap::root_quota().ok_or("root_quota")?;
+    let lines = crate::kpressure::create(&quota).map_err(|_| "kpressure")?;
+    for irq in lines {
+        let rights = default_rights(ObjectType::Interrupt);
+        let h = p
+            .cspace
+            .lock()
+            .insert(Cap {
+                object: Object::Interrupt(irq),
+                rights,
+                badge: 0,
+            })
+            .map_err(|_| "cap(pressure)")?;
+        push(KIND_PRESSURE, h);
+    }
+    let mut bytes = [0u8; 4096];
+    bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    let count = u32::try_from(n).map_err(|_| "entradas")?;
+    bytes[4..8].copy_from_slice(&count.to_le_bytes());
+    for (i, (kind, handle)) in entries[..n].iter().enumerate() {
+        let at = HEADER_BYTES + i * ENTRY_BYTES;
+        bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        bytes[at + 4..at + 8].copy_from_slice(&handle.to_le_bytes());
+    }
+    read_only_copy(p, &bytes)
 }
 
 /// Copia `data` para um `MemoryObject` novo em `p` e devolve um handle só
