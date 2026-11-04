@@ -27,7 +27,7 @@ use core::fmt;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use kabi::vm::{ALL_FLAGS, EXEC, PAGE_SIZE, WRITE};
+use kabi::vm::{ALL_FLAGS, EXEC, PAGE_SIZE, RAW, WRITE};
 use kabi::{Error, Rights};
 
 use crate::cap::object::object_bytes;
@@ -47,6 +47,8 @@ pub struct Perms {
     pub write: bool,
     /// Executável.
     pub exec: bool,
+    /// Visão crua de um objeto `LAZY` (mostra as páginas ocultas).
+    pub raw: bool,
 }
 
 impl Perms {
@@ -54,14 +56,19 @@ impl Perms {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidArgument`] para bits desconhecidos ou W e X juntos.
+    /// [`Error::InvalidArgument`] para bits desconhecidos, W e X juntos ou
+    /// `RAW` com X.
     pub const fn from_flags(flags: u64) -> Result<Self, Error> {
-        if flags & !ALL_FLAGS != 0 || flags & (WRITE | EXEC) == WRITE | EXEC {
+        if flags & !ALL_FLAGS != 0
+            || flags & (WRITE | EXEC) == WRITE | EXEC
+            || flags & (RAW | EXEC) == RAW | EXEC
+        {
             return Err(Error::InvalidArgument);
         }
         Ok(Self {
             write: flags & WRITE != 0,
             exec: flags & EXEC != 0,
+            raw: flags & RAW != 0,
         })
     }
 
@@ -75,6 +82,9 @@ impl Perms {
         if self.exec {
             bits |= Rights::EXEC.bits();
         }
+        if self.raw {
+            bits |= Rights::EVICT.bits();
+        }
         match Rights::from_bits(bits) {
             Some(r) => r,
             None => Rights::NONE,
@@ -87,13 +97,14 @@ impl Perms {
         Self {
             write: rights.contains(Rights::WRITE),
             exec: rights.contains(Rights::EXEC),
+            raw: rights.contains(Rights::EVICT),
         }
     }
 
     /// Verdadeiro se `self` não passa de `max`.
     #[must_use]
     pub const fn within(self, max: Self) -> bool {
-        (!self.write || max.write) && (!self.exec || max.exec)
+        (!self.write || max.write) && (!self.exec || max.exec) && (!self.raw || max.raw)
     }
 
     /// Flags da folha de usuário com estas permissões.
@@ -139,8 +150,15 @@ struct Lazy {
 
 impl Lazy {
     fn present(&self, page: u64) -> Option<PhysAddr> {
+        self.visible(page, false)
+    }
+
+    /// Frame da página `page` numa visão normal (só presente) ou `raw`
+    /// (oculta ou presente).
+    fn visible(&self, page: u64, raw: bool) -> Option<PhysAddr> {
         let slot = *self.slots.get(usize::try_from(page).ok()?)?;
-        (slot & PRESENT != 0).then_some(PhysAddr(slot & !(PAGE_SIZE - 1)))
+        let need = if raw { COMMITTED } else { PRESENT };
+        (slot & need != 0).then_some(PhysAddr(slot & !(PAGE_SIZE - 1)))
     }
 
     /// Tira as entradas obsoletas da lista de espaços.
@@ -311,7 +329,7 @@ impl MemoryObject {
         if !known {
             l.spaces.try_reserve(1).map_err(|_| Error::QuotaExceeded)?;
         }
-        let lookup = |page| l.present(page);
+        let lookup = |page| l.visible(page, perms.raw);
         space
             .lock()
             .map_with(start, self, offset, len, perms, max, &lookup)?;
@@ -346,6 +364,10 @@ impl MemoryObject {
                 };
                 l.slots[i] = frame.0 | COMMITTED;
                 LAZY_COMMITTED.fetch_add(1, Ordering::Relaxed);
+                // Oculta: só as visões `RAW` a mostram.
+                for space in l.spaces.iter().filter_map(Weak::upgrade) {
+                    space.lock().install(self, page, frame, true)?;
+                }
             }
             if publish {
                 self.publish_one(&mut l, i)?;
@@ -383,9 +405,102 @@ impl MemoryObject {
         l.slots[i] |= PRESENT;
         let frame = PhysAddr(l.slots[i] & !(PAGE_SIZE - 1));
         for space in l.spaces.iter().filter_map(Weak::upgrade) {
-            space.lock().install(self, i as u64, frame)?;
+            space.lock().install(self, i as u64, frame, false)?;
         }
         Ok(())
+    }
+
+    /// `HIDE` de `[first, first + count)`: presente → oculta. Cada página
+    /// sai das visões normais de todo espaço, e só depois do shootdown
+    /// (ADR 0031) a próxima é tratada; o frame fica.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] num objeto sem `LAZY`.
+    pub fn hide(&self, first: u64, count: u64) -> Result<(), Error> {
+        let Store::Lazy(lazy) = &self.store else {
+            return Err(Error::NotSupported);
+        };
+        let mut l = lazy.lock();
+        for page in first..first + count {
+            Self::hide_one(&mut l, self, page);
+        }
+        Ok(())
+    }
+
+    fn hide_one(l: &mut Lazy, object: &Self, page: u64) {
+        let i = usize::try_from(page).unwrap_or(usize::MAX);
+        if l.slots.get(i).is_some_and(|s| s & PRESENT != 0) {
+            l.slots[i] &= !PRESENT;
+            for space in l.spaces.iter().filter_map(Weak::upgrade) {
+                space.lock().remove(object, page, false);
+            }
+        }
+    }
+
+    /// `DECOMMIT` de `[first, first + count)`: a página (presente é
+    /// ocultada antes) sai também das visões `RAW`, com shootdown; só então
+    /// o frame volta ao alocador e a cota do dono é creditada (ADR 0038,
+    /// invariante 1). Página ausente fica como está.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] num objeto sem `LAZY`.
+    pub fn decommit(&self, first: u64, count: u64) -> Result<(), Error> {
+        let Store::Lazy(lazy) = &self.store else {
+            return Err(Error::NotSupported);
+        };
+        let mut l = lazy.lock();
+        for page in first..first + count {
+            let i = usize::try_from(page).unwrap_or(usize::MAX);
+            let Some(&slot) = l.slots.get(i) else {
+                continue;
+            };
+            if slot & COMMITTED == 0 {
+                continue;
+            }
+            Self::hide_one(&mut l, self, page);
+            for space in l.spaces.iter().filter_map(Weak::upgrade) {
+                space.lock().remove(self, page, true);
+            }
+            l.slots[i] = 0;
+            self.platform.free_frame(PhysAddr(slot & !(PAGE_SIZE - 1)));
+            l.charge.shrink(PAGE_SIZE);
+            LAZY_COMMITTED.fetch_sub(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// `AGE` de `[first, first + count)` (`count` ≤ 64): o mapa de bits das
+    /// páginas presentes usadas (bit de acesso ligado numa visão normal)
+    /// desde a última chamada; os bits são limpos, com invalidação.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] num objeto sem `LAZY`.
+    pub fn age(&self, first: u64, count: u64) -> Result<u64, Error> {
+        let Store::Lazy(lazy) = &self.store else {
+            return Err(Error::NotSupported);
+        };
+        let l = lazy.lock();
+        let mut used = 0;
+        for (bit, page) in (first..first + count.min(64)).enumerate() {
+            let present = usize::try_from(page)
+                .ok()
+                .and_then(|i| l.slots.get(i))
+                .is_some_and(|s| s & PRESENT != 0);
+            if !present {
+                continue;
+            }
+            let mut hit = false;
+            for space in l.spaces.iter().filter_map(Weak::upgrade) {
+                hit |= space.lock().take_accessed(self, page);
+            }
+            if hit {
+                used |= 1 << bit;
+            }
+        }
+        Ok(used)
     }
 
     /// `ZERO` de `[first, first + count)`: zera as páginas comprometidas

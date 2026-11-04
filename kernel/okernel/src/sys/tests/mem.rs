@@ -79,8 +79,14 @@ fn mem_op_confere_direitos_e_dominio() {
     );
     assert_eq!(op(&space, m, COMMIT, 0, p, 2), Err(Error::InvalidArgument));
     assert_eq!(op(&space, m, ZERO, 0, p, 1), Err(Error::InvalidArgument));
-    for o in [CACHE, HIDE, DECOMMIT, AGE] {
-        assert_eq!(op(&space, m, o, 0, p, 0), Err(Error::NotSupported), "{o}");
+    assert_eq!(op(&space, m, CACHE, 0, p, 0), Err(Error::NotSupported));
+    assert_eq!(
+        op(&space, m, AGE, 0, 65 * p, 0),
+        Err(Error::InvalidArgument)
+    );
+    // `HIDE`, `DECOMMIT` e `AGE` sobre ausentes não mudam nada.
+    for o in [HIDE, DECOMMIT, AGE] {
+        assert_eq!(op(&space, m, o, 0, p, 0), Ok([0; 3]), "{o}");
     }
     // Página ausente não se publica.
     assert_eq!(op(&space, m, PUBLISH, 0, p, 0), Err(Error::InvalidArgument));
@@ -96,6 +102,25 @@ fn mem_op_confere_direitos_e_dominio() {
     assert_eq!(op(&space, m_ev, COMMIT, 0, p, 0), Err(Error::AccessDenied));
     assert_eq!(op(&space, m_ev, ZERO, 0, p, 0), Err(Error::AccessDenied));
     assert_eq!(op(&space, m_ev, PUBLISH, 0, p, 0), Ok([0; 3]));
+    for o in [HIDE, DECOMMIT, AGE] {
+        assert_eq!(
+            op(&space, m_rw, o, 0, p, 0),
+            Err(Error::AccessDenied),
+            "{o}"
+        );
+    }
+    // Objeto sem `LAZY`: não há páginas a ocultar.
+    let ty = ObjectType::MemoryObject.to_raw();
+    let [eager, ..] = call(&space, Syscall::ObjCreate, [q, ty, p, 0, 0, 0]).unwrap();
+    let full = Cap {
+        rights: Rights::ALL,
+        ..get(&space, eager)
+    };
+    let eager_all = u64::from(space.lock().insert(full).unwrap().raw());
+    assert_eq!(
+        op(&space, eager_all, HIDE, 0, p, 0),
+        Err(Error::NotSupported)
+    );
     let ntfy = create(&space, q, ObjectType::Notification);
     assert_eq!(op(&space, ntfy, COMMIT, 0, p, 0), Err(Error::WrongType));
 }

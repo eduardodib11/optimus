@@ -66,6 +66,14 @@ impl Region {
         self.start + self.pages * PAGE_SIZE
     }
 
+    /// Verdadeiro se a região é uma visão `RAW` (ou normal, sem `raw`) da
+    /// página `page` de `object`.
+    fn shows(&self, object: &MemoryObject, page: u64, raw: bool) -> bool {
+        core::ptr::eq(Arc::as_ptr(&self.object), object)
+            && self.perms.raw == raw
+            && (self.first..self.first + self.pages).contains(&page)
+    }
+
     /// O pedaço `[start, end)` desta região.
     fn sub(&self, start: u64, end: u64) -> Self {
         Self {
@@ -183,6 +191,7 @@ impl AddressSpace {
             Perms {
                 write: m.flags.write,
                 exec: m.flags.exec,
+                raw: false,
             },
         ))
     }
@@ -330,8 +339,9 @@ impl AddressSpace {
     }
 
     /// Instala `frame`, a página `page` de `object` (`LAZY`, com a trava
-    /// dele na mão), em toda região que a mostra; o que já está mapeado
-    /// fica. As tabelas já foram cobradas no `map_with`.
+    /// dele na mão), nas visões `RAW` (com `raw`) ou nas normais que a
+    /// mostram; o que já está mapeado fica. As tabelas já foram cobradas no
+    /// `map_with`.
     ///
     /// # Errors
     ///
@@ -341,11 +351,10 @@ impl AddressSpace {
         object: &MemoryObject,
         page: u64,
         frame: PhysAddr,
+        raw: bool,
     ) -> Result<(), Error> {
         for r in &self.regions {
-            if !core::ptr::eq(Arc::as_ptr(&r.object), object)
-                || !(r.first..r.first + r.pages).contains(&page)
-            {
+            if !r.shows(object, page, raw) {
                 continue;
             }
             let virt = r.start + (page - r.first) * PAGE_SIZE;
@@ -358,6 +367,40 @@ impl AddressSpace {
             }
         }
         Ok(())
+    }
+
+    /// Tira a página `page` de `object` (`LAZY`, com a trava dele na mão)
+    /// das visões normais e, com `raw_too`, também das `RAW`, e só volta
+    /// depois do shootdown de cada endereço (ADR 0031, item 7).
+    pub(super) fn remove(&mut self, object: &MemoryObject, page: u64, raw_too: bool) {
+        let root = self.root();
+        for r in &self.regions {
+            if !(r.shows(object, page, false) || raw_too && r.shows(object, page, true)) {
+                continue;
+            }
+            let virt = r.start + (page - r.first) * PAGE_SIZE;
+            if self.tables.unmap(virt, PageSize::Size4K).is_ok() {
+                self.platform.flush(root, virt, 1);
+            }
+        }
+    }
+
+    /// Lê e limpa o bit de acesso da página `page` de `object` nas visões
+    /// normais, com invalidação; verdadeiro se alguma a usou.
+    pub(super) fn take_accessed(&mut self, object: &MemoryObject, page: u64) -> bool {
+        let root = self.root();
+        let mut used = false;
+        for r in &self.regions {
+            if !r.shows(object, page, false) {
+                continue;
+            }
+            let virt = r.start + (page - r.first) * PAGE_SIZE;
+            if self.tables.take_accessed(virt) == Some(true) {
+                used = true;
+                self.platform.flush(root, virt, 1);
+            }
+        }
+        used
     }
 
     /// Desmapeia as páginas de `[start, start + len)`; páginas sem
@@ -461,7 +504,10 @@ impl AddressSpace {
         self.split_at(end);
         for r in &mut self.regions {
             if start <= r.start && r.end() <= end {
-                r.perms = perms;
+                r.perms = Perms {
+                    raw: r.perms.raw,
+                    ..perms
+                };
             }
         }
         for page in pages_of(start, end) {
@@ -540,6 +586,10 @@ pub fn vm_unmap(aspace: &Cap, start: u64, len: u64) -> Result<(), Error> {
 /// [`AddressSpace::protect`].
 pub fn vm_protect(aspace: &Cap, start: u64, len: u64, flags: u64) -> Result<(), Error> {
     let space = aspace.object.as_address_space()?;
+    if flags & kabi::vm::RAW != 0 {
+        // A visão crua é fixa da região, dada no `vm_map`.
+        return Err(Error::InvalidArgument);
+    }
     let perms = Perms::from_flags(flags)?;
     if !aspace.rights.contains(Rights::MAP) {
         return Err(Error::AccessDenied);

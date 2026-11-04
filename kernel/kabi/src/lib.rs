@@ -191,8 +191,12 @@ pub mod vm {
     /// Flag de `vm_map`/`vm_protect`: executável. Nunca junto com
     /// [`WRITE`] (W^X).
     pub const EXEC: u64 = 1 << 1;
+    /// Flag de `vm_map` (ADR 0038, item 1): visão crua de um `MemoryObject`
+    /// `LAZY`, que mostra também as páginas ocultas. Exige `EVICT` no objeto
+    /// e nunca vai junto com [`EXEC`]; `vm_protect` a recusa.
+    pub const RAW: u64 = 1 << 2;
     /// Flags definidas; as demais são recusadas com `InvalidArgument`.
-    pub const ALL_FLAGS: u64 = WRITE | EXEC;
+    pub const ALL_FLAGS: u64 = WRITE | EXEC | RAW;
     /// `aspace = SELF` (0) em `vm_map` e `vm_unmap`: o espaço da thread
     /// que chama, sem capability (ADR 0039, item 2).
     pub const SELF: u64 = 0;
@@ -216,13 +220,18 @@ pub mod mem {
     pub const CACHE: u64 = 2;
     /// Oculta → presente (entra nos mapeamentos). Exige `EVICT`.
     pub const PUBLISH: u64 = 3;
-    /// Presente → oculta, com shootdown (T-363; hoje `NotSupported`).
+    /// Presente → oculta: sai das visões normais e só volta depois do
+    /// shootdown; o frame fica. Exige `EVICT`.
     pub const HIDE: u64 = 4;
-    /// Libera o frame e credita a cota (T-363; hoje `NotSupported`).
+    /// Oculta (ou presente, ocultada antes) → ausente: sai também das
+    /// visões `RAW`, com shootdown, libera o frame e credita a cota do
+    /// dono. Exige `EVICT`.
     pub const DECOMMIT: u64 = 5;
-    /// Lê e limpa os bits de acesso de até 64 páginas (T-363; hoje
-    /// `NotSupported`).
+    /// Até [`AGE_MAX_PAGES`] páginas: devolve o mapa de bits das presentes
+    /// com o bit de acesso ligado e limpa esses bits. Exige `EVICT`.
     pub const AGE: u64 = 6;
+    /// Páginas de uma chamada de [`AGE`].
+    pub const AGE_MAX_PAGES: u64 = 64;
     /// Flag de [`COMMIT`]: publica a página na mesma chamada.
     pub const PUBLISH_FLAG: u64 = 1;
 }

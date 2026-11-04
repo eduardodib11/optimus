@@ -516,6 +516,95 @@ user_lazy_handler:
     syscall
     ud2
 
+/* user_restore_handler(rdi = endpoint | reply << 32, rsi = página RW,
+ * rdx = MemoryObject | (visão RAW >> 12) << 32)
+ *
+ * Tratador de restauração (T-363, o fluxo do `memd` da ADR 0038, item 3),
+ * em laço até o endpoint morrer. Página: [+ 0] VA da cópia guardada, [+ 8]
+ * base da região do cliente e [+ 16] a Notification de liberação (o kernel
+ * grava; ele a sinaliza quando a cópia está pronta), [+ 24] faltas
+ * atendidas, [+ 32] status do mem_op que falhou, [+ 40] o rdx. Cada falta:
+ * espera a liberação, COMMIT sem PUBLISH (a página fica oculta), copia a
+ * cópia guardada para a visão RAW, PUBLISH e responde. */
+.global user_restore_handler
+user_restore_handler:
+    mov rbx, rdi
+    mov rbp, rsi
+    mov [rbp + 40], rdx
+1:
+    mov rdi, rbx
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 19               /* ipc_recv: r9 = endereço que faltou */
+    syscall
+    test rax, rax
+    jnz 9f
+    and r9, -4096
+    sub r9, [rbp + 8]
+    mov [rbp + 48], r9        /* deslocamento no objeto */
+    mov rdi, [rbp + 16]
+    mov eax, 23               /* ntfy_wait: a cópia está pronta */
+    syscall
+    test rax, rax
+    jnz 8f
+    mov edi, [rbp + 40]
+    xor esi, esi              /* COMMIT, sem PUBLISH */
+    mov rdx, [rbp + 48]
+    mov r10d, 4096
+    xor r8d, r8d
+    mov eax, 9
+    syscall
+    test rax, rax
+    jnz 8f
+    mov rsi, [rbp]
+    mov rdi, [rbp + 40]
+    shr rdi, 32
+    shl rdi, 12
+    add rdi, [rbp + 48]
+    mov ecx, 512
+    rep movsq
+    mov edi, [rbp + 40]
+    mov esi, 3                /* PUBLISH */
+    mov rdx, [rbp + 48]
+    mov r10d, 4096
+    xor r8d, r8d
+    mov eax, 9
+    syscall
+    test rax, rax
+    jnz 8f
+    inc qword ptr [rbp + 24]
+    mov rdi, rbx
+    shr rdi, 32
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 18               /* responde: a thread retoma */
+    syscall
+    jmp 1b
+8:
+    mov [rbp + 32], rax
+9:
+    xor esi, esi              /* thread_exit sem flags */
+    mov eax, 33
+    syscall
+    ud2
+
+/* user_lazy_counter(rdi = contador, rsi = página RW)
+ *
+ * Incrementa [rdi] (cada escrita pode faltar e ser restaurada) até o
+ * kernel gravar algo em [rsi + 8]; então grava 1 em [rsi]. */
+.global user_lazy_counter
+user_lazy_counter:
+1:
+    inc qword ptr [rdi]
+    cmp qword ptr [rsi + 8], 0
+    je 1b
+    mov qword ptr [rsi], 1
+    xor esi, esi              /* thread_exit sem flags */
+    mov eax, 33
+    syscall
+    ud2
+
 /* Benchmarks (T-213, `test=bench`). Cada amostra é a diferença do TSC
  * (LFENCE; RDTSC) em volta de uma syscall, gravada em 8 bytes a partir de
  * rdx/rsi; uma falha grava u64::MAX e termina. */

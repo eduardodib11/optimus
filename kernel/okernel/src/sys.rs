@@ -254,8 +254,9 @@ pub fn invoke(
 pub const MEM_OP_SLICE: u64 = 64;
 
 /// `mem_op(obj, op, offset, len, flags)` (ADR 0038, item 2): `COMMIT` e
-/// `ZERO` exigem `WRITE`; `PUBLISH`, `EVICT`. `CACHE`, `HIDE`, `DECOMMIT`
-/// e `AGE` devolvem `NotSupported` (os três últimos chegam na T-363).
+/// `ZERO` exigem `WRITE`; `PUBLISH`, `HIDE`, `DECOMMIT` e `AGE`, `EVICT`.
+/// `CACHE` devolve `NotSupported` no M3; `HIDE`, `DECOMMIT` e `AGE` num
+/// objeto sem `LAZY`, também.
 fn mem_op(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<Values, Error> {
     use kabi::mem::{AGE, CACHE, COMMIT, DECOMMIT, HIDE, PUBLISH, PUBLISH_FLAG, ZERO};
     let cap = cap_with(space, a[0], Rights::NONE)?;
@@ -282,15 +283,20 @@ fn mem_op(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<Valu
     if !offset.is_multiple_of(page) || !len.is_multiple_of(page) || end / page > memory.pages() {
         return Err(Error::InvalidArgument);
     }
-    if matches!(op, CACHE | HIDE | DECOMMIT | AGE) {
-        return Err(Error::NotSupported);
-    }
     let (mut first, last) = (offset / page, end / page);
+    match op {
+        CACHE => return Err(Error::NotSupported),
+        AGE if last - first > kabi::mem::AGE_MAX_PAGES => return Err(Error::InvalidArgument),
+        AGE => return Ok([memory.age(first, last - first)?, 0, 0]),
+        _ => {}
+    }
     while first < last {
         let count = (last - first).min(MEM_OP_SLICE);
         match op {
             COMMIT => memory.commit(first, count, flags & PUBLISH_FLAG != 0)?,
             PUBLISH => memory.publish(first, count)?,
+            HIDE => memory.hide(first, count)?,
+            DECOMMIT => memory.decommit(first, count)?,
             _ => memory.zero(first, count),
         }
         first += count;
