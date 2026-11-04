@@ -170,6 +170,8 @@ struct Line {
     masked: bool,
     /// Disparou com a linha mascarada.
     pending: bool,
+    /// Linha de nível afirmada (só as sintéticas do kernel).
+    level: bool,
 }
 
 /// Linha de IRQ ligável a um bit de notificação.
@@ -236,15 +238,32 @@ impl Interrupt {
         Some(binding)
     }
 
-    /// `irq_ack`: libera a linha; um disparo guardado é entregue já.
+    /// `irq_ack`: libera a linha; um disparo guardado, ou a linha de nível
+    /// ainda afirmada, é entregue já.
     pub fn ack(&self) -> Option<Binding> {
         let mut line = self.line.lock();
         line.masked = false;
-        if core::mem::take(&mut line.pending) {
+        let again = core::mem::take(&mut line.pending) || line.level;
+        if again && line.binding.is_some() {
             line.masked = true;
             return line.binding.clone();
         }
         None
+    }
+
+    /// Linha sintética de nível (pressão de memória, ADR 0038, item 5):
+    /// afirmada, dispara como [`fire`](Self::fire), e cada `ack` com ela
+    /// ainda afirmada dispara de novo; desafirmada, descarta o disparo
+    /// guardado.
+    pub fn set_level(&self, asserted: bool) -> Option<Binding> {
+        let mut line = self.line.lock();
+        line.level = asserted;
+        if !asserted {
+            line.pending = false;
+            return None;
+        }
+        drop(line);
+        self.fire()
     }
 }
 

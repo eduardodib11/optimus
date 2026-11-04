@@ -381,6 +381,12 @@ impl<T> SpinLock<T> {
         self.class
     }
 
+    /// O valor, sem travar: `&mut self` prova que ninguém mais o vê (ex.
+    /// no `Drop` do dono, que pode rodar com travas posteriores na mão).
+    pub const fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     fn addr(&self) -> usize {
         ptr::from_ref(self).addr()
     }

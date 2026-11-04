@@ -325,6 +325,7 @@ pub fn run_until_exit(thread: &Thread, limit_ns: u64) -> bool {
             // Sem nada pronto: dorme até o próximo timer (armado aqui
             // também, para nunca dormir sem prazo, mas sem adiar um que já
             // está armado para antes, como o de um `Timer`).
+            crate::kpressure::poll();
             ktime::arm_by(ktime::now_ns() + 10_000_000);
             cpu::wait_for_interrupt();
         }

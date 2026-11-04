@@ -33,12 +33,17 @@ pub const TESTS: &[Test] = &[
         name: "falta.endpoint_destruido_encerra_quem_espera",
         run: ninguem_atende,
     },
+    Test {
+        name: "falta.pagina_nao_comprometida_e_tratavel",
+        run: demanda_zero,
+    },
 ];
 
 unsafe extern "C" {
     static user_fault: u8;
     static user_fault_read: u8;
     static user_fault_handler: u8;
+    static user_lazy_handler: u8;
 }
 
 /// Aceite do T-210: sem endpoint de exceções, a thread que lê o endereço
@@ -164,5 +169,80 @@ fn ninguem_atende() -> Outcome {
     ensure!(report.kill == Kill::Unanswered(Error::PeerClosed));
     drop(t);
     delete(&p, &[h])?;
+    Ok(())
+}
+
+/// Aceite da T-360: a leitura de página não comprometida de um objeto
+/// `LAZY` falta; o tratador (no papel do `memd`) faz `mem_op(COMMIT |
+/// PUBLISH)` e responde, e a thread retoma e lê zero. Só a página tocada
+/// é comprometida, debitada da cota do dono, e `sys_info` de memória a
+/// conta.
+fn demanda_zero() -> Outcome {
+    use kabi::mem::LAZY;
+    use kabi::sched::SYS_INFO_MEMORY;
+    const BADGE: u64 = 0x1A2;
+    let (faulty, memd) = (process(1)?, process(1)?);
+    let base = DATA_VA + 16 * PAGE_SIZE;
+    let addr = base + 2 * PAGE_SIZE + 0x18;
+    let h = faulty
+        .cspace
+        .lock()
+        .obj_create_with(faulty.quota, ObjectType::MemoryObject, 4 * PAGE_SIZE, LAZY)
+        .map_err(|_| "obj_create(LAZY)")?;
+    let mo = faulty.cspace.lock().get(h).map_err(|_| "handle")?.clone();
+    ensure!(mo.rights.contains(Rights::EVICT));
+    okernel::vm::vm_map(&faulty.aspace, &mo, base, 0, 4 * PAGE_SIZE, kabi::vm::WRITE)
+        .map_err(|_| "vm_map(LAZY)")?;
+    let memory = mo.object.as_memory_object().map_err(|_| "tipo")?;
+    let charged = memory.charged();
+    let [total, free, lazy0] =
+        crate::kthread::sys_info(SYS_INFO_MEMORY, 0).map_err(|_| "sys_info(3)")?;
+    ensure!(total > 0 && free <= total);
+    let (ep_h, ep) = create(&memd, ObjectType::Endpoint)?;
+    let (reply, _) = create(&memd, ObjectType::Reply)?;
+    let evict = Rights::READ | Rights::WRITE | Rights::MAP | Rights::EVICT;
+    let m_mo = give(&memd, &mo.object, evict, 0)?;
+    let exc = give(&faulty, &ep, Rights::SEND, BADGE)?;
+    let (hm, tm) = spawn(
+        &memd,
+        &raw const user_lazy_handler,
+        [
+            recv_target(ep_h, reply),
+            DATA_VA,
+            u64::from(m_mo.raw()) | (base >> 12) << 32,
+        ],
+        0,
+    )?;
+    let (hf, tf) = crate::kthread::tests::thread(&faulty)?;
+    tf.set_exception_handler(exc);
+    let e = crate::kthread::UserEntry {
+        rip: crate::kthread::tests::user_symbol(&raw const user_fault_read),
+        rsp: DATA_VA + PAGE_SIZE,
+        args: [addr, DATA_VA, 0],
+    };
+    ensure!(crate::kthread::start(&tf, &e).is_ok());
+    let before = killed();
+    run_until_exit(&[Arc::clone(&tm), Arc::clone(&tf)])?;
+    let [status, badge, label, error, at] = user_words::<5>(&memd, DATA_VA + 16, None)?;
+    let [commit, sent] = user_words::<2>(&memd, DATA_VA + 64, None)?;
+    let [mark, read] = user_words::<2>(&faulty, DATA_VA, None)?;
+    let [_, _, lazy1] = crate::kthread::sys_info(SYS_INFO_MEMORY, 0).map_err(|_| "sys_info(3)")?;
+    info!(
+        "ktest: · falta em {at:#x} atendida com COMMIT (status {commit}); a thread leu {read:#x}; cobrado {} -> {} bytes",
+        charged,
+        memory.charged()
+    );
+    ensure!(status == STATUS_OK && badge == BADGE && label == PAGE_FAULT);
+    ensure!(at == addr && error == 4);
+    ensure!(commit == STATUS_OK && sent == STATUS_OK);
+    ensure!(mark == 2 && read == 0);
+    ensure!(killed() == before);
+    // Só a página tocada: uma página a mais na cota do dono.
+    ensure!(memory.charged() == charged + PAGE_SIZE);
+    ensure!(memory.frame(2).is_some() && [0, 1, 3].iter().all(|&p| memory.frame(p).is_none()));
+    ensure!(lazy1 == lazy0 + 1);
+    drop((tm, tf));
+    delete(&memd, &[hm])?;
+    delete(&faulty, &[hf, h])?;
     Ok(())
 }

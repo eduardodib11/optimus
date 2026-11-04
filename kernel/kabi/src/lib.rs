@@ -198,6 +198,35 @@ pub mod vm {
     pub const SELF: u64 = 0;
 }
 
+/// `MemoryObject` gerenciado e `mem_op` (syscall 9; ADR 0038, itens 1 e
+/// 2): `mem_op(objeto, op, offset, len, flags)` em `rdi`, `rsi`, `rdx`,
+/// `r10` e `r8`, com `offset` e `len` em bytes, múltiplos de
+/// [`vm::PAGE_SIZE`]; devolve `[valor, 0, 0]`.
+pub mod mem {
+    /// Flag de `obj_create(quota, MemoryObject, bytes, flags)` (`r10`): o
+    /// objeto nasce com todas as páginas ausentes (sem frame), cobrado só
+    /// pelos metadados, e o criador recebe também `EVICT`.
+    pub const LAZY: u64 = 1;
+    /// Ausente → oculta (zerada); com [`PUBLISH_FLAG`], vai a presente e
+    /// entra nos mapeamentos. Exige `WRITE`; debita a cota dona do objeto.
+    pub const COMMIT: u64 = 0;
+    /// Zera as páginas comprometidas do intervalo. Exige `WRITE`.
+    pub const ZERO: u64 = 1;
+    /// Atributo de cache (`flags`); `NotSupported` no M3. Exige `WRITE`.
+    pub const CACHE: u64 = 2;
+    /// Oculta → presente (entra nos mapeamentos). Exige `EVICT`.
+    pub const PUBLISH: u64 = 3;
+    /// Presente → oculta, com shootdown (T-363; hoje `NotSupported`).
+    pub const HIDE: u64 = 4;
+    /// Libera o frame e credita a cota (T-363; hoje `NotSupported`).
+    pub const DECOMMIT: u64 = 5;
+    /// Lê e limpa os bits de acesso de até 64 páginas (T-363; hoje
+    /// `NotSupported`).
+    pub const AGE: u64 = 6;
+    /// Flag de [`COMMIT`]: publica a página na mesma chamada.
+    pub const PUBLISH_FLAG: u64 = 1;
+}
+
 /// Flags de `thread_configure` (ADR 0029 e ADR 0039, item 3): o que muda
 /// além do `CapSpace` e do `AddressSpace`.
 ///

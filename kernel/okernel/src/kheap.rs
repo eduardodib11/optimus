@@ -293,23 +293,26 @@ fn release(mut block: u64) {
 /// janela conseguir crescer. A recusa adiada não foi contada pelo heap;
 /// se o crescimento desiste, ela conta aqui, uma vez.
 fn with_growth(mut f: impl FnMut() -> Result<u64, HeapError>) -> Result<u64, HeapError> {
-    let mut grew = false;
-    for _ in 0..GROW_TRIES {
+    let mut grows = 0;
+    for _ in 0..GROW_TRIES * 4 {
         let result = f();
-        let want = match result {
-            Err(HeapError::OutOfMemory) => with_heap(|h| h.pages().want.take()),
-            _ => None,
-        };
-        let Some(order) = want else {
-            if grew {
+        if !matches!(result, Err(HeapError::OutOfMemory)) {
+            if grows != 0 {
                 with_heap(|h| h.pages().trim());
             }
             return result;
+        }
+        // Sem pedido guardado, outra CPU que também faltou o levou e está
+        // crescendo a janela: tentar de novo, em vez de dar a falta (o
+        // `OutOfMemory` só vem da fonte vazia, que sempre deixa o pedido).
+        let Some(order) = with_heap(|h| h.pages().want.take()) else {
+            core::hint::spin_loop();
+            continue;
         };
-        if !grow(order) {
+        if grows == GROW_TRIES || !grow(order) {
             break;
         }
-        grew = true;
+        grows += 1;
     }
     with_heap(|h| {
         h.pages().want = None;

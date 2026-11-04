@@ -186,6 +186,7 @@ fn as_outras_nao_sao_suportadas_aqui() {
                 | Syscall::SchedConfigure
                 | Syscall::SchedBind
                 | Syscall::ThreadConfigure
+                | Syscall::MemOp
         );
         // Precisam de capability válida ou da thread atual.
         let sync = matches!(
@@ -953,3 +954,5 @@ fn debug_write_exige_debug_log_com_write() {
     assert_eq!(debug_cap(&space, irq), Err(Error::AccessDenied));
     assert_eq!(debug_cap(&space, 0xFFFF_FFFF), Err(Error::InvalidHandle));
 }
+
+mod mem;

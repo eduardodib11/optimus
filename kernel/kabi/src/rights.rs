@@ -16,7 +16,7 @@ impl Rights {
     /// Nenhum direito.
     pub const NONE: Self = Self(0);
     /// Todos os direitos definidos.
-    pub const ALL: Self = Self((1 << 22) - 1);
+    pub const ALL: Self = Self((1 << 23) - 1);
 
     /// Os bits crus.
     #[must_use]
@@ -93,6 +93,7 @@ rights! {
     ACK = 19 => "Reconhecer IRQ (`Interrupt`).",
     RUN = 20 => "Executar a VM (`Vcpu`, `Vm`).",
     DESTROY = 21 => "Destruir o objeto com `cap_delete(DESTROY)` (`CapSpace`, `Thread`, `Endpoint`; ADR 0035).",
+    EVICT = 22 => "Publicar, ocultar e liberar páginas e ler o bit de acesso (`MemoryObject` `LAZY`; ADR 0038).",
 }
 
 impl BitOr for Rights {
@@ -135,7 +136,8 @@ mod tests {
         assert_eq!(Rights::GRANT.bits(), 1 << 16);
         assert_eq!(Rights::RUN.bits(), 1 << 20);
         assert_eq!(Rights::DESTROY.bits(), 1 << 21);
-        assert_eq!(Rights::ALL.bits(), 0x3F_FFFF);
+        assert_eq!(Rights::EVICT.bits(), 1 << 22);
+        assert_eq!(Rights::ALL.bits(), 0x7F_FFFF);
     }
 
     #[test]
@@ -161,8 +163,8 @@ mod tests {
     fn conversao_de_registrador() {
         let r = Rights::READ | Rights::WRITE;
         assert_eq!(Rights::try_from(u64::from(r.bits())), Ok(r));
-        assert!(Rights::try_from(1 << 21).is_ok());
-        assert!(Rights::try_from(1 << 22).is_err());
+        assert!(Rights::try_from(1 << 22).is_ok());
+        assert!(Rights::try_from(1 << 23).is_err());
         assert!(Rights::try_from(1 << 32).is_err());
         assert_eq!(Rights::from_bits(u32::MAX), None);
     }

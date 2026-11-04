@@ -10,6 +10,7 @@ use super::{Fault, Kill, handle};
 use crate::cap::{MemoryQuota, Object, obj_create};
 use crate::ipc::ops::finish;
 use crate::ipc::ops::tests::{Fake, Proc, regs};
+use crate::sched::SchedContext;
 use crate::sys::Env;
 use crate::thread::Thread;
 
@@ -29,10 +30,13 @@ struct Tratador {
     server: Proc,
     reply: Handle,
     answer: Option<u64>,
+    /// O `SchedContext` com que o tratador atendia quando respondeu.
+    seen: Option<Arc<SchedContext>>,
 }
 
 impl Tratador {
     fn respond(&mut self) {
+        self.seen = self.server.thread.sched_context();
         let Some(label) = self.answer else { return };
         let me = self.fake.current.replace(Arc::clone(&self.server.thread));
         let send = regs(u64::from(self.reply.raw()), label, &[]);
@@ -96,6 +100,7 @@ fn cenario(rights: Rights, answer: Option<u64>) -> (Proc, Tratador, Object) {
         server,
         reply: s_reply,
         answer,
+        seen: None,
     };
     (faulty, t, ep)
 }
@@ -147,4 +152,26 @@ fn recusa_ou_falta_de_resposta_encerram() {
     let (faulty, mut env, _ep) = cenario(Rights::SEND, None);
     let got = handle(&faulty.thread, &FALTA, &mut env);
     assert!(matches!(got, Err(Kill::Unanswered(_))));
+}
+
+/// Premissa da ADR 0038, item 6 (primeiro teste da T-360): a falta é um
+/// `ipc_call` em nome da thread, e o tratador sem `SchedContext` próprio
+/// (o `memd` passivo) a atende com o de quem faltou, como numa chamada.
+#[test]
+fn a_falta_doa_o_sched_context_ao_tratador() {
+    let (faulty, mut env, _ep) = cenario(Rights::SEND, Some(0));
+    let quota = MemoryQuota::root(1 << 20);
+    let Object::SchedContext(sc) = obj_create(&quota, ObjectType::SchedContext, 0).unwrap() else {
+        unreachable!()
+    };
+    faulty.thread.bind_sched(Arc::clone(&sc)).unwrap();
+    assert!(env.server.thread.sched_context().is_none());
+    assert_eq!(handle(&faulty.thread, &FALTA, &mut env), Ok(()));
+    let seen = env
+        .seen
+        .take()
+        .expect("o tratador atendeu com um SchedContext");
+    assert!(Arc::ptr_eq(&seen, &sc));
+    // Respondida a falta, a doação volta.
+    assert!(env.server.thread.sched_context().is_none());
 }

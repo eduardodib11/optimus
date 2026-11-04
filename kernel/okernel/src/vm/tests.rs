@@ -25,6 +25,8 @@ pub(crate) struct Fake {
     /// Threads acordadas por objeto de IPC destruído.
     pub(crate) woken: AtomicU64,
     pub(crate) frame_limit: i64,
+    /// Frames zerados por `zero_frame`.
+    pub(crate) zeroed: AtomicU64,
     /// Shootdowns pedidos: início, páginas e frames vivos na hora.
     pub(crate) flushes: Mutex<Vec<(u64, u64, i64)>>,
 }
@@ -68,6 +70,7 @@ impl Fake {
             stacks_live: AtomicI64::new(0),
             woken: AtomicU64::new(0),
             frame_limit,
+            zeroed: AtomicU64::new(0),
             flushes: Mutex::new(Vec::new()),
         }))
     }
@@ -103,6 +106,9 @@ impl Platform for Leaked {
     }
     fn free_frame(&self, frame: PhysAddr) {
         self.0.free_frame(frame);
+    }
+    fn zero_frame(&self, _: PhysAddr) {
+        self.0.zeroed.fetch_add(1, Ordering::Relaxed);
     }
     fn flush(&self, _: PhysAddr, start: u64, pages: u64) {
         let live = self.0.frames_live.load(Ordering::Relaxed);
@@ -182,3 +188,5 @@ fn flags_recusam_w_e_x_juntos() {
         })
     );
 }
+
+mod lazy;

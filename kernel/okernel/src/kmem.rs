@@ -115,12 +115,18 @@ pub fn alloc_frames(order: usize) -> Option<PhysAddr> {
             let mut frames = FRAMES.lock();
             let buddy = frames.as_mut()?;
             c.refill(FRAME_BATCH, &mut || buddy.alloc(0).map(|f| f.0));
+            note_pressure(buddy);
             c.pop()
         });
         // Vazio aqui e no buddy: não há o que devolver desta CPU.
         return frame.map(PhysAddr);
     }
-    if let Some(frame) = FRAMES.lock().as_mut()?.alloc(order) {
+    let mut frames = FRAMES.lock();
+    let buddy = frames.as_mut()?;
+    let got = buddy.alloc(order);
+    note_pressure(buddy);
+    drop(frames);
+    if let Some(frame) = got {
         return Some(frame);
     }
     // Os frames parados no cache desta CPU podem completar um bloco.
@@ -141,6 +147,7 @@ pub fn free_frames(addr: PhysAddr, order: usize) {
             }
             if let Some(buddy) = FRAMES.lock().as_mut() {
                 c.spill(FRAME_BATCH, &mut |f| buddy_free(buddy, PhysAddr(f), 0));
+                note_pressure(buddy);
             }
             if !c.push(addr.0) {
                 error!("okernel: cache de frames cheio depois de esvaziar");
@@ -150,7 +157,14 @@ pub fn free_frames(addr: PhysAddr, order: usize) {
     }
     if let Some(buddy) = FRAMES.lock().as_mut() {
         buddy_free(buddy, addr, order);
+        note_pressure(buddy);
     }
+}
+
+/// O buddy mudou (ADR 0038, item 5): a pressão de memória é recalculada no
+/// próximo ponto sem travas. Só um atômico, com a trava do buddy na mão.
+fn note_pressure(_buddy: &FrameAllocator<'static>) {
+    crate::kpressure::touch();
 }
 
 fn buddy_free(buddy: &mut FrameAllocator<'static>, addr: PhysAddr, order: usize) {
