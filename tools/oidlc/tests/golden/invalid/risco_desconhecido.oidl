@@ -1,0 +1,6 @@
+package optimus.fs @1.0;
+
+interface Directory {
+    @tool(risk = R7, desc = "x")
+    list();
+}

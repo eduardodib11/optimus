@@ -1,0 +1,3 @@
+package optimus.fs @1.0;
+
+flags OpenFlags : u8 { Read = 1, Write }

@@ -27,6 +27,9 @@ pub trait Platform: Sync {
     fn alloc_frame(&self) -> Option<PhysAddr>;
     /// Devolve um frame de [`alloc_frame`](Self::alloc_frame).
     fn free_frame(&self, frame: PhysAddr);
+    /// Zera um frame de [`alloc_frame`](Self::alloc_frame) que ainda é de
+    /// quem chama (`mem_op(ZERO)`, ADR 0038).
+    fn zero_frame(&self, frame: PhysAddr);
     /// Invalida as traduções de `pages` páginas a partir de `start` no
     /// espaço com PML4 `root`, em toda CPU que as possa ter em cache (TLB
     /// shootdown, T-326), e só volta depois. Quem chama libera o que saiu

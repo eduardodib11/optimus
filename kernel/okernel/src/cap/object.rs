@@ -58,7 +58,14 @@ pub enum Object {
     /// Prazo ligável a uma notificação (ADR 0035, item 6); fixo na memória,
     /// porque a fila de timers aponta para ele.
     Timer(Pin<Arc<Timer>>),
+    /// Capability de depuração (ADR 0036, item 5). Sem estado: só o kernel
+    /// a cria, no boot, e `debug_write` escreve no registro dele.
+    DebugLog(Arc<DebugLog>),
 }
+
+/// Marca de identidade da [`Object::DebugLog`]; o estado é o registro do kernel.
+#[derive(Debug)]
+pub struct DebugLog;
 
 impl fmt::Debug for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,6 +81,7 @@ impl fmt::Debug for Object {
             Self::Endpoint(e) => Arc::as_ptr(e).addr(),
             Self::Reply(r) => Arc::as_ptr(r).addr(),
             Self::Timer(t) => core::ptr::from_ref::<Timer>(t).addr(),
+            Self::DebugLog(d) => Arc::as_ptr(d).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -95,6 +103,7 @@ impl Object {
             Self::Endpoint(_) => ObjectType::Endpoint,
             Self::Reply(_) => ObjectType::Reply,
             Self::Timer(_) => ObjectType::Timer,
+            Self::DebugLog(_) => ObjectType::DebugLog,
         }
     }
 
@@ -115,6 +124,7 @@ impl Object {
             (Self::Timer(a), Self::Timer(b)) => {
                 core::ptr::eq::<Timer>(&raw const **a, &raw const **b)
             }
+            (Self::DebugLog(a), Self::DebugLog(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -297,6 +307,7 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
         ObjectType::DmaDomain => Rights::MAP.bits(),
         ObjectType::Vcpu | ObjectType::Vm => Rights::RUN.bits() | Rights::MAP.bits(),
         ObjectType::Timer => Rights::BIND.bits(),
+        ObjectType::DebugLog => Rights::WRITE.bits() | Rights::BIND.bits(),
     };
     match Rights::from_bits(bits) {
         Some(r) => r,
@@ -327,16 +338,12 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 /// [`Error::InvalidArgument`] para `args` fora do domínio;
 /// [`Error::NotSupported`] para tipos ainda não implementados.
 pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result<Object, Error> {
+    // Cada tipo num construtor à parte: no build de depuração os
+    // temporários de todos os braços somariam no quadro desta função, que
+    // está no caminho de toda syscall `obj_create` (pilha de kernel de
+    // 16 KiB).
     match ty {
-        ObjectType::MemoryQuota => {
-            let bytes = object_bytes::<MemoryQuota>()
-                .checked_add(args)
-                .ok_or(Error::InvalidArgument)?;
-            let charge = quota.charge(bytes)?;
-            Ok(Object::MemoryQuota(Arc::new(MemoryQuota::child(
-                args, charge,
-            ))))
-        }
+        ObjectType::MemoryQuota => new_quota(quota, args),
         ObjectType::AddressSpace
         | ObjectType::Notification
         | ObjectType::Endpoint
@@ -346,42 +353,97 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
         {
             Err(Error::InvalidArgument)
         }
-        ObjectType::CapSpace => {
-            let limit = u32::try_from(args).map_err(|_| Error::InvalidArgument)?;
-            let mut table = CapSpace::new(quota)?;
-            table.process_mut().set_limit(limit);
-            Ok(Object::CapSpace(Arc::new(SpinLock::with_class(
-                LockClass::CapSpace,
-                table,
-            ))))
-        }
-        ObjectType::AddressSpace => {
-            let platform = platform::get().ok_or(Error::NotSupported)?;
-            let space = AddressSpace::new(quota, platform)?;
-            Ok(Object::AddressSpace(Arc::new(SpinLock::with_class(
-                LockClass::AddressSpace,
-                space,
-            ))))
-        }
-        ObjectType::MemoryObject => {
-            let platform = platform::get().ok_or(Error::NotSupported)?;
-            let memory = MemoryObject::new(quota, args, platform)?;
-            Ok(Object::MemoryObject(Arc::new(memory)))
-        }
-        ObjectType::Thread => {
-            let platform = platform::get().ok_or(Error::NotSupported)?;
-            Ok(Object::Thread(Arc::new(Thread::new(quota, platform)?)))
-        }
-        ObjectType::SchedContext => {
-            let charge = quota.charge(object_bytes::<SchedContext>())?;
-            Ok(Object::SchedContext(Arc::new(SchedContext::new(charge))))
-        }
-        ObjectType::Notification => Ok(Object::Notification(Arc::new(Notification::new(quota)?))),
-        ObjectType::Endpoint => Ok(Object::Endpoint(Arc::new(Endpoint::new(quota)?))),
-        ObjectType::Reply => Ok(Object::Reply(Arc::new(Reply::new(quota)?))),
-        ObjectType::Timer => Ok(Object::Timer(Arc::pin(Timer::new(quota, &timer::QUEUES)?))),
+        ObjectType::CapSpace => new_cap_space(quota, args),
+        ObjectType::AddressSpace => new_address_space(quota),
+        ObjectType::MemoryObject => new_memory_object(quota, args, false),
+        ObjectType::Thread => new_thread(quota),
+        ObjectType::SchedContext => new_sched_context(quota),
+        ObjectType::Notification => new_notification(quota),
+        ObjectType::Endpoint => new_endpoint(quota),
+        ObjectType::Reply => new_reply(quota),
+        ObjectType::Timer => new_timer(quota),
         _ => Err(Error::NotSupported),
     }
+}
+
+#[inline(never)]
+fn new_quota(quota: &Arc<MemoryQuota>, args: u64) -> Result<Object, Error> {
+    let bytes = object_bytes::<MemoryQuota>()
+        .checked_add(args)
+        .ok_or(Error::InvalidArgument)?;
+    let charge = quota.charge(bytes)?;
+    Ok(Object::MemoryQuota(Arc::new(MemoryQuota::child(
+        args, charge,
+    ))))
+}
+
+#[inline(never)]
+fn new_cap_space(quota: &Arc<MemoryQuota>, args: u64) -> Result<Object, Error> {
+    let limit = u32::try_from(args).map_err(|_| Error::InvalidArgument)?;
+    let mut table = CapSpace::new(quota)?;
+    table.process_mut().set_limit(limit);
+    Ok(Object::CapSpace(Arc::new(SpinLock::with_class(
+        LockClass::CapSpace,
+        table,
+    ))))
+}
+
+#[inline(never)]
+fn new_address_space(quota: &Arc<MemoryQuota>) -> Result<Object, Error> {
+    let platform = platform::get().ok_or(Error::NotSupported)?;
+    let space = AddressSpace::new(quota, platform)?;
+    Ok(Object::AddressSpace(Arc::new(SpinLock::with_class(
+        LockClass::AddressSpace,
+        space,
+    ))))
+}
+
+/// `MemoryObject` de `bytes`; com `lazy`, sem frames (ADR 0038, item 1).
+#[inline(never)]
+pub(crate) fn new_memory_object(
+    quota: &Arc<MemoryQuota>,
+    bytes: u64,
+    lazy: bool,
+) -> Result<Object, Error> {
+    let platform = platform::get().ok_or(Error::NotSupported)?;
+    let memory = if lazy {
+        MemoryObject::new_lazy(quota, bytes, platform)?
+    } else {
+        MemoryObject::new(quota, bytes, platform)?
+    };
+    Ok(Object::MemoryObject(Arc::new(memory)))
+}
+
+#[inline(never)]
+fn new_thread(quota: &Arc<MemoryQuota>) -> Result<Object, Error> {
+    let platform = platform::get().ok_or(Error::NotSupported)?;
+    Ok(Object::Thread(Arc::new(Thread::new(quota, platform)?)))
+}
+
+#[inline(never)]
+fn new_sched_context(quota: &Arc<MemoryQuota>) -> Result<Object, Error> {
+    let charge = quota.charge(object_bytes::<SchedContext>())?;
+    Ok(Object::SchedContext(Arc::new(SchedContext::new(charge))))
+}
+
+#[inline(never)]
+fn new_notification(quota: &Arc<MemoryQuota>) -> Result<Object, Error> {
+    Ok(Object::Notification(Arc::new(Notification::new(quota)?)))
+}
+
+#[inline(never)]
+fn new_endpoint(quota: &Arc<MemoryQuota>) -> Result<Object, Error> {
+    Ok(Object::Endpoint(Arc::new(Endpoint::new(quota)?)))
+}
+
+#[inline(never)]
+fn new_reply(quota: &Arc<MemoryQuota>) -> Result<Object, Error> {
+    Ok(Object::Reply(Arc::new(Reply::new(quota)?)))
+}
+
+#[inline(never)]
+fn new_timer(quota: &Arc<MemoryQuota>) -> Result<Object, Error> {
+    Ok(Object::Timer(Arc::pin(Timer::new(quota, &timer::QUEUES)?)))
 }
 
 #[cfg(test)]

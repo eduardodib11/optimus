@@ -1614,6 +1614,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
     {
         kipc::syscall(frame, call);
         frame.rflags = syscall::user_rflags(frame.rflags);
+        crate::kpressure::poll();
         exit_if_killed();
         crate::ksync::assert_none_held("volta ao usuário");
         return u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss));
@@ -1631,6 +1632,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
         Err(e) => frame.rax = e.to_raw(),
     }
     frame.rflags = syscall::user_rflags(frame.rflags);
+    crate::kpressure::poll();
     exit_if_killed();
     crate::ksync::assert_none_held("volta ao usuário");
     u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss))
@@ -1650,6 +1652,7 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
         Syscall::ClockGet => Ok([ktime::now_ns(), 0, 0]),
         Syscall::SysInfo => sys_info(a[0], a[1]),
         Syscall::ThreadStart => thread_start(a).map(|()| [0; 3]),
+        Syscall::DebugWrite => debug_write(a),
         _ => {
             let space = current()
                 .and_then(|t| t.cspace())
@@ -1687,7 +1690,9 @@ fn thread_exit(code: u64, flags: u64) -> Result<Values, Error> {
 /// `sys_info(seletor, arg)` (ADR 0032, item 4): com
 /// [`kabi::sched::SYS_INFO_CPUS`], as CPUs ligadas e o total de ids lógicos
 /// da topologia; com [`kabi::sched::SYS_INFO_EXIT`] (ADR 0035, item 2), o
-/// registro de morte da `Thread` ou do processo do `CapSpace` de `arg`; com [`kabi::sched::SYS_INFO_ENTROPY`] (ADR 0039, item 4),
+/// registro de morte da `Thread` ou do processo do `CapSpace` de `arg`; com
+/// [`kabi::sched::SYS_INFO_MEMORY`] (ADR 0038, item 5), os quadros
+/// gerenciados, os livres e os comprometidos de objetos `LAZY`; com [`kabi::sched::SYS_INFO_ENTROPY`] (ADR 0039, item 4),
 /// 24 bytes do DRBG desta CPU, sem capability, com `arg` zero.
 pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
     match selector {
@@ -1701,6 +1706,10 @@ pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
                 .and_then(|t| t.cspace())
                 .ok_or(Error::NotSupported)?;
             sys::exit_info(&space, arg)
+        }
+        kabi::sched::SYS_INFO_MEMORY => {
+            let (free, total) = kmem::frame_stats();
+            Ok([total as u64, free as u64, okernel::vm::lazy_committed()])
         }
         kabi::sched::SYS_INFO_ENTROPY => {
             if arg != 0 {
@@ -1763,6 +1772,47 @@ fn debug_print(ptr: u64, len: u64) -> Result<Values, Error> {
     let n = len.min(bytes.len() - *used);
     bytes[*used..*used + n].copy_from_slice(&buf[..n]);
     *used += n;
+    Ok([len as u64, 0, 0])
+}
+
+/// `debug_write(log, ptr, len, nível)` (ADR 0036, item 5): escreve até 256
+/// bytes UTF-8 no registro do kernel, como `nível [badge hex] texto`. Exige
+/// `WRITE` numa capability do tipo [`okernel::cap::Object::DebugLog`]; o
+/// badge da capability identifica quem escreveu.
+fn debug_write(a: [u64; 6]) -> Result<Values, Error> {
+    const MAX: usize = 256;
+    let space = current()
+        .and_then(|t| t.cspace())
+        .ok_or(Error::NotSupported)?;
+    let badge = okernel::sys::debug_cap(&space, a[0])?;
+    let len = usize::try_from(a[2])
+        .ok()
+        .filter(|&n| n <= MAX)
+        .ok_or(Error::InvalidArgument)?;
+    let level = match a[3] {
+        1 => okernel::log::Level::Error,
+        2 => okernel::log::Level::Warn,
+        3 => okernel::log::Level::Info,
+        4 => okernel::log::Level::Debug,
+        5 => okernel::log::Level::Trace,
+        _ => return Err(Error::InvalidArgument),
+    };
+    let mut buf = [0u8; MAX];
+    if !probe::copy_from_user(&mut buf[..len], a[1]) {
+        return Err(Error::InvalidArgument);
+    }
+    let text = core::str::from_utf8(&buf[..len]).map_err(|_| Error::InvalidArgument)?;
+    let text = text.trim_end();
+    if ktest::active() {
+        let line = alloc::format!("[{badge:x}] {text}\n");
+        let mut log = DEBUG_LOG.lock();
+        let (bytes, used) = &mut *log;
+        let n = line.len().min(bytes.len() - *used);
+        bytes[*used..*used + n].copy_from_slice(&line.as_bytes()[..n]);
+        *used += n;
+    } else {
+        crate::klog::write(level, format_args!("[{badge:x}] {text}"));
+    }
     Ok([len as u64, 0, 0])
 }
 

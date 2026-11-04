@@ -167,6 +167,7 @@ pub enum ObjectType: u32, raw(n) => u64::from(n);
     Vcpu = 12 => "CPU virtual (M14).",
     Vm = 13 => "Máquina virtual (M14).",
     Timer = 14 => "Prazo ligável a bits de uma `Notification` (ADR 0035, item 6).",
+    DebugLog = 15 => "Capability de depuração: `debug_write` (ADR 0036, item 5). Só o kernel a cria.",
 }
 
 /// Badge de 64 bits gravado no slot por `cap_mint` (seção 6.2).
@@ -190,11 +191,49 @@ pub mod vm {
     /// Flag de `vm_map`/`vm_protect`: executável. Nunca junto com
     /// [`WRITE`] (W^X).
     pub const EXEC: u64 = 1 << 1;
+    /// Flag de `vm_map` (ADR 0038, item 1): visão crua de um `MemoryObject`
+    /// `LAZY`, que mostra também as páginas ocultas. Exige `EVICT` no objeto
+    /// e nunca vai junto com [`EXEC`]; `vm_protect` a recusa.
+    pub const RAW: u64 = 1 << 2;
     /// Flags definidas; as demais são recusadas com `InvalidArgument`.
-    pub const ALL_FLAGS: u64 = WRITE | EXEC;
+    pub const ALL_FLAGS: u64 = WRITE | EXEC | RAW;
     /// `aspace = SELF` (0) em `vm_map` e `vm_unmap`: o espaço da thread
     /// que chama, sem capability (ADR 0039, item 2).
     pub const SELF: u64 = 0;
+}
+
+/// `MemoryObject` gerenciado e `mem_op` (syscall 9; ADR 0038, itens 1 e
+/// 2): `mem_op(objeto, op, offset, len, flags)` em `rdi`, `rsi`, `rdx`,
+/// `r10` e `r8`, com `offset` e `len` em bytes, múltiplos de
+/// [`vm::PAGE_SIZE`]; devolve `[valor, 0, 0]`.
+pub mod mem {
+    /// Flag de `obj_create(quota, MemoryObject, bytes, flags)` (`r10`): o
+    /// objeto nasce com todas as páginas ausentes (sem frame), cobrado só
+    /// pelos metadados, e o criador recebe também `EVICT`.
+    pub const LAZY: u64 = 1;
+    /// Ausente → oculta (zerada); com [`PUBLISH_FLAG`], vai a presente e
+    /// entra nos mapeamentos. Exige `WRITE`; debita a cota dona do objeto.
+    pub const COMMIT: u64 = 0;
+    /// Zera as páginas comprometidas do intervalo. Exige `WRITE`.
+    pub const ZERO: u64 = 1;
+    /// Atributo de cache (`flags`); `NotSupported` no M3. Exige `WRITE`.
+    pub const CACHE: u64 = 2;
+    /// Oculta → presente (entra nos mapeamentos). Exige `EVICT`.
+    pub const PUBLISH: u64 = 3;
+    /// Presente → oculta: sai das visões normais e só volta depois do
+    /// shootdown; o frame fica. Exige `EVICT`.
+    pub const HIDE: u64 = 4;
+    /// Oculta (ou presente, ocultada antes) → ausente: sai também das
+    /// visões `RAW`, com shootdown, libera o frame e credita a cota do
+    /// dono. Exige `EVICT`.
+    pub const DECOMMIT: u64 = 5;
+    /// Até [`AGE_MAX_PAGES`] páginas: devolve o mapa de bits das presentes
+    /// com o bit de acesso ligado e limpa esses bits. Exige `EVICT`.
+    pub const AGE: u64 = 6;
+    /// Páginas de uma chamada de [`AGE`].
+    pub const AGE_MAX_PAGES: u64 = 64;
+    /// Flag de [`COMMIT`]: publica a página na mesma chamada.
+    pub const PUBLISH_FLAG: u64 = 1;
 }
 
 /// Flags de `thread_configure` (ADR 0029 e ADR 0039, item 3): o que muda
@@ -326,7 +365,7 @@ mod tests {
     fn numeros_estaveis() {
         assert_eq!(SYSCALL_COUNT, 34);
         assert_eq!(Error::ALL.len(), 12);
-        assert_eq!(ObjectType::ALL.len(), 15);
+        assert_eq!(ObjectType::ALL.len(), 16);
         for (i, s) in Syscall::ALL.iter().enumerate() {
             assert_eq!(s.number() as usize, i);
         }
@@ -372,7 +411,7 @@ mod tests {
         for raw in [STATUS_OK, 1, (-13i64).cast_unsigned(), u64::from(u32::MAX)] {
             assert_eq!(Error::try_from(raw), Err(UnknownValue(raw)));
         }
-        assert_eq!(ObjectType::try_from(15), Err(UnknownValue(15)));
+        assert_eq!(ObjectType::try_from(16), Err(UnknownValue(16)));
     }
 
     #[test]

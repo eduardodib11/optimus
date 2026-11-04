@@ -32,6 +32,8 @@ pub const USER: u64 = 1 << 2;
 pub const WRITE_THROUGH: u64 = 1 << 3;
 /// Sem cache.
 pub const NO_CACHE: u64 = 1 << 4;
+/// Acessada (o hardware liga ao usar a tradução).
+pub const ACCESSED: u64 = 1 << 5;
 /// Folha de 2 MiB no nível 2.
 pub const HUGE: u64 = 1 << 7;
 /// Global (sobrevive à troca de CR3).
@@ -296,6 +298,16 @@ impl<M: TableMemory> PageTables<M> {
         let leaf = &mut self.mem.table(table)[index];
         *leaf = (*leaf & size.addr_mask()) | flags.bits(size);
         Ok(())
+    }
+
+    /// Lê e limpa o bit de acesso da folha de 4 KiB em `virt` (quem chama
+    /// invalida a tradução); `None` sem folha.
+    pub fn take_accessed(&mut self, virt: u64) -> Option<bool> {
+        let (table, index) = self.leaf(virt, PageSize::Size4K).ok()?;
+        let leaf = &mut self.mem.table(table)[index];
+        let was = *leaf & ACCESSED != 0;
+        *leaf &= !ACCESSED;
+        Some(was)
     }
 
     /// A folha que mapeia `virt`, se houver.

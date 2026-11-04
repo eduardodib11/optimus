@@ -91,6 +91,12 @@ pub const SYS_INFO_CPUS: u64 = 1;
 /// e auxiliar (`r8`); ver [`crate::exit`].
 pub const SYS_INFO_EXIT: u64 = 2;
 
+/// Seletor de `sys_info(seletor)`: memória (ADR 0038, item 5). Devolve os
+/// quadros de 4 KiB gerenciados (`rdx`), os livres, no buddy e nos caches
+/// por CPU (`r10`), e os comprometidos de objetos `LAZY` (`r8`), sem
+/// capability.
+pub const SYS_INFO_MEMORY: u64 = 3;
+
 /// Seletor de `sys_info(seletor, 0)`: entropia (ADR 0039, item 4). Devolve
 /// [`SYS_INFO_ENTROPY_BYTES`] bytes aleatórios criptográficos em `rdx`,
 /// `r10` e `r8` (little-endian, nessa ordem), sem capability. O argumento

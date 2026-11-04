@@ -103,6 +103,23 @@ pub trait Env {
     fn timer_armed(&mut self, _deadline: u64) {}
 }
 
+/// Confere a capability de `debug_write` (ADR 0036, item 5): o handle `raw`
+/// tem de ser do tipo `DebugLog` e ter `WRITE`. Devolve o badge, que
+/// identifica quem escreveu.
+///
+/// # Errors
+///
+/// `InvalidHandle` se o handle não existe; `AccessDenied` se não for um
+/// `DebugLog` com `WRITE`.
+pub fn debug_cap(space: &SharedCapSpace, raw: u64) -> Result<u64, Error> {
+    let cap = space.lock().get(handle(raw)?)?.clone();
+    if cap.rights.contains(Rights::WRITE) && matches!(cap.object, Object::DebugLog(_)) {
+        Ok(cap.badge)
+    } else {
+        Err(Error::AccessDenied)
+    }
+}
+
 fn handle(raw: u64) -> Result<Handle, Error> {
     Handle::try_from(raw).map_err(|_| Error::InvalidHandle)
 }
@@ -172,7 +189,9 @@ pub fn invoke(
         }
         Syscall::ObjCreate => {
             let ty = ObjectType::try_from(a[1]).map_err(|_| Error::InvalidArgument)?;
-            let h = space.lock().obj_create(handle(a[0])?, ty, a[2])?;
+            let h = space
+                .lock()
+                .obj_create_with(handle(a[0])?, ty, a[2], a[3])?;
             Ok([u64::from(h.raw()), 0, 0])
         }
         Syscall::VmMap => {
@@ -224,8 +243,68 @@ pub fn invoke(
             Ok([0; 3])
         }
         Syscall::ThreadConfigure => thread_configure(space, a, env).map(|()| [0; 3]),
+        Syscall::MemOp => mem_op(space, a, env),
         _ => invoke_sync(space, call, a, env),
     }
+}
+
+/// Páginas por fatia de `mem_op`: entre fatias, sem a trava do objeto, há
+/// um ponto de preempção (ADR 0009); `COMMIT` é idempotente por página,
+/// e o progresso fica no objeto.
+pub const MEM_OP_SLICE: u64 = 64;
+
+/// `mem_op(obj, op, offset, len, flags)` (ADR 0038, item 2): `COMMIT` e
+/// `ZERO` exigem `WRITE`; `PUBLISH`, `HIDE`, `DECOMMIT` e `AGE`, `EVICT`.
+/// `CACHE` devolve `NotSupported` no M3; `HIDE`, `DECOMMIT` e `AGE` num
+/// objeto sem `LAZY`, também.
+fn mem_op(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<Values, Error> {
+    use kabi::mem::{AGE, CACHE, COMMIT, DECOMMIT, HIDE, PUBLISH, PUBLISH_FLAG, ZERO};
+    let cap = cap_with(space, a[0], Rights::NONE)?;
+    let memory = cap.object.as_memory_object()?;
+    let [_, op, offset, len, flags, _] = a;
+    let need = match op {
+        COMMIT | ZERO | CACHE => Rights::WRITE,
+        PUBLISH | HIDE | DECOMMIT | AGE => Rights::EVICT,
+        _ => return Err(Error::InvalidArgument),
+    };
+    let allowed = match op {
+        COMMIT => PUBLISH_FLAG,
+        CACHE => u64::MAX,
+        _ => 0,
+    };
+    if flags & !allowed != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    if !cap.rights.contains(need) {
+        return Err(Error::AccessDenied);
+    }
+    let end = offset.checked_add(len).ok_or(Error::InvalidArgument)?;
+    let page = kabi::vm::PAGE_SIZE;
+    if !offset.is_multiple_of(page) || !len.is_multiple_of(page) || end / page > memory.pages() {
+        return Err(Error::InvalidArgument);
+    }
+    let (mut first, last) = (offset / page, end / page);
+    match op {
+        CACHE => return Err(Error::NotSupported),
+        AGE if last - first > kabi::mem::AGE_MAX_PAGES => return Err(Error::InvalidArgument),
+        AGE => return Ok([memory.age(first, last - first)?, 0, 0]),
+        _ => {}
+    }
+    while first < last {
+        let count = (last - first).min(MEM_OP_SLICE);
+        match op {
+            COMMIT => memory.commit(first, count, flags & PUBLISH_FLAG != 0)?,
+            PUBLISH => memory.publish(first, count)?,
+            HIDE => memory.hide(first, count)?,
+            DECOMMIT => memory.decommit(first, count)?,
+            _ => memory.zero(first, count),
+        }
+        first += count;
+        if first < last {
+            env.preempt();
+        }
+    }
+    Ok([0; 3])
 }
 
 /// `cap_delete(handle, flags)` (ADR 0035, item 4): sem flags, apaga a

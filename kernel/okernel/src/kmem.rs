@@ -115,12 +115,18 @@ pub fn alloc_frames(order: usize) -> Option<PhysAddr> {
             let mut frames = FRAMES.lock();
             let buddy = frames.as_mut()?;
             c.refill(FRAME_BATCH, &mut || buddy.alloc(0).map(|f| f.0));
+            note_pressure(buddy);
             c.pop()
         });
         // Vazio aqui e no buddy: não há o que devolver desta CPU.
         return frame.map(PhysAddr);
     }
-    if let Some(frame) = FRAMES.lock().as_mut()?.alloc(order) {
+    let mut frames = FRAMES.lock();
+    let buddy = frames.as_mut()?;
+    let got = buddy.alloc(order);
+    note_pressure(buddy);
+    drop(frames);
+    if let Some(frame) = got {
         return Some(frame);
     }
     // Os frames parados no cache desta CPU podem completar um bloco.
@@ -141,6 +147,7 @@ pub fn free_frames(addr: PhysAddr, order: usize) {
             }
             if let Some(buddy) = FRAMES.lock().as_mut() {
                 c.spill(FRAME_BATCH, &mut |f| buddy_free(buddy, PhysAddr(f), 0));
+                note_pressure(buddy);
             }
             if !c.push(addr.0) {
                 error!("okernel: cache de frames cheio depois de esvaziar");
@@ -150,7 +157,14 @@ pub fn free_frames(addr: PhysAddr, order: usize) {
     }
     if let Some(buddy) = FRAMES.lock().as_mut() {
         buddy_free(buddy, addr, order);
+        note_pressure(buddy);
     }
+}
+
+/// O buddy mudou (ADR 0038, item 5): a pressão de memória é recalculada no
+/// próximo ponto sem travas. Só um atômico, com a trava do buddy na mão.
+fn note_pressure(_buddy: &FrameAllocator<'static>) {
+    crate::kpressure::touch();
 }
 
 fn buddy_free(buddy: &mut FrameAllocator<'static>, addr: PhysAddr, order: usize) {
@@ -190,6 +204,11 @@ pub fn cached_frames() -> usize {
     percpu::bsp().frames_cached() + aps.map(percpu::PerCpu::frames_cached).sum::<usize>()
 }
 
+/// Fim (exclusivo) da faixa física gerida pelo buddy.
+pub fn managed_end() -> u64 {
+    MANAGED[1].load(Ordering::Relaxed)
+}
+
 /// PML4 do kernel.
 pub fn kernel_root() -> Option<PhysAddr> {
     Some(KERNEL_PT.lock().as_ref()?.root())
@@ -223,6 +242,35 @@ const fn kernel_flags(virt: u64, flags: Flags) -> Flags {
 /// Mapeia uma página no espaço do kernel.
 pub fn map(virt: u64, phys: PhysAddr, size: PageSize, flags: Flags) -> Result<(), MapError> {
     with_tables(|pt| pt.map(virt, phys, size, kernel_flags(virt, flags)))
+}
+
+/// Mapeia `pages` páginas de 4 KiB seguidas, de `phys` em `virt`, com a
+/// trava tomada uma vez; devolve quantas tabelas novas elas custaram. Na
+/// falha, o que já foi mapeado fica: quem chama desfaz com [`unmap_range`].
+pub fn map_range(virt: u64, phys: PhysAddr, pages: u64, flags: Flags) -> Result<u64, MapError> {
+    with_tables(|pt| {
+        let tables = pt.tables_needed(virt, virt + pages * FRAME_SIZE);
+        for i in 0..pages {
+            let v = virt + i * FRAME_SIZE;
+            let p = PhysAddr(phys.0 + i * FRAME_SIZE);
+            pt.map(v, p, PageSize::Size4K, kernel_flags(v, flags))?;
+        }
+        Ok(tables)
+    })
+}
+
+/// Desmapeia `pages` páginas de 4 KiB do kernel a partir de `start` (as
+/// que não estiverem mapeadas são puladas) com um só shootdown, que acima
+/// de [`okernel::tlb::MAX_PAGES`] esvazia a TLB toda. Os frames só podem
+/// ser liberados depois da volta.
+pub fn unmap_range(start: u64, pages: u64) {
+    if let Some(pt) = KERNEL_PT.lock().as_mut() {
+        for i in 0..pages {
+            // Página não mapeada: nada a desfazer nela.
+            let _ = pt.unmap(start + i * FRAME_SIZE, PageSize::Size4K);
+        }
+    }
+    tlb::flush(KERNEL_ROOT, Flush::range(start, pages));
 }
 
 /// Desmapeia uma página do kernel e invalida a TLB em toda CPU
