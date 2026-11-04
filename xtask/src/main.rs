@@ -1318,7 +1318,7 @@ fn check_fuzz(serial: &str, exit: std::result::Result<Option<i32>, ()>, seed: u6
 /// Formatação, clippy em cada alvo e a regra de `unsafe` da seção 17.1.
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
-    for tool in ["xtask", "mkobfs"] {
+    for tool in ["xtask", "mkobfs", "oidlc"] {
         status(cargo().args([
             "clippy",
             "--package",
@@ -1404,7 +1404,11 @@ fn check_unsafe() -> Result {
     let roots: Vec<&str> = CRATES
         .iter()
         .map(|(_, file, _)| *file)
-        .chain(["xtask/src/main.rs", "tools/mkobfs/src/main.rs"])
+        .chain([
+            "xtask/src/main.rs",
+            "tools/mkobfs/src/main.rs",
+            "tools/oidlc/src/main.rs",
+        ])
         .collect();
     unsafe_budget::check(&roots)
 }
