@@ -12,14 +12,17 @@ const U: u64 = 0x40_0000;
 const RW: Perms = Perms {
     write: true,
     exec: false,
+    raw: false,
 };
 const RX: Perms = Perms {
     write: false,
     exec: true,
+    raw: false,
 };
 const ALL: Perms = Perms {
     write: true,
     exec: true,
+    raw: false,
 };
 
 fn setup(

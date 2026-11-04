@@ -37,7 +37,13 @@ pub const TESTS: &[Test] = &[
         name: "falta.pagina_nao_comprometida_e_tratavel",
         run: demanda_zero,
     },
+    Test {
+        name: "falta.pagina_despejada_volta_restaurada",
+        run: despejo::despejo,
+    },
 ];
+
+mod despejo;
 
 unsafe extern "C" {
     static user_fault: u8;

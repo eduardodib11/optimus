@@ -184,9 +184,15 @@ fn flags_recusam_w_e_x_juntos() {
         Perms::from_flags(EXEC),
         Ok(Perms {
             write: false,
-            exec: true
+            exec: true,
+            raw: false,
         })
     );
+    // `RAW` nunca com execução, e exige `EVICT`.
+    let raw = kabi::vm::RAW;
+    assert_eq!(Perms::from_flags(raw | EXEC), Err(Error::InvalidArgument));
+    let p = Perms::from_flags(raw | WRITE).unwrap();
+    assert!(p.raw && p.rights().contains(Rights::EVICT));
 }
 
 mod lazy;

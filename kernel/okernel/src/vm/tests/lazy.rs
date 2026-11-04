@@ -13,6 +13,7 @@ fn space(quota: &Arc<MemoryQuota>, p: &'static Leaked) -> Arc<SharedAddressSpace
 const RW: Perms = Perms {
     write: true,
     exec: false,
+    raw: false,
 };
 
 #[test]
@@ -109,4 +110,90 @@ fn publicar_instala_em_todos_os_espacos() {
     drop(b);
     // A entrada do espaço morto sai na limpeza do próximo mapeamento.
     mo.map_into(&a, U + 64 * P, 0, P, RW, RW).unwrap();
+}
+
+const RAW: Perms = Perms {
+    write: true,
+    exec: false,
+    raw: true,
+};
+
+#[test]
+fn visao_raw_mostra_as_ocultas() {
+    let (_, p) = platform(100);
+    let quota = MemoryQuota::root(1 << 20);
+    let mo = Arc::new(MemoryObject::new_lazy(&quota, 2 * P, p).unwrap());
+    let (client, memd) = (space(&quota, p), space(&quota, p));
+    mo.map_into(&client, U, 0, 2 * P, RW, RW).unwrap();
+    // Sem `EVICT` na capability, o máximo não deixa `RAW`.
+    assert_eq!(
+        mo.map_into(&memd, U, 0, 2 * P, RAW, RW),
+        Err(Error::AccessDenied)
+    );
+    mo.map_into(&memd, U, 0, 2 * P, RAW, RAW).unwrap();
+    mo.commit(0, 1, false).unwrap();
+    assert!(memd.lock().query(U).is_some(), "oculta aparece na RAW");
+    assert!(client.lock().query(U).is_none());
+    mo.publish(0, 1).unwrap();
+    assert!(client.lock().query(U).is_some());
+}
+
+#[test]
+fn hide_e_decommit_tiram_com_shootdown_antes_de_liberar() {
+    let (fake, p) = platform(100);
+    let quota = MemoryQuota::root(1 << 20);
+    let mo = Arc::new(MemoryObject::new_lazy(&quota, 2 * P, p).unwrap());
+    let (client, memd) = (space(&quota, p), space(&quota, p));
+    mo.map_into(&client, U, 0, 2 * P, RW, RW).unwrap();
+    mo.map_into(&memd, U + 8 * P, 0, 2 * P, RAW, RAW).unwrap();
+    mo.commit(0, 2, true).unwrap();
+    let used = quota.used();
+    fake.flushes.lock().unwrap().clear();
+    mo.hide(0, 1).unwrap();
+    assert!(client.lock().query(U).is_none() && memd.lock().query(U + 8 * P).is_some());
+    assert!(mo.frame(0).is_none(), "oculta");
+    assert_eq!(
+        fake.flushes.lock().unwrap().as_slice(),
+        &[(U, 1, fake.frames_live.load(Ordering::Relaxed))]
+    );
+    // Idempotente.
+    mo.hide(0, 1).unwrap();
+    assert_eq!(fake.flushes.lock().unwrap().len(), 1);
+    let live = fake.frames_live.load(Ordering::Relaxed);
+    fake.flushes.lock().unwrap().clear();
+    // A página 1 está presente: é ocultada antes de sair da RAW.
+    mo.decommit(0, 2).unwrap();
+    let flushes = fake.flushes.lock().unwrap().clone();
+    // Cada página: o shootdown vem com o frame dela ainda vivo, e só depois
+    // ele volta (invariante 1). A 0 só sai da RAW; a 1 sai da visão normal
+    // e depois da RAW.
+    let want = [
+        (U + 8 * P, 1, live),
+        (U + P, 1, live - 1),
+        (U + 9 * P, 1, live - 1),
+    ];
+    assert_eq!(flushes.as_slice(), &want, "{flushes:x?}");
+    assert_eq!(fake.frames_live.load(Ordering::Relaxed), live - 2);
+    assert_eq!(quota.used(), used - 2 * P);
+    assert!(memd.lock().query(U + 8 * P).is_none() && client.lock().query(U + P).is_none());
+    // Reacesso: o `COMMIT` traz a página zerada de volta, cobrada de novo.
+    mo.commit(1, 1, true).unwrap();
+    assert!(client.lock().query(U + P).is_some());
+    assert_eq!(quota.used(), used - P);
+}
+
+#[test]
+fn age_le_e_limpa_o_bit_de_acesso() {
+    let (_, p) = platform(100);
+    let quota = MemoryQuota::root(1 << 20);
+    let mo = Arc::new(MemoryObject::new_lazy(&quota, 4 * P, p).unwrap());
+    let client = space(&quota, p);
+    mo.map_into(&client, U, 0, 4 * P, RW, RW).unwrap();
+    mo.commit(0, 3, true).unwrap();
+    mo.hide(2, 1).unwrap();
+    // A plataforma falsa não liga o bit A: nenhuma página usada.
+    assert_eq!(mo.age(0, 4), Ok(0));
+    let eager = MemoryObject::new(&quota, P, p).unwrap();
+    assert_eq!(eager.age(0, 1), Err(Error::NotSupported));
+    assert_eq!(eager.hide(0, 1), Err(Error::NotSupported));
 }
