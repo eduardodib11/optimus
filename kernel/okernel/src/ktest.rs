@@ -55,6 +55,7 @@ const SUITES: &[&[Test]] = &[
     crate::kthread::TESTS,
     crate::kipc::TESTS,
     crate::kfault::TESTS,
+    crate::kpressure::TESTS,
     crate::kroot::TESTS,
     crate::krand::TESTS,
 ];

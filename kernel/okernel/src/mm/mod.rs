@@ -6,6 +6,7 @@ pub mod buddy;
 pub mod cache;
 pub mod frames;
 pub mod paging;
+pub mod pressure;
 pub mod slab;
 
 /// Tamanho de um frame de memória física: 4 KiB.

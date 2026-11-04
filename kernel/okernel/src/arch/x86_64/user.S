@@ -463,6 +463,59 @@ user_fault_handler:
     syscall
     ud2
 
+/* user_lazy_handler(rdi = endpoint | reply << 32, rsi = página RW,
+ * rdx = MemoryObject | (base >> 12) << 32)
+ *
+ * Tratador demand-zero (T-360, o fluxo do `memd` da ADR 0038, item 3):
+ * recebe uma falta, grava em [página + 16] o status, [+ 24] o badge,
+ * [+ 32] o rótulo, [+ 40] o código de erro e [+ 48] o endereço; compromete
+ * e publica a página do objeto que faltou (mem_op COMMIT | PUBLISH, status
+ * em [+ 64]) e responde com rótulo 0 (status em [+ 72]). */
+.global user_lazy_handler
+user_lazy_handler:
+    mov rbx, rdi
+    mov rbp, rsi
+    push rdx
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 19
+    syscall
+    mov [rbp + 16], rax
+    mov [rbp + 24], rdi
+    mov [rbp + 32], rsi
+    mov [rbp + 40], r8
+    mov [rbp + 48], r9
+    test rax, rax
+    jnz 1f
+    pop rcx
+    mov edi, ecx              /* o objeto */
+    mov rdx, rcx
+    shr rdx, 32
+    shl rdx, 12               /* base da região */
+    mov rax, r9
+    and rax, -4096
+    sub rax, rdx
+    mov rdx, rax              /* deslocamento no objeto */
+    xor esi, esi              /* COMMIT */
+    mov r10d, 4096
+    mov r8d, 1                /* PUBLISH */
+    mov eax, 9
+    syscall
+    mov [rbp + 64], rax
+    mov rdi, rbx
+    shr rdi, 32
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 18
+    syscall
+    mov [rbp + 72], rax
+1:
+    xor esi, esi              /* thread_exit sem flags */
+    mov eax, 33
+    syscall
+    ud2
+
 /* Benchmarks (T-213, `test=bench`). Cada amostra é a diferença do TSC
  * (LFENCE; RDTSC) em volta de uma syscall, gravada em 8 bytes a partir de
  * rdx/rsi; uma falha grava u64::MAX e termina. */

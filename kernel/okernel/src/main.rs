@@ -28,6 +28,7 @@ mod kipc;
 mod kirq;
 mod kmem;
 mod kpanic;
+mod kpressure;
 mod krand;
 mod kroot;
 mod ksmp;

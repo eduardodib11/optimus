@@ -424,6 +424,29 @@ impl<const N: usize> CapSpace<N, Object> {
         ty: ObjectType,
         args: u64,
     ) -> Result<Handle, Error> {
+        self.obj_create_with(quota, ty, args, 0)
+    }
+
+    /// Como [`obj_create`](Self::obj_create), com as `flags` de `r10`: só
+    /// `MemoryObject` aceita uma, [`kabi::mem::LAZY`] (ADR 0038, item 1),
+    /// e o criador recebe também `EVICT`.
+    ///
+    /// # Errors
+    ///
+    /// Os de `obj_create`; [`Error::InvalidArgument`] para flags fora do
+    /// domínio.
+    pub fn obj_create_with(
+        &mut self,
+        quota: Handle,
+        ty: ObjectType,
+        args: u64,
+        flags: u64,
+    ) -> Result<Handle, Error> {
+        let lazy = match (ty, flags) {
+            (_, 0) => false,
+            (ObjectType::MemoryObject, kabi::mem::LAZY) => true,
+            _ => return Err(Error::InvalidArgument),
+        };
         let cap = self.get(quota)?;
         let q = Arc::clone(cap.object.as_quota()?);
         let needed = if ty == ObjectType::MemoryQuota {
@@ -434,10 +457,15 @@ impl<const N: usize> CapSpace<N, Object> {
         if !cap.rights.contains(needed) {
             return Err(Error::AccessDenied);
         }
-        let object = obj_create(&q, ty, args)?;
+        let (object, rights) = if lazy {
+            let object = super::object::new_memory_object(&q, args, true)?;
+            (object, default_rights(ty) | Rights::EVICT)
+        } else {
+            (obj_create(&q, ty, args)?, default_rights(ty))
+        };
         self.insert(Cap {
             object,
-            rights: default_rights(ty),
+            rights,
             badge: 0,
         })
     }

@@ -311,6 +311,7 @@ fn idle() -> ! {
         if crate::kthread::idle_steal() {
             continue;
         }
+        crate::kpressure::poll();
         ktime::arm_by(ktime::now_ns() + IDLE_TICK_NS);
         cpu::wait_for_interrupt();
     }

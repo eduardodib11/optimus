@@ -1614,6 +1614,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
     {
         kipc::syscall(frame, call);
         frame.rflags = syscall::user_rflags(frame.rflags);
+        crate::kpressure::poll();
         exit_if_killed();
         crate::ksync::assert_none_held("volta ao usuário");
         return u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss));
@@ -1631,6 +1632,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
         Err(e) => frame.rax = e.to_raw(),
     }
     frame.rflags = syscall::user_rflags(frame.rflags);
+    crate::kpressure::poll();
     exit_if_killed();
     crate::ksync::assert_none_held("volta ao usuário");
     u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss))
@@ -1687,7 +1689,9 @@ fn thread_exit(code: u64, flags: u64) -> Result<Values, Error> {
 /// `sys_info(seletor, arg)` (ADR 0032, item 4): com
 /// [`kabi::sched::SYS_INFO_CPUS`], as CPUs ligadas e o total de ids lógicos
 /// da topologia; com [`kabi::sched::SYS_INFO_EXIT`] (ADR 0035, item 2), o
-/// registro de morte da `Thread` ou do processo do `CapSpace` de `arg`; com [`kabi::sched::SYS_INFO_ENTROPY`] (ADR 0039, item 4),
+/// registro de morte da `Thread` ou do processo do `CapSpace` de `arg`; com
+/// [`kabi::sched::SYS_INFO_MEMORY`] (ADR 0038, item 5), os quadros
+/// gerenciados, os livres e os comprometidos de objetos `LAZY`; com [`kabi::sched::SYS_INFO_ENTROPY`] (ADR 0039, item 4),
 /// 24 bytes do DRBG desta CPU, sem capability, com `arg` zero.
 pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
     match selector {
@@ -1701,6 +1705,10 @@ pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
                 .and_then(|t| t.cspace())
                 .ok_or(Error::NotSupported)?;
             sys::exit_info(&space, arg)
+        }
+        kabi::sched::SYS_INFO_MEMORY => {
+            let (free, total) = kmem::frame_stats();
+            Ok([total as u64, free as u64, okernel::vm::lazy_committed()])
         }
         kabi::sched::SYS_INFO_ENTROPY => {
             if arg != 0 {

@@ -68,6 +68,10 @@ impl Platform for KernelPlatform {
         kmem::free_frames(frame, 0);
     }
 
+    fn zero_frame(&self, frame: PhysAddr) {
+        zero_frame(frame);
+    }
+
     fn flush(&self, root: PhysAddr, start: u64, pages: u64) {
         tlb::flush(root.0, Flush::range(start, pages));
     }
@@ -150,8 +154,9 @@ pub unsafe fn activate(root: PhysAddr) -> u64 {
 /// na página (do firmware ou de código de usuário que morou nela), que
 /// deixaria lenta toda escrita nela enquanto durasse.
 fn zero_frame(frame: PhysAddr) {
-    // SAFETY: frame recém-saído do buddy, só de quem chama, no mapa direto
-    // (RW), alinhado a 4 KiB.
+    // SAFETY: frame do buddy que é de quem chama (recém-alocado ou de um
+    // `MemoryObject`, sem referência Rust a ele), no mapa direto (RW),
+    // alinhado a 4 KiB.
     unsafe { core::ptr::write_bytes(kmem::direct(frame) as *mut u8, 0, 4096) };
 }
 

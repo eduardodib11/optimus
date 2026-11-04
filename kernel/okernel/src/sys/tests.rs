@@ -186,6 +186,7 @@ fn as_outras_nao_sao_suportadas_aqui() {
                 | Syscall::SchedConfigure
                 | Syscall::SchedBind
                 | Syscall::ThreadConfigure
+                | Syscall::MemOp
         );
         // Precisam de capability válida ou da thread atual.
         let sync = matches!(
@@ -921,3 +922,5 @@ fn cap_owner(space: &SharedCapSpace, h: u64) -> u32 {
     let cap = cap_with(space, h, Rights::NONE).unwrap();
     cap.object.as_timer().unwrap().owner()
 }
+
+mod mem;

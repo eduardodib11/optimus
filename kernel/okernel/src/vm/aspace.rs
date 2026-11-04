@@ -1,7 +1,7 @@
 //! `AddressSpace` e as syscalls `vm_map`, `vm_unmap` e `vm_protect` (T-205).
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem::size_of;
@@ -58,7 +58,9 @@ struct Region {
 }
 
 impl Region {
-    const BYTES: u64 = size_of::<Self>() as u64;
+    /// A região e a entrada que ela pode ocupar na lista de espaços de um
+    /// objeto `LAZY` (ADR 0038, item 1: cobrada da cota do espaço).
+    const BYTES: u64 = (size_of::<Self>() + size_of::<Weak<SharedAddressSpace>>()) as u64;
 
     const fn end(&self) -> u64 {
         self.start + self.pages * PAGE_SIZE
@@ -228,6 +230,30 @@ impl AddressSpace {
         perms: Perms,
         max: Perms,
     ) -> Result<(), Error> {
+        if object.is_lazy() {
+            // A trava do objeto vem antes desta: `MemoryObject::map_into`.
+            return Err(Error::InvalidArgument);
+        }
+        let lookup = |page| object.frame(page);
+        self.map_with(start, object, offset, len, perms, max, &lookup)
+    }
+
+    /// Como [`map`](Self::map), com o frame de cada página dado por
+    /// `frames`. Num objeto `LAZY` (com a trava dele na mão), a página sem
+    /// frame fica sem mapeamento, e as tabelas da faixa toda ficam cobradas
+    /// para as páginas que forem publicadas depois.
+    #[expect(clippy::too_many_arguments, reason = "os de `vm_map` mais a busca")]
+    pub(super) fn map_with(
+        &mut self,
+        start: u64,
+        object: &Arc<MemoryObject>,
+        offset: u64,
+        len: u64,
+        perms: Perms,
+        max: Perms,
+        frames: &dyn Fn(u64) -> Option<PhysAddr>,
+    ) -> Result<(), Error> {
+        let lazy = object.is_lazy();
         let end = user_range(start, len)?;
         if !perms.within(max) {
             return Err(Error::AccessDenied);
@@ -256,12 +282,15 @@ impl AddressSpace {
         let mut failed = None;
         let mut done = 0;
         while done < pages {
-            let frame = object.frame(first + done).ok_or(MapError::NotMapped);
             let virt = start + done * PAGE_SIZE;
-            match frame.and_then(|f| {
-                self.tables
-                    .map(virt, f, PageSize::Size4K, perms.page_flags())
-            }) {
+            let mapped = match frames(first + done) {
+                Some(f) => self
+                    .tables
+                    .map(virt, f, PageSize::Size4K, perms.page_flags()),
+                None if lazy => Ok(()),
+                None => Err(MapError::NotMapped),
+            };
+            match mapped {
                 Ok(()) => done += 1,
                 Err(e) => {
                     failed = Some(e);
@@ -270,7 +299,9 @@ impl AddressSpace {
             }
         }
         let used = self.live_tables() - before;
-        self.charge.shrink(needed.saturating_sub(used) * PAGE_SIZE);
+        if !lazy || failed.is_some() {
+            self.charge.shrink(needed.saturating_sub(used) * PAGE_SIZE);
+        }
         if let Some(e) = failed {
             self.unmap_pages(start, start + done * PAGE_SIZE);
             self.charge.shrink(Region::BYTES);
@@ -288,6 +319,44 @@ impl AddressSpace {
                 max,
             },
         );
+        Ok(())
+    }
+
+    /// Verdadeiro se alguma região mostra `object`.
+    pub(super) fn shows(&self, object: &MemoryObject) -> bool {
+        self.regions
+            .iter()
+            .any(|r| core::ptr::eq(Arc::as_ptr(&r.object), object))
+    }
+
+    /// Instala `frame`, a página `page` de `object` (`LAZY`, com a trava
+    /// dele na mão), em toda região que a mostra; o que já está mapeado
+    /// fica. As tabelas já foram cobradas no `map_with`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QuotaExceeded`] sem frame para uma tabela.
+    pub(super) fn install(
+        &mut self,
+        object: &MemoryObject,
+        page: u64,
+        frame: PhysAddr,
+    ) -> Result<(), Error> {
+        for r in &self.regions {
+            if !core::ptr::eq(Arc::as_ptr(&r.object), object)
+                || !(r.first..r.first + r.pages).contains(&page)
+            {
+                continue;
+            }
+            let virt = r.start + (page - r.first) * PAGE_SIZE;
+            match self
+                .tables
+                .map(virt, frame, PageSize::Size4K, r.perms.page_flags())
+            {
+                Ok(()) | Err(MapError::AlreadyMapped) => {}
+                Err(e) => return Err(map_error(e)),
+            }
+        }
         Ok(())
     }
 
@@ -445,7 +514,7 @@ pub fn vm_map(
         return Err(Error::AccessDenied);
     }
     let max = Perms::allowed_by(object.rights);
-    space.lock().map(start, memory, offset, len, perms, max)
+    memory.map_into(space, start, offset, len, perms, max)
 }
 
 /// `vm_unmap`: exige `UNMAP` no espaço.
