@@ -167,6 +167,7 @@ pub enum ObjectType: u32, raw(n) => u64::from(n);
     Vcpu = 12 => "CPU virtual (M14).",
     Vm = 13 => "Máquina virtual (M14).",
     Timer = 14 => "Prazo ligável a bits de uma `Notification` (ADR 0035, item 6).",
+    DebugLog = 15 => "Capability de depuração: `debug_write` (ADR 0036, item 5). Só o kernel a cria.",
 }
 
 /// Badge de 64 bits gravado no slot por `cap_mint` (seção 6.2).
@@ -326,7 +327,7 @@ mod tests {
     fn numeros_estaveis() {
         assert_eq!(SYSCALL_COUNT, 34);
         assert_eq!(Error::ALL.len(), 12);
-        assert_eq!(ObjectType::ALL.len(), 15);
+        assert_eq!(ObjectType::ALL.len(), 16);
         for (i, s) in Syscall::ALL.iter().enumerate() {
             assert_eq!(s.number() as usize, i);
         }
@@ -372,7 +373,7 @@ mod tests {
         for raw in [STATUS_OK, 1, (-13i64).cast_unsigned(), u64::from(u32::MAX)] {
             assert_eq!(Error::try_from(raw), Err(UnknownValue(raw)));
         }
-        assert_eq!(ObjectType::try_from(15), Err(UnknownValue(15)));
+        assert_eq!(ObjectType::try_from(16), Err(UnknownValue(16)));
     }
 
     #[test]

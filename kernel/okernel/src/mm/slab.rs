@@ -11,8 +11,8 @@
 //!
 //! O limite conta os bytes de páginas que o heap segura; passar dele dá
 //! [`HeapError::LimitExceeded`], nunca pânico. A memória em si fica atrás de
-//! [`PageSource`]: o kernel a lê e escreve pelo mapa direto, os testes no
-//! host por um mapa de palavras.
+//! [`PageSource`]: o kernel a lê e escreve pela faixa de objetos da seção
+//! 6.4 (`kheap`), os testes no host por um mapa de palavras.
 //!
 //! Limitações: uma liberação dupla só é detectada quando zera a contagem do
 //! slab; não há proteção contra uso depois de liberar (envenenamento e
@@ -49,6 +49,12 @@ pub trait PageSource {
     fn read(&mut self, addr: u64) -> u64;
     /// Escreve a palavra em `addr` (alinhado a 8).
     fn write(&mut self, addr: u64, value: u64);
+    /// O último [`Self::alloc_pages`] recusado vai ser atendido fora da
+    /// trava do heap: quem chamou prepara o bloco e tenta de novo, então a
+    /// recusa ainda não conta como falha.
+    fn deferred(&self) -> bool {
+        false
+    }
 }
 
 /// Erros do heap.
@@ -216,6 +222,17 @@ impl<M: PageSource> Heap<M> {
         self.failures
     }
 
+    /// Conta uma falha que o heap não viu (um pedido adiado por
+    /// [`PageSource::deferred`] que não pôde ser atendido).
+    pub const fn count_failure(&mut self) {
+        self.failures += 1;
+    }
+
+    /// A fonte de páginas.
+    pub const fn pages(&mut self) -> &mut M {
+        &mut self.mem
+    }
+
     /// Estatísticas de cada cache, do menor para o maior.
     pub fn cache_stats(&self) -> [CacheStats; CLASSES.len()] {
         self.caches.map(|c| c.stats)
@@ -236,7 +253,7 @@ impl<M: PageSource> Heap<M> {
             Some(i) => self.alloc_small(i),
             None => self.alloc_large(layout),
         };
-        if result.is_err() {
+        if result.is_err() && !(result == Err(HeapError::OutOfMemory) && self.mem.deferred()) {
             self.failures += 1;
         }
         result

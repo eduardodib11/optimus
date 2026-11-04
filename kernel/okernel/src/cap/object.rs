@@ -58,7 +58,14 @@ pub enum Object {
     /// Prazo ligável a uma notificação (ADR 0035, item 6); fixo na memória,
     /// porque a fila de timers aponta para ele.
     Timer(Pin<Arc<Timer>>),
+    /// Capability de depuração (ADR 0036, item 5). Sem estado: só o kernel
+    /// a cria, no boot, e `debug_write` escreve no registro dele.
+    DebugLog(Arc<DebugLog>),
 }
+
+/// Marca de identidade da [`Object::DebugLog`]; o estado é o registro do kernel.
+#[derive(Debug)]
+pub struct DebugLog;
 
 impl fmt::Debug for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,6 +81,7 @@ impl fmt::Debug for Object {
             Self::Endpoint(e) => Arc::as_ptr(e).addr(),
             Self::Reply(r) => Arc::as_ptr(r).addr(),
             Self::Timer(t) => core::ptr::from_ref::<Timer>(t).addr(),
+            Self::DebugLog(d) => Arc::as_ptr(d).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -95,6 +103,7 @@ impl Object {
             Self::Endpoint(_) => ObjectType::Endpoint,
             Self::Reply(_) => ObjectType::Reply,
             Self::Timer(_) => ObjectType::Timer,
+            Self::DebugLog(_) => ObjectType::DebugLog,
         }
     }
 
@@ -115,6 +124,7 @@ impl Object {
             (Self::Timer(a), Self::Timer(b)) => {
                 core::ptr::eq::<Timer>(&raw const **a, &raw const **b)
             }
+            (Self::DebugLog(a), Self::DebugLog(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -297,6 +307,7 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
         ObjectType::DmaDomain => Rights::MAP.bits(),
         ObjectType::Vcpu | ObjectType::Vm => Rights::RUN.bits() | Rights::MAP.bits(),
         ObjectType::Timer => Rights::BIND.bits(),
+        ObjectType::DebugLog => Rights::WRITE.bits() | Rights::BIND.bits(),
     };
     match Rights::from_bits(bits) {
         Some(r) => r,

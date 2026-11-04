@@ -38,5 +38,5 @@ carga sem cópia e saída sempre válida para OPS e JSON.
 ## Consequências
 
 - O `oie` vira parte grande do código; o parser GGUF exige fuzzing.
-- Sem GPU até o M12, perfis JARVIS e Premium ficam mais lentos.
+- Sem GPU até o M12, perfis Default e Premium ficam mais lentos.
 - A gramática elimina saída inválida, mas não erro de conteúdo do plano.

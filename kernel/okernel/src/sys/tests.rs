@@ -921,3 +921,35 @@ fn cap_owner(space: &SharedCapSpace, h: u64) -> u32 {
     let cap = cap_with(space, h, Rights::NONE).unwrap();
     cap.object.as_timer().unwrap().owner()
 }
+
+/// `debug_write` só aceita `DebugLog` com `WRITE` (ADR 0036, item 5).
+#[test]
+fn debug_write_exige_debug_log_com_write() {
+    let root = MemoryQuota::root(1 << 20);
+    let space = Arc::new(SpinLock::new(crate::cap::CapSpace::new(&root).unwrap()));
+    let put = |object: Object, rights: Rights, badge: u64| {
+        let h = space
+            .lock()
+            .insert(Cap {
+                object,
+                rights,
+                badge,
+            })
+            .unwrap();
+        u64::from(h.raw())
+    };
+    let log = Object::DebugLog(Arc::new(crate::cap::object::DebugLog));
+    let ok = put(log.clone(), Rights::WRITE | Rights::BIND, 7);
+    let so_bind = put(log, Rights::BIND, 7);
+    let irq = put(
+        Object::Interrupt(Arc::new(
+            crate::notify::Interrupt::new(&root, 0x41).unwrap(),
+        )),
+        default_rights(ObjectType::Interrupt),
+        0,
+    );
+    assert_eq!(debug_cap(&space, ok), Ok(7));
+    assert_eq!(debug_cap(&space, so_bind), Err(Error::AccessDenied));
+    assert_eq!(debug_cap(&space, irq), Err(Error::AccessDenied));
+    assert_eq!(debug_cap(&space, 0xFFFF_FFFF), Err(Error::InvalidHandle));
+}

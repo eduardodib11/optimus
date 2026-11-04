@@ -1650,6 +1650,7 @@ fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
         Syscall::ClockGet => Ok([ktime::now_ns(), 0, 0]),
         Syscall::SysInfo => sys_info(a[0], a[1]),
         Syscall::ThreadStart => thread_start(a).map(|()| [0; 3]),
+        Syscall::DebugWrite => debug_write(a),
         _ => {
             let space = current()
                 .and_then(|t| t.cspace())
@@ -1763,6 +1764,47 @@ fn debug_print(ptr: u64, len: u64) -> Result<Values, Error> {
     let n = len.min(bytes.len() - *used);
     bytes[*used..*used + n].copy_from_slice(&buf[..n]);
     *used += n;
+    Ok([len as u64, 0, 0])
+}
+
+/// `debug_write(log, ptr, len, nível)` (ADR 0036, item 5): escreve até 256
+/// bytes UTF-8 no registro do kernel, como `nível [badge hex] texto`. Exige
+/// `WRITE` numa capability do tipo [`okernel::cap::Object::DebugLog`]; o
+/// badge da capability identifica quem escreveu.
+fn debug_write(a: [u64; 6]) -> Result<Values, Error> {
+    const MAX: usize = 256;
+    let space = current()
+        .and_then(|t| t.cspace())
+        .ok_or(Error::NotSupported)?;
+    let badge = okernel::sys::debug_cap(&space, a[0])?;
+    let len = usize::try_from(a[2])
+        .ok()
+        .filter(|&n| n <= MAX)
+        .ok_or(Error::InvalidArgument)?;
+    let level = match a[3] {
+        1 => okernel::log::Level::Error,
+        2 => okernel::log::Level::Warn,
+        3 => okernel::log::Level::Info,
+        4 => okernel::log::Level::Debug,
+        5 => okernel::log::Level::Trace,
+        _ => return Err(Error::InvalidArgument),
+    };
+    let mut buf = [0u8; MAX];
+    if !probe::copy_from_user(&mut buf[..len], a[1]) {
+        return Err(Error::InvalidArgument);
+    }
+    let text = core::str::from_utf8(&buf[..len]).map_err(|_| Error::InvalidArgument)?;
+    let text = text.trim_end();
+    if ktest::active() {
+        let line = alloc::format!("[{badge:x}] {text}\n");
+        let mut log = DEBUG_LOG.lock();
+        let (bytes, used) = &mut *log;
+        let n = line.len().min(bytes.len() - *used);
+        bytes[*used..*used + n].copy_from_slice(&line.as_bytes()[..n]);
+        *used += n;
+    } else {
+        crate::klog::write(level, format_args!("[{badge:x}] {text}"));
+    }
     Ok([len as u64, 0, 0])
 }
 

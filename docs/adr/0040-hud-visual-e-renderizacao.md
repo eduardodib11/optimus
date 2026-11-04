@@ -1,6 +1,6 @@
 # ADR 0040: HUD do Optimus: identidade visual, widgets e renderização
 
-- Status: aceita (aprovada por Eduardo em 2026-10-22)
+- Status: substituída pela ADR 0041 (decisão de Eduardo em 2026-11-04)
 - Data: 2026-10-22
 - Origem: protótipo visual aprovado por Eduardo em 2026-10-22 (versão 7,
   HTML/CSS/SVG, fora do repositório); SDD v1.0

@@ -8,8 +8,11 @@ use core::alloc::Layout;
 
 use okernel::mm::slab::HeapError;
 
-use super::{drain_object_cache, live_blocks, set_limit, try_alloc, usage};
-use crate::kmem::frame_stats;
+use super::{
+    KEPT_FRAMES, WINDOW_END, WINDOW_START, choose_window_base, drain_object_cache, live_blocks,
+    set_limit, try_alloc, usage, window_base, window_tables,
+};
+use crate::kmem::{self, frame_stats};
 use crate::ktest::{Outcome, Test};
 
 /// Testes de kernel do heap.
@@ -29,6 +32,14 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "heap.slabs_voltam_ao_buddy",
         run: slabs_voltam,
+    },
+    Test {
+        name: "heap.na_faixa_de_objetos",
+        run: na_faixa,
+    },
+    Test {
+        name: "heap.bloco_solto_sai_da_janela",
+        run: bloco_solto,
     },
 ];
 
@@ -77,6 +88,7 @@ fn limite() -> Outcome {
 
 fn slabs_voltam() -> Outcome {
     let (free_before, _) = frame_stats();
+    let tables_before = window_tables();
     let objects: Vec<Box<[u8; 128]>> = (0..2000).map(|_| Box::new([7; 128])).collect();
     let (free_during, _) = frame_stats();
     ensure!(objects.iter().all(|o| o[127] == 7));
@@ -86,7 +98,45 @@ fn slabs_voltam() -> Outcome {
     // Os objetos parados no cache desta CPU seguram os slabs deles.
     drain_object_cache();
     let (free_after, _) = frame_stats();
-    // Só o slab vazio guardado pode continuar fora do buddy.
-    ensure!(free_after + 1 >= free_before);
+    // Só o slab vazio guardado, os blocos que a janela deixa mapeados e as
+    // tabelas novas dela podem continuar fora do buddy.
+    let tables = usize::try_from(window_tables() - tables_before).map_err(|_| "tabelas")?;
+    let kept = usize::try_from(KEPT_FRAMES).map_err(|_| "guardados")?;
+    ensure!(free_after + 1 + kept + tables >= free_before);
+    Ok(())
+}
+
+/// O heap mora na faixa de objetos da seção 6.4, fora do mapa direto, em
+/// páginas RW, NX e globais que apontam para o mesmo frame que o mapa
+/// direto mostra.
+fn na_faixa() -> Outcome {
+    let base = window_base();
+    ensure!((WINDOW_START..WINDOW_END).contains(&base) && base.is_multiple_of(1 << 30));
+    ensure!(base + kmem::managed_end() <= WINDOW_END);
+    let boxed = Box::new(0x1234_5678_9abc_def0_u64);
+    let addr = core::ptr::from_ref(&*boxed).addr() as u64;
+    ensure!((base..base + kmem::managed_end()).contains(&addr));
+    let m = kmem::translate(addr).ok_or("objeto sem mapeamento")?;
+    ensure!(m.flags.write && !m.flags.exec && m.flags.global && m.phys.0 == addr - base);
+    // SAFETY: o mesmo frame, lido pelo mapa direto (RW, alinhado a 8).
+    let alias = unsafe { (kmem::direct(m.phys) as *const u64).read_volatile() };
+    ensure!(alias == *boxed);
+    // A faixa inteira cabe para qualquer sorteio, e RAM demais é recusada.
+    ensure!(choose_window_base(0, 1 << 30) == Some(WINDOW_START));
+    ensure!(choose_window_base(u64::MAX, 1 << 30).is_some_and(|b| b + (1 << 30) <= WINDOW_END));
+    ensure!(choose_window_base(1, WINDOW_END - WINDOW_START + 1).is_none());
+    Ok(())
+}
+
+/// Um bloco grande (64 KiB, ordem 4) solto é desmapeado da janela.
+fn bloco_solto() -> Outcome {
+    let layout = Layout::from_size_align(64 << 10, 8).map_err(|_| "layout")?;
+    let ptr = try_alloc(layout).map_err(|_| "try_alloc falhou")?;
+    let addr = ptr.addr().get() as u64;
+    let mapped = (0..16).all(|i| kmem::translate(addr + i * 4096).is_some());
+    // SAFETY: o bloco veio do alocador global com este layout.
+    unsafe { dealloc(ptr.as_ptr(), layout) };
+    ensure!(mapped);
+    ensure!((0..16).all(|i| kmem::translate(addr + i * 4096).is_none()));
     Ok(())
 }
