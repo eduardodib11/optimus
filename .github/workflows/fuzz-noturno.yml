@@ -1,0 +1,53 @@
+name: Fuzzing de 4 h
+
+# Aceite do T-214 (SDD v1.0, seção 18): o okfuzz roda 4 h sem pânico nem
+# travamento num runner hospedado. Roda só à mão (workflow_dispatch), porque
+# uma rodada dura 4 h. A semente sai do relógio, a menos que seja dada.
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Duração da rodada de fuzz, em segundos
+        required: false
+        default: "14400"
+      seed:
+        description: Semente (hex, ex. 0x1234); vazio sorteia
+        required: false
+        default: ""
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v5
+      - name: QEMU e OVMF
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+      - name: Toolchain fixada em rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: okfuzz por 4 h (ou o tempo pedido)
+        env:
+          SECONDS_IN: ${{ inputs.seconds }}
+          SEED_IN: ${{ inputs.seed }}
+        run: |
+          set -o pipefail
+          secs="${SECONDS_IN:-14400}"
+          if [ -n "$SEED_IN" ]; then seed_args="--seed $SEED_IN"; else seed_args=""; fi
+          mkdir -p target/fuzz
+          cargo xtask fuzz --seconds "$secs" $seed_args 2>&1 | tee target/fuzz/fuzz.log
+      - name: Resumo da rodada
+        if: always()
+        run: |
+          {
+            echo "## Fuzz do okfuzz"
+            echo
+            echo "Commit: \`$GITHUB_SHA\`"
+            echo
+            grep -E "^xtask: fuzz|okfuzz|pânico|falhou" target/fuzz/fuzz.log | tail -n 20 | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-4h
+          path: target/fuzz/fuzz.log
