@@ -1,0 +1,3 @@
+package optimus.fs @1.0;
+
+struct vec { x: u8 }

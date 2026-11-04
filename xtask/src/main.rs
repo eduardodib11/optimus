@@ -43,7 +43,7 @@ const CRATES: &[(&str, &str, &str)] = &[
 /// Bibliotecas portáveis cujos testes rodam no host.
 const HOST_TESTED: &[&str] = &["oalloc", "obfs", "ocoll", "oelf", "optcrypt", "oidl-rt"];
 
-const PROFILES: &[&str] = &["lite", "basic", "jarvis", "premium", "server"];
+const PROFILES: &[&str] = &["lite", "basic", "default", "premium", "server"];
 
 /// Textos que o smoke test exige na serial.
 const BOOT_MARKERS: &[&str] = &[
@@ -1318,7 +1318,7 @@ fn check_fuzz(serial: &str, exit: std::result::Result<Option<i32>, ()>, seed: u6
 /// Formatação, clippy em cada alvo e a regra de `unsafe` da seção 17.1.
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
-    for tool in ["xtask", "mkobfs"] {
+    for tool in ["xtask", "mkobfs", "oidlc"] {
         status(cargo().args([
             "clippy",
             "--package",
@@ -1404,7 +1404,11 @@ fn check_unsafe() -> Result {
     let roots: Vec<&str> = CRATES
         .iter()
         .map(|(_, file, _)| *file)
-        .chain(["xtask/src/main.rs", "tools/mkobfs/src/main.rs"])
+        .chain([
+            "xtask/src/main.rs",
+            "tools/mkobfs/src/main.rs",
+            "tools/oidlc/src/main.rs",
+        ])
         .collect();
     unsafe_budget::check(&roots)
 }
@@ -1431,14 +1435,14 @@ mod tests {
             "1G",
             "--gdb",
             "--profile",
-            "jarvis",
+            "default",
             "--cmdline",
             "log=debug",
         ]))
         .unwrap();
         assert_eq!(
             (opts.smp, opts.mem.as_str(), opts.gdb, opts.profile.as_str()),
-            (4, "1G", true, "jarvis")
+            (4, "1G", true, "default")
         );
         assert_eq!(opts.cmdline, "log=debug");
         let opts = parse(&args(&["hello", "--rounds", "7"])).unwrap();

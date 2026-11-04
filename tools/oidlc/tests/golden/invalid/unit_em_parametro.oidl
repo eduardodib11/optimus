@@ -1,0 +1,5 @@
+package optimus.fs @1.0;
+
+interface File {
+    apagar(x: ()) ;
+}

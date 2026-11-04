@@ -72,7 +72,7 @@ Resumo dos RF do SDD (seção 2.2). Cada um é rastreável à seção do SDD ind
 | RNF-02 | Segurança | Conteúdo externo nunca dispara ação R3 sem confirmação física |
 | RNF-03 | Desempenho | IPC ≤ 1 µs; troca de contexto ≤ 2 µs |
 | RNF-04 | Leveza | Kernel ≤ 1 MiB; RAM em repouso ≤ 64 MiB no Lite |
-| RNF-05 | Responsividade | Voz ponta a ponta ≤ 800 ms no JARVIS |
+| RNF-05 | Responsividade | Voz ponta a ponta ≤ 800 ms no perfil Default |
 | RNF-06 | Confiabilidade | Serviço reiniciado em ≤ 100 ms; rollback em ≤ 1 boot |
 | RNF-07 | Privacidade | Nenhum dado sai sem política explícita |
 | RNF-08 | Portabilidade | Código dependente de arquitetura isolado em `arch/`; ≥ 95% do kernel portável |
@@ -85,7 +85,7 @@ Resumo dos RF do SDD (seção 2.2). Cada um é rastreável à seção do SDD ind
 |---|---|---|---|---|
 | Lite | 1 núcleo | 512 MiB | não | texto e comandos de voz simples |
 | Básico | 4 núcleos | 8–16 GiB | não | conversa útil, latência de segundos |
-| JARVIS | 8+ núcleos | 32 GiB | GPU 16 GiB ou NPU 40+ TOPS | voz fluida, raciocínio, visão |
+| Default | 8+ núcleos | 32 GiB | GPU 16 GiB ou NPU 40+ TOPS | voz fluida, raciocínio, visão |
 | Premium | 16+ núcleos | 64–128 GiB | GPU 24–48 GiB | modelos 70B, vários agentes |
 | Server | 16–256 núcleos, NUMA | 64 GiB–4 TiB | opcional | headless, VMs, realms |
 

@@ -204,6 +204,11 @@ pub fn cached_frames() -> usize {
     percpu::bsp().frames_cached() + aps.map(percpu::PerCpu::frames_cached).sum::<usize>()
 }
 
+/// Fim (exclusivo) da faixa física gerida pelo buddy.
+pub fn managed_end() -> u64 {
+    MANAGED[1].load(Ordering::Relaxed)
+}
+
 /// PML4 do kernel.
 pub fn kernel_root() -> Option<PhysAddr> {
     Some(KERNEL_PT.lock().as_ref()?.root())
@@ -237,6 +242,35 @@ const fn kernel_flags(virt: u64, flags: Flags) -> Flags {
 /// Mapeia uma página no espaço do kernel.
 pub fn map(virt: u64, phys: PhysAddr, size: PageSize, flags: Flags) -> Result<(), MapError> {
     with_tables(|pt| pt.map(virt, phys, size, kernel_flags(virt, flags)))
+}
+
+/// Mapeia `pages` páginas de 4 KiB seguidas, de `phys` em `virt`, com a
+/// trava tomada uma vez; devolve quantas tabelas novas elas custaram. Na
+/// falha, o que já foi mapeado fica: quem chama desfaz com [`unmap_range`].
+pub fn map_range(virt: u64, phys: PhysAddr, pages: u64, flags: Flags) -> Result<u64, MapError> {
+    with_tables(|pt| {
+        let tables = pt.tables_needed(virt, virt + pages * FRAME_SIZE);
+        for i in 0..pages {
+            let v = virt + i * FRAME_SIZE;
+            let p = PhysAddr(phys.0 + i * FRAME_SIZE);
+            pt.map(v, p, PageSize::Size4K, kernel_flags(v, flags))?;
+        }
+        Ok(tables)
+    })
+}
+
+/// Desmapeia `pages` páginas de 4 KiB do kernel a partir de `start` (as
+/// que não estiverem mapeadas são puladas) com um só shootdown, que acima
+/// de [`okernel::tlb::MAX_PAGES`] esvazia a TLB toda. Os frames só podem
+/// ser liberados depois da volta.
+pub fn unmap_range(start: u64, pages: u64) {
+    if let Some(pt) = KERNEL_PT.lock().as_mut() {
+        for i in 0..pages {
+            // Página não mapeada: nada a desfazer nela.
+            let _ = pt.unmap(start + i * FRAME_SIZE, PageSize::Size4K);
+        }
+    }
+    tlb::flush(KERNEL_ROOT, Flush::range(start, pages));
 }
 
 /// Desmapeia uma página do kernel e invalida a TLB em toda CPU
