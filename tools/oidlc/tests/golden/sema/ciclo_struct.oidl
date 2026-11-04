@@ -1,0 +1,4 @@
+package optimus.fs @1.0;
+
+struct A { b: B }
+struct B { a: A }

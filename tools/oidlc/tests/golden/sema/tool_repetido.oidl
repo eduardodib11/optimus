@@ -1,0 +1,7 @@
+package optimus.fs @1.0;
+
+interface I {
+    @tool(risk = R0, desc = "a")
+    @tool(risk = R1, desc = "b")
+    m();
+}

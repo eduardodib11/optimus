@@ -1,0 +1,4 @@
+package optimus.fs @1.0;
+
+struct X { x: u8 }
+interface I { m(x: handle<X>) -> result<(), u8>; }

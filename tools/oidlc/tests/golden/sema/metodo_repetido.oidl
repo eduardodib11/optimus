@@ -1,0 +1,3 @@
+package optimus.fs @1.0;
+
+interface I { m() -> result<(), u8>; m() -> result<(), u8>; }

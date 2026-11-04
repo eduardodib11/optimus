@@ -7,9 +7,8 @@ struct Par { a: i64, b: bool, c: optimus.core.Timestamp }
 interface Socket {
     oneway aviso(codigo: u8);
     @tool(risk = R4, desc = "Abre \"conexão\"\n")
-    @tool(risk = R1, desc = "")
-    conectar(alvo: handle<optimus.net.Endpoint>, p: Porta) -> result<vec<Par, 4>, Estado>;
+    conectar(alvo: handle<Endpoint>, p: Porta) -> result<vec<Par, 4>, Estado>;
     fechar() -> result<(), Estado>;
-    vazio();
+    oneway vazio();
 }
 interface Vazia {}

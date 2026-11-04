@@ -1,0 +1,4 @@
+package optimus.fs @1.0;
+
+enum E : u8 { A, B, C = 9, D }
+interface I { m() -> result<E, u8>; }

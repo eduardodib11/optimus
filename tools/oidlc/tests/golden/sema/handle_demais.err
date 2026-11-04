@@ -1,0 +1,2 @@
+3:15: erro: método 'm' sem resultado: declare '-> result<T, E>' ou marque 'oneway'
+3:15: erro: método 'm' passa do limite de 4 capabilities (5 handle)
