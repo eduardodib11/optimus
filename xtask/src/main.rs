@@ -637,9 +637,15 @@ const USER_TIMEOUT: Duration = Duration::from_mins(15);
 /// serviço `utest` do bootfs no lugar do `root`, e ele escreve o relatório
 /// na serial. O kernel sai com 33 quando o `utest` termina; quem diz se os
 /// testes passaram é o relatório (`utest: fim: N ok, 0 falharam`).
+///
+/// `kheap=64` dá ao `utest` uma cota raiz de 56 MiB. Com os 32 MiB padrão a
+/// cota é de 28 MiB, e só a cópia do bootfs de depuração leva uns 6 MiB:
+/// `thread.alocacao_repetida` (4 threads, pico de 10 segmentos de 2 MiB)
+/// rodava com ~230 KiB de folga, e qualquer crescimento do bootfs ou das
+/// tabelas de página (que o `vm_unmap` não devolve) virava pânico de memória.
 const USER_SCENARIO: Scenario = Scenario {
     name: "testes de usuário",
-    cmdline: "test=user",
+    cmdline: "test=user kheap=64",
     markers: &[UTEST_START, UTEST_END],
     forbidden: &["utest: FALHOU", "ostd: pânico", "okernel: FALTA", "PÂNICO"],
     exit: Some(KERNEL_EXIT_OK),
