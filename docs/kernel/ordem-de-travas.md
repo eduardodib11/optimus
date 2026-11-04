@@ -66,6 +66,17 @@ Notas:
   `kmem::unmap_pages` largam `KernelPageTables` antes do shootdown e só
   depois liberam os frames.
 
+- O heap mora na faixa de objetos da seção 6.4 do SDD (`kheap`, janela
+  sorteada) e mapeia e desmapeia os blocos dela, o que toma
+  `KernelPageTables` (8), anterior a `Heap` (9). Por isso nada se mapeia
+  com `Heap` na mão: sem bloco mapeado, o pedido é recusado e anotado, e o
+  alocador solta `Heap`, mapeia (`KernelPageTables`, depois `Frames`) e
+  tenta de novo; os blocos soltos com `Heap` na mão vão para uma lista e
+  são desmapeados (com shootdown) e devolvidos ao buddy depois de soltar
+  `Heap`. Consequência: alocar ou liberar com `KernelPageTables` na mão é
+  proibido (a trava seria tomada de novo); com `KernelStacks` continua
+  permitido.
+
 - Eventos de ciclo de vida (T-348, ADR 0035, item 3.4 e lacuna 6): o
   estado do processo mora no `CapSpace` (nível 2) e o evento de morte da
   thread, com o pedido de encerramento, em `Thread.binding` (nível 3). Na

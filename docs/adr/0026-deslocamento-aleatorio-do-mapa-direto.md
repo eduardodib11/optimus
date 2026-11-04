@@ -47,3 +47,13 @@ Mudanças em relação ao texto anterior:
 
 - Corrigida a entropia do mapa direto de 14 para cerca de 16 bits.
 - Acrescentada a remissão à ADR 0037, que segue o mesmo critério na v1.
+
+## Nota de 2026-11-04
+
+O heap do kernel deixou o mapa direto e foi para a faixa de objetos e
+slabs da seção 6.4 (`0xFFFF_C000_0000_0000` a `0xFFFF_E000_0000_0000`),
+como o SDD manda: cada bloco do buddy é mapeado em `janela + físico` e
+desmapeado quando volta. O kernel sorteia a janela no boot, em passos de
+1 GiB (cerca de 15 bits), com o DRBG; a `BootInfo` não muda. Assim um
+ponteiro do heap não revela `direct_map_base`. Detalhes em
+`kernel/okernel/src/kheap.rs` e em `docs/kernel/ordem-de-travas.md`.
