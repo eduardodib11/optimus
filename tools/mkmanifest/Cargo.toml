@@ -1,0 +1,13 @@
+[package]
+name = "mkmanifest"
+description = "Ferramenta de host que compila manifestos TOML (§14.4) para o formato OMAN v1 e verifica o grafo de serviços (ADR 0034)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+optcrypt = { path = "../../lib/optcrypt" }
+toml = "0.8"
+
+[lints]
+workspace = true

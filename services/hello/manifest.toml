@@ -1,0 +1,14 @@
+# Manifesto do `hello` (ADR 0034, item 4). O `root` ainda não o usa:
+# o `svcmgr` (T-352) é quem o lê. Aqui só prova que o compilador entra no bootfs.
+[service]
+name = "hello"
+binary = "hello"
+priority = 130
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:4MiB"]
+provides = []
+
+[limits]
+max_threads = 2
