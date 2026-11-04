@@ -1,0 +1,9 @@
+[package]
+name = "oidlc"
+description = "Compilador do OIDL: léxico, parser e AST (T-341); ferramenta de host (ADR 0012, ADR 0033)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

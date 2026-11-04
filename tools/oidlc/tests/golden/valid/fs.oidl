@@ -1,0 +1,22 @@
+// Exemplo do SDD 14.3, ajustado pela ADR 0033 (seção 5).
+package optimus.fs @1.0;
+
+struct DirEntry { name: string<255>, kind: EntryKind, size: u64, modified: Timestamp }
+struct DirPage  { entries: vec<DirEntry, 8>, next: u64 }
+enum EntryKind : u8 { File, Dir, Link }
+enum FsError : u8 { NotFound, NotDirectory, Io }
+flags OpenFlags : u8 { Read = 1, Write = 2, Create = 4 }
+
+interface File {
+    size() -> result<u64, FsError>;
+}
+
+interface Directory {
+    @tool(risk = R0, desc = "Lista o conteúdo de uma pasta")
+    list(path: string<1024>, cursor: u64) -> result<DirPage, FsError>;
+
+    @tool(risk = R2, desc = "Move um item para a lixeira")
+    trash(path: string<1024>) -> result<(), FsError>;
+
+    open(path: string<1024>, flags: OpenFlags) -> result<handle<File>, FsError>;
+}

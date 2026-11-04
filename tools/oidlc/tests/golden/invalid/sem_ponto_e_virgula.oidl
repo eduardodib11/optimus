@@ -1,0 +1,3 @@
+package optimus.fs @1.0;
+
+struct DirEntry { name: string<255> size: u64 }
