@@ -1,0 +1,13 @@
+[package]
+name = "olz4"
+description = "LZ4 de bloco próprio do Optimus (T-362): no_std, sem alocação e sem unsafe, base da compressão do memd."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true
