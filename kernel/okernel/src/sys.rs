@@ -103,6 +103,23 @@ pub trait Env {
     fn timer_armed(&mut self, _deadline: u64) {}
 }
 
+/// Confere a capability de `debug_write` (ADR 0036, item 5): o handle `raw`
+/// tem de ser do tipo `DebugLog` e ter `WRITE`. Devolve o badge, que
+/// identifica quem escreveu.
+///
+/// # Errors
+///
+/// `InvalidHandle` se o handle não existe; `AccessDenied` se não for um
+/// `DebugLog` com `WRITE`.
+pub fn debug_cap(space: &SharedCapSpace, raw: u64) -> Result<u64, Error> {
+    let cap = space.lock().get(handle(raw)?)?.clone();
+    if cap.rights.contains(Rights::WRITE) && matches!(cap.object, Object::DebugLog(_)) {
+        Ok(cap.badge)
+    } else {
+        Err(Error::AccessDenied)
+    }
+}
+
 fn handle(raw: u64) -> Result<Handle, Error> {
     Handle::try_from(raw).map_err(|_| Error::InvalidHandle)
 }
