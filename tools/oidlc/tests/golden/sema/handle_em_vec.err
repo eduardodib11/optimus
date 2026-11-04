@@ -1,0 +1,2 @@
+4:33: erro: handle não pode aparecer dentro de vec (ADR 0033, seção 1)
+4:26: erro: handle só pode ser parâmetro ou o sucesso de um result

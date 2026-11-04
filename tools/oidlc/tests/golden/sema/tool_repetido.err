@@ -1,0 +1,2 @@
+6:5: erro: método 'm' com @tool repetido
+6:5: erro: método 'm' sem resultado: declare '-> result<T, E>' ou marque 'oneway'

@@ -1,0 +1,4 @@
+package optimus.fs @1.0;
+
+interface File {}
+struct S { v: vec<handle<File>, 2> }

@@ -1,0 +1,3 @@
+package optimus.fs @1.0;
+
+enum E : u8 { A = 300 }

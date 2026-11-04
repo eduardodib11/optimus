@@ -1,0 +1,1 @@
+3:23: erro: vec<T, 0> não guarda nada; o limite deve ser maior que zero
