@@ -368,6 +368,44 @@ const BOOTFS: &[(&str, &str)] = &[
     ("okfuzz", "okfuzz"),
 ];
 
+/// Compila os `services/*/manifest.toml` com `tools/mkmanifest` (ADR 0034) e
+/// devolve os pares `manifest/<nome>.oman=<arquivo>` para o bootfs. Um grafo
+/// com ciclo ou dependência sem provedor faz o build falhar aqui.
+fn manifests(bin: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let out = root().join("target/manifests");
+    let mut inputs: Vec<PathBuf> = fs::read_dir(root().join("services"))
+        .map_err(|e| format!("lendo services/: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path().join("manifest.toml")))
+        .filter(|p| p.is_file())
+        .collect();
+    inputs.sort();
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    status(
+        cargo()
+            .args(["run", "--quiet", "--package", "mkmanifest", "--", "--elf"])
+            .arg(bin)
+            .arg("--out")
+            .arg(&out)
+            .args(&inputs),
+    )?;
+    let mut files: Vec<(String, PathBuf)> = fs::read_dir(out.join("manifest"))
+        .map_err(|e| format!("lendo manifest/: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "oman"))
+        .map(|p| {
+            let name = format!(
+                "manifest/{}",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            );
+            (name, p)
+        })
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
 /// Monta o bootfs com `tools/mkobfs` a partir dos binários de usuário e,
 /// com `rounds`, a entrada `hello.rounds` que o `root` lê.
 fn bootfs(opts: &Options, output: &Path, rounds: Option<u64>) -> Result {
@@ -377,6 +415,9 @@ fn bootfs(opts: &Options, output: &Path, rounds: Option<u64>) -> Result {
         .arg(output);
     for (name, file) in BOOTFS {
         cmd.arg(format!("{name}={}", bin.join(file).display()));
+    }
+    for (name, file) in manifests(&bin)? {
+        cmd.arg(format!("{name}={}", file.display()));
     }
     if let Some(n) = rounds {
         let file = root().join("target/hello.rounds");
@@ -1318,7 +1359,7 @@ fn check_fuzz(serial: &str, exit: std::result::Result<Option<i32>, ()>, seed: u6
 /// Formatação, clippy em cada alvo e a regra de `unsafe` da seção 17.1.
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
-    for tool in ["xtask", "mkobfs"] {
+    for tool in ["xtask", "mkobfs", "mkmanifest"] {
         status(cargo().args([
             "clippy",
             "--package",
