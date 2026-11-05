@@ -22,6 +22,10 @@ impl Caps for Kernel {
         ostd::cap::mint(src, rights, badge, dest)
     }
 
+    fn revoke(&mut self, h: Handle) -> Result<(), Error> {
+        ostd::cap::revoke(h)
+    }
+
     fn delete(&mut self, h: Handle) -> Result<(), Error> {
         ostd::cap::delete(h)
     }
