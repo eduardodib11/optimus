@@ -14,7 +14,7 @@
 #![forbid(unsafe_code)]
 
 use ostd::cap::create;
-use ostd::ipc::{self, Buffer, Message, Received};
+use ostd::ipc::{self, Buffer, Message};
 use ostd::kabi::ipc::FLAG_NONBLOCK;
 use ostd::kabi::vm::PAGE_SIZE;
 use ostd::kabi::{Error, Handle, ObjectType, Rights, handle_pair, split_handle_pair};
@@ -24,6 +24,9 @@ use ostd::vm::Mapping;
 
 #[path = "../../hello/src/proto.rs"]
 mod proto;
+
+#[path = "hello_servidor.rs"]
+mod hello_servidor;
 
 ostd::entry!(main);
 
@@ -42,6 +45,19 @@ const HELLO_LOG_BADGE: u64 = 0x6865_6c6c;
 /// Prioridade do `hello`: a mesma do `root`, para a troca direta do
 /// caminho rápido valer nos dois sentidos.
 const HELLO_PRIORITY: u8 = 150;
+/// Cota de partida do `svcmgr` (ADR 0034, item 2): fixa, 8 MiB no M3.
+const SVCMGR_QUOTA: u64 = 8 << 20;
+/// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
+const SVCMGR_PRIORITY: u8 = 200;
+/// Badge com que o `root` identifica o `svcmgr` no próprio endpoint.
+const ROOT_BADGE: u64 = 1;
+/// Rótulo do "olá" do `svcmgr` ao `root`.
+const LABEL_OLA: u64 = 1;
+/// Respostas do `root` ao `svcmgr`.
+const LABEL_OK: u64 = 0;
+const LABEL_ACCESS_DENIED: u64 = 1;
+/// Quanto o `root` espera o primeiro contato do `svcmgr`, em ns.
+const SVCMGR_WAIT_NS: u64 = 2_000_000_000;
 
 /// Capabilities iniciais.
 #[derive(Clone, Copy)]
@@ -127,77 +143,115 @@ fn spawn_hello(b: Boot) -> Result<(Handle, u64), Error> {
     Ok((ep, rounds))
 }
 
-/// A saudação do `hello`, lida do buffer de IPC.
-fn greeting(m: &Received, buffer: &mut Buffer) {
-    let len = usize::try_from(m.msg.words[0]).unwrap_or(0);
-    let words = &buffer.get().words[..usize::from(m.msg.info.buffer_words)];
-    let mut bytes = [0u8; 256];
-    for (dst, w) in bytes.chunks_mut(8).zip(words) {
-        dst.copy_from_slice(&w.to_le_bytes());
+/// Estado do atendimento ao `hello`: a implementação do protocolo OIDL
+/// (`idl/optimus/hello.oidl`) e as contagens que o `root` confere no fim.
+struct Atende {
+    next: u64,
+    bad: u64,
+    t0: u64,
+    feitas: u64,
+    erros: u64,
+    encerrou: bool,
+}
+
+#[allow(clippy::many_single_char_names, reason = "nomes do IDL: a..f")]
+impl hello_servidor::Hello for Atende {
+    fn saudacao(&mut self, _ctx: &hello_servidor::Contexto, texto: &str) -> Result<u64, u8> {
+        ostd::debug::print("root: o hello disse:");
+        ostd::debug::print(texto);
+        Ok(texto.len() as u64)
     }
-    let text = core::str::from_utf8(&bytes[..len.min(words.len() * 8)]).unwrap_or("?");
-    ostd::debug::print("root: o hello disse:");
-    ostd::debug::print(text);
+
+    fn ping(
+        &mut self,
+        _ctx: &hello_servidor::Contexto,
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+        e: u64,
+        f: u64,
+    ) -> Result<hello_servidor::Seis, u8> {
+        if self.next == 0 {
+            self.t0 = ostd::time::now_ns();
+        }
+        let ok = [a, b, c, d, e, f]
+            .iter()
+            .enumerate()
+            .all(|(k, &w)| w == proto::word(self.next, k as u64));
+        self.bad += u64::from(!ok);
+        self.next += 1;
+        Ok(hello_servidor::Seis {
+            w0: a.wrapping_add(1),
+            w1: b.wrapping_add(1),
+            w2: c.wrapping_add(1),
+            w3: d.wrapping_add(1),
+            w4: e.wrapping_add(1),
+            w5: f.wrapping_add(1),
+        })
+    }
+
+    fn bye(&mut self, _ctx: &hello_servidor::Contexto, voltas: u64, erros: u64) -> Result<(), u8> {
+        self.feitas = voltas;
+        self.erros = erros;
+        self.encerrou = true;
+        Ok(())
+    }
 }
 
 /// Atende o `hello` até a despedida; `Ok` se as voltas conferiram.
 fn serve(b: Boot, ep: Handle, rounds: u64, buffer: &mut Buffer) -> Result<(), Error> {
     let reply = create(b.quota, ObjectType::Reply, 0)?;
-    let (mut next, mut bad, mut t0) = (0u64, 0u64, 0);
-    let mut m = ipc::recv(ep, reply, 0)?;
+    let mut st = Atende {
+        next: 0,
+        bad: 0,
+        t0: 0,
+        feitas: 0,
+        erros: 0,
+        encerrou: false,
+    };
+    let mut corpo = [0u8; 256];
+    let mut saida = [0u8; 64];
+    let mut rec = ipc::recv_corpo(ep, reply, buffer, &mut corpo, 0)?;
     loop {
-        if m.badge == proto::EXCEPTION_BADGE {
+        if rec.badge == proto::EXCEPTION_BADGE {
             ostd::debug::print_fmt(format_args!(
                 "root: exceção no hello: rótulo {:#x}",
-                m.msg.label
+                rec.rotulo
             ));
             return Err(Error::Cancelled);
         }
-        let answer = match m.msg.label {
-            proto::HELLO => {
-                greeting(&m, buffer);
-                Message::new(proto::HELLO, &[])
-            }
-            proto::PING => {
-                if next == 0 {
-                    t0 = ostd::time::now_ns();
-                }
-                let mut words = m.msg.words;
-                let ok = m.msg.info.words == 6
-                    && (0..).zip(words).all(|(k, w)| w == proto::word(next, k));
-                bad += u64::from(!ok);
-                next += 1;
-                for w in &mut words {
-                    *w = w.wrapping_add(1);
-                }
-                Message::new(proto::PONG, &words)
-            }
-            proto::BYE => {
-                ipc::send(reply, &Message::new(proto::BYE, &[]), 0)?;
-                let ns = ostd::time::now_ns() - t0;
-                let [done, errors, ..] = m.msg.words;
-                ostd::debug::print_fmt(format_args!(
-                    "root: {} ns por ida e volta com o hello",
-                    ns / rounds.max(1)
-                ));
-                return if done == rounds && next == rounds && bad == 0 && errors == 0 {
-                    ostd::debug::print_fmt(format_args!(
-                        "root: hello: {rounds} idas e voltas sem erro"
-                    ));
-                    Ok(())
-                } else {
-                    ostd::debug::print_fmt(format_args!(
-                        "root: hello: {next}/{rounds} voltas, {bad}+{errors} erros"
-                    ));
-                    Err(Error::InvalidArgument)
-                };
-            }
-            _ => {
-                bad += 1;
-                Message::new(0, &[])
-            }
+        let entrada = hello_servidor::Entrada {
+            rotulo: rec.rotulo,
+            badge: rec.badge,
+            corpo: &corpo[..rec.corpo],
+            caps: &[],
         };
-        m = ipc::reply_recv(ep, reply, &answer, 0)?;
+        let despacho = hello_servidor::despacha_hello(&mut st, 0, &entrada, &mut saida, &mut []);
+        let Some(d) = despacho else {
+            return Err(Error::InvalidArgument);
+        };
+        let resposta = &saida[..d.corpo];
+        if st.encerrou {
+            ipc::responde_corpo(reply, buffer, d.rotulo, resposta, 0)?;
+            break;
+        }
+        rec = ipc::responde_recebe_corpo(ep, reply, buffer, d.rotulo, resposta, &mut corpo, 0)?;
+    }
+    let ns = ostd::time::now_ns() - st.t0;
+    ostd::debug::print_fmt(format_args!(
+        "root: {} ns por ida e volta com o hello",
+        ns / rounds.max(1)
+    ));
+    if st.feitas == rounds && st.next == rounds && st.bad == 0 && st.erros == 0 {
+        ostd::debug::print_fmt(format_args!("root: hello: {rounds} idas e voltas sem erro"));
+        Ok(())
+    } else {
+        ostd::debug::print_fmt(format_args!(
+            "root: hello: {}/{rounds} voltas, {}+{} erros",
+            st.next, st.bad, st.erros
+        ));
+        Err(Error::InvalidArgument)
     }
 }
 
@@ -237,6 +291,58 @@ fn table_entry(aspace: Handle, table: Handle, kind: u32) -> Result<Handle, Error
     Err(Error::InvalidArgument)
 }
 
+/// Carrega o `svcmgr` do bootfs com a própria cota de partida, dá a ele o
+/// endpoint do `root` (badge [`ROOT_BADGE`]), o bootfs só de leitura e a
+/// cota, e o inicia. Devolve o endpoint para atender o primeiro contato.
+///
+/// A capability da thread do `svcmgr` não vai para o `CapSpace` dele (ADR
+/// 0034, item 2): a thread já guarda a tabela, e a tabela guardar a thread
+/// fecharia o ciclo da ADR 0029, que deixaria o processo inteiro preso na
+/// cota depois da saída. Para mexer em si mesmo, o `svcmgr` usa
+/// `thread = 0` (ADR 0039, item 3).
+fn spawn_svcmgr(b: Boot) -> Result<Handle, Error> {
+    let fs_map = map_bootfs(b)?;
+    let fs = obfs::Image::parse(fs_map.bytes()).map_err(|_| Error::InvalidArgument)?;
+    let elf = fs.find("svcmgr").ok_or(Error::InvalidArgument)?;
+    let child = process::load(&Spec {
+        elf: elf.data,
+        quota: b.quota,
+        quota_bytes: SVCMGR_QUOTA,
+        own_aspace: b.aspace,
+        scratch_va: SCRATCH_VA,
+        priority: SVCMGR_PRIORITY,
+    })?;
+    let ep = create(b.quota, ObjectType::Endpoint, 0)?;
+    let ep_child = child.give(ep, Rights::SEND, ROOT_BADGE)?;
+    let bootfs = child.give(b.bootfs, Rights::READ | Rights::MAP, 0)?;
+    let quota = child.give(child.quota, Rights::CREATE, 0)?;
+    child.start([u64::from(ep_child.raw()), handle_pair(bootfs, quota), 0])?;
+    Ok(ep)
+}
+
+/// Atende o primeiro contato do `svcmgr` no endpoint do `root`. Só o badge
+/// [`ROOT_BADGE`] é aceito; qualquer outro recebe `AccessDenied` e o
+/// atendimento termina com erro.
+fn atende_svcmgr(b: Boot, ep: Handle) -> Result<(), Error> {
+    let reply = create(b.quota, ObjectType::Reply, 0)?;
+    let deadline = ostd::time::now_ns() + SVCMGR_WAIT_NS;
+    let rec = ipc::recv(ep, reply, deadline)?;
+    if rec.badge != ROOT_BADGE || rec.msg.label != LABEL_OLA {
+        ipc::send(reply, &Message::new(LABEL_ACCESS_DENIED, &[]), 0)?;
+        ostd::debug::print("root: chamada recusada no endpoint do svcmgr");
+        return Err(Error::AccessDenied);
+    }
+    ipc::send(reply, &Message::new(LABEL_OK, &[]), 0)?;
+    ostd::debug::print("root: o svcmgr se anunciou e foi aceito");
+    Ok(())
+}
+
+/// Cria o `svcmgr` e atende o contato dele.
+fn svcmgr(b: Boot) -> Result<(), Error> {
+    let ep = spawn_svcmgr(b)?;
+    atende_svcmgr(b, ep)
+}
+
 fn main(start: Start) -> ! {
     let [quota, aspace, rdx] = start.args;
     let (thread, table) = split_handle_pair(rdx);
@@ -267,6 +373,9 @@ fn main(start: Start) -> ! {
     }
     if let Err(e) = hello(boot) {
         ostd::debug::print_fmt(format_args!("root: conversa com o hello falhou: {e:?}"));
+    }
+    if let Err(e) = svcmgr(boot) {
+        ostd::debug::print_fmt(format_args!("root: svcmgr: {e:?}"));
     }
     ostd::thread::exit()
 }
