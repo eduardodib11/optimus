@@ -1,0 +1,18 @@
+[package]
+name = "oman"
+description = "Leitor do manifesto binário OMAN v1 (ADR 0034, item 4) e ordem de partida do svcmgr."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[dependencies]
+
+[dev-dependencies]
+mkmanifest = { path = "../../tools/mkmanifest" }
+
+[lints]
+workspace = true
