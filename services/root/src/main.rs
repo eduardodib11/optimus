@@ -199,6 +199,22 @@ impl hello_servidor::Hello for Atende {
     }
 }
 
+impl Atende {
+    /// `ping` pelo caminho de registradores (experimento da T-345 parte 3).
+    fn ping_palavras(&mut self, w: [u64; 6]) -> [u64; 6] {
+        if self.next == 0 {
+            self.t0 = ostd::time::now_ns();
+        }
+        let ok = w
+            .iter()
+            .enumerate()
+            .all(|(k, &v)| v == proto::word(self.next, k as u64));
+        self.bad += u64::from(!ok);
+        self.next += 1;
+        w.map(|v| v.wrapping_add(1))
+    }
+}
+
 /// Atende o `hello` até a despedida; `Ok` se as voltas conferiram.
 fn serve(b: Boot, ep: Handle, rounds: u64, buffer: &mut Buffer) -> Result<(), Error> {
     let reply = create(b.quota, ObjectType::Reply, 0)?;
@@ -212,31 +228,40 @@ fn serve(b: Boot, ep: Handle, rounds: u64, buffer: &mut Buffer) -> Result<(), Er
     };
     let mut corpo = [0u8; 256];
     let mut saida = [0u8; 64];
-    let mut rec = ipc::recv_corpo(ep, reply, buffer, &mut corpo, 0)?;
+    let mut rec = ipc::recv(ep, reply, 0)?;
     loop {
         if rec.badge == proto::EXCEPTION_BADGE {
             ostd::debug::print_fmt(format_args!(
                 "root: exceção no hello: rótulo {:#x}",
-                rec.rotulo
+                rec.msg.label
             ));
             return Err(Error::Cancelled);
         }
-        let entrada = hello_servidor::Entrada {
-            rotulo: rec.rotulo,
-            badge: rec.badge,
-            corpo: &corpo[..rec.corpo],
-            caps: &[],
+        let resp = if (rec.msg.label >> 32) as u32 == hello_servidor::ID_HELLO
+            && (rec.msg.label & 0xFFFF) == 1
+        {
+            let w = st.ping_palavras(rec.msg.words);
+            Message::new(0, &w)
+        } else {
+            let n = ipc::copia(buffer, &rec.msg, &mut corpo)?;
+            let entrada = hello_servidor::Entrada {
+                rotulo: rec.msg.label,
+                badge: rec.badge,
+                corpo: &corpo[..n],
+                caps: &[],
+            };
+            let Some(d) =
+                hello_servidor::despacha_hello(&mut st, 0, &entrada, &mut saida, &mut [])
+            else {
+                return Err(Error::InvalidArgument);
+            };
+            ipc::monta(buffer, d.rotulo, &saida[..d.corpo])?
         };
-        let despacho = hello_servidor::despacha_hello(&mut st, 0, &entrada, &mut saida, &mut []);
-        let Some(d) = despacho else {
-            return Err(Error::InvalidArgument);
-        };
-        let resposta = &saida[..d.corpo];
         if st.encerrou {
-            ipc::responde_corpo(reply, buffer, d.rotulo, resposta, 0)?;
+            ipc::send(reply, &resp, 0)?;
             break;
         }
-        rec = ipc::responde_recebe_corpo(ep, reply, buffer, d.rotulo, resposta, &mut corpo, 0)?;
+        rec = ipc::reply_recv(ep, reply, &resp, 0)?;
     }
     let ns = ostd::time::now_ns() - st.t0;
     ostd::debug::print_fmt(format_args!(

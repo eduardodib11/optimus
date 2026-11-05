@@ -108,21 +108,20 @@ impl HelloCliente {
         e: u64,
         f: u64,
     ) -> Result<Result<Seis, u8>, ostd::kabi::Error> {
-        let mut pedido = [0u8; 48];
-        let n = codifica_hello_1(&mut pedido, &a, &b, &c, &d, &e, &f).map_err(erro_oidl)?;
-        let mut saida = [0u8; 48];
-        let (rotulo, m) = ostd::ipc::call_corpo(
-            self.ep,
-            buf,
-            0x0C5F05E300000001,
-            &pedido[..n],
-            &mut saida,
-            0,
-        )?;
+        let _ = buf;
+        let (rotulo, w) =
+            ostd::ipc::call_palavras(self.ep, 0x0C5F05E300000001, [a, b, c, d, e, f], 0)?;
         if rotulo >> 62 == 0 {
-            Ok(Ok(decodifica_ok_hello_1(&saida[..m]).map_err(erro_oidl)?))
+            Ok(Ok(Seis {
+                w0: w[0],
+                w1: w[1],
+                w2: w[2],
+                w3: w[3],
+                w4: w[4],
+                w5: w[5],
+            }))
         } else {
-            Ok(Err(decodifica_err_hello_1(&saida[..m]).map_err(erro_oidl)?))
+            Ok(Err(0))
         }
     }
 

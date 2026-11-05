@@ -141,7 +141,7 @@ pub fn reply_recv(
 
 /// Mensagem com rótulo `rotulo` e `corpo`: até [`MSG_REG_WORDS`] palavras
 /// vão em registradores, o resto pelo buffer de IPC de `buf` (ADR 0033).
-fn monta(buf: &mut Buffer, rotulo: u64, corpo: &[u8]) -> Result<Message, Error> {
+pub fn monta(buf: &mut Buffer, rotulo: u64, corpo: &[u8]) -> Result<Message, Error> {
     let palavras = corpo.len().div_ceil(8);
     if palavras > IPC_BUFFER_WORDS {
         return Err(Error::InvalidArgument);
@@ -164,7 +164,7 @@ fn monta(buf: &mut Buffer, rotulo: u64, corpo: &[u8]) -> Result<Message, Error> 
 
 /// Copia o corpo de `msg` (registradores ou buffer) para `saida`; devolve os
 /// bytes copiados, múltiplo de 8.
-fn copia(buf: &mut Buffer, msg: &Message, saida: &mut [u8]) -> Result<usize, Error> {
+pub fn copia(buf: &mut Buffer, msg: &Message, saida: &mut [u8]) -> Result<usize, Error> {
     let (n, do_buffer) = if msg.info.buffer_words > 0 {
         (
             usize::from(msg.info.buffer_words).min(IPC_BUFFER_WORDS),
@@ -333,4 +333,21 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         let _ = crate::thread::set_ipc_buffer(self.thread, None);
     }
+}
+
+/// Chamada com até seis palavras em registradores, sem passar por bytes
+/// (experimento da T-345 parte 3).
+pub fn call_palavras(
+    ep: Handle,
+    rotulo: u64,
+    palavras: [u64; MSG_REG_WORDS],
+    deadline: u64,
+) -> Result<(u64, [u64; MSG_REG_WORDS]), Error> {
+    let msg = Message {
+        label: rotulo,
+        info: MsgInfo::words(MSG_REG_WORDS as u8),
+        words: palavras,
+    };
+    let rec = call(ep, &msg, deadline)?;
+    Ok((rec.msg.label, rec.msg.words))
 }
