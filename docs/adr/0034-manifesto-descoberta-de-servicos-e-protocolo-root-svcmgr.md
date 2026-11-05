@@ -377,3 +377,24 @@ Mudanças em relação à proposta:
   processo é o `mem:quota` obrigatório e único.
 - O badge do cliente é o do item 8; `name_of` recebe `badge & 0xFFFF_FFFF`.
 - `Root.spawn` cria o `SchedContext` com orçamento igual ao período.
+
+## Notas da implementação (T-353, 2026-11-05)
+
+Pontos que a ADR deixava abertos, decididos no corretor
+(`services/svcmgr/src/broker.rs`):
+
+- **Badge nunca é zero.** `cap_mint` com badge 0 mantém a capability sem
+  badge, e quem tem uma cópia sem badge pode cunhar outra com o badge que
+  quiser. Por isso a `generation` do item 8 começa em 1 e, ao dar a volta,
+  passa de `u16::MAX` para 1. O canal de controle do item 6 usa o mesmo
+  badge do item 8, `(generation << 32) | id`, e não só o `id`: o serviço
+  de id 0 teria badge 0, e o `svcmgr` também passa a reconhecer, pela
+  geração, um `connect` vindo de instância velha. Os 32 bits baixos
+  continuam sendo o id.
+- **`kernel:` sem máscara.** O `mkmanifest` grava `value = 0` para
+  `kernel:debug` e `kernel:mem-pressure`; 0 quer dizer "sem redução" (a
+  cópia leva os direitos que o `root` recebeu do kernel). Uma máscara
+  diferente de zero reduz, e bits desconhecidos recusam a partida.
+- **Dependência opcional sem provedor em `Running`** não entra no
+  descritor; o serviço a pede depois por `connect`. A obrigatória sem
+  provedor em `Running` recusa a entrega.

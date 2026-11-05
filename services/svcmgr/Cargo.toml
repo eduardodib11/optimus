@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+doctest = false
+bench = false
+
 [[bin]]
 name = "svcmgr"
 test = false
@@ -12,6 +16,12 @@ bench = false
 
 [dependencies]
 ostd = { path = "../../lib/ostd" }
+kabi = { path = "../../kernel/kabi" }
+oman = { path = "../../lib/oman" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[dev-dependencies]
+mkmanifest = { path = "../../tools/mkmanifest" }
 
 [lints]
 workspace = true
