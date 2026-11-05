@@ -1,0 +1,17 @@
+[package]
+name = "memd"
+description = "memd: tratador de faltas de página em espaço de usuário (T-361; ADR 0038)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+
+[lints]
+workspace = true
