@@ -215,7 +215,8 @@ fn parse(args: &[String]) -> Result<Options> {
                         .map_err(|_| "--rounds espera um número")?,
                 );
             }
-            "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "all" => {
+            "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
+            | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -1278,6 +1279,26 @@ const FUZZ_SHORT_SEED: u64 = 0x0c_f022;
 /// em pânico, tomar uma falta ou travar. A semente é impressa para
 /// reproduzir com `--seed`.
 fn fuzz(opts: &Options) -> Result {
+    if opts.suite == "oidlc" {
+        // Fuzzer host do oidlc (T-347): sem QEMU, roda direto na ferramenta.
+        let seed = opts.seed.unwrap_or_else(seed_from_clock) & ((1 << 48) - 1);
+        let secs = if opts.minutes > 0 {
+            opts.minutes * 60
+        } else {
+            opts.seconds
+        };
+        println!("xtask: fuzz oidlc, {secs} s, semente 0x{seed:x}");
+        return status(cargo().args([
+            "run",
+            "-q",
+            "-p",
+            "oidlc",
+            "--",
+            "fuzz",
+            &secs.to_string(),
+            &format!("{seed:x}"),
+        ]));
+    }
     build_test(opts)?;
     let seed = opts.seed.unwrap_or_else(seed_from_clock) & ((1 << 48) - 1);
     run_fuzz(opts, opts.seconds, seed)
