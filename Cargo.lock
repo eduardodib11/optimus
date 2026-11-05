@@ -181,6 +181,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ologd"
+version = "0.1.0"
+
+[[package]]
 name = "olz4"
 version = "0.1.0"
 
