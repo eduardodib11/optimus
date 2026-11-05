@@ -139,17 +139,64 @@ pub fn reply_recv(
     ipc(Syscall::IpcReplyRecv, recv_target(ep, reply), msg, deadline)
 }
 
-/// `ipc_call` com corpo: põe `corpo` no buffer de IPC de `buf`, chama `ep`
-/// com o rótulo `rotulo` e copia o corpo da resposta para `saida`.
-///
-/// Corpos são palavras de 64 bits em ordem little-endian, então o tamanho
-/// vai em múltiplos de 8 bytes (ADR 0033, arredondamento do corpo). A
-/// resposta devolve o rótulo e o número de bytes copiados.
+/// Mensagem com rótulo `rotulo` e `corpo`: até [`MSG_REG_WORDS`] palavras
+/// vão em registradores, o resto pelo buffer de IPC de `buf` (ADR 0033).
+fn monta(buf: &mut Buffer, rotulo: u64, corpo: &[u8]) -> Result<Message, Error> {
+    let palavras = corpo.len().div_ceil(8);
+    if palavras > IPC_BUFFER_WORDS {
+        return Err(Error::InvalidArgument);
+    }
+    let mut msg = Message::new(rotulo, &[]);
+    if palavras <= MSG_REG_WORDS {
+        for (dst, bloco) in msg.words.iter_mut().zip(corpo.chunks(8)) {
+            *dst = palavra_le(bloco);
+        }
+        msg.info = MsgInfo::words(u8::try_from(palavras).unwrap_or(0));
+    } else {
+        let ib = buf.get();
+        for (dst, bloco) in ib.words.iter_mut().zip(corpo.chunks(8)) {
+            *dst = palavra_le(bloco);
+        }
+        msg.info.buffer_words = u16::try_from(palavras).map_err(|_| Error::InvalidArgument)?;
+    }
+    Ok(msg)
+}
+
+/// Copia o corpo de `msg` (registradores ou buffer) para `saida`; devolve os
+/// bytes copiados, múltiplo de 8.
+fn copia(buf: &mut Buffer, msg: &Message, saida: &mut [u8]) -> Result<usize, Error> {
+    let (n, do_buffer) = if msg.info.buffer_words > 0 {
+        (
+            usize::from(msg.info.buffer_words).min(IPC_BUFFER_WORDS),
+            true,
+        )
+    } else {
+        (usize::from(msg.info.words).min(MSG_REG_WORDS), false)
+    };
+    if n * 8 > saida.len() {
+        return Err(Error::InvalidArgument);
+    }
+    if do_buffer {
+        let ib = buf.get();
+        for (bloco, palavra) in saida.chunks_mut(8).zip(ib.words.iter().take(n)) {
+            let b = palavra.to_le_bytes();
+            bloco.copy_from_slice(&b[..bloco.len()]);
+        }
+    } else {
+        for (bloco, palavra) in saida.chunks_mut(8).zip(msg.words.iter().take(n)) {
+            let b = palavra.to_le_bytes();
+            bloco.copy_from_slice(&b[..bloco.len()]);
+        }
+    }
+    Ok(n * 8)
+}
+
+/// `ipc_call` com corpo: envia `corpo` com o rótulo `rotulo` e copia o corpo
+/// da resposta para `saida`. Devolve o rótulo da resposta e os bytes copiados.
 ///
 /// # Errors
 ///
-/// `InvalidArgument` se `corpo` não cabe no buffer ou se a resposta não cabe
-/// em `saida`; os do kernel na chamada.
+/// `InvalidArgument` se o corpo ou a resposta não cabem; os do kernel.
 pub fn call_corpo(
     ep: Handle,
     buf: &mut Buffer,
@@ -158,29 +205,91 @@ pub fn call_corpo(
     saida: &mut [u8],
     deadline: u64,
 ) -> Result<(u64, usize), Error> {
-    let palavras = corpo.len().div_ceil(8);
-    if palavras > IPC_BUFFER_WORDS {
-        return Err(Error::InvalidArgument);
-    }
-    let ib = buf.get();
-    for (dst, bloco) in ib.words.iter_mut().zip(corpo.chunks(8)) {
-        let mut b = [0u8; 8];
-        b[..bloco.len()].copy_from_slice(bloco);
-        *dst = u64::from_le_bytes(b);
-    }
-    let mut msg = Message::new(rotulo, &[]);
-    msg.info.buffer_words = u16::try_from(palavras).map_err(|_| Error::InvalidArgument)?;
+    let msg = monta(buf, rotulo, corpo)?;
     let rec = call(ep, &msg, deadline)?;
-    let n = usize::from(rec.msg.info.buffer_words).min(IPC_BUFFER_WORDS);
-    if n * 8 > saida.len() {
-        return Err(Error::InvalidArgument);
-    }
-    let ib = buf.get();
-    for (bloco, palavra) in saida.chunks_mut(8).zip(ib.words.iter().take(n)) {
-        let b = palavra.to_le_bytes();
-        bloco.copy_from_slice(&b[..bloco.len()]);
-    }
-    Ok((rec.msg.label, n * 8))
+    let n = copia(buf, &rec.msg, saida)?;
+    Ok((rec.msg.label, n))
+}
+
+/// Uma mensagem recebida com corpo: badge, rótulo e bytes copiados.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recebido {
+    /// Badge de quem chamou (zero numa resposta).
+    pub badge: Badge,
+    /// Rótulo da mensagem.
+    pub rotulo: u64,
+    /// Bytes do corpo copiados para `saida`.
+    pub corpo: usize,
+}
+
+/// `ipc_recv` com corpo: recebe do `ep` (a chamada fica em `reply`) e copia
+/// o corpo para `saida`.
+///
+/// # Errors
+///
+/// Os do kernel e `InvalidArgument` se o corpo não cabe em `saida`.
+pub fn recv_corpo(
+    ep: Handle,
+    reply: Handle,
+    buf: &mut Buffer,
+    saida: &mut [u8],
+    deadline: u64,
+) -> Result<Recebido, Error> {
+    let rec = recv(ep, reply, deadline)?;
+    let corpo = copia(buf, &rec.msg, saida)?;
+    Ok(Recebido {
+        badge: rec.badge,
+        rotulo: rec.msg.label,
+        corpo,
+    })
+}
+
+/// `ipc_send` com corpo para o `reply` (resposta a quem chamou).
+///
+/// # Errors
+///
+/// Os do kernel; `InvalidArgument` se o corpo não cabe no buffer.
+pub fn responde_corpo(
+    reply: Handle,
+    buf: &mut Buffer,
+    rotulo: u64,
+    resposta: &[u8],
+    deadline: u64,
+) -> Result<(), Error> {
+    let msg = monta(buf, rotulo, resposta)?;
+    send(reply, &msg, deadline)
+}
+
+/// `ipc_reply_recv` com corpo: responde a quem chamou pelo `reply` e recebe
+/// a próxima mensagem de `ep` nele, com o corpo copiado para `saida`.
+///
+/// # Errors
+///
+/// Os do kernel e `InvalidArgument` se algum corpo não cabe.
+pub fn responde_recebe_corpo(
+    ep: Handle,
+    reply: Handle,
+    buf: &mut Buffer,
+    rotulo: u64,
+    resposta: &[u8],
+    saida: &mut [u8],
+    deadline: u64,
+) -> Result<Recebido, Error> {
+    let msg = monta(buf, rotulo, resposta)?;
+    let rec = reply_recv(ep, reply, &msg, deadline)?;
+    let corpo = copia(buf, &rec.msg, saida)?;
+    Ok(Recebido {
+        badge: rec.badge,
+        rotulo: rec.msg.label,
+        corpo,
+    })
+}
+
+/// Palavra de 64 bits, little-endian, de até 8 bytes (o resto é zero).
+fn palavra_le(bloco: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    b[..bloco.len()].copy_from_slice(bloco);
+    u64::from_le_bytes(b)
 }
 
 /// Endereço sugerido para o buffer de IPC da thread inicial de um processo
