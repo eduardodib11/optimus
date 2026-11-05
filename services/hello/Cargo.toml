@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 ostd = { path = "../../lib/ostd" }
+oidl-rt = { path = "../../lib/oidl-rt" }
 
 [lints]
 workspace = true

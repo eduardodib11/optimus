@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "tools/oidlc", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oalloc", "lib/obfs", "lib/ocoll", "lib/olz4", "lib/oelf", "lib/oidl-rt", "lib/optcrypt", "lib/ostd", "services/hello", "services/memd", "services/root", "services/utest", "services/svcmgr", "services/timed", "fuzz/okfuzz", "tools/mkobfs", "tools/mkmanifest", "lib/oman"]
+members = ["xtask", "tools/oidlc", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oalloc", "lib/obfs", "lib/ocoll", "lib/olz4", "lib/oelf", "lib/oidl-rt", "lib/optcrypt", "lib/ostd", "lib/oman", "lib/ologd", "services/hello", "services/memd", "services/root", "services/utest", "services/svcmgr", "services/timed", "fuzz/okfuzz", "tools/mkobfs", "tools/mkmanifest"]
 # Só o xtask roda no host (os testes das bibliotecas também); as demais crates
 # são compiladas por `cargo xtask build`.
 default-members = ["xtask"]
@@ -49,6 +49,11 @@ debug = 0
 
 # O `utest` lê o bootfs para carregar o filho do teste de anéis (T-339).
 [profile.dev.package.obfs]
+debug = 0
+
+# O `svcmgr` entra no bootfs: sem informação de depuração, a cota do `root`
+# paga só o código (T-351).
+[profile.dev.package.svcmgr]
 debug = 0
 
 [profile.release]

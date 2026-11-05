@@ -1,59 +1,48 @@
 //! `hello`: o primeiro serviço que o `root` carrega do bootfs (T-212).
 //!
-//! Registra o próprio buffer de IPC, cumprimenta o `root` com um texto
-//! nas palavras do buffer, faz as idas e voltas de [`proto::PING`] pedidas
-//! (só registradores, o caminho rápido da seção 6.7), conferindo cada
-//! resposta, e se despede com o total e os erros. O protocolo está em
-//! [`proto`].
+//! Registra o próprio buffer de IPC, cumprimenta o `root` com um texto,
+//! faz as idas e voltas pedidas pelo `root`, conferindo cada resposta, e se
+//! despede com o total e os erros. Desde a T-345 as chamadas passam pelo
+//! cliente gerado do `idl/optimus/hello.oidl` ([`hello_cliente`]); o
+//! [`proto`] fica só com a função de palavras e os badges.
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
 
-use ostd::ipc::{self, Buffer, Message};
-use ostd::kabi::ipc::MsgInfo;
-use ostd::kabi::{Error, Handle, IPC_BUFFER_WORDS, split_handle_pair};
+use ostd::ipc::Buffer;
+use ostd::kabi::{Error, Handle, split_handle_pair};
 use ostd::rt::Start;
 
+mod hello_cliente;
 mod proto;
+
+use hello_cliente::HelloCliente;
 
 ostd::entry!(main);
 
 const GREETING: &str = "olá, root! aqui é o hello, pelo buffer de IPC";
 
-/// Saudação pelo buffer de IPC.
-fn greet(ep: Handle, buffer: &mut Buffer) -> Result<(), Error> {
-    let bytes = GREETING.as_bytes();
-    let words = bytes.len().div_ceil(8);
-    let b = buffer.get();
-    for (w, chunk) in b.words.iter_mut().zip(bytes.chunks(8)) {
-        let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        *w = u64::from_le_bytes(word);
-    }
-    let mut msg = Message::new(proto::HELLO, &[bytes.len() as u64]);
-    msg.info.buffer_words = u16::try_from(words.min(IPC_BUFFER_WORDS)).unwrap_or(0);
-    let reply = ipc::call(ep, &msg, 0)?;
-    if reply.msg.label == proto::HELLO {
-        Ok(())
-    } else {
-        Err(Error::InvalidArgument)
+/// Saudação pelo cliente gerado.
+fn greet(cli: &HelloCliente, buf: &mut Buffer) -> Result<(), Error> {
+    match cli.saudacao(buf, GREETING)? {
+        Ok(_) => Ok(()),
+        Err(_) => Err(Error::InvalidArgument),
     }
 }
 
 /// `rounds` idas e voltas; devolve quantas respostas não conferiram.
-fn ping(ep: Handle, rounds: u64) -> Result<u64, Error> {
+fn ping(cli: &HelloCliente, buf: &mut Buffer, rounds: u64) -> Result<u64, Error> {
     let mut errors = 0;
     for i in 0..rounds {
-        let mut words = [0; 6];
-        for (k, w) in (0..).zip(words.iter_mut()) {
-            *w = proto::word(i, k);
-        }
-        let reply = ipc::call(ep, &Message::new(proto::PING, &words), 0)?;
-        let m = reply.msg;
-        let ok = m.label == proto::PONG
-            && m.info == MsgInfo::words(6)
-            && (0..).zip(m.words).all(|(k, w)| w == proto::word(i, k) + 1);
+        let w: [u64; 6] = core::array::from_fn(|k| proto::word(i, k as u64));
+        let ok = match cli.ping(buf, w[0], w[1], w[2], w[3], w[4], w[5])? {
+            Ok(r) => [r.w0, r.w1, r.w2, r.w3, r.w4, r.w5]
+                .iter()
+                .zip(w)
+                .all(|(&got, sent)| got == sent.wrapping_add(1)),
+            Err(_) => false,
+        };
         if !ok {
             errors += 1;
         }
@@ -73,12 +62,16 @@ fn main(start: Start) -> ! {
     }
     ostd::rt::init(ostd::rt::Env { quota });
     ostd::debug::print("hello: iniciado pelo root");
-    let result = Buffer::new(quota, aspace, thread, ipc::DEFAULT_BUFFER_VA).and_then(|mut b| {
-        greet(ep, &mut b)?;
-        let errors = ping(ep, rounds)?;
-        ipc::call(ep, &Message::new(proto::BYE, &[rounds, errors]), 0)?;
-        Ok(errors)
-    });
+    let cli = HelloCliente::new(ep);
+    let result = ostd::ipc::Buffer::new(quota, aspace, thread, ostd::ipc::DEFAULT_BUFFER_VA)
+        .and_then(|mut b| {
+            greet(&cli, &mut b)?;
+            let errors = ping(&cli, &mut b, rounds)?;
+            match cli.bye(&mut b, rounds, errors)? {
+                Ok(()) => Ok(errors),
+                Err(_) => Err(Error::InvalidArgument),
+            }
+        });
     match result {
         Ok(0) => {}
         Ok(errors) => ostd::debug::print_fmt(format_args!("hello: {errors} respostas erradas")),
