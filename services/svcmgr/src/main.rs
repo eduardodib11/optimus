@@ -1,9 +1,14 @@
 //! `svcmgr`: o corretor de capabilities (ADR 0034). Criado pelo `root`
 //! (T-351), que lhe entrega, nesta ordem em `rdi`, `rsi` e `rdx`:
 //!
-//! - `rdi`: o endpoint do `root` (badge 1) e a própria thread;
+//! - `rdi`: o endpoint do `root` (badge 1);
 //! - `rsi`: o bootfs só de leitura e a cota de partida;
-//! - `rdx`: a cota de partida e a tabela de handles de partida do kernel.
+//! - `rdx`: reservado (a tabela de handles de partida vem na T-355).
+//!
+//! O `svcmgr` não recebe a capability da própria thread (ADR 0034, item 2):
+//! ela fecharia o ciclo thread ↔ `CapSpace` da ADR 0029 e prenderia o
+//! processo na cota do `root` depois da saída. Para configurar a si mesmo,
+//! usa `thread = 0` (ADR 0039, item 3).
 //!
 //! Nesta versão ele só confere as capabilities recebidas e se anuncia;
 //! manifestos, grafo e partida dos serviços vêm nas T-352 e T-353.
@@ -27,18 +32,16 @@ const LABEL_OLA: u64 = 1;
 #[derive(Clone, Copy)]
 struct Boot {
     root_ep: Handle,
-    thread: Handle,
     bootfs: Handle,
     quota: Handle,
 }
 
 fn main(start: Start) -> ! {
     let [a, b, c] = start.args;
-    let (root_ep, thread) = split_handle_pair(a);
+    let (root_ep, _) = split_handle_pair(a);
     let (bootfs, quota) = split_handle_pair(b);
     let boot = Boot {
         root_ep,
-        thread,
         bootfs,
         quota,
     };
@@ -46,9 +49,8 @@ fn main(start: Start) -> ! {
     ostd::rt::init(ostd::rt::Env { quota: boot.quota });
     ostd::debug::print("svcmgr: iniciado pelo root");
     ostd::debug::print_fmt(format_args!(
-        "svcmgr: caps recebidas: root_ep={} thread={} bootfs={} quota={}",
+        "svcmgr: caps recebidas: root_ep={} bootfs={} quota={}",
         boot.root_ep.raw(),
-        boot.thread.raw(),
         boot.bootfs.raw(),
         boot.quota.raw()
     ));

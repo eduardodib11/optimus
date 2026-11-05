@@ -324,12 +324,7 @@ pub fn run_until_exit_within(threads: &[Arc<Thread>], limit_ns: u64) -> Outcome 
 /// referência a uma thread que rodou noutra CPU é solta lá, logo depois da
 /// troca que a tirou da CPU.
 pub fn settled(quota: &MemoryQuota, used: u64) -> bool {
-    settled_within(quota, used, 1_000_000_000)
-}
-
-/// Como [`settled`], com prazo de `ns` nanossegundos.
-pub fn settled_within(quota: &MemoryQuota, used: u64, ns: u64) -> bool {
-    let give_up = ktime::now_ns() + ns;
+    let give_up = ktime::now_ns() + 1_000_000_000;
     while quota.used() != used {
         if ktime::now_ns() > give_up {
             return false;

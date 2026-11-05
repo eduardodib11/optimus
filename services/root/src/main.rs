@@ -294,6 +294,12 @@ fn table_entry(aspace: Handle, table: Handle, kind: u32) -> Result<Handle, Error
 /// Carrega o `svcmgr` do bootfs com a própria cota de partida, dá a ele o
 /// endpoint do `root` (badge [`ROOT_BADGE`]), o bootfs só de leitura e a
 /// cota, e o inicia. Devolve o endpoint para atender o primeiro contato.
+///
+/// A capability da thread do `svcmgr` não vai para o `CapSpace` dele (ADR
+/// 0034, item 2): a thread já guarda a tabela, e a tabela guardar a thread
+/// fecharia o ciclo da ADR 0029, que deixaria o processo inteiro preso na
+/// cota depois da saída. Para mexer em si mesmo, o `svcmgr` usa
+/// `thread = 0` (ADR 0039, item 3).
 fn spawn_svcmgr(b: Boot) -> Result<Handle, Error> {
     let fs_map = map_bootfs(b)?;
     let fs = obfs::Image::parse(fs_map.bytes()).map_err(|_| Error::InvalidArgument)?;
@@ -308,10 +314,9 @@ fn spawn_svcmgr(b: Boot) -> Result<Handle, Error> {
     })?;
     let ep = create(b.quota, ObjectType::Endpoint, 0)?;
     let ep_child = child.give(ep, Rights::SEND, ROOT_BADGE)?;
-    let thread = child.give(child.thread, Rights::WRITE_STATE, 0)?;
     let bootfs = child.give(b.bootfs, Rights::READ | Rights::MAP, 0)?;
     let quota = child.give(child.quota, Rights::CREATE, 0)?;
-    child.start([handle_pair(ep_child, thread), handle_pair(bootfs, quota), 0])?;
+    child.start([u64::from(ep_child.raw()), handle_pair(bootfs, quota), 0])?;
     Ok(ep)
 }
 
