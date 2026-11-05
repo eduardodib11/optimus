@@ -1,0 +1,15 @@
+[package]
+name = "ologd"
+description = "Núcleo do logd (T-356): registro de produtores, buffer em memória e consulta. Sem I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[dependencies]
+
+[lints]
+workspace = true
