@@ -76,6 +76,10 @@ struct Test {
 /// Os testes, na ordem em que rodam.
 const TESTS: &[Test] = &[
     Test {
+        name: "timed.hora_do_boot",
+        run: hora_do_boot,
+    },
+    Test {
         name: "memd.heap_esparso",
         run: paginador::heap_esparso,
     },
@@ -1050,6 +1054,27 @@ fn threads_guarda(ctx: &Ctx) -> Outcome {
     };
     let _ = (delete(exc), delete(ep), delete(reply), delete(q));
     verdict.and(joined)
+}
+
+/// T-358: a hora do RTC do boot chega por `sys_info` classe 4, é posterior
+/// a 2025 e o núcleo do `timed` a faz avançar com o relógio monotônico.
+fn hora_do_boot(_ctx: &Ctx) -> Outcome {
+    /// 2025-01-01T00:00:00Z.
+    const Y2025: i64 = 1_735_689_600 * 1_000_000_000;
+    let (wall, at) = ostd::time::boot_wall()
+        .map_err(|_| "sys_info(4)")?
+        .ok_or("o boot não trouxe hora do RTC")?;
+    let clock = timed::Clock::from_boot(wall, at, true);
+    let a = clock.now(ostd::time::now_ns()).map_err(|_| "now")?;
+    let b = clock.now(ostd::time::now_ns()).map_err(|_| "now")?;
+    ostd::debug::print_fmt(format_args!(
+        "utest: timed: unix {} s",
+        a.unix_ns / 1_000_000_000
+    ));
+    if wall < Y2025 || a.unix_ns < wall || b.unix_ns < a.unix_ns {
+        return Err("hora do boot fora da faixa ou regredindo");
+    }
+    Ok(())
 }
 
 /// T-337: a entropia do kernel (`sys_info` classe 5) muda a cada pedido,

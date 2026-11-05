@@ -97,6 +97,15 @@ pub const SYS_INFO_EXIT: u64 = 2;
 /// capability.
 pub const SYS_INFO_MEMORY: u64 = 3;
 
+/// Seletor de `sys_info(seletor)`: hora de parede do boot (ADR 0037, item
+/// 1). Devolve `wall_unix_ns` (`rdx`, como `i64`), `wall_tsc_ns` (`r10`, na
+/// base do relógio monotônico) e as flags (`r8`, [`WALL_VALID`]), sem
+/// capability.
+pub const SYS_INFO_WALL: u64 = 4;
+
+/// Flag de [`SYS_INFO_WALL`]: o `GetTime` do boot deu uma hora válida.
+pub const WALL_VALID: u64 = 1;
+
 /// Seletor de `sys_info(seletor, 0)`: entropia (ADR 0039, item 4). Devolve
 /// [`SYS_INFO_ENTROPY_BYTES`] bytes aleatórios criptográficos em `rdx`,
 /// `r10` e `r8` (little-endian, nessa ordem), sem capability. O argumento

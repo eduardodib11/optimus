@@ -312,6 +312,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "timed"
+version = "0.1.0"
+
+[[package]]
 name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,6 +369,7 @@ dependencies = [
  "memd",
  "obfs",
  "ostd",
+ "timed",
 ]
 
 [[package]]

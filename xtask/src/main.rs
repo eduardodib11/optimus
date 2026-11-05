@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, sync::mpsc, thread};
 
 mod bench;
@@ -39,13 +39,14 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("hello", "services/hello/src/main.rs", USER_TARGET),
     ("svcmgr", "services/svcmgr/src/main.rs", USER_TARGET),
     ("memd", "services/memd/src/lib.rs", USER_TARGET),
+    ("timed", "services/timed/src/lib.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
 
 /// Bibliotecas portáveis cujos testes rodam no host.
 const HOST_TESTED: &[&str] = &[
-    "oalloc", "obfs", "ocoll", "olz4", "oelf", "optcrypt", "oidl-rt", "svcmgr",
+    "oalloc", "obfs", "ocoll", "olz4", "oelf", "optcrypt", "oidl-rt", "svcmgr", "timed",
 ];
 
 const PROFILES: &[&str] = &["lite", "basic", "default", "premium", "server"];
@@ -758,6 +759,102 @@ fn check_direct_map_bases(bases: &[u64]) -> Result {
     Ok(())
 }
 
+/// Linha do `optboot` com a hora do RTC (T-358).
+const WALL_LINE: &str = "optboot: hora do RTC ";
+/// Erro aceito da hora de parede do boot contra o host (aceite da T-358).
+/// O `optboot` amostra o TSC na virada do segundo do RTC, então a
+/// resolução de 1 s do `GetTime` não entra no erro.
+const WALL_TOLERANCE_MS: i128 = 1000;
+
+/// Aceite da T-358: a hora do RTC menos o tempo desde o reset tem de cair
+/// perto da hora do host em que o QEMU partiu. Sem a linha (cenários que
+/// não passam pelo `optboot`) não há o que conferir.
+fn check_wall_time(serial: &str, spawned_unix_ms: u128, seen_unix_ms: Option<u128>) -> Result {
+    let Some(rest) = serial.lines().find_map(|l| l.split_once(WALL_LINE)) else {
+        return Ok(());
+    };
+    let mut nums = rest
+        .1
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|w| !w.is_empty());
+    let (Some(secs), Some(ms)) = (nums.next(), nums.next()) else {
+        return Err(format!("linha da hora do RTC ilegível: {}", rest.1));
+    };
+    let secs: i128 = secs.parse().map_err(|_| "segundos do RTC")?;
+    let ms: i128 = ms.parse().map_err(|_| "ms desde o reset")?;
+    let at_reset = secs * 1000 - ms;
+    let reset_err = at_reset - i128::try_from(spawned_unix_ms).unwrap_or(0);
+    println!(
+        "xtask: hora do RTC no reset difere {reset_err} ms da do host na partida do QEMU (via TSC)"
+    );
+    let Some(seen) = seen_unix_ms else {
+        return Err("a linha da hora do RTC não foi vista ao chegar".into());
+    };
+    // `secs` é a hora do RTC na virada do segundo; o host a viu logo depois.
+    let err = secs * 1000 - i128::try_from(seen).unwrap_or(0);
+    println!("xtask: hora do RTC difere {err} ms da do host na virada do segundo");
+    if err.abs() > WALL_TOLERANCE_MS {
+        return Err(format!(
+            "hora do RTC errada em {err} ms (limite {WALL_TOLERANCE_MS} ms)"
+        ));
+    }
+    Ok(())
+}
+
+/// Dorme até logo depois da próxima virada do segundo do relógio do host.
+fn align_to_host_second() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let left = 1_000_000_000 - now.subsec_nanos();
+    thread::sleep(Duration::from_nanos(u64::from(left) + 2_000_000));
+}
+
+/// Lê a serial do QEMU numa thread e anota a hora do host em que chega a
+/// linha da hora do RTC.
+fn spawn_reader(
+    mut stdout: std::process::ChildStdout,
+    tx: mpsc::Sender<Vec<u8>>,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Option<u128>>>,
+    thread::JoinHandle<()>,
+) {
+    // A hora do host em que a linha da hora do RTC chega: o `optboot` a
+    // imprime logo depois de ver a virada do segundo, então ela mede o RTC
+    // contra o host sem depender do TSC (que no TCG anda fora do tempo
+    // real) nem da demora de partida do QEMU.
+    let wall_seen = std::sync::Arc::new(std::sync::Mutex::new(None::<u128>));
+    let seen = wall_seen.clone();
+    let reader = thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        let mut tail = Vec::new();
+        while let Ok(n @ 1..) = stdout.read(&mut chunk) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            if let Ok(mut s) = seen.lock()
+                && s.is_none()
+            {
+                tail.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&tail);
+                if text
+                    .split_once(WALL_LINE)
+                    .is_some_and(|(_, r)| r.contains('\n'))
+                {
+                    *s = Some(now);
+                }
+                if tail.len() > 1 << 16 {
+                    tail.drain(..tail.len() - 4096);
+                }
+            }
+            if tx.send(chunk[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    (wall_seen, reader)
+}
+
 /// Dá boot num cenário e devolve a serial, se ela conferir.
 fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let esp = image(opts, sc.cmdline, sc.rounds)?;
@@ -773,22 +870,22 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     } else {
         Stdio::null()
     };
+    // O RTC do QEMU só tem segundos e começa na fase de subsegundo em que o
+    // QEMU parte, truncada: partir logo depois da virada do segundo do host
+    // deixa o RTC alinhado com ele, como num RTC real acertado.
+    align_to_host_second();
+    let spawned_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
     let mut child = cmd
         .stdin(stdin)
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("falha ao iniciar o QEMU: {e}"))?;
     let mut screen: Option<Result> = None;
-    let mut stdout = child.stdout.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        while let Ok(n @ 1..) = stdout.read(&mut chunk) {
-            if tx.send(chunk[..n].to_vec()).is_err() {
-                break;
-            }
-        }
-    });
+    let (wall_seen, reader) = spawn_reader(stdout, tx);
     let mut raw = Vec::new();
     let start = Instant::now();
     let seen_all = |raw: &[u8]| {
@@ -827,6 +924,10 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let serial = String::from_utf8_lossy(&raw);
     let result = check_serial(&serial, sc.markers, sc.forbidden)
         .and_then(|()| check_hello(&serial, sc))
+        .and_then(|()| {
+            let seen = wall_seen.lock().ok().and_then(|s| *s);
+            check_wall_time(&serial, spawned_unix_ms, seen)
+        })
         .and_then(|()| match sc.harness {
             Some(Harness::Kernel) => check_ktest(&serial),
             Some(Harness::User) => check_utest(&serial),

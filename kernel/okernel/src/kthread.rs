@@ -1694,7 +1694,9 @@ fn thread_exit(code: u64, flags: u64) -> Result<Values, Error> {
 /// registro de morte da `Thread` ou do processo do `CapSpace` de `arg`; com
 /// [`kabi::sched::SYS_INFO_MEMORY`] (ADR 0038, item 5), os quadros
 /// gerenciados, os livres e os comprometidos de objetos `LAZY`; com [`kabi::sched::SYS_INFO_ENTROPY`] (ADR 0039, item 4),
-/// 24 bytes do DRBG desta CPU, sem capability, com `arg` zero.
+/// 24 bytes do DRBG desta CPU, sem capability, com `arg` zero; com
+/// [`kabi::sched::SYS_INFO_WALL`] (ADR 0037, item 1), a hora do RTC lida
+/// no boot e o instante dela.
 pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
     match selector {
         kabi::sched::SYS_INFO_CPUS => Ok([
@@ -1712,6 +1714,14 @@ pub(crate) fn sys_info(selector: u64, arg: u64) -> Result<Values, Error> {
             let (free, total) = kmem::frame_stats();
             Ok([total as u64, free as u64, okernel::vm::lazy_committed()])
         }
+        kabi::sched::SYS_INFO_WALL => Ok(crate::bootinfo::get().map_or([0; 3], |b| {
+            let valid = if b.wall_unix_ns > 0 {
+                kabi::sched::WALL_VALID
+            } else {
+                0
+            };
+            [b.wall_unix_ns.cast_unsigned(), b.wall_tsc_ns, valid]
+        })),
         kabi::sched::SYS_INFO_ENTROPY => {
             if arg != 0 {
                 return Err(Error::InvalidArgument);
