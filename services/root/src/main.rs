@@ -250,8 +250,7 @@ fn serve(b: Boot, ep: Handle, rounds: u64, buffer: &mut Buffer) -> Result<(), Er
                 corpo: &corpo[..n],
                 caps: &[],
             };
-            let Some(d) =
-                hello_servidor::despacha_hello(&mut st, 0, &entrada, &mut saida, &mut [])
+            let Some(d) = hello_servidor::despacha_hello(&mut st, 0, &entrada, &mut saida, &mut [])
             else {
                 return Err(Error::InvalidArgument);
             };
