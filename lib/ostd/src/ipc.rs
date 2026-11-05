@@ -10,7 +10,7 @@
 //! sem prazo.
 
 use kabi::ipc::{MsgInfo, recv_target};
-use kabi::{Badge, Error, Handle, MSG_REG_WORDS, STATUS_OK, Syscall};
+use kabi::{Badge, Error, Handle, IPC_BUFFER_WORDS, MSG_REG_WORDS, STATUS_OK, Syscall};
 
 /// Rótulo, `info` e palavras em registradores.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -137,6 +137,50 @@ pub fn reply_recv(
     deadline: u64,
 ) -> Result<Received, Error> {
     ipc(Syscall::IpcReplyRecv, recv_target(ep, reply), msg, deadline)
+}
+
+/// `ipc_call` com corpo: põe `corpo` no buffer de IPC de `buf`, chama `ep`
+/// com o rótulo `rotulo` e copia o corpo da resposta para `saida`.
+///
+/// Corpos são palavras de 64 bits em ordem little-endian, então o tamanho
+/// vai em múltiplos de 8 bytes (ADR 0033, arredondamento do corpo). A
+/// resposta devolve o rótulo e o número de bytes copiados.
+///
+/// # Errors
+///
+/// `InvalidArgument` se `corpo` não cabe no buffer ou se a resposta não cabe
+/// em `saida`; os do kernel na chamada.
+pub fn call_corpo(
+    ep: Handle,
+    buf: &mut Buffer,
+    rotulo: u64,
+    corpo: &[u8],
+    saida: &mut [u8],
+    deadline: u64,
+) -> Result<(u64, usize), Error> {
+    let palavras = corpo.len().div_ceil(8);
+    if palavras > IPC_BUFFER_WORDS {
+        return Err(Error::InvalidArgument);
+    }
+    let ib = buf.get();
+    for (dst, bloco) in ib.words.iter_mut().zip(corpo.chunks(8)) {
+        let mut b = [0u8; 8];
+        b[..bloco.len()].copy_from_slice(bloco);
+        *dst = u64::from_le_bytes(b);
+    }
+    let mut msg = Message::new(rotulo, &[]);
+    msg.info.buffer_words = u16::try_from(palavras).map_err(|_| Error::InvalidArgument)?;
+    let rec = call(ep, &msg, deadline)?;
+    let n = usize::from(rec.msg.info.buffer_words).min(IPC_BUFFER_WORDS);
+    if n * 8 > saida.len() {
+        return Err(Error::InvalidArgument);
+    }
+    let ib = buf.get();
+    for (bloco, palavra) in saida.chunks_mut(8).zip(ib.words.iter().take(n)) {
+        let b = palavra.to_le_bytes();
+        bloco.copy_from_slice(&b[..bloco.len()]);
+    }
+    Ok((rec.msg.label, n * 8))
 }
 
 /// Endereço sugerido para o buffer de IPC da thread inicial de um processo

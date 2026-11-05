@@ -95,6 +95,36 @@ fn esquemas(arq: &str) -> bool {
     }
 }
 
+/// Imprime o módulo de cliente gerado para `arq` (T-345).
+fn gera_cliente(arq: &str) -> bool {
+    let file = match carrega(arq) {
+        Ok(f) => f,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return false;
+        }
+    };
+    let erros = oidlc::analyze(&file);
+    if !erros.is_empty() {
+        for e in &erros {
+            eprintln!("{arq}:{e}");
+        }
+        return false;
+    }
+    match oidlc::servidor::gera_cliente(&file) {
+        Ok(src) => {
+            print!("{}", oidlc::servidor::formata(&src));
+            true
+        }
+        Err(erros) => {
+            for e in &erros {
+                eprintln!("{arq}:{e}");
+            }
+            false
+        }
+    }
+}
+
 /// Imprime o módulo de servidor gerado para `arq` (T-344).
 fn gera(arq: &str) -> bool {
     let file = match carrega(arq) {
@@ -137,6 +167,7 @@ fn main() -> ExitCode {
         [cmd, velho, novo] if cmd == "check-compat" => compat(velho, novo),
         [cmd, arq] if cmd == "gera-servidor" => gera(arq),
         [cmd, arq] if cmd == "esquemas" => esquemas(arq),
+        [cmd, arq] if cmd == "gera-cliente" => gera_cliente(arq),
         paths => {
             // Sem curto-circuito: todo arquivo é checado e reportado.
             let mut ok = true;

@@ -1,0 +1,19 @@
+// Protocolo entre o `hello` e o `root` (T-212), descrito em OIDL (T-345).
+// Os rótulos e as palavras do protocolo atual estão em
+// services/hello/src/proto.rs; esta especificação os substitui quando o
+// `hello` migrar para os stubs gerados.
+package optimus.hello @1.0;
+
+struct Seis { w0: u64, w1: u64, w2: u64, w3: u64, w4: u64, w5: u64 }
+
+interface Hello {
+    // Saudação: o `root` responde com o tamanho recebido.
+    @tool(risk = R0, desc = "Cumprimenta o serviço de teste")
+    saudacao(texto: string<64>) -> result<u64, u8>;
+
+    // Uma volta de ida e volta: seis palavras, somadas de 1 na resposta.
+    ping(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> result<Seis, u8>;
+
+    // Fim da rodada: voltas feitas e erros vistos pelo `hello`.
+    bye(voltas: u64, erros: u64) -> result<(), u8>;
+}
