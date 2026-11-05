@@ -65,6 +65,36 @@ fn compat(velho: &str, novo: &str) -> bool {
     false
 }
 
+/// Imprime os esquemas JSON das ferramentas (`@tool`) de `arq` (T-346).
+fn esquemas(arq: &str) -> bool {
+    let file = match carrega(arq) {
+        Ok(f) => f,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return false;
+        }
+    };
+    let erros = oidlc::analyze(&file);
+    if !erros.is_empty() {
+        for e in &erros {
+            eprintln!("{arq}:{e}");
+        }
+        return false;
+    }
+    match oidlc::esquemas::gera_esquemas(&file) {
+        Ok(json) => {
+            print!("{json}");
+            true
+        }
+        Err(erros) => {
+            for e in &erros {
+                eprintln!("{arq}:{e}");
+            }
+            false
+        }
+    }
+}
+
 /// Imprime o módulo de servidor gerado para `arq` (T-344).
 fn gera(arq: &str) -> bool {
     let file = match carrega(arq) {
@@ -99,11 +129,14 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let ok = match args.as_slice() {
         [] => {
-            eprintln!("uso: oidlc <arquivo.oidl>... | oidlc check-compat <velho> <novo>");
+            eprintln!(
+                "uso: oidlc <arquivo.oidl>... | oidlc check-compat <velho> <novo> | oidlc gera-servidor <arq> | oidlc esquemas <arq>"
+            );
             return ExitCode::from(2);
         }
         [cmd, velho, novo] if cmd == "check-compat" => compat(velho, novo),
         [cmd, arq] if cmd == "gera-servidor" => gera(arq),
+        [cmd, arq] if cmd == "esquemas" => esquemas(arq),
         paths => {
             // Sem curto-circuito: todo arquivo é checado e reportado.
             let mut ok = true;
