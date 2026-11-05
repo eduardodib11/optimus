@@ -183,6 +183,13 @@ name = "olz4"
 version = "0.1.0"
 
 [[package]]
+name = "oman"
+version = "0.1.0"
+dependencies = [
+ "mkmanifest",
+]
+
+[[package]]
 name = "optboot"
 version = "0.1.0"
 dependencies = [
