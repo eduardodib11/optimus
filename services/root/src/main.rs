@@ -37,6 +37,8 @@ const TABLE_VA: u64 = 0x5000_0000;
 const SCRATCH_VA: u64 = 0x8000_0000;
 /// Cota do `hello`.
 const HELLO_QUOTA: u64 = 4 << 20;
+/// Badge da `DebugLog` que o `root` dá ao `hello`: "hell" em ASCII.
+const HELLO_LOG_BADGE: u64 = 0x6865_6c6c;
 /// Prioridade do `hello`: a mesma do `root`, para a troca direta do
 /// caminho rápido valer nos dois sentidos.
 const HELLO_PRIORITY: u8 = 150;
@@ -48,6 +50,8 @@ struct Boot {
     aspace: Handle,
     thread: Handle,
     bootfs: Handle,
+    /// `DebugLog` da tabela de partida, 0 se a tabela não a trouxer.
+    log: Handle,
 }
 
 /// Sem ninguém no endpoint, receber com prazo vencido dá `TimedOut` e
@@ -106,11 +110,19 @@ fn spawn_hello(b: Boot) -> Result<(Handle, u64), Error> {
     let thread = child.give(child.thread, Rights::WRITE_STATE, 0)?;
     let aspace = child.give(child.aspace, Rights::MAP | Rights::UNMAP, 0)?;
     let quota = child.give(child.quota, Rights::CREATE, 0)?;
+    // A `DebugLog` vai com `WRITE` e um badge próprio do `hello`. Em
+    // `args[2]`, a parte alta leva o handle dela e a baixa, as voltas.
+    let small = u32::try_from(rounds).map_err(|_| Error::InvalidArgument)?;
+    let log = if b.log.raw() == 0 {
+        0
+    } else {
+        child.give(b.log, Rights::WRITE, HELLO_LOG_BADGE)?.raw()
+    };
     ostd::thread::set_exception_handler(child.thread, Some(exception))?;
     child.start([
         handle_pair(ep_child, thread),
         handle_pair(aspace, quota),
-        rounds,
+        (u64::from(log) << 32) | u64::from(small),
     ])?;
     Ok((ep, rounds))
 }
@@ -244,6 +256,8 @@ fn main(start: Start) -> ! {
         aspace: handle(aspace),
         thread,
         bootfs,
+        log: table_entry(handle(aspace), table, ostd::kabi::startup::KIND_DEBUG_LOG)
+            .unwrap_or(Handle::from_raw(0)),
     };
     ostd::rt::init(ostd::rt::Env { quota: boot.quota });
     ostd::debug::print("root: iniciado");

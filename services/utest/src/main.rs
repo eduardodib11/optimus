@@ -1359,7 +1359,12 @@ const TABLE_VA: u64 = 0x5000_0000;
 /// Acha o bootfs na tabela de partida, lida por uma mapeação temporária
 /// (mesmo formato de `kabi::startup`, lido também pelo `root`).
 fn bootfs_from_table(aspace: Handle, table: Handle) -> Option<Handle> {
-    use ostd::kabi::startup::{ENTRY_BYTES, HEADER_BYTES, KIND_BOOTFS, MAGIC, MAX_ENTRIES};
+    table_entry(aspace, table, ostd::kabi::startup::KIND_BOOTFS)
+}
+
+/// Handle da primeira entrada do tipo `kind` na tabela de partida.
+fn table_entry(aspace: Handle, table: Handle, kind: u32) -> Option<Handle> {
+    use ostd::kabi::startup::{ENTRY_BYTES, HEADER_BYTES, MAGIC, MAX_ENTRIES};
     use ostd::vm::Mapping;
     let map = Mapping::new(aspace, table, TABLE_VA, ostd::kabi::vm::PAGE_SIZE, 0).ok()?;
     let bytes = map.bytes();
@@ -1372,7 +1377,7 @@ fn bootfs_from_table(aspace: Handle, table: Handle) -> Option<Handle> {
     let count = (word(4)? as usize).min(MAX_ENTRIES);
     (0..count).find_map(|i| {
         let at = HEADER_BYTES + i * ENTRY_BYTES;
-        (word(at)? == KIND_BOOTFS)
+        (word(at)? == kind)
             .then(|| word(at + 4))
             .flatten()
             .map(Handle::from_raw)
@@ -1385,9 +1390,13 @@ fn main(start: Start) -> ! {
         anel::child(&start);
     }
     let (_, table) = ostd::kabi::split_handle_pair(start.args[2]);
+    let aspace = handle(start.args[1]);
+    if let Some(log) = table_entry(aspace, table, ostd::kabi::startup::KIND_DEBUG_LOG) {
+        ostd::debug::set_log(log);
+    }
     let ctx = Ctx {
         quota: handle(start.args[0]),
-        bootfs: bootfs_from_table(handle(start.args[1]), table).unwrap_or(table),
+        bootfs: bootfs_from_table(aspace, table).unwrap_or(table),
     };
     ostd::rt::init(Env { quota: ctx.quota });
     ostd::debug::print_fmt(format_args!("utest: início, {} testes", TESTS.len()));
