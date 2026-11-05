@@ -9,6 +9,7 @@
 pub mod ast;
 pub mod compat;
 pub mod esquemas;
+pub mod fuzz;
 pub mod ids;
 pub mod layout;
 pub mod lexer;

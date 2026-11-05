@@ -65,6 +65,27 @@ fn compat(velho: &str, novo: &str) -> bool {
     false
 }
 
+/// Roda o fuzzer por `secs` segundos com a semente `seed` (T-347).
+fn fuzz(secs: &str, seed: &str) -> bool {
+    let (Ok(secs), Ok(seed)) = (
+        secs.parse::<u64>(),
+        u64::from_str_radix(seed.trim_start_matches("0x"), 16),
+    ) else {
+        eprintln!("uso: oidlc fuzz <segundos> <semente hex>");
+        return false;
+    };
+    match oidlc::fuzz::roda(secs, seed) {
+        Ok(n) => {
+            println!("oidlc fuzz: {n} execuções sem falha");
+            true
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            false
+        }
+    }
+}
+
 /// Imprime os esquemas JSON das ferramentas (`@tool`) de `arq` (T-346).
 fn esquemas(arq: &str) -> bool {
     let file = match carrega(arq) {
@@ -167,6 +188,7 @@ fn main() -> ExitCode {
         [cmd, velho, novo] if cmd == "check-compat" => compat(velho, novo),
         [cmd, arq] if cmd == "gera-servidor" => gera(arq),
         [cmd, arq] if cmd == "esquemas" => esquemas(arq),
+        [cmd, secs, seed] if cmd == "fuzz" => fuzz(secs, seed),
         [cmd, arq] if cmd == "gera-cliente" => gera_cliente(arq),
         paths => {
             // Sem curto-circuito: todo arquivo é checado e reportado.
