@@ -14,7 +14,7 @@
 #![forbid(unsafe_code)]
 
 use ostd::cap::create;
-use ostd::ipc::{self, Buffer, Message, Received};
+use ostd::ipc::{self, Buffer, Message};
 use ostd::kabi::ipc::FLAG_NONBLOCK;
 use ostd::kabi::vm::PAGE_SIZE;
 use ostd::kabi::{Error, Handle, ObjectType, Rights, handle_pair, split_handle_pair};
@@ -24,6 +24,9 @@ use ostd::vm::Mapping;
 
 #[path = "../../hello/src/proto.rs"]
 mod proto;
+
+#[path = "hello_servidor.rs"]
+mod hello_servidor;
 
 ostd::entry!(main);
 
@@ -127,77 +130,115 @@ fn spawn_hello(b: Boot) -> Result<(Handle, u64), Error> {
     Ok((ep, rounds))
 }
 
-/// A saudação do `hello`, lida do buffer de IPC.
-fn greeting(m: &Received, buffer: &mut Buffer) {
-    let len = usize::try_from(m.msg.words[0]).unwrap_or(0);
-    let words = &buffer.get().words[..usize::from(m.msg.info.buffer_words)];
-    let mut bytes = [0u8; 256];
-    for (dst, w) in bytes.chunks_mut(8).zip(words) {
-        dst.copy_from_slice(&w.to_le_bytes());
+/// Estado do atendimento ao `hello`: a implementação do protocolo OIDL
+/// (`idl/optimus/hello.oidl`) e as contagens que o `root` confere no fim.
+struct Atende {
+    next: u64,
+    bad: u64,
+    t0: u64,
+    feitas: u64,
+    erros: u64,
+    encerrou: bool,
+}
+
+#[allow(clippy::many_single_char_names, reason = "nomes do IDL: a..f")]
+impl hello_servidor::Hello for Atende {
+    fn saudacao(&mut self, _ctx: &hello_servidor::Contexto, texto: &str) -> Result<u64, u8> {
+        ostd::debug::print("root: o hello disse:");
+        ostd::debug::print(texto);
+        Ok(texto.len() as u64)
     }
-    let text = core::str::from_utf8(&bytes[..len.min(words.len() * 8)]).unwrap_or("?");
-    ostd::debug::print("root: o hello disse:");
-    ostd::debug::print(text);
+
+    fn ping(
+        &mut self,
+        _ctx: &hello_servidor::Contexto,
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+        e: u64,
+        f: u64,
+    ) -> Result<hello_servidor::Seis, u8> {
+        if self.next == 0 {
+            self.t0 = ostd::time::now_ns();
+        }
+        let ok = [a, b, c, d, e, f]
+            .iter()
+            .enumerate()
+            .all(|(k, &w)| w == proto::word(self.next, k as u64));
+        self.bad += u64::from(!ok);
+        self.next += 1;
+        Ok(hello_servidor::Seis {
+            w0: a.wrapping_add(1),
+            w1: b.wrapping_add(1),
+            w2: c.wrapping_add(1),
+            w3: d.wrapping_add(1),
+            w4: e.wrapping_add(1),
+            w5: f.wrapping_add(1),
+        })
+    }
+
+    fn bye(&mut self, _ctx: &hello_servidor::Contexto, voltas: u64, erros: u64) -> Result<(), u8> {
+        self.feitas = voltas;
+        self.erros = erros;
+        self.encerrou = true;
+        Ok(())
+    }
 }
 
 /// Atende o `hello` até a despedida; `Ok` se as voltas conferiram.
 fn serve(b: Boot, ep: Handle, rounds: u64, buffer: &mut Buffer) -> Result<(), Error> {
     let reply = create(b.quota, ObjectType::Reply, 0)?;
-    let (mut next, mut bad, mut t0) = (0u64, 0u64, 0);
-    let mut m = ipc::recv(ep, reply, 0)?;
+    let mut st = Atende {
+        next: 0,
+        bad: 0,
+        t0: 0,
+        feitas: 0,
+        erros: 0,
+        encerrou: false,
+    };
+    let mut corpo = [0u8; 256];
+    let mut saida = [0u8; 64];
+    let mut rec = ipc::recv_corpo(ep, reply, buffer, &mut corpo, 0)?;
     loop {
-        if m.badge == proto::EXCEPTION_BADGE {
+        if rec.badge == proto::EXCEPTION_BADGE {
             ostd::debug::print_fmt(format_args!(
                 "root: exceção no hello: rótulo {:#x}",
-                m.msg.label
+                rec.rotulo
             ));
             return Err(Error::Cancelled);
         }
-        let answer = match m.msg.label {
-            proto::HELLO => {
-                greeting(&m, buffer);
-                Message::new(proto::HELLO, &[])
-            }
-            proto::PING => {
-                if next == 0 {
-                    t0 = ostd::time::now_ns();
-                }
-                let mut words = m.msg.words;
-                let ok = m.msg.info.words == 6
-                    && (0..).zip(words).all(|(k, w)| w == proto::word(next, k));
-                bad += u64::from(!ok);
-                next += 1;
-                for w in &mut words {
-                    *w = w.wrapping_add(1);
-                }
-                Message::new(proto::PONG, &words)
-            }
-            proto::BYE => {
-                ipc::send(reply, &Message::new(proto::BYE, &[]), 0)?;
-                let ns = ostd::time::now_ns() - t0;
-                let [done, errors, ..] = m.msg.words;
-                ostd::debug::print_fmt(format_args!(
-                    "root: {} ns por ida e volta com o hello",
-                    ns / rounds.max(1)
-                ));
-                return if done == rounds && next == rounds && bad == 0 && errors == 0 {
-                    ostd::debug::print_fmt(format_args!(
-                        "root: hello: {rounds} idas e voltas sem erro"
-                    ));
-                    Ok(())
-                } else {
-                    ostd::debug::print_fmt(format_args!(
-                        "root: hello: {next}/{rounds} voltas, {bad}+{errors} erros"
-                    ));
-                    Err(Error::InvalidArgument)
-                };
-            }
-            _ => {
-                bad += 1;
-                Message::new(0, &[])
-            }
+        let entrada = hello_servidor::Entrada {
+            rotulo: rec.rotulo,
+            badge: rec.badge,
+            corpo: &corpo[..rec.corpo],
+            caps: &[],
         };
-        m = ipc::reply_recv(ep, reply, &answer, 0)?;
+        let despacho = hello_servidor::despacha_hello(&mut st, 0, &entrada, &mut saida, &mut []);
+        let Some(d) = despacho else {
+            return Err(Error::InvalidArgument);
+        };
+        let resposta = &saida[..d.corpo];
+        if st.encerrou {
+            ipc::responde_corpo(reply, buffer, d.rotulo, resposta, 0)?;
+            break;
+        }
+        rec = ipc::responde_recebe_corpo(ep, reply, buffer, d.rotulo, resposta, &mut corpo, 0)?;
+    }
+    let ns = ostd::time::now_ns() - st.t0;
+    ostd::debug::print_fmt(format_args!(
+        "root: {} ns por ida e volta com o hello",
+        ns / rounds.max(1)
+    ));
+    if st.feitas == rounds && st.next == rounds && st.bad == 0 && st.erros == 0 {
+        ostd::debug::print_fmt(format_args!("root: hello: {rounds} idas e voltas sem erro"));
+        Ok(())
+    } else {
+        ostd::debug::print_fmt(format_args!(
+            "root: hello: {}/{rounds} voltas, {}+{} erros",
+            st.next, st.bad, st.erros
+        ));
+        Err(Error::InvalidArgument)
     }
 }
 
