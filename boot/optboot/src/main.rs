@@ -512,7 +512,16 @@ fn read_wall_time(out: &mut Console, st: &SystemTable, hz: u64, info: &mut BootI
     let rt = unsafe { &*st.runtime_services };
     let mut raw = RawEfiTime::default();
     // SAFETY: `raw` é um `EFI_TIME` gravável; `caps` nulo é permitido.
-    let status = unsafe { (rt.get_time)(&raw mut raw, ptr::null_mut()) };
+    let get = |t: &mut RawEfiTime| unsafe { (rt.get_time)(t, ptr::null_mut()) };
+    let mut status = get(&mut raw);
+    // O RTC só tem resolução de 1 s: espera a virada do segundo (até
+    // ~1,1 s) para amostrar o TSC no começo dele, e o erro de truncamento
+    // some (aceite da T-358: ≤ 1 s contra o host).
+    let first = raw.second;
+    let deadline = rdtsc().saturating_add(hz.saturating_mul(11) / 10);
+    while status == 0 && raw.second == first && rdtsc() < deadline {
+        status = get(&mut raw);
+    }
     let tsc = rdtsc();
     let t = EfiTime {
         year: raw.year,

@@ -760,9 +760,10 @@ fn check_direct_map_bases(bases: &[u64]) -> Result {
 
 /// Linha do `optboot` com a hora do RTC (T-358).
 const WALL_LINE: &str = "optboot: hora do RTC ";
-/// Erro aceito da hora de parede do boot contra o host: 1 s do aceite da
-/// T-358 mais 1 s da resolução do RTC (`GetTime` trunca os segundos).
-const WALL_TOLERANCE_MS: i128 = 2000;
+/// Erro aceito da hora de parede do boot contra o host (aceite da T-358).
+/// O `optboot` amostra o TSC na virada do segundo do RTC, então a
+/// resolução de 1 s do `GetTime` não entra no erro.
+const WALL_TOLERANCE_MS: i128 = 1000;
 
 /// Aceite da T-358: a hora do RTC menos o tempo desde o reset tem de cair
 /// perto da hora do host em que o QEMU partiu. Sem a linha (cenários que
