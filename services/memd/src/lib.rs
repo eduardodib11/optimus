@@ -18,13 +18,20 @@
 //! O processo é identificado pelos 32 bits baixos do badge do endpoint
 //! (ADR 0034, item 8). Ficam para depois: a interface OIDL
 //! `optimus.mem.Mem@1` com transferência do objeto (`manage` remoto), o
-//! aviso ao `svcmgr` ao negar uma falta (T-353) e a memória comprimida
-//! (T-364).
+//! aviso ao `svcmgr` ao negar uma falta (T-353) e a pressão global de
+//! memória.
+//!
+//! Com [`Pager::enable_compression`], a região ganha memória comprimida
+//! ([`compress`], T-364): quando o `COMMIT` dá `QuotaExceeded`, o `memd`
+//! despeja a página mais fria do mesmo processo e tenta de novo
+//! (auto-paginação), e a falta numa página despejada a restaura.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+
+pub mod compress;
 
 use alloc::vec::Vec;
 
@@ -105,7 +112,10 @@ pub enum Decision {
     Deny(Denial),
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Tentativas de despejo por falta antes de desistir.
+const EVICT_TRIES: usize = 8;
+
+#[derive(Debug)]
 struct Region {
     id: u32,
     owner: u32,
@@ -113,6 +123,7 @@ struct Region {
     base: u64,
     len: u64,
     kind: Kind,
+    store: Option<compress::Store>,
 }
 
 /// Tabela de regiões gerenciadas e contadores.
@@ -191,6 +202,7 @@ impl Pager {
             base,
             len,
             kind,
+            store: None,
         });
         Ok(id)
     }
@@ -208,6 +220,80 @@ impl Pager {
             .ok_or(MemError::InvalidArgument)?;
         self.regions.swap_remove(at);
         Ok(())
+    }
+
+    /// Liga a memória comprimida na região `id` de `owner`: o `memd` mapeia
+    /// a visão `RAW` do objeto em `raw_va` do próprio espaço e guarda no
+    /// máximo `max_compressed` bytes comprimidos da região.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::InvalidArgument`] se a região não existe ou o mapeamento
+    /// falha; [`MemError::Busy`] se já estiver ligada.
+    pub fn enable_compression(
+        &mut self,
+        owner: u32,
+        id: u32,
+        raw_va: u64,
+        max_compressed: u64,
+    ) -> Result<(), MemError> {
+        let r = self
+            .regions
+            .iter_mut()
+            .find(|r| r.id == id && r.owner == owner)
+            .ok_or(MemError::InvalidArgument)?;
+        if r.store.is_some() {
+            return Err(MemError::Busy);
+        }
+        let store = compress::Store::new(r.object, raw_va, r.len, max_compressed)
+            .map_err(|_| MemError::InvalidArgument)?;
+        r.store = Some(store);
+        Ok(())
+    }
+
+    /// Contadores de compressão da região `id` de `owner`.
+    #[must_use]
+    pub fn compression_stats(&self, owner: u32, id: u32) -> Option<compress::Stats> {
+        self.regions
+            .iter()
+            .find(|r| r.id == id && r.owner == owner)
+            .and_then(|r| r.store.as_ref().map(|s| s.stats))
+    }
+
+    /// Resolve a falta na página `offset` da região de `owner` em `addr`,
+    /// despejando páginas frias do mesmo processo se a cota acabar.
+    fn resolve(&mut self, owner: u32, addr: u64, offset: u64) -> Result<(), Error> {
+        let Some(i) = self
+            .regions
+            .iter()
+            .position(|r| r.owner == owner && addr >= r.base && addr - r.base < r.len)
+        else {
+            return Err(Error::InvalidArgument);
+        };
+        for _ in 0..EVICT_TRIES {
+            let r = &mut self.regions[i];
+            let result = match r.store.as_mut() {
+                Some(s) => s.fault_in(r.object, offset),
+                None => mem::commit(r.object, offset, PAGE_SIZE, true),
+            };
+            match result {
+                Err(Error::QuotaExceeded) if self.evict_from(owner)? => {}
+                other => return other,
+            }
+        }
+        Err(Error::QuotaExceeded)
+    }
+
+    /// Despeja uma página de alguma região comprimida de `owner`.
+    fn evict_from(&mut self, owner: u32) -> Result<bool, Error> {
+        for r in self.regions.iter_mut().filter(|r| r.owner == owner) {
+            if let Some(s) = r.store.as_mut()
+                && s.evict_one(r.object)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Esquece todas as regiões de `owner` (processo encerrado).
@@ -257,15 +343,13 @@ impl Pager {
         let addr = msg.words[WORD_ADDR];
         let decision = self.decide(owner, msg.label, msg.words[WORD_ERROR], addr);
         let denial = match decision {
-            Decision::Commit { object, offset } => {
-                match mem::commit(object, offset, PAGE_SIZE, true) {
-                    Ok(()) => {
-                        self.served += 1;
-                        return REPLY_RESUME;
-                    }
-                    Err(e) => Denial::Commit(e),
+            Decision::Commit { offset, .. } => match self.resolve(owner, addr, offset) {
+                Ok(()) => {
+                    self.served += 1;
+                    return REPLY_RESUME;
                 }
-            }
+                Err(e) => Denial::Commit(e),
+            },
             Decision::Deny(d) => d,
         };
         self.denied += 1;
@@ -275,7 +359,8 @@ impl Pager {
 }
 
 /// Atende faltas de `ep` (com o `Reply` `reply`) até `stop` devolver
-/// `true` depois de uma falta, ou até o `recv` falhar.
+/// `true` depois de uma falta ou depois de `idle_ns` sem faltas (0: sem
+/// prazo), ou até o `recv` falhar.
 ///
 /// # Errors
 ///
@@ -284,14 +369,31 @@ pub fn serve(
     pager: &mut Pager,
     ep: Handle,
     reply: Handle,
+    idle_ns: u64,
     mut stop: impl FnMut(&Pager) -> bool,
 ) -> Result<(), Error> {
-    let mut got = ipc::recv(ep, reply, 0)?;
+    let deadline = || {
+        if idle_ns == 0 {
+            0
+        } else {
+            ostd::time::now_ns() + idle_ns
+        }
+    };
+    let mut got = ipc::recv(ep, reply, deadline());
     loop {
-        let label = pager.handle(got.badge, &got.msg);
+        let m = match got {
+            Ok(m) => m,
+            Err(Error::TimedOut) if stop(pager) => return Ok(()),
+            Err(Error::TimedOut) => {
+                got = ipc::recv(ep, reply, deadline());
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let label = pager.handle(m.badge, &m.msg);
         if stop(pager) {
             return ipc::send(reply, &Message::new(label, &[]), 0);
         }
-        got = ipc::reply_recv(ep, reply, &Message::new(label, &[]), 0)?;
+        got = ipc::reply_recv(ep, reply, &Message::new(label, &[]), deadline());
     }
 }

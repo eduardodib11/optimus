@@ -12,6 +12,8 @@ bench = false
 
 [dependencies]
 ostd = { path = "../../lib/ostd" }
+olz4 = { path = "../../lib/olz4" }
+optcrypt = { path = "../../lib/optcrypt" }
 
 [lints]
 workspace = true

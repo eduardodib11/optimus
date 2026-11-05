@@ -84,6 +84,10 @@ const TESTS: &[Test] = &[
         run: paginador::acesso_invalido_encerra,
     },
     Test {
+        name: "memd.comprimida_1_5x",
+        run: paginador::comprimida_1_5x,
+    },
+    Test {
         name: "cap.criar_e_apagar",
         run: criar_e_apagar,
     },
