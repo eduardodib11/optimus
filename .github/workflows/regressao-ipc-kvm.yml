@@ -59,7 +59,14 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Base: $(echo $base) ns (mediana $mb)" >> "$GITHUB_STEP_SUMMARY"
           echo "Gerado: $(echo $novo) ns (mediana $mn)" >> "$GITHUB_STEP_SUMMARY"
-          awk -v b="$mb" -v n="$mn" 'BEGIN{d=(n-b)*100/b; printf "Variação: %+.1f%%\n", d; exit (d>5)?1:0}' | tee -a "$GITHUB_STEP_SUMMARY"
+          pct=$(awk -v b="$mb" -v n="$mn" 'BEGIN{printf "%.1f", (n-b)*100/b}')
+          echo "Variação: ${pct}%" >> "$GITHUB_STEP_SUMMARY"
+          if awk -v p="$pct" 'BEGIN{exit (p>5)?1:0}'; then
+            echo "Dentro do limite de 5%."
+          else
+            echo "Passou de 5% acima da linha de base." >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
