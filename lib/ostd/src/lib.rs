@@ -67,19 +67,39 @@ pub use kabi;
 
 /// Depuração.
 pub mod debug {
-    /// Manda `text` ao registro do kernel pela syscall de depuração
-    /// provisória (`kabi::DEBUG_PRINT`), em pedaços de até
-    /// `kabi::DEBUG_PRINT_MAX` bytes cortados em fronteira de caractere
-    /// (cada pedaço vira uma linha).
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Handle da `DebugLog` deste processo, 0 se não tiver (ADR 0036, item 5).
+    static LOG: AtomicU32 = AtomicU32::new(0);
+
+    /// Passa a mandar as mensagens pela `DebugLog` `log` (`debug_write`), em
+    /// vez da syscall provisória. O `root` a recebe na tabela de partida.
+    pub fn set_log(log: kabi::Handle) {
+        LOG.store(log.raw(), Ordering::Relaxed);
+    }
+
+    /// Manda `text` ao registro do kernel: pela `DebugLog` quando há uma
+    /// (`debug_write`, nível `info`), senão pela syscall provisória
+    /// (`kabi::DEBUG_PRINT`, só nas imagens de teste). Em pedaços de até
+    /// `kabi::DEBUG_PRINT_MAX` bytes cortados em fronteira de caractere (cada
+    /// pedaço vira uma linha).
     pub fn print(text: &str) {
+        let log = LOG.load(Ordering::Relaxed);
         let mut rest = text;
         while !rest.is_empty() {
             let cut = crate::utf8::floor_boundary(rest, kabi::DEBUG_PRINT_MAX);
             let (part, tail) = rest.split_at(cut);
-            let _ = crate::sys::call(
-                kabi::DEBUG_PRINT,
-                [part.as_ptr() as u64, part.len() as u64, 0, 0, 0, 0],
-            );
+            let ptr = part.as_ptr() as u64;
+            let len = part.len() as u64;
+            if log != 0 {
+                // Nível 3 é `info` (ADR 0036, item 5).
+                let _ = crate::sys::call(
+                    kabi::Syscall::DebugWrite.to_raw(),
+                    [u64::from(log), ptr, len, 3, 0, 0],
+                );
+            } else {
+                let _ = crate::sys::call(kabi::DEBUG_PRINT, [ptr, len, 0, 0, 0, 0]);
+            }
             rest = tail;
         }
     }
