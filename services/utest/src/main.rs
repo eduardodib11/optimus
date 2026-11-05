@@ -45,6 +45,7 @@ use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::{Env, Start};
 
 mod anel;
+mod paginador;
 mod tempo;
 mod timer;
 mod vida;
@@ -74,6 +75,14 @@ struct Test {
 
 /// Os testes, na ordem em que rodam.
 const TESTS: &[Test] = &[
+    Test {
+        name: "memd.heap_esparso",
+        run: paginador::heap_esparso,
+    },
+    Test {
+        name: "memd.acesso_invalido_encerra",
+        run: paginador::acesso_invalido_encerra,
+    },
     Test {
         name: "cap.criar_e_apagar",
         run: criar_e_apagar,

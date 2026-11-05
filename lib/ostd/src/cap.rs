@@ -11,7 +11,7 @@ pub(crate) fn raw(h: Handle) -> u64 {
     u64::from(h.raw())
 }
 
-fn handle(v: u64) -> Result<Handle, Error> {
+pub(crate) fn handle(v: u64) -> Result<Handle, Error> {
     u32::try_from(v)
         .map(Handle::from_raw)
         .map_err(|_| Error::InvalidHandle)
