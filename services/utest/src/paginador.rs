@@ -87,7 +87,7 @@ fn heap_com(ctx: &Ctx, obj: ostd::kabi::Handle) -> Outcome {
             (0..TOUCHED as usize).all(|i| bytes[i * step + 8] == i as u8)
         })
         .map_err(|_| "spawn")?;
-    memd::serve(&mut pager, wire.ep, wire.reply, |p| {
+    memd::serve(&mut pager, wire.ep, wire.reply, 0, |p| {
         p.served + p.denied >= TOUCHED
     })
     .map_err(|_| "serve")?;
@@ -155,7 +155,7 @@ fn invalido_com(ctx: &Ctx, obj: ostd::kabi::Handle) -> Outcome {
             bytes[PAGE_SIZE as usize] = 2;
         })
         .map_err(|_| "spawn")?;
-    memd::serve(&mut pager, wire.ep, wire.reply, |p| p.denied >= 1).map_err(|_| "serve")?;
+    memd::serve(&mut pager, wire.ep, wire.reply, 0, |p| p.denied >= 1).map_err(|_| "serve")?;
     let joined = client.join_status();
     let _ = ostd::vm::unmap(SELF, VA_INVALID, 2 * PAGE_SIZE);
     match joined {
@@ -170,6 +170,102 @@ fn invalido_com(ctx: &Ctx, obj: ostd::kabi::Handle) -> Outcome {
             != Some((VA_INVALID + PAGE_SIZE, Denial::Unmanaged))
     {
         return Err("contagem do memd errada");
+    }
+    Ok(())
+}
+
+/// Onde o teste de compressão mapeia o objeto para o cliente e a visão
+/// `RAW` do `memd`.
+const VA_PACKED: u64 = 0x4_0000_0000;
+const VA_RAW: u64 = 0x5_0000_0000;
+
+/// Aceite da T-364: uma carga que excede a cota física em 1,5× roda até o
+/// fim sem OOM (o `memd` despeja comprimindo e restaura na falta), com a
+/// razão de compressão e a latência de falta no relatório.
+pub fn comprimida_1_5x(ctx: &Ctx) -> Outcome {
+    const QUOTA: u64 = 1 << 20;
+    let q = child_quota(ctx, QUOTA)?;
+    let len = QUOTA + QUOTA / 2;
+    let obj = mem::create_lazy(q, len).map_err(|_| "create_lazy")?;
+    let verdict = comprimida_com(ctx, obj, len);
+    let _ = (delete(obj), delete(q));
+    verdict
+}
+
+fn comprimida_com(ctx: &Ctx, obj: ostd::kabi::Handle, len: u64) -> Outcome {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    let mut map = Mapping::new(SELF, obj, VA_PACKED, len, WRITE).map_err(|_| "vm_map")?;
+    let wire = Wire::new(ctx)?;
+    let mut pager = Pager::new();
+    let owner = memd::owner_of(OWNER);
+    let id = pager
+        .manage(owner, obj, VA_PACKED, len, Kind::Heap)
+        .map_err(|_| "manage")?;
+    pager
+        .enable_compression(owner, id, VA_RAW, len)
+        .map_err(|_| "enable_compression")?;
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    let npages = (len / PAGE_SIZE) as usize;
+    let client = Builder::new()
+        .exception_endpoint(wire.exc)
+        .spawn(move || {
+            let bytes = map.bytes_mut().expect("gravável");
+            let fill = |page: &mut [u8], i: usize| {
+                page[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                for (j, b) in page[64..512].iter_mut().enumerate() {
+                    *b = (i + j / 16) as u8;
+                }
+            };
+            for i in 0..npages {
+                fill(&mut bytes[i * 4096..(i + 1) * 4096], i);
+            }
+            let mut want = [0u8; 4096];
+            let ok = (0..npages).all(|i| {
+                want.fill(0);
+                fill(&mut want, i);
+                bytes[i * 4096..(i + 1) * 4096] == want
+            });
+            flag.store(true, Ordering::Release);
+            ok
+        })
+        .map_err(|_| "spawn")?;
+    let t0 = ostd::time::now_ns();
+    memd::serve(&mut pager, wire.ep, wire.reply, 200_000_000, |p| {
+        p.denied > 0 || done.load(Ordering::Acquire)
+    })
+    .map_err(|_| "serve")?;
+    let ok = client.join().map_err(|_| "o cliente morreu (OOM?)")?;
+    let elapsed = ostd::time::now_ns() - t0;
+    let s = pager
+        .compression_stats(owner, id)
+        .ok_or("sem estatísticas")?;
+    let ratio_x100 = (s.original_bytes * 100)
+        .checked_div(s.packed_bytes)
+        .unwrap_or(0);
+    let restore_us = s.restore_ns.checked_div(s.restored).unwrap_or(0) / 1000;
+    let fault_us = elapsed.checked_div(pager.served).unwrap_or(0) / 1000;
+    let p = |args: core::fmt::Arguments<'_>| ostd::debug::print_fmt(args);
+    p(format_args!("utest: memd: {npages} pág., cota 256"));
+    p(format_args!("utest: memd: {} faltas", pager.served));
+    p(format_args!("utest: memd: {} despejos", s.evicted));
+    p(format_args!("utest: memd: {} restaurações", s.restored));
+    p(format_args!(
+        "utest: memd: razão {}.{:02}x",
+        ratio_x100 / 100,
+        ratio_x100 % 100
+    ));
+    p(format_args!("utest: memd: restauração {restore_us} µs"));
+    p(format_args!("utest: memd: falta média {fault_us} µs"));
+    if !ok {
+        return Err("o conteúdo restaurado não bate");
+    }
+    if pager.denied != 0 || s.corrupt != 0 {
+        return Err("o memd negou falta ou achou hash errado");
+    }
+    if s.evicted == 0 || s.restored == 0 {
+        return Err("a carga devia forçar despejo e restauração");
     }
     Ok(())
 }

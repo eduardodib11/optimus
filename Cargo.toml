@@ -35,6 +35,12 @@ debug = 0
 [profile.dev.package.memd]
 debug = 0
 
+[profile.dev.package.olz4]
+debug = 0
+
+[profile.dev.package.optcrypt]
+debug = 0
+
 [profile.dev.package.ocoll]
 debug = 0
 

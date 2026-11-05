@@ -772,3 +772,220 @@ pub fn formata(src: &str) -> String {
         _ => src.to_string(),
     }
 }
+
+/// Gera o módulo de cliente de `file` (T-345): para cada interface, uma
+/// struct `<Interface>Cliente` com um método por método da interface. Cada
+/// método codifica o pedido, chama pelo `ostd::ipc::call_corpo` e decodifica
+/// a resposta (ok ou erro, pelo tipo do rótulo).
+///
+/// Limites desta versão: parâmetros só de tipos por valor (primitivos,
+/// `string`, `enum`, `flags` e tipos com `Timestamp`); `handle`, `vec`,
+/// `struct` como parâmetro e `oneway` ainda não têm cliente.
+///
+/// # Errors
+///
+/// Tipo sem layout, parâmetro fora dos tipos por valor, `handle` na resposta.
+pub fn gera_cliente(file: &File) -> Result<String, Vec<Error>> {
+    let mut g = Gen {
+        file,
+        lay: Layouts::new(file),
+        out: String::new(),
+        erros: Vec::new(),
+        n: 0,
+    };
+    g.prelude_cliente();
+    g.tipos();
+    g.clientes();
+    if g.erros.is_empty() {
+        Ok(g.out)
+    } else {
+        Err(g.erros)
+    }
+}
+
+impl Gen<'_> {
+    fn prelude_cliente(&mut self) {
+        self.out.push_str(
+            "// Gerado pelo oidlc a partir do arquivo .oidl. Não edite à mão.\n\
+             //\n\
+             // Cliente de IPC (T-345): cada chamada usa `ostd::ipc::call_corpo`.\n\n\
+             #![allow(unused_parens, reason = \"o codificador põe parênteses em volta de expressões\")]\n\n\
+             use oidl_rt::{Error, Reader, Writer};\n\n\
+             /// Erro de codificação ou decodificação vira erro de IPC.\n\
+             fn erro_oidl(_: Error) -> ostd::kabi::Error {\n    ostd::kabi::Error::InvalidArgument\n}\n\n",
+        );
+    }
+
+    /// Um tipo passa por valor no pedido se é primitivo, texto ou um enum,
+    /// flags ou apelido deles (o codificador lê esses tipos por referência).
+    fn por_valor(&self, t: &Type) -> bool {
+        match t {
+            Type::Prim(..) | Type::String(_) => true,
+            Type::Named(id) => match self.decl(&id.name) {
+                Some(Decl::Enum(_) | Decl::Flags(_)) => true,
+                Some(Decl::Alias(a)) => self.por_valor(&a.ty),
+                _ => id.name == "Timestamp",
+            },
+            Type::Unit | Type::Vec(..) | Type::Handle(_) => false,
+        }
+    }
+
+    fn clientes(&mut self) {
+        let decls: Vec<Decl> = self.file.decls.clone();
+        let minor = u16::try_from(self.file.package.version.minor).unwrap_or(u16::MAX);
+        for d in &decls {
+            let Decl::Interface(i) = d else { continue };
+            let nome = i.name.name.clone();
+            let id = interface_id(self.pkg(), &nome, self.file.package.version.major);
+            let sn = snake(&nome);
+            let mut metodos = String::new();
+            let mut auxiliares = String::new();
+            for (ordinal, m) in i.methods.iter().enumerate() {
+                let ordinal = u16::try_from(ordinal).unwrap_or(u16::MAX);
+                self.metodo_cliente(&sn, id, minor, ordinal, m, &mut metodos, &mut auxiliares);
+            }
+            let _ = writeln!(
+                self.out,
+                "/// Cliente da interface `{nome}` (T-345).\npub struct {nome}Cliente {{\n    /// Endpoint para onde as chamadas vão.\n    pub ep: ostd::kabi::Handle,\n}}\n\nimpl {nome}Cliente {{\n    /// Cliente para `ep`.\n    #[must_use]\n    pub const fn new(ep: ostd::kabi::Handle) -> Self {{\n        Self {{ ep }}\n    }}\n{metodos}}}\n"
+            );
+            self.out.push_str(&auxiliares);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn metodo_cliente(
+        &mut self,
+        sn: &str,
+        id: u32,
+        minor: u16,
+        ordinal: u16,
+        m: &Method,
+        metodos: &mut String,
+        aux: &mut String,
+    ) {
+        let nome = m.name.name.clone();
+        let Some(ret) = &m.ret else {
+            self.erro(
+                m.name.pos,
+                format!("'{nome}': método sem resultado não tem cliente ainda"),
+            );
+            return;
+        };
+        if m.oneway {
+            self.erro(
+                m.name.pos,
+                format!("'{nome}': oneway não tem cliente ainda"),
+            );
+            return;
+        }
+        let (pedido, resposta) = match self.lay.metodo(m) {
+            Ok((p, Some((ok, err)))) => (p, (ok, err)),
+            Ok((_, None)) => return,
+            Err(msg) => {
+                self.erro(m.name.pos, format!("'{nome}': {msg}"));
+                return;
+            }
+        };
+        let (cab_ok, cab_err) = resposta;
+        let mut assinatura_pub = String::new();
+        let mut assinatura_aux = String::new();
+        let mut chamada = String::new();
+        for p in &m.params {
+            if !self.por_valor(&p.ty) {
+                self.erro(
+                    p.name.pos,
+                    format!(
+                        "parâmetro '{}' de '{nome}' não é de tipo por valor",
+                        p.name.name
+                    ),
+                );
+                return;
+            }
+            let Some(rust) = self.rs(&p.ty, Modo::Elidido) else {
+                self.erro(
+                    p.name.pos,
+                    format!("parâmetro '{}' de '{nome}' sem tipo Rust", p.name.name),
+                );
+                return;
+            };
+            let _ = write!(assinatura_pub, ", {}: {rust}", p.name.name);
+            let _ = write!(assinatura_aux, ", {}: &{rust}", p.name.name);
+            let _ = write!(chamada, ", &{}", p.name.name);
+        }
+        let mut enc = String::new();
+        if let Ok(cab) = self.lay.cabeca_de(&m.params) {
+            for (c, p) in cab.campos.iter().zip(&m.params) {
+                let at = c.deslocamento.to_string();
+                enc.push_str(&self.enc(&p.ty, &p.name.name, &at));
+            }
+        }
+        let mutavel = if m.params.is_empty() { "" } else { "mut " };
+        let _ = writeln!(
+            aux,
+            "fn codifica_{sn}_{ordinal}(saida: &mut [u8]{assinatura_aux}) -> Result<usize, Error> {{\n    let {mutavel}w = Writer::new(saida, {})?;\n{enc}    Ok(w.finish())\n}}\n",
+            pedido.tamanho
+        );
+
+        let ok_rust = match &m.ret {
+            Some(r) if matches!(r.ok, Type::Unit) => "()".to_string(),
+            Some(r) => match self.rs(&r.ok, Modo::Elidido) {
+                Some(t) => t,
+                None => return self.erro(m.name.pos, format!("'{nome}': resposta sem tipo Rust")),
+            },
+            None => "()".to_string(),
+        };
+        let err_rust = match &m.ret {
+            Some(r) if matches!(r.err, Type::Unit) => "()".to_string(),
+            Some(r) => match self.rs(&r.err, Modo::Elidido) {
+                Some(t) => t,
+                None => return self.erro(m.name.pos, format!("'{nome}': erro sem tipo Rust")),
+            },
+            None => "()".to_string(),
+        };
+        if matches!(ret.ok, Type::Handle(_)) || matches!(ret.err, Type::Handle(_)) {
+            self.erro(
+                m.name.pos,
+                format!("'{nome}': resposta com handle ainda não tem cliente"),
+            );
+            return;
+        }
+        for (lado, ty, cab, rust) in [
+            ("ok", &ret.ok, cab_ok.tamanho, &ok_rust),
+            ("err", &ret.err, cab_err.tamanho, &err_rust),
+        ] {
+            let corpo = if matches!(ty, Type::Unit) {
+                String::from("    let _ = corpo;\n")
+            } else {
+                match self.dec(ty) {
+                    Ok(e) => format!("    let v = {e};\n"),
+                    Err(msg) => return self.erro(m.name.pos, format!("'{nome}': {msg}")),
+                }
+            };
+            let valor = if matches!(ty, Type::Unit) {
+                "Ok(())"
+            } else {
+                "Ok(v)"
+            };
+            let mutavel_r = if matches!(ty, Type::Unit) { "" } else { "mut " };
+            let _ = writeln!(
+                aux,
+                "fn decodifica_{lado}_{sn}_{ordinal}(corpo: &[u8]) -> Result<{rust}, Error> {{\n    let {mutavel_r}r = Reader::new(corpo, {cab})?;\n{corpo}    r.finish()?;\n    {valor}\n}}\n"
+            );
+        }
+
+        let rotulo = crate::ids::rotulo_pedido(id, minor, ordinal);
+        let tam_pedido = tamanho_buffer(pedido.tamanho, pedido.pior_caso);
+        let tam_resposta = tamanho_buffer(cab_ok.tamanho, cab_ok.pior_caso)
+            .max(tamanho_buffer(cab_err.tamanho, cab_err.pior_caso));
+        let _ = writeln!(
+            metodos,
+            "    /// Método `{nome}` (ordinal {ordinal}).\n    pub fn {nome}(&self, buf: &mut ostd::ipc::Buffer{assinatura_pub}) -> Result<Result<{ok_rust}, {err_rust}>, ostd::kabi::Error> {{\n        let mut pedido = [0u8; {tam_pedido}];\n        let n = codifica_{sn}_{ordinal}(&mut pedido{chamada}).map_err(erro_oidl)?;\n        let mut saida = [0u8; {tam_resposta}];\n        let (rotulo, m) = ostd::ipc::call_corpo(self.ep, buf, {rotulo:#018X}, &pedido[..n], &mut saida, 0)?;\n        if rotulo >> 62 == 0 {{\n            Ok(Ok(decodifica_ok_{sn}_{ordinal}(&saida[..m]).map_err(erro_oidl)?))\n        }} else {{\n            Ok(Err(decodifica_err_{sn}_{ordinal}(&saida[..m]).map_err(erro_oidl)?))\n        }}\n    }}\n"
+        );
+    }
+}
+
+/// Tamanho de buffer para um corpo: o maior entre a cabeça e o pior caso,
+/// arredondado a 8 bytes.
+fn tamanho_buffer(cabeca: u64, pior: u64) -> u64 {
+    cabeca.max(pior).div_ceil(8) * 8
+}
