@@ -14,6 +14,29 @@ mod handle;
 mod rights;
 
 pub use handle::{Handle, handle_pair, split_handle_pair};
+
+/// Tabela de handles de partida do `root` (ADR 0036, item 5; T-355).
+///
+/// `rdx` do `root` leva `handle_pair(thread, tabela)`. A tabela é um
+/// `MemoryObject` somente leitura de uma página: `u32` mágico, `u32`
+/// quantidade de entradas e, a partir do byte 8, entradas de 8 bytes
+/// `u32` tipo e `u32` handle (little-endian), no `CapSpace` do root.
+pub mod startup {
+    /// Mágico `"OSTA"` little-endian.
+    pub const MAGIC: u32 = 0x4153_544F;
+    /// Entrada: o bootfs (cópia só de leitura).
+    pub const KIND_BOOTFS: u32 = 1;
+    /// Entrada: a [`DebugLog`](crate::ObjectType::DebugLog) de depuração.
+    pub const KIND_DEBUG_LOG: u32 = 2;
+    /// Entrada: uma das duas linhas de pressão de memória (ADR 0038).
+    pub const KIND_PRESSURE: u32 = 3;
+    /// Bytes do cabeçalho antes da primeira entrada.
+    pub const HEADER_BYTES: usize = 8;
+    /// Bytes de cada entrada.
+    pub const ENTRY_BYTES: usize = 8;
+    /// Entradas que cabem na página.
+    pub const MAX_ENTRIES: usize = (4096 - HEADER_BYTES) / ENTRY_BYTES;
+}
 pub use rights::Rights;
 
 /// Versão da ABI de syscalls (seção 14.2, "ABI v1").
