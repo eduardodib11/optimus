@@ -1,0 +1,116 @@
+{
+  "pacote": "optimus.fs@1.0",
+  "ferramentas": [
+    {
+      "nome": "optimus.fs.Directory.list",
+      "descricao": "Lista o conteúdo de uma pasta",
+      "risco": "R0",
+      "entrada": {
+        "tipo": "object",
+        "propriedades": {
+          "path": {
+            "tipo": "string",
+            "tamanhoMaximo": 1024
+          },
+          "cursor": {
+            "tipo": "integer",
+            "minimo": 0,
+            "maximo": 18446744073709551615
+          }
+        },
+        "obrigatorios": [
+          "path",
+          "cursor"
+        ],
+        "adicionais": false
+      },
+      "saida": {
+        "tipo": "object",
+        "propriedades": {
+          "entries": {
+            "tipo": "array",
+            "itens": {
+              "tipo": "object",
+              "propriedades": {
+                "name": {
+                  "tipo": "string",
+                  "tamanhoMaximo": 255
+                },
+                "kind": {
+                  "tipo": "string",
+                  "valores": [
+                    "File",
+                    "Dir",
+                    "Link"
+                  ]
+                },
+                "size": {
+                  "tipo": "integer",
+                  "minimo": 0,
+                  "maximo": 18446744073709551615
+                },
+                "modified": {
+                  "tipo": "integer",
+                  "descricao": "nanossegundos desde 1970-01-01 UTC"
+                }
+              },
+              "obrigatorios": [
+                "name",
+                "kind",
+                "size",
+                "modified"
+              ],
+              "adicionais": false
+            },
+            "tamanhoMaximo": 8
+          },
+          "next": {
+            "tipo": "integer",
+            "minimo": 0,
+            "maximo": 18446744073709551615
+          }
+        },
+        "obrigatorios": [
+          "entries",
+          "next"
+        ],
+        "adicionais": false
+      },
+      "erro": {
+        "tipo": "string",
+        "valores": [
+          "NotFound",
+          "NotDirectory",
+          "Io"
+        ]
+      }
+    },
+    {
+      "nome": "optimus.fs.Directory.trash",
+      "descricao": "Move um item para a lixeira",
+      "risco": "R2",
+      "entrada": {
+        "tipo": "object",
+        "propriedades": {
+          "path": {
+            "tipo": "string",
+            "tamanhoMaximo": 1024
+          }
+        },
+        "obrigatorios": [
+          "path"
+        ],
+        "adicionais": false
+      },
+      "saida": null,
+      "erro": {
+        "tipo": "string",
+        "valores": [
+          "NotFound",
+          "NotDirectory",
+          "Io"
+        ]
+      }
+    }
+  ]
+}
