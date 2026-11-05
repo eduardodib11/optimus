@@ -3,7 +3,7 @@
 use super::{ROOT_NAME, bootfs, load, run_until_exit};
 use crate::kcap::root_quota;
 use crate::ktest::{Outcome, Test};
-use crate::kthread::tests::settled;
+use crate::kthread::tests::settled_within;
 use crate::kthread::{take_debug_log, yield_now};
 
 /// Testes de kernel do bootfs.
@@ -60,6 +60,10 @@ fn root_inicia() -> Outcome {
         let [_, _, thread, _] = p.handles;
         drop(p.cspace.lock().delete(thread));
     }
-    ensure!(settled(&quota, used0));
+    // O svcmgr termina depois do próprio contato com o root (T-351): a
+    // cota pode levar mais que 1 s para voltar. O prazo é de 5 s e a
+    // igualdade continua exata; o registro de depuração guarda só 256 bytes,
+    // por isso não serve de sinal.
+    ensure!(settled_within(&quota, used0, 5_000_000_000));
     Ok(())
 }
