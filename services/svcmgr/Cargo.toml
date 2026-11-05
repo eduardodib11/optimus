@@ -1,0 +1,17 @@
+[package]
+name = "svcmgr"
+description = "Corretor de capabilities e supervisor dos serviços (ADR 0034). Criado pelo root."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "svcmgr"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+
+[lints]
+workspace = true

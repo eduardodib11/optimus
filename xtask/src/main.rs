@@ -37,6 +37,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
     ("root", "services/root/src/main.rs", USER_TARGET),
     ("hello", "services/hello/src/main.rs", USER_TARGET),
+    ("svcmgr", "services/svcmgr/src/main.rs", USER_TARGET),
     ("memd", "services/memd/src/lib.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
