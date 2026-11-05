@@ -13,6 +13,7 @@ pub mod layout;
 pub mod lexer;
 pub mod parser;
 pub mod sema;
+pub mod servidor;
 
 pub use compat::check_compat;
 pub use parser::parse;
