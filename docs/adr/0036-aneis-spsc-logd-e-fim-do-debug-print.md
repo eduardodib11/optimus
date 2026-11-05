@@ -345,3 +345,19 @@ Mudanças em relação à proposta:
   boot.
 - **Mapeamento do `root`:** `TABLE_VA = 0x5000_0000`, só leitura, mapeado só
   para ler a tabela e liberado em seguida.
+
+### Passos 4 e 5 (T-355, 2026-11-05)
+
+- **Passo 4:** `DEBUG_PRINT` só existe com `cfg(ktest_debug)`, ligado por
+  `OPTIMUS_KTEST_DEBUG` (`kernel/okernel/build.rs`). O `xtask` liga essa
+  variável em `smoke`, `smp`, `stress`, `fuzz` e na imagem de falha
+  proposital. Nas imagens normais, o número cai em `NotSupported`.
+- **`ostd::debug`:** `set_log` guarda o handle da `DebugLog`; com ele,
+  `print` manda pela `debug_write` (nível 3, `info`). Sem ele, usa
+  `DEBUG_PRINT`, que só funciona nas imagens de teste.
+- **`root`:** lê a `DebugLog` da tabela de partida e chama `set_log`.
+- **Pendente:** `hello` e `utest` ainda não recebem a `DebugLog` pela
+  tabela (o `hello` recebe os argumentos da própria `root`). Fora das
+  imagens de teste, a saída deles fica muda até essa migração.
+- **Passo 5:** `okfuzz` roda sem regressão no `test all` (semente
+  0xcf022, 60 s), com `DEBUG_PRINT` ligado pela imagem de fuzzing.

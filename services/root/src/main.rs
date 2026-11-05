@@ -197,7 +197,12 @@ fn hello(b: Boot) -> Result<(), Error> {
 
 /// Acha o bootfs na tabela de handles de partida, lendo-a só por leitura.
 fn bootfs_from_table(aspace: Handle, table: Handle) -> Result<Handle, Error> {
-    use ostd::kabi::startup::{ENTRY_BYTES, HEADER_BYTES, KIND_BOOTFS, MAGIC, MAX_ENTRIES};
+    table_entry(aspace, table, ostd::kabi::startup::KIND_BOOTFS)
+}
+
+/// Handle da primeira entrada do tipo `kind` na tabela de partida.
+fn table_entry(aspace: Handle, table: Handle, kind: u32) -> Result<Handle, Error> {
+    use ostd::kabi::startup::{ENTRY_BYTES, HEADER_BYTES, MAGIC, MAX_ENTRIES};
     let map = Mapping::new(aspace, table, TABLE_VA, PAGE_SIZE, 0)?;
     let bytes = map.bytes();
     let word = |at: usize| -> Option<u32> {
@@ -212,7 +217,7 @@ fn bootfs_from_table(aspace: Handle, table: Handle) -> Result<Handle, Error> {
     }
     for i in 0..count {
         let at = HEADER_BYTES + i * ENTRY_BYTES;
-        if word(at) == Some(KIND_BOOTFS) {
+        if word(at) == Some(kind) {
             let raw = word(at + 4).ok_or(Error::InvalidArgument)?;
             return Ok(Handle::from_raw(raw));
         }
@@ -224,6 +229,9 @@ fn main(start: Start) -> ! {
     let [quota, aspace, rdx] = start.args;
     let (thread, table) = split_handle_pair(rdx);
     let handle = |raw: u64| Handle::from_raw(u32::try_from(raw).unwrap_or(0));
+    if let Ok(log) = table_entry(handle(aspace), table, ostd::kabi::startup::KIND_DEBUG_LOG) {
+        ostd::debug::set_log(log);
+    }
     let bootfs = match bootfs_from_table(handle(aspace), table) {
         Ok(h) => h,
         Err(e) => {

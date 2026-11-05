@@ -1639,6 +1639,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
 }
 
 fn dispatch(nr: u64, a: [u64; 6]) -> Result<Values, Error> {
+    #[cfg(ktest_debug)]
     if nr == kabi::DEBUG_PRINT {
         return debug_print(a[0], a[1]);
     }
@@ -1753,6 +1754,7 @@ fn thread_start(a: [u64; 6]) -> Result<(), Error> {
 /// registro que eles leem; fora deles, ao registro do kernel, uma linha por
 /// chamada. Qualquer thread pode chamá-la até `debug_write` ganhar a
 /// capability de depuração.
+#[cfg(ktest_debug)]
 fn debug_print(ptr: u64, len: u64) -> Result<Values, Error> {
     let mut buf = [0u8; kabi::DEBUG_PRINT_MAX];
     let len = usize::try_from(len)
@@ -1804,11 +1806,12 @@ fn debug_write(a: [u64; 6]) -> Result<Values, Error> {
     let text = core::str::from_utf8(&buf[..len]).map_err(|_| Error::InvalidArgument)?;
     let text = text.trim_end();
     if ktest::active() {
-        let line = alloc::format!("[{badge:x}] {text}\n");
+        // Nos testes o texto vai puro ao registro que eles leem (como
+        // `DEBUG_PRINT`); o badge e o nível ficam para a serial.
         let mut log = DEBUG_LOG.lock();
         let (bytes, used) = &mut *log;
-        let n = line.len().min(bytes.len() - *used);
-        bytes[*used..*used + n].copy_from_slice(&line.as_bytes()[..n]);
+        let n = text.len().min(bytes.len() - *used);
+        bytes[*used..*used + n].copy_from_slice(&text.as_bytes()[..n]);
         *used += n;
     } else {
         crate::klog::write(level, format_args!("[{badge:x}] {text}"));

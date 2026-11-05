@@ -295,6 +295,12 @@ fn build(opts: &Options) -> Result {
     build_with(opts, &[])
 }
 
+/// Imagem de teste e de fuzzing: liga `DEBUG_PRINT` (ADR 0036, item 5), que
+/// os programas de usuário de teste usam.
+fn build_test(opts: &Options) -> Result {
+    build_with(opts, &[("OPTIMUS_KTEST_DEBUG", "1")])
+}
+
 /// [`build`] com variáveis de ambiente a mais para o `cargo`.
 fn build_with(opts: &Options, env: &[(&str, &str)]) -> Result {
     println!(
@@ -711,7 +717,7 @@ const UTEST_END: &str = "utest: fim: ";
 /// Dá boot em cada cenário e confere a serial com [`check_serial`]; com
 /// mais de um boot, confere também que o mapa direto mudou de lugar.
 fn smoke(opts: &Options, scenarios: &[Scenario]) -> Result {
-    build(opts)?;
+    build_test(opts)?;
     let mut bases = Vec::new();
     for scenario in scenarios {
         let serial = boot_scenario(opts, scenario)?;
@@ -1060,7 +1066,7 @@ fn test(opts: &Options) -> Result {
     if opts.suite == "user" && opts.fail_on_purpose {
         // Compila o `utest` com o teste que falha de propósito: o comando
         // tem de terminar com erro (o CI confere que o código é ≠ 0).
-        build_with(opts, &[("UTEST_FALHA", "1")])?;
+        build_with(opts, &[("UTEST_FALHA", "1"), ("OPTIMUS_KTEST_DEBUG", "1")])?;
         boot_scenario(opts, &USER_SCENARIO)?;
         return Err("o teste que falha de propósito não derrubou o comando".into());
     }
@@ -1083,7 +1089,7 @@ const SMP_COUNTS: &[u32] = &[2, 4, 8];
 /// de IPC com o servidor seguindo quem chama, e uma rodada curta de
 /// `okfuzz` com um processo por CPU.
 fn smp(opts: &Options) -> Result {
-    build(opts)?;
+    build_test(opts)?;
     let release = Options {
         release: true,
         ..opts.clone()
@@ -1181,7 +1187,7 @@ fn stress(opts: &Options) -> Result {
         format!("test=kernel ktest=smp.estresse smp.estresse_s={seconds}").into_boxed_str(),
     );
     println!("xtask: estresse SMP: {} min em -smp {smp}", opts.minutes);
-    build(opts)?;
+    build_test(opts)?;
     let serial = boot_scenario(
         &Options {
             smp,
@@ -1271,7 +1277,7 @@ const FUZZ_SHORT_SEED: u64 = 0x0c_f022;
 /// em pânico, tomar uma falta ou travar. A semente é impressa para
 /// reproduzir com `--seed`.
 fn fuzz(opts: &Options) -> Result {
-    build(opts)?;
+    build_test(opts)?;
     let seed = opts.seed.unwrap_or_else(seed_from_clock) & ((1 << 48) - 1);
     run_fuzz(opts, opts.seconds, seed)
 }
