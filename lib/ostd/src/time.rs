@@ -251,3 +251,17 @@ pub fn sleep_until(deadline: Instant) {
         }
     }
 }
+
+/// Hora do RTC lida no boot (`sys_info` classe 4, ADR 0037): `(ns Unix,
+/// instante monotônico da leitura)`, ou `None` se o `GetTime` falhou.
+///
+/// # Errors
+///
+/// Os do kernel.
+pub fn boot_wall() -> Result<Option<(i64, u64)>, kabi::Error> {
+    let [wall, at, flags] = crate::sys::syscall(
+        kabi::Syscall::SysInfo,
+        [kabi::sched::SYS_INFO_WALL, 0, 0, 0, 0, 0],
+    )?;
+    Ok((flags & kabi::sched::WALL_VALID != 0).then_some((wall.cast_signed(), at)))
+}

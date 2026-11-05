@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, sync::mpsc, thread};
 
 mod bench;
@@ -39,13 +39,14 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("hello", "services/hello/src/main.rs", USER_TARGET),
     ("svcmgr", "services/svcmgr/src/main.rs", USER_TARGET),
     ("memd", "services/memd/src/lib.rs", USER_TARGET),
+    ("timed", "services/timed/src/lib.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
 
 /// Bibliotecas portáveis cujos testes rodam no host.
 const HOST_TESTED: &[&str] = &[
-    "oalloc", "obfs", "ocoll", "olz4", "oelf", "optcrypt", "oidl-rt", "svcmgr",
+    "oalloc", "obfs", "ocoll", "olz4", "oelf", "optcrypt", "oidl-rt", "svcmgr", "timed",
 ];
 
 const PROFILES: &[&str] = &["lite", "basic", "default", "premium", "server"];
@@ -757,6 +758,39 @@ fn check_direct_map_bases(bases: &[u64]) -> Result {
     Ok(())
 }
 
+/// Linha do `optboot` com a hora do RTC (T-358).
+const WALL_LINE: &str = "optboot: hora do RTC ";
+/// Erro aceito da hora de parede do boot contra o host: 1 s do aceite da
+/// T-358 mais 1 s da resolução do RTC (`GetTime` trunca os segundos).
+const WALL_TOLERANCE_MS: i128 = 2000;
+
+/// Aceite da T-358: a hora do RTC menos o tempo desde o reset tem de cair
+/// perto da hora do host em que o QEMU partiu. Sem a linha (cenários que
+/// não passam pelo `optboot`) não há o que conferir.
+fn check_wall_time(serial: &str, spawned_unix_ms: u128) -> Result {
+    let Some(rest) = serial.lines().find_map(|l| l.split_once(WALL_LINE)) else {
+        return Ok(());
+    };
+    let mut nums = rest
+        .1
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|w| !w.is_empty());
+    let (Some(secs), Some(ms)) = (nums.next(), nums.next()) else {
+        return Err(format!("linha da hora do RTC ilegível: {}", rest.1));
+    };
+    let secs: i128 = secs.parse().map_err(|_| "segundos do RTC")?;
+    let ms: i128 = ms.parse().map_err(|_| "ms desde o reset")?;
+    let at_reset = secs * 1000 - ms;
+    let err = at_reset - i128::try_from(spawned_unix_ms).unwrap_or(0);
+    println!("xtask: hora do RTC no reset difere {err} ms da do host na partida do QEMU");
+    if err.abs() > WALL_TOLERANCE_MS {
+        return Err(format!(
+            "hora do RTC errada em {err} ms (limite {WALL_TOLERANCE_MS} ms)"
+        ));
+    }
+    Ok(())
+}
+
 /// Dá boot num cenário e devolve a serial, se ela conferir.
 fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let esp = image(opts, sc.cmdline, sc.rounds)?;
@@ -772,6 +806,9 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     } else {
         Stdio::null()
     };
+    let spawned_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
     let mut child = cmd
         .stdin(stdin)
         .stdout(Stdio::piped())
@@ -826,6 +863,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let serial = String::from_utf8_lossy(&raw);
     let result = check_serial(&serial, sc.markers, sc.forbidden)
         .and_then(|()| check_hello(&serial, sc))
+        .and_then(|()| check_wall_time(&serial, spawned_unix_ms))
         .and_then(|()| match sc.harness {
             Some(Harness::Kernel) => check_ktest(&serial),
             Some(Harness::User) => check_utest(&serial),

@@ -217,6 +217,12 @@ pub struct BootInfo {
     pub tpm_event_log: PhysRange,
     /// Instante da entrega ao kernel, em ns desde o reset da CPU.
     pub boot_time_ns: u64,
+    /// Hora de parede do RTC (UEFI `GetTime`) em ns Unix UTC; 0 se a
+    /// leitura falhou (ADR 0037, item 1).
+    pub wall_unix_ns: i64,
+    /// Instante da leitura de [`Self::wall_unix_ns`], em ns desde o reset
+    /// da CPU (a mesma base de [`Self::boot_time_ns`]).
+    pub wall_tsc_ns: u64,
 }
 
 impl BootInfo {
@@ -246,6 +252,8 @@ impl BootInfo {
             direct_map_base: DIRECT_MAP_START,
             tpm_event_log: PhysRange { base: 0, len: 0 },
             boot_time_ns: 0,
+            wall_unix_ns: 0,
+            wall_tsc_ns: 0,
         }
     }
 
@@ -291,6 +299,86 @@ impl BootInfo {
         }
         self.cmdline[..len].copy_from_slice(&text.as_bytes()[..len]);
         self.cmdline_len = len as u64;
+    }
+}
+
+/// `EFI_TIME.TimeZone` sem fuso: o RTC guarda UTC (ADR 0037, item 1).
+pub const EFI_UNSPECIFIED_TIMEZONE: i16 = 0x07FF;
+/// `EFI_TIME.Daylight`: a hora já está no horário de verão.
+pub const EFI_TIME_IN_DAYLIGHT: u8 = 0x02;
+
+/// Campos de `EFI_TIME` usados na conversão.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EfiTime {
+    /// 1900 a 9999.
+    pub year: u16,
+    /// 1 a 12.
+    pub month: u8,
+    /// 1 a 31.
+    pub day: u8,
+    /// 0 a 23.
+    pub hour: u8,
+    /// 0 a 59.
+    pub minute: u8,
+    /// 0 a 59.
+    pub second: u8,
+    /// 0 a 999 999 999.
+    pub nanosecond: u32,
+    /// Minutos de -1440 a 1440, ou [`EFI_UNSPECIFIED_TIMEZONE`].
+    pub time_zone: i16,
+    /// Bits de horário de verão.
+    pub daylight: u8,
+}
+
+/// Dias desde 1970-01-01 da data civil (algoritmo de Howard Hinnant).
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+impl EfiTime {
+    /// Hora em ns Unix UTC; `None` para campo fora do domínio ou antes de
+    /// 1970.
+    ///
+    /// Sinal do fuso, conferido na T-358: a especificação UEFI define
+    /// `hora local = UTC - TimeZone` (o EDK2 grava `TimeZone = 300` para
+    /// UTC-5), então `UTC = local + TimeZone`. Com `EFI_TIME_IN_DAYLIGHT`
+    /// a hora local está uma hora à frente e a hora é descontada. Sem fuso
+    /// ([`EFI_UNSPECIFIED_TIMEZONE`]) o RTC guarda UTC.
+    #[must_use]
+    pub const fn to_unix_ns(&self) -> Option<i64> {
+        let ok = self.year >= 1970
+            && self.month >= 1
+            && self.month <= 12
+            && self.day >= 1
+            && self.day <= 31
+            && self.hour < 24
+            && self.minute < 60
+            && self.second < 60
+            && self.nanosecond < 1_000_000_000
+            && (self.time_zone == EFI_UNSPECIFIED_TIMEZONE
+                || (self.time_zone >= -1440 && self.time_zone <= 1440));
+        if !ok {
+            return None;
+        }
+        let days = days_from_civil(self.year as i64, self.month as i64, self.day as i64);
+        let mut secs =
+            days * 86_400 + self.hour as i64 * 3600 + self.minute as i64 * 60 + self.second as i64;
+        if self.time_zone != EFI_UNSPECIFIED_TIMEZONE {
+            secs += self.time_zone as i64 * 60;
+            if self.daylight & EFI_TIME_IN_DAYLIGHT != 0 {
+                secs -= 3600;
+            }
+        }
+        if secs < 0 {
+            return None;
+        }
+        Some(secs * 1_000_000_000 + self.nanosecond as i64)
     }
 }
 

@@ -14,6 +14,7 @@ bench = false
 ostd = { path = "../../lib/ostd" }
 obfs = { path = "../../lib/obfs" }
 memd = { path = "../memd" }
+timed = { path = "../timed" }
 
 [lints]
 workspace = true

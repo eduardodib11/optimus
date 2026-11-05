@@ -1,0 +1,13 @@
+[package]
+name = "timed"
+description = "timed: hora de parede do sistema (T-358; ADR 0037), núcleo testado no host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

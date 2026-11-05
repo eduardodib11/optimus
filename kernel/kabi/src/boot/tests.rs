@@ -17,7 +17,10 @@ fn layout_estavel() {
         offset_of!(BootInfo, direct_map_base),
         88 + 1024 + 8 + 64 + 8
     );
-    assert_eq!(size_of::<BootInfo>(), 88 + 1024 + 8 + 64 + 8 + 8 + 16 + 8);
+    let wall = 88 + 1024 + 8 + 64 + 8 + 8 + 16 + 8;
+    assert_eq!(offset_of!(BootInfo, wall_unix_ns), wall);
+    assert_eq!(offset_of!(BootInfo, wall_tsc_ns), wall + 8);
+    assert_eq!(size_of::<BootInfo>(), wall + 16);
     assert_eq!(BOOT_MAGIC.to_be_bytes(), *b"OPTIMUS!");
 }
 
@@ -115,4 +118,86 @@ fn mapa_direto_sorteado_em_passos_de_1_gib() {
     assert!(!direct_map_base_valid(DIRECT_MAP_START + 4096, GIB));
     assert!(!direct_map_base_valid(DIRECT_MAP_START - GIB, GIB));
     assert_eq!(BootInfo::empty().direct_map_base, DIRECT_MAP_START);
+}
+
+fn efi(hour: u8, time_zone: i16, daylight: u8) -> EfiTime {
+    EfiTime {
+        year: 2026,
+        month: 11,
+        day: 5,
+        hour,
+        minute: 30,
+        second: 15,
+        nanosecond: 7,
+        time_zone,
+        daylight,
+    }
+}
+
+/// 2026-11-05 12:30:15 UTC.
+const NOON: i64 = 1_793_881_815_000_000_007;
+
+#[test]
+fn efi_time_sem_fuso_e_utc() {
+    assert_eq!(
+        efi(12, EFI_UNSPECIFIED_TIMEZONE, 0).to_unix_ns(),
+        Some(NOON)
+    );
+    let epoch = EfiTime {
+        year: 1970,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        nanosecond: 0,
+        ..efi(0, 0, 0)
+    };
+    assert_eq!(epoch.to_unix_ns(), Some(0));
+    // 2000-02-29 (bissexto de século).
+    let leap = EfiTime {
+        year: 2000,
+        month: 2,
+        day: 29,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        nanosecond: 0,
+        ..efi(0, 0, 0)
+    };
+    assert_eq!(leap.to_unix_ns(), Some(951_782_400 * 1_000_000_000));
+}
+
+#[test]
+fn efi_time_fuso_nos_dois_sinais() {
+    // Local = UTC - TimeZone: UTC-5 grava +300 e mostra 07:30.
+    assert_eq!(efi(7, 300, 0).to_unix_ns(), Some(NOON));
+    // UTC-3 (America/Sao_Paulo) grava +180 e mostra 09:30.
+    assert_eq!(efi(9, 180, 0).to_unix_ns(), Some(NOON));
+    // UTC+2 grava -120 e mostra 14:30.
+    assert_eq!(efi(14, -120, 0).to_unix_ns(), Some(NOON));
+    // Horário de verão: UTC-4 efetivo (fuso -5 com verão) mostra 08:30.
+    assert_eq!(efi(8, 300, EFI_TIME_IN_DAYLIGHT).to_unix_ns(), Some(NOON));
+}
+
+#[test]
+fn efi_time_invalido() {
+    assert_eq!(efi(24, 0, 0).to_unix_ns(), None);
+    assert_eq!(efi(12, 1441, 0).to_unix_ns(), None);
+    assert_eq!(
+        EfiTime {
+            year: 1969,
+            ..efi(12, 0, 0)
+        }
+        .to_unix_ns(),
+        None
+    );
+    assert_eq!(
+        EfiTime {
+            month: 13,
+            ..efi(12, 0, 0)
+        }
+        .to_unix_ns(),
+        None
+    );
 }

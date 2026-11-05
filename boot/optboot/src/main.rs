@@ -27,7 +27,9 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr::{self, null_mut};
 
-use kabi::boot::{BootInfo, CMDLINE_MAX, MemKind, MemRegion, PhysRange, choose_direct_map_base};
+use kabi::boot::{
+    BootInfo, CMDLINE_MAX, EfiTime, MemKind, MemRegion, PhysRange, choose_direct_map_base,
+};
 
 use arch::x86_64::{disable_interrupts, enter_kernel, rdtsc};
 use firmware::{BOOTFS_MEMORY, Entropy, KERNEL_MEMORY, RawMap};
@@ -58,11 +60,29 @@ struct SimpleTextOutput {
     output_string: extern "efiapi" fn(this: *mut SimpleTextOutput, string: *const u16) -> Status,
 }
 
+/// `EFI_TIME` (UEFI 2.x, 8.3), 16 bytes.
+#[repr(C)]
+#[derive(Default)]
+struct RawEfiTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    pad1: u8,
+    nanosecond: u32,
+    time_zone: i16,
+    daylight: u8,
+    pad2: u8,
+}
+
 /// Início de `EFI_RUNTIME_SERVICES`, até `ResetSystem`.
 #[repr(C)]
 struct RuntimeServices {
     hdr: TableHeader,
-    unused: [usize; 10],
+    get_time: unsafe extern "efiapi" fn(time: *mut RawEfiTime, caps: *mut c_void) -> Status,
+    unused: [usize; 9],
     reset_system:
         extern "efiapi" fn(kind: u32, status: Status, size: usize, data: *const c_void) -> !,
 }
@@ -485,6 +505,45 @@ fn choose_direct_base(bs: &BootServices, limit: u64) -> Result<u64, Error> {
 /// Carrega o kernel, monta `BootInfo` e tabelas de página, encerra os serviços
 /// de boot e salta para `kernel_entry` (seção 5.1, passos 5 a 7). Só volta com
 /// erro, e sempre antes de `ExitBootServices`.
+/// Hora do RTC por `GetTime` (ADR 0037, item 1) e o instante dela na base
+/// do `boot_time_ns`; sem leitura válida, `wall_unix_ns` fica 0.
+fn read_wall_time(out: &mut Console, st: &SystemTable, hz: u64, info: &mut BootInfo) {
+    // SAFETY: `runtime_services` vem da System Table e é válido durante todo o boot.
+    let rt = unsafe { &*st.runtime_services };
+    let mut raw = RawEfiTime::default();
+    // SAFETY: `raw` é um `EFI_TIME` gravável; `caps` nulo é permitido.
+    let status = unsafe { (rt.get_time)(&raw mut raw, ptr::null_mut()) };
+    let tsc = rdtsc();
+    let t = EfiTime {
+        year: raw.year,
+        month: raw.month,
+        day: raw.day,
+        hour: raw.hour,
+        minute: raw.minute,
+        second: raw.second,
+        nanosecond: raw.nanosecond,
+        time_zone: raw.time_zone,
+        daylight: raw.daylight,
+    };
+    let wall = if status == 0 { t.to_unix_ns() } else { None };
+    info.wall_unix_ns = wall.unwrap_or(0);
+    let ns = u128::from(tsc) * 1_000_000_000 / u128::from(hz);
+    info.wall_tsc_ns = u64::try_from(ns).unwrap_or(u64::MAX);
+    let _ = write!(
+        out,
+        "optboot: hora do RTC {} s Unix, {} ms após o reset (GetTime {:04}-{:02}-{:02} {:02}:{:02}:{:02}, fuso {})\r\n",
+        info.wall_unix_ns / 1_000_000_000,
+        info.wall_tsc_ns / 1_000_000,
+        raw.year,
+        raw.month,
+        raw.day,
+        raw.hour,
+        raw.minute,
+        raw.second,
+        raw.time_zone
+    );
+}
+
 fn boot(
     out: &mut Console,
     bs: &BootServices,
@@ -506,6 +565,7 @@ fn boot(
     info.set_cmdline(cmdline.trim());
     let _ = write!(out, "optboot: cmdline \"{}\"\r\n", cmdline.trim());
     let hz = tsc_hz(bs);
+    read_wall_time(out, st, hz, info);
     // Tudo o que precisa de memória é reservado agora: depois do último
     // GetMemoryMap não se pode mais alocar.
     let size = firmware::memory_map_size(bs);
