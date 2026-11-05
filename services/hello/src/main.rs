@@ -64,7 +64,13 @@ fn ping(ep: Handle, rounds: u64) -> Result<u64, Error> {
 fn main(start: Start) -> ! {
     let (ep, thread) = split_handle_pair(start.args[0]);
     let (aspace, quota) = split_handle_pair(start.args[1]);
-    let rounds = start.args[2];
+    // `args[2]`: a parte alta é o handle da `DebugLog` (ADR 0036, item 5) e a
+    // baixa, as voltas.
+    let log = Handle::from_raw((start.args[2] >> 32) as u32);
+    let rounds = start.args[2] & 0xFFFF_FFFF;
+    if log.raw() != 0 {
+        ostd::debug::set_log(log);
+    }
     ostd::rt::init(ostd::rt::Env { quota });
     ostd::debug::print("hello: iniciado pelo root");
     let result = Buffer::new(quota, aspace, thread, ipc::DEFAULT_BUFFER_VA).and_then(|mut b| {
