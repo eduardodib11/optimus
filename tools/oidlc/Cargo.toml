@@ -11,3 +11,7 @@ blake3 = "1.8.7"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# O código gerado pelo servidor (T-344) usa oidl_rt; os testes o compilam e o rodam.
+oidl-rt = { path = "../../lib/oidl-rt" }

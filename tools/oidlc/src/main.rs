@@ -65,6 +65,36 @@ fn compat(velho: &str, novo: &str) -> bool {
     false
 }
 
+/// Imprime o módulo de servidor gerado para `arq` (T-344).
+fn gera(arq: &str) -> bool {
+    let file = match carrega(arq) {
+        Ok(f) => f,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return false;
+        }
+    };
+    let erros = oidlc::analyze(&file);
+    if !erros.is_empty() {
+        for e in &erros {
+            eprintln!("{arq}:{e}");
+        }
+        return false;
+    }
+    match oidlc::servidor::gera_servidor(&file) {
+        Ok(src) => {
+            print!("{}", oidlc::servidor::formata(&src));
+            true
+        }
+        Err(erros) => {
+            for e in &erros {
+                eprintln!("{arq}:{e}");
+            }
+            false
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let ok = match args.as_slice() {
@@ -73,6 +103,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         [cmd, velho, novo] if cmd == "check-compat" => compat(velho, novo),
+        [cmd, arq] if cmd == "gera-servidor" => gera(arq),
         paths => {
             // Sem curto-circuito: todo arquivo é checado e reportado.
             let mut ok = true;
