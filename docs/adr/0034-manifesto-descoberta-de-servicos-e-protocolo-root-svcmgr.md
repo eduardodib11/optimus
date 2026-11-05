@@ -391,10 +391,17 @@ Pontos que a ADR deixava abertos, decididos no corretor
   de id 0 teria badge 0, e o `svcmgr` também passa a reconhecer, pela
   geração, um `connect` vindo de instância velha. Os 32 bits baixos
   continuam sendo o id.
-- **`kernel:` sem máscara.** O `mkmanifest` grava `value = 0` para
-  `kernel:debug` e `kernel:mem-pressure`; 0 quer dizer "sem redução" (a
-  cópia leva os direitos que o `root` recebeu do kernel). Uma máscara
-  diferente de zero reduz, e bits desconhecidos recusam a partida.
+- **`kernel:` com máscara explícita.** O TOML não tem sintaxe de máscara,
+  então o `mkmanifest` grava em `value` os direitos fixos de cada nome:
+  `kernel:debug` leva `WRITE|BIND` (ADR 0036) e `kernel:mem-pressure`
+  leva `BIND|ACK` (ADR 0038). O `svcmgr` recusa máscara 0 ou com bits
+  desconhecidos (`BadRights`), sem cunhar nada: falha fechado, nunca
+  entrega todos os direitos do pool.
+- **Volta da geração.** Depois de 65 535 reinícios do mesmo serviço, a
+  geração volta a 1, e um badge muito velho voltaria a valer. O limite de
+  falhas da T-354 (5 por minuto) põe isso a mais de 9 dias de falhas
+  seguidas. Quem afrouxar esse limite precisa rever este ponto (por
+  exemplo, parar o serviço em vez de dar a volta).
 - **Dependência opcional sem provedor em `Running`** não entra no
   descritor; o serviço a pede depois por `connect`. A obrigatória sem
   provedor em `Running` recusa a entrega.

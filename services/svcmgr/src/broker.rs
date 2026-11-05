@@ -33,6 +33,12 @@ use oman::{NeedKind, Oman};
 
 /// `CapDesc.kind` do canal de controle.
 pub const KIND_CONTROL: u8 = 0;
+/// `CapDesc.kind` de um `svc:` (como no `OMAN`).
+pub const KIND_SVC: u8 = 1;
+/// `CapDesc.kind` da cota (`mem:quota:`).
+pub const KIND_MEM: u8 = 2;
+/// `CapDesc.kind` de um `kernel:`.
+pub const KIND_KERNEL: u8 = 5;
 /// `CapDesc.kind` de um `provide`.
 pub const KIND_PROVIDE: u8 = 6;
 /// `CapDesc.index` da cota do processo.
@@ -120,7 +126,7 @@ pub enum DeliverError {
     NotRunning,
     /// `kernel:` obrigatório que o `root` não repassou.
     MissingKernelCap,
-    /// Máscara de direitos inválida no manifesto.
+    /// Máscara de direitos de `kernel:` zero ou inválida no manifesto.
     BadRights,
     /// O serviço já tem endpoints; falta [`Broker::retire`].
     Busy,
@@ -261,7 +267,7 @@ impl Broker {
         };
         let mut steps = Vec::new();
         steps.push(mint(control, Rights::SEND, b, KIND_CONTROL, 0, 0));
-        steps.push(mint(quota, QUOTA_RIGHTS, 0, 2, QUOTA_INDEX, 0));
+        steps.push(mint(quota, QUOTA_RIGHTS, 0, KIND_MEM, QUOTA_INDEX, 0));
         let mut quotas = 0;
         for (i, need) in e.manifest.needs.iter().enumerate() {
             let index = u16::try_from(i).map_err(|_| DeliverError::NotSupported)?;
@@ -272,23 +278,30 @@ impl Broker {
                     let iid = interface_id(&need.name, need.major);
                     match self.provider(iid) {
                         Some((p, j)) if p.manifest.provides[j].minor >= need.minor => {
-                            steps.push(mint(p.roots[j], CLIENT_RIGHTS, b, 1, index, iid));
+                            steps.push(mint(p.roots[j], CLIENT_RIGHTS, b, KIND_SVC, index, iid));
                         }
                         _ if need.optional => {}
                         _ => return Err(DeliverError::NotRunning),
                     }
                 }
                 NeedKind::Kernel => {
-                    // Máscara 0 = sem redução: a capability do pool já vem
-                    // com os direitos que o `root` recebeu do kernel.
-                    let rights = if need.value == 0 {
-                        Rights::ALL
-                    } else {
-                        Rights::try_from(need.value).map_err(|_| DeliverError::BadRights)?
-                    };
+                    // Menor privilégio: a máscara é obrigatória (o
+                    // `mkmanifest` a grava por nome); 0 ou bits
+                    // desconhecidos recusam a partida, nunca abrem tudo.
+                    let rights = Rights::try_from(need.value)
+                        .ok()
+                        .filter(|r| *r != Rights::NONE)
+                        .ok_or(DeliverError::BadRights)?;
                     match pool.iter().find(|(n, _)| *n == need.name) {
                         Some(&(_, h)) => {
-                            steps.push(mint(h, rights, 0, 5, index, name_hash(&need.name)));
+                            steps.push(mint(
+                                h,
+                                rights,
+                                0,
+                                KIND_KERNEL,
+                                index,
+                                name_hash(&need.name),
+                            ));
                         }
                         None if need.optional => {}
                         None => return Err(DeliverError::MissingKernelCap),

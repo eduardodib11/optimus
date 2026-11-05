@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+kabi = { path = "../../kernel/kabi" }
 optcrypt = { path = "../../lib/optcrypt" }
 toml = "0.8"
 

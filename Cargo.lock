@@ -116,6 +116,7 @@ dependencies = [
 name = "mkmanifest"
 version = "0.1.0"
 dependencies = [
+ "kabi",
  "optcrypt",
  "toml",
 ]

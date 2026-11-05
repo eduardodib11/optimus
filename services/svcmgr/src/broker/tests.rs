@@ -135,7 +135,7 @@ fn servico_so_recebe_o_que_o_manifesto_lista() {
         vec![
             (CONTROL, Rights::SEND, badge(0, 1)),
             (QUOTA, QUOTA_RIGHTS, 0),
-            (DEBUG, Rights::ALL, 0),
+            (DEBUG, Rights::WRITE | Rights::BIND, 0),
             (clock_root, PROVIDER_RIGHTS, 0),
         ]
     );
@@ -267,6 +267,18 @@ fn recusas_antes_de_qualquer_syscall() {
     assert_eq!(tenta(&mut b, 2), Err(DeliverError::NotSupported));
     assert_eq!(tenta(&mut b, 3), Err(DeliverError::NoSuchService));
     assert!(caps.mints.is_empty() && caps.endpoints.is_empty());
+}
+
+#[test]
+fn kernel_sem_mascara_e_recusado() {
+    let mut m = manifest("a", &["kernel:debug"], &[]);
+    m.needs[0].value = 0;
+    let mut b = Broker::new(vec![m]).expect("corretor");
+    let mut caps = Fake::default();
+    let pool = [("debug", DEBUG)];
+    let r = b.deliver(0, child(0), CONTROL, QUOTA, &pool, &mut caps);
+    assert_eq!(r, Err(DeliverError::BadRights));
+    assert!(caps.mints.is_empty());
 }
 
 #[test]
