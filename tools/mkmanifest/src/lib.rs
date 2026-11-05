@@ -84,7 +84,8 @@ pub struct Need {
     pub minor: u16,
     /// Nome: interface, classe, diretório ou capability do kernel.
     pub name: String,
-    /// Valor numérico: bytes da cota (`mem`), ou 0.
+    /// Valor numérico: bytes da cota (`mem`), máscara de direitos
+    /// (`kernel`) ou 0.
     pub value: u64,
 }
 
@@ -342,8 +343,11 @@ fn parse_need(service: &str, item: &str) -> Result<Need, Error> {
             };
             Ok(plain(kind))
         }
-        "kernel" => match rest {
-            "debug" | "mem-pressure" => Ok(plain(NeedKind::Kernel)),
+        "kernel" => match kernel_rights(rest) {
+            Some(rights) => Ok(Need {
+                value: u64::from(rights.bits()),
+                ..plain(NeedKind::Kernel)
+            }),
             _ => err(format!(
                 "{service}: capability de kernel desconhecida: {item:?}"
             )),
@@ -351,6 +355,22 @@ fn parse_need(service: &str, item: &str) -> Result<Need, Error> {
         _ => err(format!(
             "{service}: prefixo desconhecido em {item:?} (nomes antigos como log:write não existem mais)"
         )),
+    }
+}
+
+/// Direitos de cada capability de origem do kernel (ADR 0034, item 4: em
+/// `kernel:`, `value` é a máscara). O `svcmgr` recusa máscara 0, para que
+/// nenhum serviço receba mais do que isto (menor privilégio).
+///
+/// - `debug`: `DebugLog` com `WRITE` (`debug_write`) e `BIND` (ADR 0036).
+/// - `mem-pressure`: `Interrupt` de pressão com `BIND` e `ACK` (ADR 0038).
+#[must_use]
+pub fn kernel_rights(name: &str) -> Option<kabi::Rights> {
+    use kabi::Rights;
+    match name {
+        "debug" => Some(Rights::WRITE.union(Rights::BIND)),
+        "mem-pressure" => Some(Rights::BIND.union(Rights::ACK)),
+        _ => None,
     }
 }
 
@@ -628,5 +648,20 @@ ipc_rate = 10000
     fn falta_provedor_obrigatorio() {
         let a = svc("a", &["svc:optimus.z.Z@1"], &[]);
         assert!(check_graph(&[a]).unwrap_err().0.contains("nenhum provedor"));
+    }
+
+    #[test]
+    fn kernel_leva_mascara_explicita() {
+        use kabi::Rights;
+        let m = svc("a", &["kernel:debug", "kernel:mem-pressure"], &[]);
+        assert_eq!(m.needs[0].kind, NeedKind::Kernel);
+        assert_eq!(
+            m.needs[0].value,
+            u64::from((Rights::WRITE | Rights::BIND).bits())
+        );
+        assert_eq!(
+            m.needs[1].value,
+            u64::from((Rights::BIND | Rights::ACK).bits())
+        );
     }
 }

@@ -45,7 +45,7 @@ const CRATES: &[(&str, &str, &str)] = &[
 
 /// Bibliotecas portáveis cujos testes rodam no host.
 const HOST_TESTED: &[&str] = &[
-    "oalloc", "obfs", "ocoll", "olz4", "oelf", "optcrypt", "oidl-rt",
+    "oalloc", "obfs", "ocoll", "olz4", "oelf", "optcrypt", "oidl-rt", "svcmgr",
 ];
 
 const PROFILES: &[&str] = &["lite", "basic", "default", "premium", "server"];
