@@ -2,6 +2,25 @@
 //
 // Layout e formato de fio: ADR 0033. Usa só `oidl_rt` e `core`.
 
+#![allow(
+    unused_parens,
+    unused_variables,
+    dead_code,
+    clippy::double_parens,
+    clippy::unreadable_literal,
+    clippy::many_single_char_names,
+    clippy::doc_markdown,
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::manual_let_else,
+    clippy::elidable_lifetime_names,
+    clippy::needless_lifetimes,
+    clippy::explicit_auto_deref,
+    clippy::needless_pass_by_value,
+    reason = "código gerado: estilo e campos que um serviço pode não usar"
+)]
+
 use oidl_rt::{Error, Reader, Writer};
 
 /// Contexto de uma chamada: o badge do remetente (ADR 0027).
@@ -60,13 +79,13 @@ pub struct DirEntry<'a> {
 }
 
 fn enc_dir_entry<'a>(w: &mut Writer<'_>, v: &DirEntry<'a>, base: usize) -> Result<(), Error> {
-    w.seek((base + 0));
+    w.seek(base);
     w.string(v.name, 255)?;
-    w.seek((base + 8));
+    w.seek(base + 8);
     w.u8((&v.kind).0)?;
-    w.seek((base + 16));
+    w.seek(base + 16);
     w.u64(v.size)?;
-    w.seek((base + 24));
+    w.seek(base + 24);
     w.i64(v.modified)?;
     Ok(())
 }
@@ -82,14 +101,14 @@ pub struct DirPage<'a> {
 
 fn enc_dir_page<'a>(w: &mut Writer<'_>, v: &DirPage<'a>, base: usize) -> Result<(), Error> {
     let off1 = {
-        w.seek((base + 0));
+        w.seek(base);
         w.vec((v.entries).len(), 32, 8)?
     };
     for (i1, el) in (v.entries).iter().enumerate() {
         let at2 = off1 + i1 * 32;
         enc_dir_entry(w, el, at2)?;
     }
-    w.seek((base + 8));
+    w.seek(base + 8);
     w.u64(v.next)?;
     Ok(())
 }

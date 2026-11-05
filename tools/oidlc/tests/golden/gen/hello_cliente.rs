@@ -4,7 +4,21 @@
 
 #![allow(
     unused_parens,
-    reason = "o codificador põe parênteses em volta de expressões"
+    unused_variables,
+    dead_code,
+    clippy::double_parens,
+    clippy::unreadable_literal,
+    clippy::many_single_char_names,
+    clippy::doc_markdown,
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::manual_let_else,
+    clippy::elidable_lifetime_names,
+    clippy::needless_lifetimes,
+    clippy::explicit_auto_deref,
+    clippy::needless_pass_by_value,
+    reason = "código gerado: estilo e campos que um serviço pode não usar"
 )]
 
 use oidl_rt::{Error, Reader, Writer};
@@ -32,17 +46,17 @@ pub struct Seis {
 }
 
 fn enc_seis(w: &mut Writer<'_>, v: &Seis, base: usize) -> Result<(), Error> {
-    w.seek((base + 0));
+    w.seek(base);
     w.u64(v.w0)?;
-    w.seek((base + 8));
+    w.seek(base + 8);
     w.u64(v.w1)?;
-    w.seek((base + 16));
+    w.seek(base + 16);
     w.u64(v.w2)?;
-    w.seek((base + 24));
+    w.seek(base + 24);
     w.u64(v.w3)?;
-    w.seek((base + 32));
+    w.seek(base + 32);
     w.u64(v.w4)?;
-    w.seek((base + 40));
+    w.seek(base + 40);
     w.u64(v.w5)?;
     Ok(())
 }
