@@ -37,6 +37,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
     ("root", "services/root/src/main.rs", USER_TARGET),
     ("hello", "services/hello/src/main.rs", USER_TARGET),
+    ("svcmgr", "services/svcmgr/src/main.rs", USER_TARGET),
     ("memd", "services/memd/src/lib.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
@@ -337,7 +338,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        "root" | "hello" | "svcmgr" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -375,6 +376,7 @@ fn image(opts: &Options, cmdline: &str, rounds: Option<u64>) -> Result<PathBuf> 
 const BOOTFS: &[(&str, &str)] = &[
     ("root", "root"),
     ("hello", "hello"),
+    ("svcmgr", "svcmgr"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];

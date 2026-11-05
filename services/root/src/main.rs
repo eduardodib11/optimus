@@ -45,6 +45,19 @@ const HELLO_LOG_BADGE: u64 = 0x6865_6c6c;
 /// Prioridade do `hello`: a mesma do `root`, para a troca direta do
 /// caminho rápido valer nos dois sentidos.
 const HELLO_PRIORITY: u8 = 150;
+/// Cota de partida do `svcmgr` (ADR 0034, item 2): fixa, 8 MiB no M3.
+const SVCMGR_QUOTA: u64 = 8 << 20;
+/// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
+const SVCMGR_PRIORITY: u8 = 200;
+/// Badge com que o `root` identifica o `svcmgr` no próprio endpoint.
+const ROOT_BADGE: u64 = 1;
+/// Rótulo do "olá" do `svcmgr` ao `root`.
+const LABEL_OLA: u64 = 1;
+/// Respostas do `root` ao `svcmgr`.
+const LABEL_OK: u64 = 0;
+const LABEL_ACCESS_DENIED: u64 = 1;
+/// Quanto o `root` espera o primeiro contato do `svcmgr`, em ns.
+const SVCMGR_WAIT_NS: u64 = 2_000_000_000;
 
 /// Capabilities iniciais.
 #[derive(Clone, Copy)]
@@ -278,6 +291,58 @@ fn table_entry(aspace: Handle, table: Handle, kind: u32) -> Result<Handle, Error
     Err(Error::InvalidArgument)
 }
 
+/// Carrega o `svcmgr` do bootfs com a própria cota de partida, dá a ele o
+/// endpoint do `root` (badge [`ROOT_BADGE`]), o bootfs só de leitura e a
+/// cota, e o inicia. Devolve o endpoint para atender o primeiro contato.
+///
+/// A capability da thread do `svcmgr` não vai para o `CapSpace` dele (ADR
+/// 0034, item 2): a thread já guarda a tabela, e a tabela guardar a thread
+/// fecharia o ciclo da ADR 0029, que deixaria o processo inteiro preso na
+/// cota depois da saída. Para mexer em si mesmo, o `svcmgr` usa
+/// `thread = 0` (ADR 0039, item 3).
+fn spawn_svcmgr(b: Boot) -> Result<Handle, Error> {
+    let fs_map = map_bootfs(b)?;
+    let fs = obfs::Image::parse(fs_map.bytes()).map_err(|_| Error::InvalidArgument)?;
+    let elf = fs.find("svcmgr").ok_or(Error::InvalidArgument)?;
+    let child = process::load(&Spec {
+        elf: elf.data,
+        quota: b.quota,
+        quota_bytes: SVCMGR_QUOTA,
+        own_aspace: b.aspace,
+        scratch_va: SCRATCH_VA,
+        priority: SVCMGR_PRIORITY,
+    })?;
+    let ep = create(b.quota, ObjectType::Endpoint, 0)?;
+    let ep_child = child.give(ep, Rights::SEND, ROOT_BADGE)?;
+    let bootfs = child.give(b.bootfs, Rights::READ | Rights::MAP, 0)?;
+    let quota = child.give(child.quota, Rights::CREATE, 0)?;
+    child.start([u64::from(ep_child.raw()), handle_pair(bootfs, quota), 0])?;
+    Ok(ep)
+}
+
+/// Atende o primeiro contato do `svcmgr` no endpoint do `root`. Só o badge
+/// [`ROOT_BADGE`] é aceito; qualquer outro recebe `AccessDenied` e o
+/// atendimento termina com erro.
+fn atende_svcmgr(b: Boot, ep: Handle) -> Result<(), Error> {
+    let reply = create(b.quota, ObjectType::Reply, 0)?;
+    let deadline = ostd::time::now_ns() + SVCMGR_WAIT_NS;
+    let rec = ipc::recv(ep, reply, deadline)?;
+    if rec.badge != ROOT_BADGE || rec.msg.label != LABEL_OLA {
+        ipc::send(reply, &Message::new(LABEL_ACCESS_DENIED, &[]), 0)?;
+        ostd::debug::print("root: chamada recusada no endpoint do svcmgr");
+        return Err(Error::AccessDenied);
+    }
+    ipc::send(reply, &Message::new(LABEL_OK, &[]), 0)?;
+    ostd::debug::print("root: o svcmgr se anunciou e foi aceito");
+    Ok(())
+}
+
+/// Cria o `svcmgr` e atende o contato dele.
+fn svcmgr(b: Boot) -> Result<(), Error> {
+    let ep = spawn_svcmgr(b)?;
+    atende_svcmgr(b, ep)
+}
+
 fn main(start: Start) -> ! {
     let [quota, aspace, rdx] = start.args;
     let (thread, table) = split_handle_pair(rdx);
@@ -308,6 +373,9 @@ fn main(start: Start) -> ! {
     }
     if let Err(e) = hello(boot) {
         ostd::debug::print_fmt(format_args!("root: conversa com o hello falhou: {e:?}"));
+    }
+    if let Err(e) = svcmgr(boot) {
+        ostd::debug::print_fmt(format_args!("root: svcmgr: {e:?}"));
     }
     ostd::thread::exit()
 }
