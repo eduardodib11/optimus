@@ -8,6 +8,8 @@
 
 pub mod ast;
 pub mod compat;
+pub mod ids;
+pub mod layout;
 pub mod lexer;
 pub mod parser;
 pub mod sema;

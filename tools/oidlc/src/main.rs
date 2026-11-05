@@ -24,7 +24,18 @@ fn checa(path: &str) -> bool {
             return false;
         }
     };
-    let erros = oidlc::analyze(&file);
+    let mut erros = oidlc::analyze(&file);
+    if erros.is_empty() {
+        // Layout só faz sentido sobre um arquivo semanticamente correto.
+        erros = oidlc::layout::Layouts::new(&file)
+            .confere_tamanhos()
+            .into_iter()
+            .map(|e| oidlc::lexer::Error {
+                pos: e.pos,
+                msg: e.msg,
+            })
+            .collect();
+    }
     if erros.is_empty() {
         println!("{path}: ok");
         return true;
