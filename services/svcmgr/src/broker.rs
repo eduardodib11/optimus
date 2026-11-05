@@ -71,6 +71,12 @@ pub trait Caps {
         badge: Badge,
         dest: Option<Handle>,
     ) -> Result<Handle, KError>;
+    /// `cap_revoke`: apaga todas as cópias derivadas de `h` (as dos
+    /// clientes e a do provedor), mantendo `h`.
+    ///
+    /// # Errors
+    /// Os do kernel.
+    fn revoke(&mut self, h: Handle) -> Result<(), KError>;
     /// `cap_delete` de uma capability do `svcmgr`.
     ///
     /// # Errors

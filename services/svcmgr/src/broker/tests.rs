@@ -11,6 +11,7 @@ struct Fake {
     endpoints: Vec<Handle>,
     mints: Vec<(Handle, Rights, Badge, Option<Handle>)>,
     deleted: Vec<Handle>,
+    revoked: Vec<Handle>,
     /// Falha o `mint` de número `fail_at` (a partir de 0).
     fail_at: Option<usize>,
 }
@@ -49,6 +50,11 @@ impl Caps for Fake {
         }
         self.mints.push((src, rights, badge, dest));
         Ok(self.fresh())
+    }
+
+    fn revoke(&mut self, h: Handle) -> Result<(), KError> {
+        self.revoked.push(h);
+        Ok(())
     }
 
     fn delete(&mut self, h: Handle) -> Result<(), KError> {
@@ -319,4 +325,26 @@ fn provedor_duplicado_e_recusado() {
         manifest("b", &[], &["optimus.x.X@1.1"]),
     ]);
     assert!(matches!(r, Err(DeliverError::DuplicateProvider)));
+}
+
+/// T-354: a morte do provedor revoga e apaga a raiz; depois do reinício o
+/// cliente reconecta e recebe uma cópia da raiz nova.
+#[test]
+fn reinicio_revoga_e_o_cliente_reconecta() {
+    let mut b = sistema();
+    let mut caps = Fake::default();
+    sobe(&mut b, 0, &mut caps);
+    sobe(&mut b, 1, &mut caps);
+    let old = caps.endpoints[0];
+    crate::supervisor::revoke_instance(&mut b, 0, &mut caps).expect("revoga");
+    assert_eq!(caps.revoked, [old]);
+    assert!(caps.deleted.contains(&old));
+    let clock = interface_id("optimus.time.Clock", 1);
+    sobe(&mut b, 0, &mut caps);
+    let new = *caps.endpoints.last().expect("raiz nova");
+    assert_ne!(new, old);
+    b.connect(badge(1, 1), clock, 0, &mut caps)
+        .expect("reconecta");
+    let last = caps.mints.last().copied().expect("mint");
+    assert_eq!((last.0, last.1, last.2), (new, CLIENT_RIGHTS, badge(1, 1)));
 }

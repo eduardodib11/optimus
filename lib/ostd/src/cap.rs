@@ -57,6 +57,15 @@ pub fn delete(h: Handle) -> Result<(), Error> {
     syscall(Syscall::CapDelete, [raw(h), 0, 0, 0, 0, 0]).map(drop)
 }
 
+/// `cap_revoke`: apaga todas as capabilities derivadas de `h`; `h` fica.
+///
+/// # Errors
+///
+/// `InvalidHandle` para handle sem capability.
+pub fn revoke(h: Handle) -> Result<(), Error> {
+    syscall(Syscall::CapRevoke, [raw(h), 0, 0, 0, 0, 0]).map(drop)
+}
+
 /// `cap_delete` com `DESTROY` (ADR 0035, item 4): apaga a capability e
 /// destrói o objeto. `CapSpace`: encerra o processo (as threads dele morrem
 /// como `Killed` e a tabela é esvaziada); `Thread`: encerra a thread;
