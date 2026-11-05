@@ -1,0 +1,53 @@
+name: Fuzzing do oidlc (noturno)
+
+# T-347 (SDD v1.0, backlog M3): `cargo xtask fuzz oidlc` roda 1 h toda noite
+# (parser, analisador e geradores do oidlc). Também roda à mão, com semente
+# opcional. Uma falha sai com código diferente de zero e grava falha.oidl.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Duração da rodada, em minutos
+        required: false
+        default: "60"
+      seed:
+        description: Semente (hex, ex. 0x1234); vazio sorteia
+        required: false
+        default: ""
+
+jobs:
+  fuzz-oidlc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain fixada em rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: oidlc por 1 h (ou o tempo pedido)
+        env:
+          MINUTES_IN: ${{ inputs.minutes }}
+          SEED_IN: ${{ inputs.seed }}
+        run: |
+          set -o pipefail
+          mins="${MINUTES_IN:-60}"
+          if [ -n "$SEED_IN" ]; then seed_args="--seed $SEED_IN"; else seed_args=""; fi
+          mkdir -p target/fuzz
+          cargo xtask fuzz oidlc --minutes "$mins" $seed_args 2>&1 | tee target/fuzz/fuzz-oidlc.log
+      - name: Resumo da rodada
+        if: always()
+        run: |
+          {
+            echo "## Fuzz do oidlc"
+            echo
+            echo "Commit: \`$GITHUB_SHA\`"
+            echo
+            grep -E "^xtask: fuzz|oidlc|pânico|falhou|execuç" target/fuzz/fuzz-oidlc.log | tail -n 20 | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-oidlc
+          path: target/fuzz/
