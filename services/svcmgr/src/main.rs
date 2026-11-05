@@ -12,13 +12,16 @@
 #![no_main]
 #![forbid(unsafe_code)]
 
-use ostd::kabi::{Handle, split_handle_pair};
+use ostd::ipc::{self, Message};
+use ostd::kabi::{Error, Handle, split_handle_pair};
 use ostd::rt::Start;
 
 ostd::entry!(main);
 
-/// Badge com que o `root` identifica o `svcmgr` no próprio endpoint.
-pub const ROOT_BADGE: u64 = 1;
+/// Quanto o `svcmgr` espera a resposta do `root`, em ns.
+const CALL_WAIT_NS: u64 = 15_000_000_000;
+/// Rótulo do "olá" ao `root` (o `root` aceita só esse rótulo do badge 1).
+const LABEL_OLA: u64 = 1;
 
 /// Capabilities recebidas do `root`, já separadas.
 #[derive(Clone, Copy)]
@@ -49,5 +52,14 @@ fn main(start: Start) -> ! {
         boot.bootfs.raw(),
         boot.quota.raw()
     ));
+    // Prazo: se o `root` não responder, o `svcmgr` sai em vez de ficar preso
+    // e segurar a cota de partida (ADR 0034, item 2).
+    let deadline = ostd::time::now_ns() + CALL_WAIT_NS;
+    match ipc::call(boot.root_ep, &Message::new(LABEL_OLA, &[]), deadline) {
+        Ok(r) if r.msg.label == 0 => ostd::debug::print("svcmgr: o root aceitou o anúncio"),
+        Ok(_) => ostd::debug::print("svcmgr: o root respondeu com erro"),
+        Err(Error::AccessDenied) => ostd::debug::print("svcmgr: o root recusou o anúncio"),
+        Err(_) => ostd::debug::print("svcmgr: falha ao falar com o root"),
+    }
     ostd::thread::exit()
 }

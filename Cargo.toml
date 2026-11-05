@@ -51,5 +51,10 @@ debug = 0
 [profile.dev.package.obfs]
 debug = 0
 
+# O `svcmgr` entra no bootfs: sem informação de depuração, a cota do `root`
+# paga só o código (T-351).
+[profile.dev.package.svcmgr]
+debug = 0
+
 [profile.release]
 panic = "abort"
