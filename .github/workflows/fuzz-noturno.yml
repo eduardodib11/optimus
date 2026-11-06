@@ -15,6 +15,10 @@ on:
         description: Semente (hex, ex. 0x1234); vazio sorteia
         required: false
         default: ""
+      smp:
+        description: Número de CPUs (o Gate 1 pede 4)
+        required: false
+        default: "4"
 
 jobs:
   fuzz:
@@ -30,12 +34,13 @@ jobs:
         env:
           SECONDS_IN: ${{ inputs.seconds }}
           SEED_IN: ${{ inputs.seed }}
+          SMP_IN: ${{ inputs.smp }}
         run: |
           set -o pipefail
           secs="${SECONDS_IN:-14400}"
           if [ -n "$SEED_IN" ]; then seed_args="--seed $SEED_IN"; else seed_args=""; fi
           mkdir -p target/fuzz
-          cargo xtask fuzz --seconds "$secs" $seed_args 2>&1 | tee target/fuzz/fuzz.log
+          cargo xtask fuzz --seconds "$secs" --smp "${SMP_IN:-4}" $seed_args 2>&1 | tee target/fuzz/fuzz.log
       - name: Resumo da rodada
         if: always()
         run: |
