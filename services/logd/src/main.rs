@@ -24,7 +24,7 @@ const TICK_NS: u64 = 20_000_000;
 /// Onde o anel do kernel é mapeado.
 const RING_VA: u64 = 0x2000_0000;
 /// Linhas guardadas (todas as fontes).
-const CAPACITY: usize = 4096;
+const CAPACITY: usize = 1024;
 
 fn hash(text: &[u8]) -> u32 {
     let h = optcrypt::blake3::hash(text);
