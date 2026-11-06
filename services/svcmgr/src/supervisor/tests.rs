@@ -107,3 +107,22 @@ fn reinicios_vencidos_em_ordem() {
     assert!(sup.due(S).is_empty());
     assert_eq!(sup.due(S + 100 * MS), [0]);
 }
+
+#[test]
+fn morte_induzida_volta_ja_sem_contar_falha() {
+    let mut sup = Supervisor::new(&[Policy::OnFailure]);
+    for i in 0..(MAX_FAILURES as u64 * 4) {
+        sup.started(0, i * MS);
+        sup.induced(0, i * MS);
+        assert_eq!(sup.due(i * MS), [0]);
+    }
+    // Nenhuma falha contada: a primeira de verdade ainda tem o recuo mínimo.
+    sup.started(0, S);
+    assert_eq!(
+        sup.exited(0, Exit::Failed, S),
+        Action::Restart {
+            at_ns: S + BACKOFF_MIN_NS,
+            backoff_ns: BACKOFF_MIN_NS
+        }
+    );
+}

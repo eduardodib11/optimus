@@ -156,6 +156,9 @@ struct Options {
     /// `test user --falha-proposital`: compila o `utest` com o teste que
     /// falha de propósito (T-332).
     fail_on_purpose: bool,
+    /// Rodadas do teste de caos do `svcmgr` (entrada `svcmgr.caos` do
+    /// bootfs, T-366); `None` não liga o caos.
+    chaos: Option<u64>,
 }
 
 impl Default for Options {
@@ -174,6 +177,7 @@ impl Default for Options {
             seed: None,
             minutes: STRESS_MINUTES,
             fail_on_purpose: false,
+            chaos: None,
         }
     }
 }
@@ -226,7 +230,7 @@ fn parse(args: &[String]) -> Result<Options> {
                 );
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
-            | "integration" | "all" => {
+            | "integration" | "chaos" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -445,6 +449,12 @@ fn bootfs(opts: &Options, output: &Path, rounds: Option<u64>) -> Result {
     }
     for (name, file) in manifests(&bin)? {
         cmd.arg(format!("{name}={}", file.display()));
+    }
+    if let Some(n) = opts.chaos {
+        let file = root().join("target/svcmgr.caos");
+        fs::write(&file, format!("{n}\n"))
+            .map_err(|e| format!("gravando {}: {e}", file.display()))?;
+        cmd.arg(format!("svcmgr.caos={}", file.display()));
     }
     if let Some(n) = rounds {
         let file = root().join("target/hello.rounds");
@@ -1173,6 +1183,9 @@ fn test(opts: &Options) -> Result {
     if opts.suite == "integration" {
         integration(opts)?;
     }
+    if opts.suite == "chaos" {
+        chaos(opts)?;
+    }
     if opts.suite == "hello" {
         // 10⁶ idas e voltas no build de depuração levariam horas sob TCG.
         let release = Options {
@@ -1242,6 +1255,65 @@ fn integration(opts: &Options) -> Result {
         }
         println!("xtask: integração em -smp {n}: serviços em Running e encerrados em ordem");
     }
+    Ok(())
+}
+
+/// Rodadas do teste de caos (aceite do T-366).
+const CHAOS_ROUNDS: u64 = 100;
+/// CPUs do teste de caos sem `--smp`.
+const CHAOS_CPUS: u32 = 4;
+/// Pior volta aceita no caos sob TCG, em ms. O §18 pede ≤ 1 s em KVM; sob
+/// emulação o limite é ampliado e declarado aqui.
+const CHAOS_TCG_LIMIT_MS: u64 = 3_000;
+
+/// `cargo xtask test chaos [--smp N]` (T-366): o `svcmgr` mata um serviço
+/// ao acaso [`CHAOS_ROUNDS`] vezes em `-smp 4` e espera cada um voltar a
+/// `Running`. Exige todas as voltas e a pior abaixo de
+/// [`CHAOS_TCG_LIMIT_MS`]; as linhas de reinício passam pelo anel do log
+/// do kernel até o `logd`.
+fn chaos(opts: &Options) -> Result {
+    let opts = Options {
+        chaos: Some(CHAOS_ROUNDS),
+        smp: if opts.smp > 1 { opts.smp } else { CHAOS_CPUS },
+        ..opts.clone()
+    };
+    build_test(&opts)?;
+    let done: &'static str =
+        Box::leak(format!("svcmgr: caos: {CHAOS_ROUNDS} rodadas, 0 sem volta").into_boxed_str());
+    let markers: &'static [&'static str] = Box::leak(
+        BOOT_MARKERS
+            .iter()
+            .chain(&[done, "logd: encerrado"])
+            .copied()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let serial = boot_scenario(
+        &opts,
+        &Scenario {
+            name: "caos",
+            markers,
+            timeout: Duration::from_mins(20),
+            ..SCENARIOS[0]
+        },
+    )?;
+    let worst = serial
+        .lines()
+        .find_map(|l| {
+            l.split_once("pior volta ")
+                .map(|(_, r)| r.trim_end_matches(" ms").trim())
+        })
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .ok_or("caos: sem a pior volta na serial")?;
+    if worst > CHAOS_TCG_LIMIT_MS {
+        return Err(format!(
+            "caos: pior volta de {worst} ms, acima de {CHAOS_TCG_LIMIT_MS} ms"
+        ));
+    }
+    println!(
+        "xtask: caos em -smp {}: {CHAOS_ROUNDS} rodadas, pior volta {worst} ms",
+        opts.smp
+    );
     Ok(())
 }
 

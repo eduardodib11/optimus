@@ -157,6 +157,8 @@ struct Svcmgr<'a> {
     buffer: Buffer,
     sup: Supervisor,
     live: Vec<Option<Started>>,
+    /// Mortes que o próprio `svcmgr` causou (teste de caos).
+    induced: Vec<u32>,
 }
 
 /// O erro do corretor no fio.
@@ -219,7 +221,9 @@ impl Svcmgr<'_> {
         );
         let c = s.child;
         for h in [c.thread, c.aspace, c.cspace, c.quota] {
-            let _ = ostd::cap::delete(h);
+            if h.raw() != 0 {
+                let _ = ostd::cap::delete(h);
+            }
         }
     }
 
@@ -244,6 +248,11 @@ impl Svcmgr<'_> {
             self.retire(id);
             let now = ostd::time::now_ns();
             let n = name(&self.plan, id);
+            if let Some(i) = self.induced.iter().position(|&x| x == id) {
+                self.induced.swap_remove(i);
+                self.sup.induced(id, now);
+                continue;
+            }
             match self.sup.exited(id, exit, now) {
                 Action::Restart { backoff_ns, .. } => ostd::debug::print_fmt(format_args!(
                     "svcmgr: {n} morreu ({exit:?}); volta em {} ms",
@@ -405,6 +414,69 @@ impl Svcmgr<'_> {
         }
     }
 
+    /// Teste de caos (T-366; §18, "volta em ≤ 1 s"): `rounds` vezes, mata
+    /// um serviço em `Running` escolhido ao acaso (`cap_delete` com
+    /// `DESTROY` da thread dele) e espera que volte a `Running`. Registra o
+    /// tempo de cada volta; quem não volta em [`READY_NS`] conta como falha.
+    fn chaos(&mut self, rounds: u64) {
+        let mut seed = ostd::time::now_ns() | 1;
+        let mut worst = 0;
+        let mut failed = 0u64;
+        for k in 0..rounds {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let alive: Vec<u32> = (0..self.live.len())
+                .filter_map(|i| u32::try_from(i).ok())
+                .filter(|&id| self.started(id).is_some() && self.plan.broker.badge_of(id).is_some())
+                .collect();
+            let Some(&id) =
+                alive.get(usize::try_from(seed % alive.len().max(1) as u64).unwrap_or(0))
+            else {
+                ostd::debug::print("svcmgr: caos: nenhum serviço vivo");
+                return;
+            };
+            let Some(thread) = self.started(id).map(|s| s.child.thread) else {
+                continue;
+            };
+            let t0 = ostd::time::now_ns();
+            self.induced.push(id);
+            if ostd::cap::destroy(thread).is_err() {
+                self.induced.retain(|&x| x != id);
+                continue;
+            }
+            // `destroy` já apagou a capability: o `retire` não pode apagar o
+            // mesmo número, que o kernel pode ter dado a outra.
+            if let Some(Some(s)) = usize::try_from(id).ok().and_then(|i| self.live.get_mut(i)) {
+                s.child.thread = Handle::from_raw(0);
+            }
+            let deadline = t0.saturating_add(READY_NS);
+            let back = loop {
+                if ostd::time::now_ns() >= deadline {
+                    break None;
+                }
+                if self.serve_one(deadline) == Some(id) {
+                    break Some(ostd::time::now_ns().saturating_sub(t0));
+                }
+            };
+            let n = name(&self.plan, id);
+            if let Some(ns) = back {
+                worst = worst.max(ns);
+                ostd::debug::print_fmt(format_args!(
+                    "svcmgr: caos {k}: {n} voltou em {} ms",
+                    ns / 1_000_000
+                ));
+            } else {
+                failed += 1;
+                ostd::debug::print_fmt(format_args!("svcmgr: caos {k}: {n} não voltou"));
+            }
+        }
+        ostd::debug::print_fmt(format_args!(
+            "svcmgr: caos: {rounds} rodadas, {failed} sem volta, pior volta {} ms",
+            worst / 1_000_000
+        ));
+    }
+
     /// Desligamento ordenado: encerra os serviços em ordem inversa de
     /// partida, para a cota voltar ao `root`.
     fn shutdown(&mut self) {
@@ -453,6 +525,7 @@ fn start_all(boot: &Boot) -> Result<(), Error> {
         buffer,
         sup: Supervisor::new(&policies),
         live,
+        induced: Vec::new(),
     };
     let levels = s.plan.levels.clone();
     let mut running = 0;
@@ -464,6 +537,13 @@ fn start_all(boot: &Boot) -> Result<(), Error> {
         }
     }
     ostd::debug::print_fmt(format_args!("svcmgr: {running} serviços em Running"));
+    if let Some(rounds) =
+        s.fs.find("svcmgr.caos")
+            .and_then(|e| core::str::from_utf8(e.data).ok())
+            .and_then(|t| t.trim().parse::<u64>().ok())
+    {
+        s.chaos(rounds);
+    }
     s.supervise(ostd::time::now_ns().saturating_add(SUPERVISE_NS));
     s.shutdown();
     for h in [s.deaths, s.reply, s.control] {
