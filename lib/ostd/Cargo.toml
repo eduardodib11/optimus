@@ -17,3 +17,4 @@ kabi = { path = "../../kernel/kabi" }
 oalloc = { path = "../oalloc" }
 ocoll = { path = "../ocoll" }
 oelf = { path = "../oelf" }
+osvc = { path = "../osvc" }

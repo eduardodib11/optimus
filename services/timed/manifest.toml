@@ -1,0 +1,14 @@
+# Manifesto do `timed` (ADR 0034, item 4; ADR 0037): o primeiro serviço que
+# o `svcmgr` parte.
+[service]
+name = "timed"
+binary = "timed"
+priority = 140
+restart = "on-failure"
+
+[capabilities]
+needs = ["mem:quota:2MiB"]
+provides = ["optimus.time.Clock@1.0"]
+
+[limits]
+max_threads = 1

@@ -9,5 +9,15 @@ license.workspace = true
 doctest = false
 bench = false
 
+[[bin]]
+name = "timed"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+optcrypt = { path = "../../lib/optcrypt" }
+
 [lints]
 workspace = true

@@ -33,6 +33,7 @@ pub mod process;
 pub mod rand;
 pub mod ring;
 pub mod rt;
+pub mod svc;
 pub mod sync;
 pub mod sys;
 pub mod thread;

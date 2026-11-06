@@ -216,6 +216,7 @@ dependencies = [
  "oalloc",
  "ocoll",
  "oelf",
+ "osvc",
 ]
 
 [[package]]
@@ -307,6 +308,7 @@ dependencies = [
  "oman",
  "optcrypt",
  "ostd",
+ "osvc",
 ]
 
 [[package]]
@@ -323,6 +325,11 @@ dependencies = [
 [[package]]
 name = "timed"
 version = "0.1.0"
+dependencies = [
+ "optcrypt",
+ "ostd",
+ "osvc",
+]
 
 [[package]]
 name = "toml"

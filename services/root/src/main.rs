@@ -45,6 +45,8 @@ const HELLO_LOG_BADGE: u64 = 0x6865_6c6c;
 /// Prioridade do `hello`: a mesma do `root`, para a troca direta do
 /// caminho rápido valer nos dois sentidos.
 const HELLO_PRIORITY: u8 = 150;
+/// Badge da `DebugLog` do `svcmgr`: "svcm" em ASCII.
+const SVCMGR_LOG_BADGE: u64 = 0x7376_636d;
 /// Cota de partida do `svcmgr` (ADR 0034, item 2): fixa, 8 MiB no M3.
 const SVCMGR_QUOTA: u64 = 8 << 20;
 /// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
@@ -315,8 +317,16 @@ fn spawn_svcmgr(b: Boot) -> Result<Handle, Error> {
     let ep = create(b.quota, ObjectType::Endpoint, 0)?;
     let ep_child = child.give(ep, Rights::SEND, ROOT_BADGE)?;
     let bootfs = child.give(b.bootfs, Rights::READ | Rights::MAP, 0)?;
-    let quota = child.give(child.quota, Rights::CREATE, 0)?;
-    child.start([u64::from(ep_child.raw()), handle_pair(bootfs, quota), 0])?;
+    // `SPLIT`: o `svcmgr` tira dela as cotas dos serviços (ADR 0034, item 5).
+    let quota = child.give(child.quota, Rights::CREATE | Rights::SPLIT, 0)?;
+    // `kernel:debug` do pool (ADR 0036, item 5): o `svcmgr` escreve com ela
+    // e a repassa a quem o manifesto pedir.
+    let log = if b.log.raw() == 0 {
+        0
+    } else {
+        u64::from(child.give(b.log, Rights::WRITE, SVCMGR_LOG_BADGE)?.raw())
+    };
+    child.start([u64::from(ep_child.raw()), handle_pair(bootfs, quota), log])?;
     Ok(ep)
 }
 
