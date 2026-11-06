@@ -6,6 +6,12 @@
 //! Garantias: a ordem de cada serviço é preservada (todas as linhas têm um
 //! `seq` global crescente); quando o buffer enche, a linha mais antiga sai e
 //! conta-se em `dropped`; nunca se perde nada sem contar.
+//!
+//! T-357: cada linha tem o `ts_ns` (monotônico) do produtor, e a consulta
+//! devolve as últimas N linhas filtradas em ordem temporal, misturando o
+//! kernel ([`KERNEL`], sempre registrado) e os serviços. [`record`]
+//! decodifica o registro de log da ADR 0036 (item 2) e [`kernel`] cuida da
+//! posição de leitura no anel do kernel, que sobrescreve o mais antigo.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -15,6 +21,13 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
+
+pub mod kernel;
+pub mod record;
+
+/// Produtor do log do kernel (ADR 0036, item 6), registrado em
+/// [`Store::new`] com o nome `kernel`.
+pub const KERNEL: u16 = 0;
 
 /// Nível de uma linha, do mais grave ao mais detalhado.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -53,6 +66,8 @@ pub struct Record {
     pub seq: u64,
     /// Produtor que escreveu a linha.
     pub service: u16,
+    /// Hora monotônica do produtor, em ns.
+    pub ts_ns: u64,
     /// Nível.
     pub level: Level,
     /// Texto.
@@ -100,12 +115,21 @@ impl Store {
     /// Cria um buffer com `capacity` linhas.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        let mut producers = BTreeMap::new();
+        producers.insert(
+            KERNEL,
+            Producer {
+                name: String::from("kernel"),
+                dropped: 0,
+                last_seq: 0,
+            },
+        );
         Self {
             capacity: capacity.max(1),
             records: VecDeque::new(),
             next_seq: 1,
             dropped: 0,
-            producers: BTreeMap::new(),
+            producers,
             next_id: 1,
             flushed: 0,
         }
@@ -116,11 +140,14 @@ impl Store {
     /// # Errors
     /// [`Error::TooManyServices`] acima de [`MAX_SERVICES`].
     pub fn register(&mut self, name: &str) -> Result<u16, Error> {
-        if self.producers.len() >= MAX_SERVICES {
+        if self.producers.len() > MAX_SERVICES {
             return Err(Error::TooManyServices);
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
+        if self.producers.contains_key(&id) {
+            return Err(Error::TooManyServices);
+        }
         self.producers.insert(
             id,
             Producer {
@@ -144,6 +171,20 @@ impl Store {
     /// # Errors
     /// [`Error::UnknownService`] e [`Error::LineTooLong`].
     pub fn ingest(&mut self, service: u16, level: Level, text: &str) -> Result<u64, Error> {
+        self.ingest_at(service, level, 0, text)
+    }
+
+    /// Como [`Store::ingest`], com a hora `ts_ns` do produtor.
+    ///
+    /// # Errors
+    /// [`Error::UnknownService`] e [`Error::LineTooLong`].
+    pub fn ingest_at(
+        &mut self,
+        service: u16,
+        level: Level,
+        ts_ns: u64,
+        text: &str,
+    ) -> Result<u64, Error> {
         if text.len() > MAX_LINE {
             return Err(Error::LineTooLong);
         }
@@ -168,6 +209,7 @@ impl Store {
         self.records.push_back(Record {
             seq,
             service,
+            ts_ns,
             level,
             text: String::from(text),
         });
@@ -193,19 +235,19 @@ impl Store {
         self.producers.get(&service).map(|p| p.dropped)
     }
 
-    /// Últimas `n` linhas que passam pelo filtro, em ordem crescente.
-    /// `service` = `None` aceita todos; `max_level` é o nível mais detalhado
-    /// aceito.
+    /// Últimas `n` linhas que passam pelo filtro, em ordem temporal
+    /// (`ts_ns`, e `seq` no empate). `service` = `None` aceita todos;
+    /// `max_level` é o nível mais detalhado aceito.
     #[must_use]
     pub fn query(&self, service: Option<u16>, max_level: Level, n: usize) -> Vec<&Record> {
         let mut out: Vec<&Record> = self
             .records
             .iter()
-            .rev()
             .filter(|r| service.is_none_or(|s| r.service == s) && r.level <= max_level)
-            .take(n)
             .collect();
-        out.reverse();
+        out.sort_by_key(|r| (r.ts_ns, r.seq));
+        let skip = out.len().saturating_sub(n);
+        out.drain(..skip);
         out
     }
 
@@ -227,6 +269,39 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_e_servicos_em_ordem_temporal() {
+        let mut s = Store::new(100);
+        let a = s.register("a").unwrap();
+        assert_eq!(s.name(KERNEL), Some("kernel"));
+        // O anel do kernel é lido depois do serviço, mas tem horas no meio.
+        s.ingest_at(a, Level::Info, 10, "a10").unwrap();
+        s.ingest_at(a, Level::Info, 30, "a30").unwrap();
+        s.ingest_at(KERNEL, Level::Warn, 20, "k20").unwrap();
+        s.ingest_at(KERNEL, Level::Debug, 40, "k40").unwrap();
+        let t: Vec<&str> = s
+            .query(None, Level::Trace, 3)
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(t, ["k20", "a30", "k40"]);
+        let k: Vec<&str> = s
+            .query(Some(KERNEL), Level::Info, 10)
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(k, ["k20"]);
+    }
+
+    #[test]
+    fn limite_de_servicos_exclui_o_kernel() {
+        let mut s = Store::new(4);
+        for i in 0..MAX_SERVICES {
+            s.register(&alloc::format!("s{i}")).unwrap();
+        }
+        assert_eq!(s.register("x"), Err(Error::TooManyServices));
+    }
 
     #[test]
     fn ordem_por_servico_preservada() {
