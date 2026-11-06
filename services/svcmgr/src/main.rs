@@ -3,7 +3,8 @@
 //!
 //! - `rdi`: o endpoint do `root` (badge 1);
 //! - `rsi`: o bootfs só de leitura e a cota de partida;
-//! - `rdx`: a `DebugLog` do `kernel:debug` (0 se o `root` não tiver).
+//! - `rdx`: a `DebugLog` do `kernel:debug` e o anel do `kernel:log` (0 se o
+//!   `root` não tiver).
 //!
 //! O `svcmgr` não recebe a capability da própria thread (ADR 0034, item 2):
 //! ela fecharia o ciclo thread ↔ `CapSpace` da ADR 0029 e prenderia o
@@ -102,11 +103,13 @@ fn spawn(
         scratch_va: SCRATCH_VA,
         priority: m.priority,
     })?;
-    let pool: &[(&str, Handle)] = if boot.log.raw() == 0 {
-        &[]
-    } else {
-        &[("debug", boot.log)]
-    };
+    let mut pool: Vec<(&str, Handle)> = Vec::new();
+    if boot.log.raw() != 0 {
+        pool.push(("debug", boot.log));
+    }
+    if boot.klog.raw() != 0 {
+        pool.push(("log", boot.klog));
+    }
     let desc = plan
         .broker
         .deliver(
@@ -114,7 +117,7 @@ fn spawn(
             child.cspace,
             control,
             child.quota,
-            pool,
+            &pool,
             &mut svcmgr::kernel::Kernel,
         )
         .map_err(|e| {
@@ -476,17 +479,20 @@ struct Boot {
     bootfs: Handle,
     quota: Handle,
     log: Handle,
+    klog: Handle,
 }
 
 fn main(start: Start) -> ! {
     let [a, b, c] = start.args;
     let (root_ep, _) = split_handle_pair(a);
     let (bootfs, quota) = split_handle_pair(b);
+    let (log, klog) = split_handle_pair(c);
     let boot = Boot {
         root_ep,
         bootfs,
         quota,
-        log: Handle::from_raw(u32::try_from(c).unwrap_or(0)),
+        log,
+        klog,
     };
     if boot.log.raw() != 0 {
         ostd::debug::set_log(boot.log);

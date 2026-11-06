@@ -427,3 +427,138 @@ impl Producer {
         self.shared.u64_at(OFF_DROPPED).load(Ordering::Relaxed)
     }
 }
+
+/// O que [`Watcher::next`] encontrou.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watched {
+    /// Um registro: `kind` e bytes copiados para o início do buffer.
+    Record(u16, usize),
+    /// Em dia com o produtor.
+    Empty,
+    /// O produtor sobrescreveu o que ainda não fora lido: a leitura pulou
+    /// para o `tail`, e estes são os bytes perdidos.
+    Lost(u64),
+}
+
+/// Leitor de um anel que o produtor **sobrescreve** (o anel do log do
+/// kernel; ADR 0036, item 6): mapeado só para leitura, sem `head` no
+/// cabeçalho. Guarda a posição fora do anel e, depois de copiar um
+/// registro, relê o `tail`: se o produtor já passou mais de `data_len`
+/// adiante, a cópia pode estar rasgada e é descartada.
+///
+/// Na perda, a leitura recomeça no `tail` (sempre o início de um registro),
+/// em vez de tentar achar o registro mais antigo ainda inteiro.
+#[derive(Debug)]
+pub struct Watcher {
+    shared: Shared,
+    pos: u64,
+    lost: u64,
+}
+
+impl Watcher {
+    /// Mapeia o anel `object` em `va`, só para leitura, e confere o
+    /// cabeçalho. A leitura começa no `tail` atual quando `from_start` é
+    /// falso, e no registro mais antigo ainda no anel quando é verdadeiro
+    /// (do zero se o anel ainda não deu a volta).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` para cabeçalho inválido; os de `vm_map`.
+    pub fn open(object: Handle, va: u64, from_start: bool) -> Result<Self, Error> {
+        let data_len = {
+            let head = Shared {
+                map: Mapping::new(crate::vm::SELF, object, va, HEADER_BYTES, 0)?,
+                data_len: 0,
+            };
+            let ok = head.u32_at(OFF_MAGIC).load(Ordering::Acquire) == MAGIC
+                && head.u32_at(OFF_VERSION_KIND).load(Ordering::Relaxed) & 0xFFFF
+                    == u32::from(VERSION);
+            let n = head.u32_at(OFF_DATA_LEN).load(Ordering::Relaxed);
+            if !ok || !valid_data_len(n) {
+                return Err(Error::InvalidArgument);
+            }
+            n
+        };
+        let shared = Shared {
+            map: Mapping::new(crate::vm::SELF, object, va, object_bytes(data_len), 0)?,
+            data_len: u64::from(data_len),
+        };
+        let tail = shared.u64_at(OFF_TAIL).load(Ordering::Acquire);
+        let pos = if !from_start {
+            tail
+        } else if tail <= shared.data_len {
+            0
+        } else {
+            tail
+        };
+        Ok(Self {
+            shared,
+            pos,
+            lost: 0,
+        })
+    }
+
+    /// Bytes perdidos por sobrescrita até agora.
+    #[must_use]
+    pub const fn lost(&self) -> u64 {
+        self.lost
+    }
+
+    /// Bytes ainda não lidos.
+    #[must_use]
+    pub fn pending(&self) -> u64 {
+        self.shared
+            .u64_at(OFF_TAIL)
+            .load(Ordering::Acquire)
+            .saturating_sub(self.pos)
+    }
+
+    fn skip_to(&mut self, tail: u64) -> Watched {
+        let n = tail.saturating_sub(self.pos);
+        self.lost += n;
+        self.pos = tail;
+        Watched::Lost(n)
+    }
+
+    /// O próximo registro, copiado para `buf` (pula enchimentos).
+    pub fn next(&mut self, buf: &mut [u8]) -> Watched {
+        loop {
+            let tail = self.shared.u64_at(OFF_TAIL).load(Ordering::Acquire);
+            if tail < self.pos {
+                // `tail` regrediu: produtor inválido; recomeça nele.
+                self.pos = tail;
+                return Watched::Empty;
+            }
+            if tail - self.pos > self.shared.data_len {
+                return self.skip_to(tail);
+            }
+            if tail == self.pos {
+                return Watched::Empty;
+            }
+            let start = self.pos;
+            let at = self.shared.pos(start);
+            let mut head = [0u8; RECORD_HEAD];
+            self.shared.read(at, &mut head);
+            let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+            let kind = u16::from_le_bytes([head[4], head[5]]);
+            let size = record_size(len);
+            let n = len.min(buf.len());
+            let fits = at + size <= self.shared.data_len && size <= tail - start;
+            if fits && kind != KIND_PAD {
+                self.shared.read(at + RECORD_HEAD as u64, &mut buf[..n]);
+            }
+            let after = self.shared.u64_at(OFF_TAIL).load(Ordering::Acquire);
+            if after.saturating_sub(start) > self.shared.data_len {
+                return self.skip_to(after);
+            }
+            if !fits {
+                // Registro impossível sem sobrescrita: descarta até `tail`.
+                return self.skip_to(tail);
+            }
+            self.pos = start + size;
+            if kind != KIND_PAD {
+                return Watched::Record(kind, n);
+            }
+        }
+    }
+}

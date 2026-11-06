@@ -364,12 +364,15 @@ fn parse_need(service: &str, item: &str) -> Result<Need, Error> {
 ///
 /// - `debug`: `DebugLog` com `WRITE` (`debug_write`) e `BIND` (ADR 0036).
 /// - `mem-pressure`: `Interrupt` de pressão com `BIND` e `ACK` (ADR 0038).
+/// - `log`: o anel do log do kernel, `MemoryObject` com `READ` e `MAP`
+///   (ADR 0036, item 6).
 #[must_use]
 pub fn kernel_rights(name: &str) -> Option<kabi::Rights> {
     use kabi::Rights;
     match name {
         "debug" => Some(Rights::WRITE.union(Rights::BIND)),
         "mem-pressure" => Some(Rights::BIND.union(Rights::ACK)),
+        "log" => Some(Rights::READ.union(Rights::MAP)),
         _ => None,
     }
 }
