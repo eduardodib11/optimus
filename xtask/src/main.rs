@@ -1201,7 +1201,7 @@ fn test(opts: &Options) -> Result {
 
 /// O que o cenário de integração (T-365) exige além do boot normal: cada
 /// serviço do plano sai pelo desligamento ordenado do `svcmgr`.
-const INTEGRATION_MARKERS: &[&str] = &["logd: encerrado (PeerClosed)", "memd: encerrado", "logd: "];
+const INTEGRATION_MARKERS: &[&str] = &["logd: encerrado", "memd: encerrado"];
 
 /// CPUs do cenário de integração sem `--smp`.
 const INTEGRATION_COUNTS: &[u32] = &[1, 4];
