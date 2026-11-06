@@ -226,7 +226,7 @@ fn parse(args: &[String]) -> Result<Options> {
                 );
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
-            | "all" => {
+            | "integration" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -1170,6 +1170,9 @@ fn test(opts: &Options) -> Result {
     if opts.suite == "stress" {
         stress(opts)?;
     }
+    if opts.suite == "integration" {
+        integration(opts)?;
+    }
     if opts.suite == "hello" {
         // 10⁶ idas e voltas no build de depuração levariam horas sob TCG.
         let release = Options {
@@ -1192,6 +1195,52 @@ fn test(opts: &Options) -> Result {
         // Rodada curta com semente fixa: breve o bastante para o CI, mas
         // já exercita todas as syscalls (`cargo xtask fuzz` roda o longo).
         run_fuzz(opts, FUZZ_SHORT_SECONDS, FUZZ_SHORT_SEED)?;
+    }
+    Ok(())
+}
+
+/// O que o cenário de integração (T-365) exige além do boot normal: cada
+/// serviço do plano sai pelo desligamento ordenado do `svcmgr`.
+const INTEGRATION_MARKERS: &[&str] = &["logd: encerrado (PeerClosed)", "memd: encerrado", "logd: "];
+
+/// CPUs do cenário de integração sem `--smp`.
+const INTEGRATION_COUNTS: &[u32] = &[1, 4];
+
+/// `cargo xtask test integration [--smp N]` (T-365): boot → `root` →
+/// `svcmgr` → `timed`, `logd` e `memd`, com o `hello` do `root`, em
+/// `-smp 1` e `-smp 4` (só N com `--smp`). Exige os marcadores do boot
+/// normal e o desligamento ordenado de cada serviço.
+fn integration(opts: &Options) -> Result {
+    build_test(opts)?;
+    let markers: &'static [&'static str] = Box::leak(
+        BOOT_MARKERS
+            .iter()
+            .chain(INTEGRATION_MARKERS)
+            .copied()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let counts = if opts.smp > 1 {
+        vec![opts.smp]
+    } else {
+        INTEGRATION_COUNTS.to_vec()
+    };
+    for n in counts {
+        let serial = boot_scenario(
+            &Options {
+                smp: n,
+                ..opts.clone()
+            },
+            &Scenario {
+                name: "integração",
+                markers,
+                ..SCENARIOS[0]
+            },
+        )?;
+        if n > 1 {
+            check_cpus_online(&serial, n)?;
+        }
+        println!("xtask: integração em -smp {n}: serviços em Running e encerrados em ordem");
     }
     Ok(())
 }
