@@ -1,0 +1,14 @@
+// Protocolo entre os serviços e o `svcmgr` (ADR 0034, item 6). O código
+// à mão em lib/osvc segue esta especificação até os stubs gerados.
+package optimus.svc @1.0;
+
+struct CapDesc { kind: u8, index: u16, handle: u32, name_hash: u32 }
+struct Boot { caps: vec<CapDesc, 96>, generation: u16 }
+enum SvcError : u8 { NotInManifest, NotRunning, VersionTooOld, Busy }
+
+interface Supervisor {
+    bootstrap() -> result<Boot, SvcError>;
+    ready() -> result<(), SvcError>;
+    connect(interface: u32, minor: u16) -> result<handle<Endpoint>, SvcError>;
+    name_of(id: u32) -> result<string<31>, SvcError>;
+}
