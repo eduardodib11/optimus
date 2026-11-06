@@ -1,4 +1,12 @@
-//! `cargo xtask bench`: benchmarks de IPC e de troca de contexto (T-213).
+//! `cargo xtask bench`: benchmarks de IPC e de troca de contexto (T-213) e
+//! do M3 (T-367).
+//!
+//! Do M3: IPC entre CPUs (com `--smp` maior que 1), a partida dos serviços
+//! pelo `svcmgr`, a leitura do anel do kernel pelo `logd` e a latência de
+//! falta do `memd` (do teste de usuário do paginador). O relatório guarda as
+//! medianas num comentário `metricas:` e é comparado com o anterior do mesmo
+//! `-smp`: em KVM, piora de mais de [`GATE_PCT`] % em qualquer métrica
+//! derruba o comando (o gate de regressão); em TCG a comparação só informa.
 //!
 //! Dá boot no kernel de release com `test=bench`, lê as linhas `bench:`
 //! da serial (ver `kernel/okernel/src/kbench.rs`) e grava o relatório em
@@ -11,7 +19,13 @@ use std::fs;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{KERNEL_EXIT_OK, Options, Result, Scenario, boot_scenario, build, root};
+use super::{
+    KERNEL_EXIT_OK, Options, Result, SCENARIOS, Scenario, USER_SCENARIO, boot_scenario, build,
+    build_test, root,
+};
+
+/// Piora máxima aceita entre duas rodadas em KVM, em %.
+pub const GATE_PCT: u64 = 5;
 
 /// O boot dos benchmarks.
 const BENCH_SCENARIO: Scenario = Scenario {
@@ -34,6 +48,11 @@ const ROWS: &[(&str, &str, &str)] = &[
         "ipc_call_reply_recv",
         "IPC `ipc_call` → `ipc_reply_recv`, ida e volta",
         "≤ 1 µs",
+    ),
+    (
+        "ipc_entre_cpus",
+        "IPC entre CPUs (servidor noutra CPU), ida e volta",
+        "—",
     ),
     (
         "troca_de_contexto_entre_processos",
@@ -69,8 +88,26 @@ pub fn bench(opts: &Options) -> Result {
     };
     build(&opts)?;
     let serial = boot_scenario(&opts, &BENCH_SCENARIO)?;
+    // Os serviços: o boot normal (partida e `logd`) e o paginador do
+    // `utest` (falta do `memd`), no build de teste.
+    // O `utest` roda como no CI (depuração, uma CPU): a mesma base de
+    // comparação em toda rodada.
+    let ci = Options {
+        release: false,
+        smp: 1,
+        ..opts.clone()
+    };
+    build_test(&opts)?;
+    let boot = boot_scenario(&opts, &SCENARIOS[0])?;
+    build_test(&ci)?;
+    let user = boot_scenario(&ci, &USER_SCENARIO)?;
+    let services = services(&boot, &user)?;
     let meta = meta();
-    let report = report(&serial, &meta, opts.smp)?;
+    let mut report = report(&serial, &meta, opts.smp)?;
+    report.push_str(&services_section(&services));
+    let mut metrics = kernel_metrics(&serial);
+    metrics.extend(services.iter().map(|(k, _, v)| ((*k).to_string(), *v)));
+    let kvm = report.contains("Acelerador: KVM");
     let dir = root().join("docs/bench");
     fs::create_dir_all(&dir).map_err(|e| format!("criando {}: {e}", dir.display()))?;
     // Com mais de uma CPU, o relatório não sobrescreve o de uma.
@@ -79,11 +116,161 @@ pub fn bench(opts: &Options) -> Result {
     } else {
         String::new()
     };
-    let file = dir.join(format!("{}-{}{smp}.md", meta.date, meta.commit));
+    let suffix = format!("-m3{smp}.md");
+    let previous = latest(&dir, &suffix);
+    let verdict = previous.as_ref().map(|(name, text)| {
+        let old = parse_metrics(text);
+        let old_kvm = text.contains("Acelerador: KVM");
+        (name.clone(), compare(&old, &metrics), old_kvm)
+    });
+    if let Some((name, rows, _)) = &verdict {
+        report.push_str(&comparison_section(name, rows));
+    }
+    report.push_str(&metrics_comment(&metrics));
+    let file = dir.join(format!("{}-{}{suffix}", meta.date, meta.commit));
     fs::write(&file, &report).map_err(|e| format!("gravando {}: {e}", file.display()))?;
     println!("{report}");
     println!("xtask: relatório em {}", file.display());
+    if let Some((name, rows, old_kvm)) = verdict
+        && kvm
+        && old_kvm
+    {
+        let worse: Vec<String> = rows
+            .iter()
+            .filter(|r| r.3 > i64::try_from(GATE_PCT).unwrap_or(5))
+            .map(|r| format!("{} (+{}%)", r.0, r.3))
+            .collect();
+        if !worse.is_empty() {
+            return Err(format!(
+                "regressão de mais de {GATE_PCT}% em relação a {name}: {}",
+                worse.join(", ")
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Métrica dos serviços: chave, descrição e valor em ns.
+type Service = (&'static str, &'static str, u64);
+
+/// Número depois de `prefix` numa linha da serial, até o primeiro espaço.
+fn after(serial: &str, prefix: &str) -> Option<u64> {
+    serial.lines().find_map(|l| {
+        let (_, rest) = l.split_once(prefix)?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
+/// As métricas dos serviços, das seriais do boot normal e do `utest`.
+fn services(boot: &str, user: &str) -> Result<Vec<Service>> {
+    let start = after(boot, "svcmgr: partida em ").ok_or("sem a partida do svcmgr")?;
+    let logd = after(boot, "logd: vazão ").ok_or("sem a vazão do logd")?;
+    let fault = after(user, "memd: falta média ").ok_or("sem a falta do memd")?;
+    Ok(vec![
+        (
+            "partida_dos_servicos",
+            "Partida dos serviços (svcmgr, do primeiro spawn ao último ready)",
+            start * 1000,
+        ),
+        (
+            "logd_por_linha",
+            "logd: leitura do anel do kernel, por linha",
+            logd,
+        ),
+        (
+            "memd_falta",
+            "memd: latência média de falta (paginador do utest)",
+            fault * 1000,
+        ),
+    ])
+}
+
+fn services_section(rows: &[Service]) -> String {
+    let mut md = String::from(
+        "\n## Serviços (M3)\n\n\
+         | Medida | Valor |\n|---|---:|\n",
+    );
+    for (_, label, v) in rows {
+        let _ = writeln!(md, "| {label} | {} |", human(*v));
+    }
+    md.push_str(
+        "\nA partida e o `logd` vêm do boot normal (build de teste); a falta do \
+         `memd`, do teste do paginador do `utest`, com a carga 1,5× acima da cota.\n",
+    );
+    md
+}
+
+/// Medianas dos benchmarks do kernel presentes na serial.
+fn kernel_metrics(serial: &str) -> Vec<(String, u64)> {
+    ROWS.iter()
+        .filter_map(|(name, _, _)| {
+            let f = fields(line(serial, name)?);
+            let v = f.iter().find(|(k, _)| *k == "mediana_ns")?.1.parse().ok()?;
+            Some(((*name).to_string(), v))
+        })
+        .collect()
+}
+
+/// O comentário com as métricas, para a próxima comparação.
+fn metrics_comment(m: &[(String, u64)]) -> String {
+    let body: Vec<String> = m.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!("\n<!-- metricas: {} -->\n", body.join(" "))
+}
+
+/// As métricas do comentário `metricas:` de um relatório.
+pub fn parse_metrics(text: &str) -> Vec<(String, u64)> {
+    let Some((_, rest)) = text.split_once("<!-- metricas: ") else {
+        return Vec::new();
+    };
+    let body = rest.split_once("-->").map_or(rest, |(b, _)| b);
+    body.split_whitespace()
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_string(), v.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Para cada métrica nas duas rodadas: nome, antes, agora e variação em %
+/// (positiva = piorou).
+pub fn compare(old: &[(String, u64)], new: &[(String, u64)]) -> Vec<(String, u64, u64, i64)> {
+    new.iter()
+        .filter_map(|(k, v)| {
+            let (_, o) = old.iter().find(|(ok, _)| ok == k)?;
+            let o = *o;
+            if o == 0 {
+                return None;
+            }
+            let pct = (i128::from(*v) - i128::from(o)) * 100 / i128::from(o);
+            Some((k.clone(), o, *v, i64::try_from(pct).unwrap_or(i64::MAX)))
+        })
+        .collect()
+}
+
+fn comparison_section(name: &str, rows: &[(String, u64, u64, i64)]) -> String {
+    let mut md = format!(
+        "\n## Comparação com `{name}`\n\n\
+         Gate: em KVM, mais de {GATE_PCT}% de piora em qualquer linha derruba o \
+         `cargo xtask bench`; em TCG a tabela só informa.\n\n\
+         | Métrica | Antes | Agora | Variação |\n|---|---:|---:|---:|\n"
+    );
+    for (k, o, v, pct) in rows {
+        let _ = writeln!(md, "| `{k}` | {} | {} | {pct:+}% |", human(*o), human(*v));
+    }
+    md
+}
+
+/// O relatório mais recente de `dir` com o sufixo dado (nome e texto).
+fn latest(dir: &std::path::Path, suffix: &str) -> Option<(String, String)> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.ends_with(suffix))
+        .collect();
+    names.sort();
+    let name = names.pop()?;
+    let text = fs::read_to_string(dir.join(&name)).ok()?;
+    Some((name, text))
 }
 
 fn output(cmd: &mut Command) -> Option<String> {
@@ -223,6 +410,9 @@ pub fn report(serial: &str, meta: &Meta, smp: u32) -> Result<String> {
          |---|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for (name, label, goal) in ROWS {
+        if *name == "ipc_entre_cpus" && line(serial, name).is_none() {
+            continue;
+        }
         let row = line(serial, name).ok_or_else(|| format!("sem a linha bench: {name}"))?;
         let f = fields(row);
         let num = |k: &str| -> Result<u64> {
@@ -298,6 +488,34 @@ mod tests {
         assert!(!report(&kvm, &meta(), 1).unwrap().contains("Sem KVM"));
         let missing = SERIAL.replace("bench: troca_de_contexto_mesmo_processo", "x");
         assert!(report(&missing, &meta(), 1).is_err());
+    }
+
+    #[test]
+    fn metricas_vao_e_voltam_e_a_comparacao_da_variacao() {
+        let m = vec![("a".to_string(), 1000), ("b".to_string(), 200)];
+        let text = format!("# x\n{}", metrics_comment(&m));
+        assert_eq!(parse_metrics(&text), m);
+        let new = vec![
+            ("a".to_string(), 1060),
+            ("b".to_string(), 190),
+            ("c".to_string(), 5),
+        ];
+        let rows = compare(&m, &new);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].3, 6);
+        assert_eq!(rows[1].3, -5);
+        assert!(parse_metrics("sem comentário").is_empty());
+    }
+
+    #[test]
+    fn servicos_das_seriais() {
+        let boot = "info  [7376636d] svcmgr: partida em 1234 us\r\ninfo  [7376636d] logd: vazão 850 ns por linha\r\n";
+        let user = "info  utest: memd: falta média 5951 µs\r\n";
+        let s = services(boot, user).unwrap();
+        assert_eq!(s[0].2, 1_234_000);
+        assert_eq!(s[1].2, 850);
+        assert_eq!(s[2].2, 5_951_000);
+        assert!(services("", user).is_err());
     }
 
     #[test]
