@@ -1,0 +1,17 @@
+[package]
+name = "osvc"
+description = "Protocolo optimus.svc.Supervisor@1 (ADR 0034, item 6): rótulos e o descritor de partida no fio do OIDL."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[dependencies]
+oidl-rt = { path = "../oidl-rt" }
+optcrypt = { path = "../optcrypt" }
+
+[lints]
+workspace = true
