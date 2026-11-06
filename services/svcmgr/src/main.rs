@@ -10,16 +10,20 @@
 //! processo na cota do `root` depois da saída. Para configurar a si mesmo,
 //! usa `thread = 0` (ADR 0039, item 3).
 //!
-//! Nesta versão ele só confere as capabilities recebidas e se anuncia;
-//! manifestos, grafo e partida dos serviços vêm nas T-352 e T-353.
+//! Nesta versão ele confere as capabilities recebidas, se anuncia, lê os
+//! manifestos do bootfs e calcula a ordem de partida ([`svcmgr::plan`]);
+//! a partida dos serviços vem no passo seguinte.
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 use ostd::ipc::{self, Message};
 use ostd::kabi::{Error, Handle, split_handle_pair};
 use ostd::rt::Start;
+use ostd::vm::{Mapping, SELF};
 
 ostd::entry!(main);
 
@@ -27,6 +31,42 @@ ostd::entry!(main);
 const CALL_WAIT_NS: u64 = 15_000_000_000;
 /// Rótulo do "olá" ao `root` (o `root` aceita só esse rótulo do badge 1).
 const LABEL_OLA: u64 = 1;
+
+/// Onde o `svcmgr` mapeia o bootfs.
+const BOOTFS_VA: u64 = 0x10_0000_0000;
+
+/// Mapeia o bootfs inteiro (o tamanho está no byte 32 do cabeçalho).
+fn map_bootfs(bootfs: Handle) -> Result<Mapping, Error> {
+    let len = {
+        let head = Mapping::new(SELF, bootfs, BOOTFS_VA, 4096, 0)?;
+        let field = head.bytes().get(32..40).ok_or(Error::InvalidArgument)?;
+        u64::from_le_bytes(field.try_into().map_err(|_| Error::InvalidArgument)?)
+    };
+    Mapping::new(SELF, bootfs, BOOTFS_VA, len, 0)
+}
+
+/// Lê os manifestos e anuncia a ordem de partida.
+fn plan(bootfs: Handle) -> Result<(), Error> {
+    let map = map_bootfs(bootfs)?;
+    let fs = obfs::Image::parse(map.bytes()).map_err(|_| Error::InvalidArgument)?;
+    let entries: alloc::vec::Vec<(&str, &[u8])> = fs.entries().map(|e| (e.name, e.data)).collect();
+    let plan = match svcmgr::plan::build(&entries) {
+        Ok(p) => p,
+        Err(e) => {
+            ostd::debug::print_fmt(format_args!("svcmgr: plano recusado: {e:?}"));
+            return Err(Error::InvalidArgument);
+        }
+    };
+    for (n, level) in plan.levels.iter().enumerate() {
+        for &id in level {
+            let name = plan.broker.manifest(id).map_or("?", |m| m.name.as_str());
+            ostd::debug::print_fmt(format_args!("svcmgr: nível {n}: {name}"));
+        }
+    }
+    let total: usize = plan.levels.iter().map(alloc::vec::Vec::len).sum();
+    ostd::debug::print_fmt(format_args!("svcmgr: {total} serviços no plano"));
+    Ok(())
+}
 
 /// Capabilities recebidas do `root`, já separadas.
 #[derive(Clone, Copy)]
@@ -63,5 +103,6 @@ fn main(start: Start) -> ! {
         Err(Error::AccessDenied) => ostd::debug::print("svcmgr: o root recusou o anúncio"),
         Err(_) => ostd::debug::print("svcmgr: falha ao falar com o root"),
     }
+    let _ = plan(boot.bootfs);
     ostd::thread::exit()
 }

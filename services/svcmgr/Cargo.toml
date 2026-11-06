@@ -18,6 +18,7 @@ bench = false
 ostd = { path = "../../lib/ostd" }
 kabi = { path = "../../kernel/kabi" }
 oman = { path = "../../lib/oman" }
+obfs = { path = "../../lib/obfs" }
 optcrypt = { path = "../../lib/optcrypt" }
 
 [dev-dependencies]
