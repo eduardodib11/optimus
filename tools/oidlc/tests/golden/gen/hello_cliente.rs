@@ -97,7 +97,7 @@ impl HelloCliente {
         }
     }
 
-    /// Método `ping` (ordinal 1).
+    /// Método `ping` (ordinal 1), pelo caminho de registradores.
     pub fn ping(
         &self,
         buf: &mut ostd::ipc::Buffer,
@@ -108,46 +108,37 @@ impl HelloCliente {
         e: u64,
         f: u64,
     ) -> Result<Result<Seis, u8>, ostd::kabi::Error> {
-        let mut pedido = [0u8; 48];
-        let n = codifica_hello_1(&mut pedido, &a, &b, &c, &d, &e, &f).map_err(erro_oidl)?;
-        let mut saida = [0u8; 48];
-        let (rotulo, m) = ostd::ipc::call_corpo(
-            self.ep,
-            buf,
-            0x0C5F05E300000001,
-            &pedido[..n],
-            &mut saida,
-            0,
-        )?;
+        let _ = buf;
+        let (rotulo, w) =
+            ostd::ipc::call_palavras(self.ep, 0x0C5F05E300000001, [a, b, c, d, e, f], 0)?;
         if rotulo >> 62 == 0 {
-            Ok(Ok(decodifica_ok_hello_1(&saida[..m]).map_err(erro_oidl)?))
+            Ok(Ok(Seis {
+                w0: w[0],
+                w1: w[1],
+                w2: w[2],
+                w3: w[3],
+                w4: w[4],
+                w5: w[5],
+            }))
         } else {
-            Ok(Err(decodifica_err_hello_1(&saida[..m]).map_err(erro_oidl)?))
+            Ok(Err(u8::try_from(w[0]).unwrap_or(u8::MAX)))
         }
     }
 
-    /// Método `bye` (ordinal 2).
+    /// Método `bye` (ordinal 2), pelo caminho de registradores.
     pub fn bye(
         &self,
         buf: &mut ostd::ipc::Buffer,
         voltas: u64,
         erros: u64,
     ) -> Result<Result<(), u8>, ostd::kabi::Error> {
-        let mut pedido = [0u8; 16];
-        let n = codifica_hello_2(&mut pedido, &voltas, &erros).map_err(erro_oidl)?;
-        let mut saida = [0u8; 8];
-        let (rotulo, m) = ostd::ipc::call_corpo(
-            self.ep,
-            buf,
-            0x0C5F05E300000002,
-            &pedido[..n],
-            &mut saida,
-            0,
-        )?;
+        let _ = buf;
+        let (rotulo, w) =
+            ostd::ipc::call_palavras(self.ep, 0x0C5F05E300000002, [voltas, erros, 0, 0, 0, 0], 0)?;
         if rotulo >> 62 == 0 {
-            Ok(Ok(decodifica_ok_hello_2(&saida[..m]).map_err(erro_oidl)?))
+            Ok(Ok(()))
         } else {
-            Ok(Err(decodifica_err_hello_2(&saida[..m]).map_err(erro_oidl)?))
+            Ok(Err(u8::try_from(w[0]).unwrap_or(u8::MAX)))
         }
     }
 }
@@ -167,75 +158,6 @@ fn decodifica_ok_hello_0(corpo: &[u8]) -> Result<u64, Error> {
 }
 
 fn decodifica_err_hello_0(corpo: &[u8]) -> Result<u8, Error> {
-    let mut r = Reader::new(corpo, 1)?;
-    let v = r.u8()?;
-    r.finish()?;
-    Ok(v)
-}
-
-fn codifica_hello_1(
-    saida: &mut [u8],
-    a: &u64,
-    b: &u64,
-    c: &u64,
-    d: &u64,
-    e: &u64,
-    f: &u64,
-) -> Result<usize, Error> {
-    let mut w = Writer::new(saida, 48)?;
-    w.seek(0);
-    w.u64((*a))?;
-    w.seek(8);
-    w.u64((*b))?;
-    w.seek(16);
-    w.u64((*c))?;
-    w.seek(24);
-    w.u64((*d))?;
-    w.seek(32);
-    w.u64((*e))?;
-    w.seek(40);
-    w.u64((*f))?;
-    Ok(w.finish())
-}
-
-fn decodifica_ok_hello_1(corpo: &[u8]) -> Result<Seis, Error> {
-    let mut r = Reader::new(corpo, 48)?;
-    let v = Seis {
-        w0: r.u64()?,
-        w1: r.u64()?,
-        w2: r.u64()?,
-        w3: r.u64()?,
-        w4: r.u64()?,
-        w5: r.u64()?,
-    };
-    r.finish()?;
-    Ok(v)
-}
-
-fn decodifica_err_hello_1(corpo: &[u8]) -> Result<u8, Error> {
-    let mut r = Reader::new(corpo, 1)?;
-    let v = r.u8()?;
-    r.finish()?;
-    Ok(v)
-}
-
-fn codifica_hello_2(saida: &mut [u8], voltas: &u64, erros: &u64) -> Result<usize, Error> {
-    let mut w = Writer::new(saida, 16)?;
-    w.seek(0);
-    w.u64((*voltas))?;
-    w.seek(8);
-    w.u64((*erros))?;
-    Ok(w.finish())
-}
-
-fn decodifica_ok_hello_2(corpo: &[u8]) -> Result<(), Error> {
-    let r = Reader::new(corpo, 0)?;
-    let _ = corpo;
-    r.finish()?;
-    Ok(())
-}
-
-fn decodifica_err_hello_2(corpo: &[u8]) -> Result<u8, Error> {
     let mut r = Reader::new(corpo, 1)?;
     let v = r.u8()?;
     r.finish()?;

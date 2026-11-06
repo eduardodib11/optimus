@@ -554,6 +554,7 @@ impl Gen<'_> {
             self.out.push_str(&trait_src);
             self.out.push_str(&resto);
             self.despacho(&nome, &up, &sn, i.methods.as_slice());
+            self.despacho_palavras(&nome, &up, &sn, i.methods.as_slice());
         }
     }
 
@@ -883,6 +884,10 @@ impl Gen<'_> {
             );
             return;
         }
+        if self.elegivel(m) {
+            self.metodo_cliente_palavras(id, minor, ordinal, m, metodos);
+            return;
+        }
         let (pedido, resposta) = match self.lay.metodo(m) {
             Ok((p, Some((ok, err)))) => (p, (ok, err)),
             Ok((_, None)) => return,
@@ -993,4 +998,166 @@ impl Gen<'_> {
 /// arredondado a 8 bytes.
 fn tamanho_buffer(cabeca: u64, pior: u64) -> u64 {
     cabeca.max(pior).div_ceil(8) * 8
+}
+
+/// Tipo que cabe numa palavra de 64 bits: o caminho de registradores (T-345
+/// parte 3) só cobre esses. O fio é o mesmo do caminho de bytes (ADR 0033).
+fn palavra(t: &Type) -> bool {
+    matches!(t, Type::Prim(Prim::U64 | Prim::I64, _))
+}
+
+/// Valor de uma palavra no tipo `t` (a leitura do cliente).
+fn de_palavra(t: &Type, src: &str) -> String {
+    match t {
+        Type::Prim(Prim::I64, _) => format!("i64::from_le_bytes({src}.to_le_bytes())"),
+        _ => src.to_string(),
+    }
+}
+
+/// Palavra de 64 bits de um valor de tipo `t` (a escrita do servidor).
+fn para_palavra(t: &Type, src: &str) -> String {
+    match t {
+        Type::Prim(Prim::I64, _) => format!("u64::from_le_bytes({src}.to_le_bytes())"),
+        _ => src.to_string(),
+    }
+}
+
+impl Gen<'_> {
+    /// Um método cabe no caminho de registradores se os parâmetros forem
+    /// `u64`/`i64` (até seis), e a resposta couber em seis palavras: `()`,
+    /// um valor de 64 bits ou uma estrutura de até seis desses. O erro é
+    /// `()` ou `u8`.
+    fn elegivel(&self, m: &Method) -> bool {
+        if m.oneway || m.params.len() > 6 || !m.params.iter().all(|p| palavra(&p.ty)) {
+            return false;
+        }
+        let Some(ret) = &m.ret else {
+            return false;
+        };
+        let ok = match &ret.ok {
+            Type::Unit => true,
+            Type::Prim(..) => palavra(&ret.ok),
+            Type::Named(id) => match self.decl(&id.name) {
+                Some(Decl::Struct(s)) => {
+                    s.fields.len() <= 6 && s.fields.iter().all(|f| palavra(&f.ty))
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        ok && matches!(ret.err, Type::Unit | Type::Prim(Prim::U8, _))
+    }
+
+    /// Cliente de um método elegível: monta as palavras e lê a resposta
+    /// delas, sem passar por bytes.
+    fn metodo_cliente_palavras(
+        &mut self,
+        id: u32,
+        minor: u16,
+        ordinal: u16,
+        m: &Method,
+        metodos: &mut String,
+    ) {
+        let nome = m.name.name.clone();
+        let Some(ret) = m.ret.as_ref() else {
+            return;
+        };
+        let mut assinatura = String::new();
+        let mut args: Vec<String> = Vec::new();
+        for p in &m.params {
+            let rust = self.rs(&p.ty, Modo::Elidido).unwrap_or_default();
+            let _ = write!(assinatura, ", {}: {rust}", p.name.name);
+            args.push(p.name.name.clone());
+        }
+        while args.len() < 6 {
+            args.push("0".to_string());
+        }
+        let ok_rust = match &ret.ok {
+            Type::Unit => "()".to_string(),
+            t => self.rs(t, Modo::Elidido).unwrap_or_default(),
+        };
+        let err_rust = match &ret.err {
+            Type::Unit => "()".to_string(),
+            t => self.rs(t, Modo::Elidido).unwrap_or_default(),
+        };
+        let ok_val = match &ret.ok {
+            Type::Unit => "()".to_string(),
+            Type::Named(id) => match self.decl(&id.name) {
+                Some(Decl::Struct(s)) => {
+                    let campos: Vec<String> = s
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(k, f)| {
+                            format!("{}: {}", f.name.name, de_palavra(&f.ty, &format!("w[{k}]")))
+                        })
+                        .collect();
+                    format!("{} {{ {} }}", id.name, campos.join(", "))
+                }
+                _ => String::new(),
+            },
+            t => de_palavra(t, "w[0]"),
+        };
+        let err_val = match &ret.err {
+            Type::Unit => "()".to_string(),
+            _ => "u8::try_from(w[0]).unwrap_or(u8::MAX)".to_string(),
+        };
+        let rotulo = crate::ids::rotulo_pedido(id, minor, ordinal);
+        let _ = writeln!(
+            metodos,
+            "    /// Método `{nome}` (ordinal {ordinal}), pelo caminho de registradores.\n    pub fn {nome}(&self, buf: &mut ostd::ipc::Buffer{assinatura}) -> Result<Result<{ok_rust}, {err_rust}>, ostd::kabi::Error> {{\n        let _ = buf;\n        let (rotulo, w) = ostd::ipc::call_palavras(self.ep, {rotulo:#018X}, [{}], 0)?;\n        if rotulo >> 62 == 0 {{\n            Ok(Ok({ok_val}))\n        }} else {{\n            Ok(Err({err_val}))\n        }}\n    }}\n",
+            args.join(", ")
+        );
+    }
+
+    /// Despacho de palavras: `despacha_<iface>_palavras` atende os métodos
+    /// elegíveis e devolve `None` para os outros (que vão pelo de bytes).
+    fn despacho_palavras(&mut self, nome: &str, up: &str, sn: &str, metodos: &[Method]) {
+        let mut braços = String::new();
+        for (ordinal, m) in metodos.iter().enumerate() {
+            if !self.elegivel(m) {
+                continue;
+            }
+            let Some(ret) = m.ret.as_ref() else {
+                continue;
+            };
+            let mut lets = String::new();
+            let mut args = String::new();
+            for (k, p) in m.params.iter().enumerate() {
+                let _ = writeln!(lets, "            let p_{} = p[{k}];", p.name.name);
+                let _ = write!(args, ", p_{}", p.name.name);
+            }
+            let saida_ok = match &ret.ok {
+                Type::Unit => "[0; 6]".to_string(),
+                Type::Named(id) => match self.decl(&id.name) {
+                    Some(Decl::Struct(s)) => {
+                        let mut v: Vec<String> = s
+                            .fields
+                            .iter()
+                            .map(|f| para_palavra(&f.ty, &format!("x.{}", f.name.name)))
+                            .collect();
+                        while v.len() < 6 {
+                            v.push("0".to_string());
+                        }
+                        format!("[{}]", v.join(", "))
+                    }
+                    _ => "[0; 6]".to_string(),
+                },
+                t => format!("[{}, 0, 0, 0, 0, 0]", para_palavra(t, "x")),
+            };
+            let saida_err = match &ret.err {
+                Type::Unit => "[0; 6]".to_string(),
+                _ => "[u64::from(e), 0, 0, 0, 0, 0]".to_string(),
+            };
+            let _ = writeln!(
+                braços,
+                "        {ordinal} => {{\n{lets}            Some(match s.{}(ctx{args}) {{\n                Ok(x) => (rotulo_resposta(0, 0), {saida_ok}),\n                Err(e) => (rotulo_resposta(1, 0), {saida_err}),\n            }})\n        }}",
+                m.name.name
+            );
+        }
+        let _ = write!(
+            self.out,
+            "/// Despacho pelo caminho de registradores (T-345 parte 3): atende os\n/// métodos que cabem em seis palavras. Os outros devolvem `None` e vão pelo\n/// despacho de bytes.\npub fn despacha_{sn}_palavras<S: {nome}>(s: &mut S, rotulo: u64, p: &[u64; 6], ctx: &Contexto) -> Option<(u64, [u64; 6])> {{\n    if (rotulo >> 32) as u32 != ID_{up} {{\n        return None;\n    }}\n    match (rotulo & 0xFFFF) as u16 {{\n{braços}        _ => None,\n    }}\n}}\n\n"
+        );
+    }
 }

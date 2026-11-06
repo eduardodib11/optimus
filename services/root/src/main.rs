@@ -199,22 +199,6 @@ impl hello_servidor::Hello for Atende {
     }
 }
 
-impl Atende {
-    /// `ping` pelo caminho de registradores (experimento da T-345 parte 3).
-    fn ping_palavras(&mut self, w: [u64; 6]) -> [u64; 6] {
-        if self.next == 0 {
-            self.t0 = ostd::time::now_ns();
-        }
-        let ok = w
-            .iter()
-            .enumerate()
-            .all(|(k, &v)| v == proto::word(self.next, k as u64));
-        self.bad += u64::from(!ok);
-        self.next += 1;
-        w.map(|v| v.wrapping_add(1))
-    }
-}
-
 /// Atende o `hello` até a despedida; `Ok` se as voltas conferiram.
 fn serve(b: Boot, ep: Handle, rounds: u64, buffer: &mut Buffer) -> Result<(), Error> {
     let reply = create(b.quota, ObjectType::Reply, 0)?;
@@ -237,11 +221,11 @@ fn serve(b: Boot, ep: Handle, rounds: u64, buffer: &mut Buffer) -> Result<(), Er
             ));
             return Err(Error::Cancelled);
         }
-        let resp = if (rec.msg.label >> 32) as u32 == hello_servidor::ID_HELLO
-            && (rec.msg.label & 0xFFFF) == 1
+        let ctx = hello_servidor::Contexto { badge: rec.badge };
+        let resp = if let Some((rotulo, w)) =
+            hello_servidor::despacha_hello_palavras(&mut st, rec.msg.label, &rec.msg.words, &ctx)
         {
-            let w = st.ping_palavras(rec.msg.words);
-            Message::new(0, &w)
+            Message::new(rotulo, &w)
         } else {
             let n = ipc::copia(buffer, &rec.msg, &mut corpo)?;
             let entrada = hello_servidor::Entrada {
