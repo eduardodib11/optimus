@@ -195,6 +195,17 @@ impl Supervisor {
             .collect()
     }
 
+    /// Morte induzida de propósito (o teste de caos, T-366): o serviço volta
+    /// em `now_ns`, sem contar falha nem mexer no recuo. Não reinicia quem
+    /// já está `Failed` ou `Stopped`.
+    pub fn induced(&mut self, id: u32, now_ns: u64) {
+        if let Some(s) = self.slot(id)
+            && !matches!(s.state, State::Failed | State::Stopped)
+        {
+            s.state = State::Waiting(now_ns);
+        }
+    }
+
     /// Próximo instante de reinício pendente, para armar o `Timer`.
     #[must_use]
     pub fn next_due(&self) -> Option<u64> {
