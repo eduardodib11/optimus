@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod broker;
+pub mod plan;
 pub mod supervisor;
 // O `ostd` traz o `panic_impl` do alvo e não convive com o `std` dos testes.
 #[cfg(not(test))]
