@@ -204,5 +204,101 @@ pub fn decode_boot(body: &[u8]) -> oidl_rt::Result<Boot> {
     })
 }
 
+/// Cabeça de `connect(interface: u32, minor: u16)`.
+const CONNECT_HEAD: usize = 6;
+/// Cabeça de `name_of(id: u32)`.
+const NAME_OF_HEAD: usize = 4;
+/// Cabeça da resposta de `name_of` (`string<31>`: ponteiro de 8 bytes).
+const NAME_HEAD: usize = 8;
+/// Tamanho máximo do nome em `name_of`.
+pub const MAX_NAME: usize = 31;
+/// Bytes que bastam para qualquer pedido ou resposta curta deste protocolo.
+pub const MAX_SHORT_BYTES: usize = 48;
+
+/// Codifica o pedido de `connect`.
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] sem espaço em `out`.
+pub fn encode_connect(interface: u32, minor: u16, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    let mut w = Writer::new(out, CONNECT_HEAD)?;
+    w.u32(interface)?;
+    w.u16(minor)?;
+    Ok(w.finish())
+}
+
+/// Decodifica o pedido de `connect`: `(interface, minor)`.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_connect(body: &[u8]) -> oidl_rt::Result<(u32, u16)> {
+    let mut r = Reader::new(body, CONNECT_HEAD)?;
+    let v = (r.u32()?, r.u16()?);
+    r.finish()?;
+    Ok(v)
+}
+
+/// Codifica o pedido de `name_of`.
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] sem espaço em `out`.
+pub fn encode_name_of(id: u32, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    let mut w = Writer::new(out, NAME_OF_HEAD)?;
+    w.u32(id)?;
+    Ok(w.finish())
+}
+
+/// Decodifica o pedido de `name_of`.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_name_of(body: &[u8]) -> oidl_rt::Result<u32> {
+    let mut r = Reader::new(body, NAME_OF_HEAD)?;
+    let id = r.u32()?;
+    r.finish()?;
+    Ok(id)
+}
+
+/// Codifica a resposta de `name_of`.
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] acima de [`MAX_NAME`] ou sem espaço.
+pub fn encode_name(name: &str, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    let mut w = Writer::new(out, NAME_HEAD)?;
+    w.string(name, MAX_NAME)?;
+    Ok(w.finish())
+}
+
+/// Decodifica a resposta de `name_of`.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_name(body: &[u8]) -> oidl_rt::Result<&str> {
+    let mut r = Reader::new(body, NAME_HEAD)?;
+    let s = r.string(MAX_NAME)?;
+    r.finish()?;
+    Ok(s)
+}
+
+/// Codifica um `SvcError` (corpo de uma resposta [`REPLY_ERR`]).
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] sem espaço em `out`.
+pub fn encode_error(e: SvcError, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    let mut w = Writer::new(out, 1)?;
+    w.u8(e as u8)?;
+    Ok(w.finish())
+}
+
+/// Decodifica o corpo de uma resposta [`REPLY_ERR`].
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_error(body: &[u8]) -> oidl_rt::Result<SvcError> {
+    let mut r = Reader::new(body, 1)?;
+    let v = r.u8()?;
+    r.finish()?;
+    SvcError::from_u8(v).ok_or(oidl_rt::Error::BadMessage)
+}
+
 #[cfg(test)]
 mod tests;

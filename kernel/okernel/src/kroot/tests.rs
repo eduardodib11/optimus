@@ -43,7 +43,7 @@ fn root_inicia() -> Outcome {
         let image = bootfs().ok_or("sem bootfs")?;
         let _ = take_debug_log();
         let p = load(image)?;
-        ensure!(run_until_exit(&p.thread, 5_000_000_000));
+        ensure!(run_until_exit(&p.thread, 15_000_000_000));
         let (log, len) = take_debug_log();
         let text = core::str::from_utf8(&log[..len]).unwrap_or("?");
         info!("ktest: · o root imprimiu \"{text}\"");

@@ -78,6 +78,8 @@ const BOOT_MARKERS: &[&str] = &[
     " ns por ida e volta com o hello",
     "svcmgr: timed em Running",
     "svcmgr: 1 serviços em Running",
+    "svcmgr: serviços encerrados",
+    "root: o svcmgr terminou",
     "okernel: root terminou",
 ];
 /// Linha em que o kernel diz onde ficou o mapa direto (ADR 0026).
@@ -1697,6 +1699,8 @@ mod tests {
                   info  root: hello: 10000 idas e voltas sem erro\r\n\
                   info  [7376636d] svcmgr: timed em Running\r\n\
                   info  [7376636d] svcmgr: 1 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: serviços encerrados\r\n\
+                  info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));

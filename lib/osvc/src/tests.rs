@@ -80,3 +80,18 @@ fn rotulos() {
     assert_eq!(SvcError::from_u8(3), Some(SvcError::Busy));
     assert_eq!(SvcError::from_u8(4), None);
 }
+
+#[test]
+fn connect_name_of_e_erro_vao_e_voltam() {
+    let mut b = [0u8; MAX_SHORT_BYTES];
+    let n = encode_connect(0xDEAD_BEEF, 7, &mut b).unwrap();
+    assert_eq!(decode_connect(&b[..n]), Ok((0xDEAD_BEEF, 7)));
+    let n = encode_name_of(42, &mut b).unwrap();
+    assert_eq!(decode_name_of(&b[..n]), Ok(42));
+    let n = encode_name("timed", &mut b).unwrap();
+    assert_eq!(decode_name(&b[..n]), Ok("timed"));
+    assert!(encode_name(&"x".repeat(MAX_NAME + 1), &mut b).is_err());
+    let n = encode_error(SvcError::NotRunning, &mut b).unwrap();
+    assert_eq!(decode_error(&b[..n]), Ok(SvcError::NotRunning));
+    assert!(decode_connect(&b[..4]).is_err());
+}
