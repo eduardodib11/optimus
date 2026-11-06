@@ -528,6 +528,7 @@ fn start_all(boot: &Boot) -> Result<(), Error> {
         induced: Vec::new(),
     };
     let levels = s.plan.levels.clone();
+    let t0 = ostd::time::now_ns();
     let mut running = 0;
     for level in &levels {
         let k = s.start_level(level);
@@ -537,6 +538,10 @@ fn start_all(boot: &Boot) -> Result<(), Error> {
         }
     }
     ostd::debug::print_fmt(format_args!("svcmgr: {running} serviços em Running"));
+    ostd::debug::print_fmt(format_args!(
+        "svcmgr: partida em {} us",
+        ostd::time::now_ns().saturating_sub(t0) / 1_000
+    ));
     if let Some(rounds) =
         s.fs.find("svcmgr.caos")
             .and_then(|e| core::str::from_utf8(e.data).ok())

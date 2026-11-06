@@ -9,6 +9,9 @@
 //!
 //! - `ipc_call_reply_recv`: ida e volta `ipc_call` → `ipc_reply_recv` sem
 //!   palavras, entre dois processos (troca de CR3), pelo caminho rápido.
+//! - `ipc_entre_cpus` (T-367, só com mais de uma CPU): a mesma ida e
+//!   volta com o servidor preso a outra CPU; cada sentido acorda a outra
+//!   CPU por IPI, sem a troca direta.
 //! - `troca_de_contexto_*`: duas threads de mesma prioridade alternando
 //!   com `yield`; uma amostra cobre duas trocas (ida e volta), e o valor
 //!   publicado é metade dela. `entre_processos` troca o CR3; `mesmo_processo`
@@ -76,7 +79,11 @@ struct Bench {
 const BENCHES: &[Bench] = &[
     Bench {
         name: "ipc_call_reply_recv",
-        run: ipc,
+        run: || ipc_on(false),
+    },
+    Bench {
+        name: "ipc_entre_cpus",
+        run: || ipc_on(true),
     },
     Bench {
         name: "troca_de_contexto_entre_processos",
@@ -98,8 +105,19 @@ fn spawn(
     args: [u64; 3],
     stack_page: u64,
 ) -> Result<(Handle, Arc<Thread>), &'static str> {
+    spawn_on(p, sym, args, stack_page, percpu::cpu_id())
+}
+
+/// Como [`spawn`], com a thread presa à CPU `cpu`.
+fn spawn_on(
+    p: &Process,
+    sym: *const u8,
+    args: [u64; 3],
+    stack_page: u64,
+    cpu: u32,
+) -> Result<(Handle, Arc<Thread>), &'static str> {
     let (h, t) = thread(p)?;
-    pin(&t, percpu::cpu_id())?;
+    pin(&t, cpu)?;
     let e = UserEntry {
         rip: user_symbol(sym),
         rsp: DATA_VA + (stack_page + 1) * PAGE_SIZE,
@@ -130,8 +148,9 @@ fn samples(p: &Process, per: u64) -> Result<Vec<u64>, &'static str> {
     Ok(out.split_off(WARMUP))
 }
 
-/// `ipc_call` → `ipc_reply_recv` entre dois processos.
-fn ipc() -> Result<Vec<u64>, &'static str> {
+/// `ipc_call` → `ipc_reply_recv` entre dois processos; com `cross`, o
+/// servidor fica preso a outra CPU.
+fn ipc_on(cross: bool) -> Result<Vec<u64>, &'static str> {
     let (client, server) = (process(DATA_PAGES)?, process(DATA_PAGES)?);
     let (ep_h, ep) = create(&server, ObjectType::Endpoint)?;
     let (reply, _) = create(&server, ObjectType::Reply)?;
@@ -140,7 +159,14 @@ fn ipc() -> Result<Vec<u64>, &'static str> {
     let rounds = ROUNDS as u64;
     let target = recv_target(ep_h, reply);
     let server_sym = &raw const user_bench_ipc_server;
-    let (hs, ts) = spawn(&server, server_sym, [target, rounds, 0], STACK_PAGE)?;
+    let here = percpu::cpu_id();
+    let cpus = u32::try_from(crate::ksmp::start::online_count()).unwrap_or(1);
+    let cpu = if cross {
+        (here + 1) % cpus.max(1)
+    } else {
+        here
+    };
+    let (hs, ts) = spawn_on(&server, server_sym, [target, rounds, 0], STACK_PAGE, cpu)?;
     let client_sym = &raw const user_bench_ipc_client;
     let args = [u64::from(c_ep.raw()), rounds, SAMPLES_VA];
     let (hc, tc) = spawn(&client, client_sym, args, STACK_PAGE)?;
@@ -148,9 +174,12 @@ fn ipc() -> Result<Vec<u64>, &'static str> {
     let fast = fast_switches() - fast0;
     let paths = crate::kipc::fast_paths() - paths0;
     // Só a primeira chamada e a última resposta podem não ser diretas, nem
-    // ir pelo caminho rápido (`okernel::ipc::fast`).
-    ensure!(fast + 2 >= 2 * rounds);
-    ensure!(paths + 2 >= 2 * rounds);
+    // ir pelo caminho rápido (`okernel::ipc::fast`). Entre CPUs não há
+    // troca direta.
+    if !cross {
+        ensure!(fast + 2 >= 2 * rounds);
+        ensure!(paths + 2 >= 2 * rounds);
+    }
     let out = samples(&client, 1)?;
     drop((ts, tc));
     delete(&client, &[hc])?;
@@ -188,7 +217,7 @@ pub fn profile() -> ! {
     environment();
     info!("perfil: pronto");
     loop {
-        if let Err(why) = ipc().and_then(|_| switches(false)) {
+        if let Err(why) = ipc_on(false).and_then(|_| switches(false)) {
             error!("perfil: FALHOU: {why}");
             qemu_exit(QemuExit::Failure);
         }
@@ -244,6 +273,10 @@ pub fn run() -> ! {
     environment();
     let mut ok = true;
     for b in BENCHES {
+        if b.name == "ipc_entre_cpus" && crate::ksmp::start::online_count() < 2 {
+            info!("bench: {} pulado: uma CPU só", b.name);
+            continue;
+        }
         match (b.run)() {
             Ok(mut s) => {
                 s.sort_unstable();

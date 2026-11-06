@@ -31,8 +31,21 @@ fn hash(text: &[u8]) -> u32 {
     u32::from_le_bytes([h[0], h[1], h[2], h[3]])
 }
 
+/// Tempo gasto lendo o anel, em ns (para a vazão do relatório do M3).
+static BUSY_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Lê tudo o que há no anel; devolve as linhas guardadas.
 fn drain(w: &mut Watcher, store: &mut ologd::Store, buf: &mut [u8]) -> u64 {
+    let t0 = ostd::time::now_ns();
+    let n = drain_all(w, store, buf);
+    BUSY_NS.fetch_add(
+        ostd::time::now_ns().saturating_sub(t0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    n
+}
+
+fn drain_all(w: &mut Watcher, store: &mut ologd::Store, buf: &mut [u8]) -> u64 {
     let mut n = 0;
     loop {
         match w.next(buf) {
@@ -78,6 +91,11 @@ fn serve(ep: Handle, quota: Handle, mut w: Watcher) -> Result<(), Error> {
     ostd::debug::print_fmt(format_args!(
         "logd: encerrado ({end:?}); {total} linhas do kernel, {} bytes perdidos",
         w.lost()
+    ));
+    let busy = BUSY_NS.load(core::sync::atomic::Ordering::Relaxed);
+    ostd::debug::print_fmt(format_args!(
+        "logd: vazão {} ns por linha",
+        busy / total.max(1)
     ));
     Ok(())
 }
