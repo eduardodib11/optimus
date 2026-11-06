@@ -30,6 +30,9 @@ pub mod startup {
     pub const KIND_DEBUG_LOG: u32 = 2;
     /// Entrada: uma das duas linhas de pressão de memória (ADR 0038).
     pub const KIND_PRESSURE: u32 = 3;
+    /// Entrada: o anel do log do kernel (`MemoryObject` com `READ | MAP`;
+    /// ADR 0036, item 6; T-357).
+    pub const KIND_KERNEL_LOG: u32 = 4;
     /// Bytes do cabeçalho antes da primeira entrada.
     pub const HEADER_BYTES: usize = 8;
     /// Bytes de cada entrada.

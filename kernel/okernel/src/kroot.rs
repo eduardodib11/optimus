@@ -284,7 +284,8 @@ pub fn spawn(elf: &oelf::Elf<'_>, fs: &[u8]) -> Result<Process, &'static str> {
 /// O passo que falhou.
 fn start_table(p: &Image, fs: Handle) -> Result<Handle, &'static str> {
     use kabi::startup::{
-        ENTRY_BYTES, HEADER_BYTES, KIND_BOOTFS, KIND_DEBUG_LOG, KIND_PRESSURE, MAGIC,
+        ENTRY_BYTES, HEADER_BYTES, KIND_BOOTFS, KIND_DEBUG_LOG, KIND_KERNEL_LOG, KIND_PRESSURE,
+        MAGIC,
     };
     let mut entries: [(u32, u32); kabi::startup::MAX_ENTRIES] =
         [(0, 0); kabi::startup::MAX_ENTRIES];
@@ -322,6 +323,7 @@ fn start_table(p: &Image, fs: Handle) -> Result<Handle, &'static str> {
             .map_err(|_| "cap(pressure)")?;
         push(KIND_PRESSURE, h);
     }
+    push(KIND_KERNEL_LOG, kernel_log(p)?);
     let mut bytes = [0u8; 4096];
     bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     let count = u32::try_from(n).map_err(|_| "entradas")?;
@@ -332,6 +334,31 @@ fn start_table(p: &Image, fs: Handle) -> Result<Handle, &'static str> {
         bytes[at + 4..at + 8].copy_from_slice(&handle.to_le_bytes());
     }
     read_only_copy(p, &bytes)
+}
+
+/// Cria o anel do log do kernel (cobrado da cota raiz), passa o `klog` a
+/// escrever nele e devolve em `p` uma capability só com `READ | MAP`.
+///
+/// # Errors
+///
+/// O passo que falhou.
+fn kernel_log(p: &Image) -> Result<Handle, &'static str> {
+    let len = crate::klogring::OBJECT_BYTES;
+    let full = p
+        .cspace
+        .lock()
+        .obj_create(p.quota, ObjectType::MemoryObject, len)
+        .map_err(|_| "obj_create(anel do kernel)")?;
+    let object = cap(&p.cspace, full)?;
+    let mo = object.object.as_memory_object().map_err(|_| "tipo")?;
+    drop(crate::klogring::install(Arc::clone(mo))?);
+    let ro = p
+        .cspace
+        .lock()
+        .mint(full, Rights::READ | Rights::MAP, None)
+        .map_err(|_| "cap_mint(anel do kernel)")?;
+    drop(p.cspace.lock().delete(full));
+    Ok(ro)
 }
 
 /// Copia `data` para um `MemoryObject` novo em `p` e devolve um handle só

@@ -20,19 +20,53 @@ pub fn init(level: Level) {
     MAX_LEVEL.store(level as u8, Ordering::Relaxed);
 }
 
-/// Escreve uma mensagem se `level` estiver habilitado.
-pub fn write(level: Level, args: fmt::Arguments<'_>) {
-    if level as u8 > MAX_LEVEL.load(Ordering::Relaxed) {
-        return;
-    }
+/// Roda `f` com a trava do `klog` (a última folha, ADR 0031).
+pub fn locked<R>(f: impl FnOnce() -> R) -> R {
     while LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         core::hint::spin_loop();
     }
-    let _ = writeln!(Serial::com1(), "{level:5} {args}");
+    let r = f();
     LOCK.store(false, Ordering::Release);
+    r
+}
+
+/// Mensagem formatada num buffer fixo, cortada na fronteira UTF-8.
+struct Line {
+    buf: [u8; crate::klogring::MAX_MSG],
+    len: usize,
+}
+
+impl Write for Line {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let mut n = s.len().min(self.buf.len() - self.len);
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// Escreve uma mensagem se `level` estiver habilitado: na serial e no anel
+/// do kernel para o `logd` (T-357).
+pub fn write(level: Level, args: fmt::Arguments<'_>) {
+    if level as u8 > MAX_LEVEL.load(Ordering::Relaxed) {
+        return;
+    }
+    let ts = crate::ktime::now_ns();
+    locked(|| {
+        let _ = writeln!(Serial::com1(), "{level:5} {args}");
+        let mut line = Line {
+            buf: [0; crate::klogring::MAX_MSG],
+            len: 0,
+        };
+        let _ = line.write_fmt(args);
+        crate::klogring::push(ts, level, &line.buf[..line.len]);
+    });
 }
 
 /// Escreve ignorando nível e trava: para pânico e faltas, quando quem segurava
