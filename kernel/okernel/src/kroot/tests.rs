@@ -60,6 +60,9 @@ fn root_inicia() -> Outcome {
         let [_, _, thread, _] = p.handles;
         drop(p.cspace.lock().delete(thread));
     }
+    // O anel do log do kernel (T-357) vive além do root: tirá-lo devolve a
+    // cota dele.
+    drop(crate::klogring::uninstall());
     ensure!(settled(&quota, used0));
     Ok(())
 }

@@ -26,6 +26,7 @@ mod kfuzz;
 mod kheap;
 mod kipc;
 mod kirq;
+mod klogring;
 mod kmem;
 mod kpanic;
 mod kpressure;
