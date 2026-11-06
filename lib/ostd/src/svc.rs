@@ -81,4 +81,80 @@ impl Session {
             Err(Error::AccessDenied)
         }
     }
+
+    /// `connect(interface, minor)`: a capability `SEND` do provedor de
+    /// `interface` (o `interface_id` da ADR 0033), com versão menor de pelo
+    /// menos `minor`.
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel; `AccessDenied` com o `SvcError` em `Err` do segundo
+    /// nível ([`Session::connect_svc`]).
+    pub fn connect(&mut self, interface: u32, minor: u16) -> Result<Handle, Error> {
+        self.connect_svc(interface, minor)?
+            .map_err(|_| Error::AccessDenied)
+    }
+
+    /// Como [`Session::connect`], mas devolve o `SvcError` do `svcmgr`.
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel e `InvalidArgument` para resposta fora do protocolo.
+    pub fn connect_svc(
+        &mut self,
+        interface: u32,
+        minor: u16,
+    ) -> Result<Result<Handle, SvcError>, Error> {
+        let mut req = [0u8; osvc::MAX_SHORT_BYTES];
+        let n =
+            osvc::encode_connect(interface, minor, &mut req).map_err(|_| Error::InvalidArgument)?;
+        let mut body = [0u8; osvc::MAX_SHORT_BYTES];
+        let (label, m) = ipc::call_corpo(
+            self.control,
+            &mut self.buffer,
+            osvc::label(Method::Connect),
+            &req[..n],
+            &mut body,
+            deadline(),
+        )?;
+        if label == osvc::REPLY_OK {
+            let h = self.buffer.get().caps[0];
+            return if h == 0 {
+                Err(Error::InvalidArgument)
+            } else {
+                Ok(Ok(Handle::from_raw(h)))
+            };
+        }
+        osvc::decode_error(&body[..m])
+            .map(Err)
+            .map_err(|_| Error::InvalidArgument)
+    }
+
+    /// `name_of(id)`: o nome do serviço `id` (o id é a metade baixa de um
+    /// badge de serviço), copiado para `out`; devolve os bytes.
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel, `AccessDenied` se o `svcmgr` recusar e
+    /// `InvalidArgument` se `out` não couber o nome.
+    pub fn name_of(&mut self, id: u32, out: &mut [u8]) -> Result<usize, Error> {
+        let mut req = [0u8; osvc::MAX_SHORT_BYTES];
+        let n = osvc::encode_name_of(id, &mut req).map_err(|_| Error::InvalidArgument)?;
+        let mut body = [0u8; osvc::MAX_SHORT_BYTES];
+        let (label, m) = ipc::call_corpo(
+            self.control,
+            &mut self.buffer,
+            osvc::label(Method::NameOf),
+            &req[..n],
+            &mut body,
+            deadline(),
+        )?;
+        if label != osvc::REPLY_OK {
+            return Err(Error::AccessDenied);
+        }
+        let name = osvc::decode_name(&body[..m]).map_err(|_| Error::InvalidArgument)?;
+        let dst = out.get_mut(..name.len()).ok_or(Error::InvalidArgument)?;
+        dst.copy_from_slice(name.as_bytes());
+        Ok(name.len())
+    }
 }

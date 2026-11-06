@@ -32,8 +32,10 @@ use ostd::kabi::{Error, Handle, ObjectType, split_handle_pair};
 use ostd::process::{self, Spec};
 use ostd::rt::Start;
 use ostd::vm::{Mapping, SELF};
+use osvc::{Method, SvcError};
 use svcmgr::broker::Boot as Desc;
 use svcmgr::plan::Plan;
+use svcmgr::supervisor::{Action, Exit, Policy, Supervisor};
 
 ostd::entry!(main);
 
@@ -73,7 +75,6 @@ fn plan(fs: &obfs::Image<'_>) -> Result<Plan, Error> {
 
 /// Um serviço partido e o descritor dele.
 struct Started {
-    id: u32,
     desc: Desc,
     child: process::Child,
 }
@@ -132,104 +133,85 @@ fn spawn(
         0,
     ];
     child.start(args)?;
-    Ok(Started { id, desc, child })
+    Ok(Started { desc, child })
 }
 
-/// Atende `bootstrap` e `ready` no canal de controle até os serviços de
-/// `level` ficarem em `Running` ou o prazo vencer. Devolve quantos ficaram.
-fn serve_level(
-    plan: &mut Plan,
-    started: &[Started],
-    level: &[u32],
+/// Quanto o laço espera por mensagem antes de olhar as mortes, em ns.
+const TICK_NS: u64 = 20_000_000;
+/// Janela de supervisão do M3: quanto o `svcmgr` supervisiona depois da
+/// partida antes do desligamento ordenado. Até existir quem peça o
+/// desligamento (M4), é ela que devolve a cota ao `root` nos testes.
+const SUPERVISE_NS: u64 = 1_000_000_000;
+
+/// O `svcmgr` em execução: plano, canal de controle e instâncias vivas.
+struct Svcmgr<'a> {
+    plan: Plan,
+    fs: obfs::Image<'a>,
+    boot: Boot,
     control: Handle,
     reply: Handle,
-    buffer: &mut Buffer,
-) -> usize {
-    let deadline = ostd::time::now_ns().saturating_add(READY_NS);
-    let mut ready: Vec<u32> = Vec::new();
-    let mut body = [0u8; osvc::MAX_BOOT_BYTES];
-    let mut sink = [0u8; 64];
-    while ready.len() < level.len() {
-        let Ok(r) = ipc::recv_corpo(control, reply, buffer, &mut sink, deadline) else {
-            break;
-        };
-        let id = u32::try_from(r.badge & 0xFFFF_FFFF).unwrap_or(u32::MAX);
-        let live = plan.broker.badge_of(id) == Some(r.badge);
-        let svc = started.iter().find(|s| s.id == id).filter(|_| live);
-        let answer = match (svc, osvc::method_of(r.rotulo)) {
-            (Some(s), Some(osvc::Method::Bootstrap)) => {
-                let caps: Vec<osvc::CapDesc> = s
-                    .desc
-                    .caps
-                    .iter()
-                    .map(|c| osvc::CapDesc {
-                        kind: c.kind,
-                        index: c.index,
-                        handle: c.handle,
-                        name_hash: c.name_hash,
-                    })
-                    .collect();
-                match osvc::encode_boot(&caps, s.desc.generation, &mut body) {
-                    Ok(n) => (osvc::REPLY_OK, n),
-                    Err(_) => (osvc::REPLY_ERR, 0),
-                }
-            }
-            (Some(s), Some(osvc::Method::Ready)) => {
-                plan.broker.set_running(s.id, true);
-                if !ready.contains(&s.id) {
-                    ready.push(s.id);
-                }
-                let name = plan.broker.manifest(s.id).map_or("?", |m| m.name.as_str());
-                ostd::debug::print_fmt(format_args!("svcmgr: {name} em Running"));
-                (osvc::REPLY_OK, 0)
-            }
-            (Some(_), _) => (osvc::REPLY_UNKNOWN_METHOD, 0),
-            (None, _) => (osvc::REPLY_ERR, 0),
-        };
-        let _ = ipc::responde_corpo(reply, buffer, answer.0, &body[..answer.1], 0);
-    }
-    ready.len()
+    deaths: Handle,
+    buffer: Buffer,
+    sup: Supervisor,
+    live: Vec<Option<Started>>,
 }
 
-/// Parte todos os serviços do plano, nível a nível.
-fn start_all(boot: &Boot) -> Result<(), Error> {
-    let map = map_bootfs(boot.bootfs)?;
-    let fs = obfs::Image::parse(map.bytes()).map_err(|_| Error::InvalidArgument)?;
-    let mut plan = plan(&fs)?;
-    let control = ostd::cap::create(boot.quota, ObjectType::Endpoint, 0)?;
-    let reply = ostd::cap::create(boot.quota, ObjectType::Reply, 0)?;
-    let mut buffer = Buffer::new(boot.quota, SELF, Handle::from_raw(0), BUFFER_VA)?;
-    let levels = plan.levels.clone();
-    let mut started = Vec::new();
-    let mut running = 0;
-    for level in &levels {
-        let mut here = Vec::new();
-        for &id in level {
-            match spawn(&mut plan, &fs, id, boot, control) {
-                Ok(s) => {
-                    here.push(id);
-                    started.push(s);
+/// O erro do corretor no fio.
+const fn wire(e: svcmgr::broker::SvcError) -> SvcError {
+    use svcmgr::broker::SvcError as B;
+    match e {
+        B::NotInManifest => SvcError::NotInManifest,
+        B::NotRunning => SvcError::NotRunning,
+        B::VersionTooOld => SvcError::VersionTooOld,
+        B::Busy => SvcError::Busy,
+    }
+}
+
+fn name(plan: &Plan, id: u32) -> &str {
+    plan.broker.manifest(id).map_or("?", |m| m.name.as_str())
+}
+
+impl Svcmgr<'_> {
+    /// Parte `id` e liga a morte do processo ao bit dele em `deaths`.
+    fn launch(&mut self, id: u32) -> bool {
+        match spawn(&mut self.plan, &self.fs, id, &self.boot, self.control) {
+            Ok(s) => {
+                let bit = 1u64 << (id % 64);
+                if let Err(e) = ostd::cap::bind_notify(s.child.cspace, self.deaths, bit) {
+                    ostd::debug::print_fmt(format_args!("svcmgr: sem aviso de morte: {e:?}"));
                 }
-                Err(e) => {
-                    let name = plan.broker.manifest(id).map_or("?", |m| m.name.as_str());
-                    ostd::debug::print_fmt(format_args!("svcmgr: {name} não partiu: {e:?}"));
+                self.sup.started(id, ostd::time::now_ns());
+                if let Some(slot) = usize::try_from(id).ok().and_then(|i| self.live.get_mut(i)) {
+                    *slot = Some(s);
                 }
+                true
+            }
+            Err(e) => {
+                let n = name(&self.plan, id);
+                ostd::debug::print_fmt(format_args!("svcmgr: {n} não partiu: {e:?}"));
+                false
             }
         }
-        let n = serve_level(&mut plan, &started, &here, control, reply, &mut buffer);
-        running += n;
-        if n < level.len() {
-            break;
-        }
     }
-    ostd::debug::print_fmt(format_args!("svcmgr: {running} serviços em Running"));
-    // Até o laço de supervisão (ADR 0034, item 9), o `svcmgr` sai depois da
-    // partida: antes, encerra os serviços para a cota voltar ao `root`. A
-    // revogação das raízes dá `PeerClosed` a quem atende, e o serviço sai.
-    for s in &started {
+
+    fn started(&self, id: u32) -> Option<&Started> {
+        self.live.get(usize::try_from(id).ok()?)?.as_ref()
+    }
+
+    /// Fim da instância de `id` (item 9): revoga os endpoints e apaga o
+    /// processo.
+    fn retire(&mut self, id: u32) {
+        let Some(s) = usize::try_from(id)
+            .ok()
+            .and_then(|i| self.live.get_mut(i))
+            .and_then(Option::take)
+        else {
+            return;
+        };
+        let _ = ostd::cap::bind_notify(s.child.cspace, self.deaths, 0);
         let _ = svcmgr::supervisor::revoke_instance(
-            &mut plan.broker,
-            s.id,
+            &mut self.plan.broker,
+            id,
             &mut svcmgr::kernel::Kernel,
         );
         let c = s.child;
@@ -237,7 +219,253 @@ fn start_all(boot: &Boot) -> Result<(), Error> {
             let _ = ostd::cap::delete(h);
         }
     }
-    ostd::debug::print("svcmgr: serviços encerrados");
+
+    /// Olha as mortes sinalizadas e decide cada uma; parte os reinícios
+    /// vencidos.
+    fn reap(&mut self) {
+        let bits = ostd::cap::ntfy_poll(self.deaths).unwrap_or(0);
+        let ids: Vec<u32> = (0..self.live.len())
+            .filter_map(|i| u32::try_from(i).ok())
+            .filter(|&id| bits & (1u64 << (id % 64)) != 0)
+            .collect();
+        for id in ids {
+            let Some(s) = self.started(id) else { continue };
+            let Ok(Some(d)) = ostd::cap::death(s.child.cspace) else {
+                continue;
+            };
+            let exit = if d.cause == ostd::kabi::exit::CAUSE_EXITED && d.code == 0 {
+                Exit::Clean
+            } else {
+                Exit::Failed
+            };
+            self.retire(id);
+            let now = ostd::time::now_ns();
+            let n = name(&self.plan, id);
+            match self.sup.exited(id, exit, now) {
+                Action::Restart { backoff_ns, .. } => ostd::debug::print_fmt(format_args!(
+                    "svcmgr: {n} morreu ({exit:?}); volta em {} ms",
+                    backoff_ns / 1_000_000
+                )),
+                Action::Stop => {
+                    ostd::debug::print_fmt(format_args!("svcmgr: {n} terminou ({exit:?})"));
+                }
+                Action::Alert { failures } => ostd::debug::print_fmt(format_args!(
+                    "svcmgr: error: {n} falhou {failures} vezes em 1 min; fica Failed"
+                )),
+            }
+        }
+        for id in self.sup.due(ostd::time::now_ns()) {
+            if self.launch(id) {
+                let n = name(&self.plan, id);
+                ostd::debug::print_fmt(format_args!("svcmgr: {n} reiniciado"));
+            }
+        }
+    }
+
+    /// Resposta de `bootstrap`: o descritor de `id`.
+    fn boot_answer(&self, id: u32, body: &mut [u8]) -> (u64, usize) {
+        let Some(s) = self.started(id) else {
+            return (osvc::REPLY_ERR, 0);
+        };
+        let caps: Vec<osvc::CapDesc> = s
+            .desc
+            .caps
+            .iter()
+            .map(|c| osvc::CapDesc {
+                kind: c.kind,
+                index: c.index,
+                handle: c.handle,
+                name_hash: c.name_hash,
+            })
+            .collect();
+        match osvc::encode_boot(&caps, s.desc.generation, body) {
+            Ok(n) => (osvc::REPLY_OK, n),
+            Err(_) => (osvc::REPLY_ERR, 0),
+        }
+    }
+
+    /// Atende uma mensagem do canal de controle (ou nada, até `until`).
+    /// Devolve o id que chamou `ready`, se foi isso.
+    fn serve_one(&mut self, until: u64) -> Option<u32> {
+        let mut body = [0u8; osvc::MAX_BOOT_BYTES];
+        let mut req = [0u8; osvc::MAX_SHORT_BYTES];
+        let tick = ostd::time::now_ns().saturating_add(TICK_NS);
+        let deadline = match self.sup.next_due() {
+            Some(at) => until.min(tick).min(at),
+            None => until.min(tick),
+        };
+        let r = ipc::recv_corpo(
+            self.control,
+            self.reply,
+            &mut self.buffer,
+            &mut req,
+            deadline,
+        );
+        let Ok(r) = r else {
+            self.reap();
+            return None;
+        };
+        let id = u32::try_from(r.badge & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+        let live = self.plan.broker.badge_of(id) == Some(r.badge) && self.started(id).is_some();
+        let mut ready = None;
+        let mut cap = None;
+        let err = |e, body: &mut [u8]| match osvc::encode_error(e, body) {
+            Ok(n) => (osvc::REPLY_ERR, n),
+            Err(_) => (osvc::REPLY_ERR, 0),
+        };
+        let answer = match (live, osvc::method_of(r.rotulo)) {
+            (false, _) => err(SvcError::NotRunning, &mut body),
+            (true, Some(Method::Bootstrap)) => self.boot_answer(id, &mut body),
+            (true, Some(Method::Ready)) => {
+                self.plan.broker.set_running(id, true);
+                ready = Some(id);
+                let n = name(&self.plan, id);
+                ostd::debug::print_fmt(format_args!("svcmgr: {n} em Running"));
+                (osvc::REPLY_OK, 0)
+            }
+            (true, Some(Method::Connect)) => match osvc::decode_connect(&req[..r.corpo]) {
+                Ok((interface, minor)) => {
+                    let got = self.plan.broker.connect(
+                        r.badge,
+                        interface,
+                        minor,
+                        &mut svcmgr::kernel::Kernel,
+                    );
+                    match got {
+                        Ok(h) => {
+                            cap = Some(h);
+                            (osvc::REPLY_OK, 0)
+                        }
+                        Err(e) => err(wire(e), &mut body),
+                    }
+                }
+                Err(_) => (osvc::REPLY_BAD_MESSAGE, 0),
+            },
+            (true, Some(Method::NameOf)) => match osvc::decode_name_of(&req[..r.corpo]) {
+                Ok(who) => match self.plan.broker.manifest(who) {
+                    Some(m) => match osvc::encode_name(&m.name, &mut body) {
+                        Ok(n) => (osvc::REPLY_OK, n),
+                        Err(_) => (osvc::REPLY_ERR, 0),
+                    },
+                    None => err(SvcError::NotInManifest, &mut body),
+                },
+                Err(_) => (osvc::REPLY_BAD_MESSAGE, 0),
+            },
+            (true, None) => (osvc::REPLY_UNKNOWN_METHOD, 0),
+        };
+        match cap {
+            Some(h) => {
+                let mut msg = Message::new(answer.0, &[]);
+                msg.info.caps = 1;
+                self.buffer.get().caps[0] = h.raw();
+                let _ = ipc::send(self.reply, &msg, 0);
+                let _ = ostd::cap::delete(h);
+            }
+            None => {
+                let _ = ipc::responde_corpo(
+                    self.reply,
+                    &mut self.buffer,
+                    answer.0,
+                    &body[..answer.1],
+                    0,
+                );
+            }
+        }
+        self.reap();
+        ready
+    }
+
+    /// Parte um nível e espera todos em `Running` até [`READY_NS`].
+    fn start_level(&mut self, level: &[u32]) -> usize {
+        let here: Vec<u32> = level
+            .iter()
+            .copied()
+            .filter(|&id| self.launch(id))
+            .collect();
+        let deadline = ostd::time::now_ns().saturating_add(READY_NS);
+        let mut ready: Vec<u32> = Vec::new();
+        while ready.len() < here.len() && ostd::time::now_ns() < deadline {
+            if let Some(id) = self.serve_one(deadline)
+                && here.contains(&id)
+                && !ready.contains(&id)
+            {
+                ready.push(id);
+            }
+        }
+        ready.len()
+    }
+
+    /// Supervisiona até `until`: atende o canal de controle e reinicia.
+    fn supervise(&mut self, until: u64) {
+        while ostd::time::now_ns() < until {
+            let _ = self.serve_one(until);
+        }
+    }
+
+    /// Desligamento ordenado: encerra os serviços em ordem inversa de
+    /// partida, para a cota voltar ao `root`.
+    fn shutdown(&mut self) {
+        let levels = self.plan.levels.clone();
+        for level in levels.iter().rev() {
+            for &id in level.iter().rev() {
+                self.retire(id);
+            }
+        }
+        ostd::debug::print("svcmgr: serviços encerrados");
+    }
+}
+
+/// Parte todos os serviços do plano, nível a nível, supervisiona e desliga.
+fn start_all(boot: &Boot) -> Result<(), Error> {
+    let map = map_bootfs(boot.bootfs)?;
+    let fs = obfs::Image::parse(map.bytes()).map_err(|_| Error::InvalidArgument)?;
+    let plan = plan(&fs)?;
+    let count = plan
+        .levels
+        .iter()
+        .flatten()
+        .max()
+        .map_or(0, |&m| m as usize + 1);
+    let policies: Vec<Policy> = (0..count)
+        .map(|i| {
+            let id = u32::try_from(i).unwrap_or(u32::MAX);
+            plan.broker
+                .manifest(id)
+                .map_or(Policy::Never, |m| Policy::from_manifest(m.restart))
+        })
+        .collect();
+    let control = ostd::cap::create(boot.quota, ObjectType::Endpoint, 0)?;
+    let reply = ostd::cap::create(boot.quota, ObjectType::Reply, 0)?;
+    let deaths = ostd::cap::create(boot.quota, ObjectType::Notification, 0)?;
+    let buffer = Buffer::new(boot.quota, SELF, Handle::from_raw(0), BUFFER_VA)?;
+    let mut live = Vec::new();
+    live.resize_with(count, || None);
+    let mut s = Svcmgr {
+        plan,
+        fs,
+        boot: *boot,
+        control,
+        reply,
+        deaths,
+        buffer,
+        sup: Supervisor::new(&policies),
+        live,
+    };
+    let levels = s.plan.levels.clone();
+    let mut running = 0;
+    for level in &levels {
+        let k = s.start_level(level);
+        running += k;
+        if k < level.len() {
+            break;
+        }
+    }
+    ostd::debug::print_fmt(format_args!("svcmgr: {running} serviços em Running"));
+    s.supervise(ostd::time::now_ns().saturating_add(SUPERVISE_NS));
+    s.shutdown();
+    for h in [s.deaths, s.reply, s.control] {
+        let _ = ostd::cap::delete(h);
+    }
     Ok(())
 }
 

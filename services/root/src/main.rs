@@ -58,6 +58,10 @@ const LABEL_OLA: u64 = 1;
 /// Respostas do `root` ao `svcmgr`.
 const LABEL_OK: u64 = 0;
 const LABEL_ACCESS_DENIED: u64 = 1;
+/// Quanto o `root` espera o `svcmgr` terminar, no máximo, em ns.
+const SVCMGR_LIFE_NS: u64 = 30_000_000_000;
+/// De quanto em quanto o `root` olha a morte do `svcmgr`, em ns.
+const SVCMGR_TICK_NS: u64 = 20_000_000;
 /// Quanto o `root` espera o primeiro contato do `svcmgr`, em ns.
 const SVCMGR_WAIT_NS: u64 = 2_000_000_000;
 
@@ -302,7 +306,7 @@ fn table_entry(aspace: Handle, table: Handle, kind: u32) -> Result<Handle, Error
 /// fecharia o ciclo da ADR 0029, que deixaria o processo inteiro preso na
 /// cota depois da saída. Para mexer em si mesmo, o `svcmgr` usa
 /// `thread = 0` (ADR 0039, item 3).
-fn spawn_svcmgr(b: Boot) -> Result<Handle, Error> {
+fn spawn_svcmgr(b: Boot) -> Result<(Handle, Handle), Error> {
     let fs_map = map_bootfs(b)?;
     let fs = obfs::Image::parse(fs_map.bytes()).map_err(|_| Error::InvalidArgument)?;
     let elf = fs.find("svcmgr").ok_or(Error::InvalidArgument)?;
@@ -327,14 +331,13 @@ fn spawn_svcmgr(b: Boot) -> Result<Handle, Error> {
         u64::from(child.give(b.log, Rights::WRITE, SVCMGR_LOG_BADGE)?.raw())
     };
     child.start([u64::from(ep_child.raw()), handle_pair(bootfs, quota), log])?;
-    Ok(ep)
+    Ok((ep, child.cspace))
 }
 
 /// Atende o primeiro contato do `svcmgr` no endpoint do `root`. Só o badge
 /// [`ROOT_BADGE`] é aceito; qualquer outro recebe `AccessDenied` e o
 /// atendimento termina com erro.
-fn atende_svcmgr(b: Boot, ep: Handle) -> Result<(), Error> {
-    let reply = create(b.quota, ObjectType::Reply, 0)?;
+fn atende_svcmgr(ep: Handle, reply: Handle) -> Result<(), Error> {
     let deadline = ostd::time::now_ns() + SVCMGR_WAIT_NS;
     let rec = ipc::recv(ep, reply, deadline)?;
     if rec.badge != ROOT_BADGE || rec.msg.label != LABEL_OLA {
@@ -347,10 +350,38 @@ fn atende_svcmgr(b: Boot, ep: Handle) -> Result<(), Error> {
     Ok(())
 }
 
-/// Cria o `svcmgr` e atende o contato dele.
+/// Depois do anúncio, o `root` fica em `ipc_recv` no seu endpoint (ADR
+/// 0034, item 2) até o `svcmgr` morrer. `optimus.root.Root@1` ainda não tem
+/// métodos atendidos: toda chamada recebe `AccessDenied`. Desiste depois de
+/// [`SVCMGR_LIFE_NS`].
+fn espera_svcmgr(b: Boot, ep: Handle, reply: Handle, cspace: Handle) -> Result<(), Error> {
+    let ntfy = create(b.quota, ObjectType::Notification, 0)?;
+    ostd::cap::bind_notify(cspace, ntfy, 1)?;
+    let give_up = ostd::time::now_ns().saturating_add(SVCMGR_LIFE_NS);
+    let mut dead = false;
+    while !dead && ostd::time::now_ns() < give_up {
+        let tick = ostd::time::now_ns().saturating_add(SVCMGR_TICK_NS);
+        if ipc::recv(ep, reply, tick.min(give_up)).is_ok() {
+            let _ = ipc::send(reply, &Message::new(LABEL_ACCESS_DENIED, &[]), 0);
+        }
+        dead = ostd::cap::ntfy_poll(ntfy).unwrap_or(0) != 0;
+    }
+    let _ = ostd::cap::bind_notify(cspace, ntfy, 0);
+    let _ = ostd::cap::delete(ntfy);
+    if dead {
+        ostd::debug::print("root: o svcmgr terminou");
+        Ok(())
+    } else {
+        Err(Error::TimedOut)
+    }
+}
+
+/// Cria o `svcmgr`, atende o contato dele e espera ele terminar.
 fn svcmgr(b: Boot) -> Result<(), Error> {
-    let ep = spawn_svcmgr(b)?;
-    atende_svcmgr(b, ep)
+    let (ep, cspace) = spawn_svcmgr(b)?;
+    let reply = create(b.quota, ObjectType::Reply, 0)?;
+    atende_svcmgr(ep, reply)?;
+    espera_svcmgr(b, ep, reply, cspace)
 }
 
 fn main(start: Start) -> ! {
