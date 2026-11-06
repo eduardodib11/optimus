@@ -37,7 +37,21 @@ fn cada_metodo_tem_um_envio_com_rotulo_do_ordinal() {
 fn resposta_separa_ok_de_erro_pelo_tipo_do_rotulo() {
     let g = gerado();
     assert!(g.contains("if rotulo >> 62 == 0"));
-    assert!(g.contains("Ok(Err(decodifica_err_hello_1"));
+    // `ping` cabe em registradores: o erro é a palavra 0 (u8).
+    assert!(g.contains("Ok(Err(u8::try_from(w[0]).unwrap_or(u8::MAX)))"));
+}
+
+#[test]
+fn metodo_que_cabe_em_registradores_nao_passa_por_bytes() {
+    let g = gerado();
+    // `ping` (seis u64 e resposta Seis) vai por `call_palavras`.
+    let ping = g.split("pub fn ping(").nth(1).expect("ping existe");
+    let ping = &ping[..ping.find("pub fn bye(").unwrap_or(ping.len())];
+    assert!(ping.contains("ostd::ipc::call_palavras("), "{ping}");
+    assert!(!ping.contains("codifica_hello_1"), "{ping}");
+    // `saudacao` tem string: continua pelo caminho de bytes.
+    let saud = g.split("pub fn saudacao(").nth(1).expect("saudacao existe");
+    assert!(saud.contains("ostd::ipc::call_corpo("), "{saud}");
 }
 
 #[test]

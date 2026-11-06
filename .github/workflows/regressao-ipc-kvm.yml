@@ -1,0 +1,74 @@
+name: Regressão de IPC do hello em KVM
+
+# T-345 parte 3 (SDD v1.0, backlog M3): a linha de base (antes da migração
+# para o OIDL gerado, 4f5160e^) e o código gerado medidos no mesmo runner,
+# com KVM. A métrica é o ns por ida e volta do `hello` com o `root`
+# (`cargo xtask test hello`). Limite: no máximo 5% acima da linha de base.
+# Roda nos PRs que mudam este arquivo e à mão.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/regressao-ipc-kvm.yml
+
+jobs:
+  regressao:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          path: novo
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          path: base
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Linha de base (antes da migração)
+        working-directory: base
+        run: git checkout --quiet 4f5160e^
+      - name: KVM no runner
+        run: |
+          grep -m1 "model name" /proc/cpuinfo
+          sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Toolchain fixada em rust-toolchain.toml
+        working-directory: novo
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Três rodadas alternadas de cada lado
+        run: |
+          set -o pipefail
+          mkdir -p resultados
+          for i in 1 2 3; do
+            (cd base && cargo xtask test hello 2>&1 | tee ../resultados/base-$i.log)
+            (cd novo && cargo xtask test hello 2>&1 | tee ../resultados/novo-$i.log)
+          done
+      - name: Resumo e limite de 5%
+        run: |
+          base=$(grep -h "ns por ida e volta" resultados/base-*.log | grep -oE '[0-9]+ ns' | awk '{print $1}')
+          novo=$(grep -h "ns por ida e volta" resultados/novo-*.log | grep -oE '[0-9]+ ns' | awk '{print $1}')
+          mb=$(printf '%s\n' $base | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+          mn=$(printf '%s\n' $novo | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+          echo "## Regressão de IPC do hello (KVM)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Base: $(echo $base) ns (mediana $mb)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Gerado: $(echo $novo) ns (mediana $mn)" >> "$GITHUB_STEP_SUMMARY"
+          pct=$(awk -v b="$mb" -v n="$mn" 'BEGIN{printf "%.1f", (n-b)*100/b}')
+          echo "Variação: ${pct}%" >> "$GITHUB_STEP_SUMMARY"
+          if awk -v p="$pct" 'BEGIN{exit (p>5)?1:0}'; then
+            echo "Dentro do limite de 5%."
+          else
+            echo "Passou de 5% acima da linha de base." >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regressao-ipc-kvm
+          path: resultados/

@@ -245,6 +245,23 @@ pub fn despacha_file<S: File>(
     }
 }
 
+/// Despacho pelo caminho de registradores (T-345 parte 3): atende os
+/// métodos que cabem em seis palavras. Os outros devolvem `None` e vão pelo
+/// despacho de bytes.
+pub fn despacha_file_palavras<S: File>(
+    s: &mut S,
+    rotulo: u64,
+    p: &[u64; 6],
+    ctx: &Contexto,
+) -> Option<(u64, [u64; 6])> {
+    if (rotulo >> 32) as u32 != ID_FILE {
+        return None;
+    }
+    match (rotulo & 0xFFFF) as u16 {
+        _ => None,
+    }
+}
+
 /// Identificador da interface `Directory` (ADR 0033, seção 2).
 pub const ID_DIRECTORY: u32 = 0xA17CD8BB;
 
@@ -451,5 +468,22 @@ pub fn despacha_directory<S: Directory>(
             }
         }
         _ => protocolo(2),
+    }
+}
+
+/// Despacho pelo caminho de registradores (T-345 parte 3): atende os
+/// métodos que cabem em seis palavras. Os outros devolvem `None` e vão pelo
+/// despacho de bytes.
+pub fn despacha_directory_palavras<S: Directory>(
+    s: &mut S,
+    rotulo: u64,
+    p: &[u64; 6],
+    ctx: &Contexto,
+) -> Option<(u64, [u64; 6])> {
+    if (rotulo >> 32) as u32 != ID_DIRECTORY {
+        return None;
+    }
+    match (rotulo & 0xFFFF) as u16 {
+        _ => None,
     }
 }

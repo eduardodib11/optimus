@@ -314,3 +314,40 @@ pub fn despacha_hello<S: Hello>(
         _ => protocolo(2),
     }
 }
+
+/// Despacho pelo caminho de registradores (T-345 parte 3): atende os
+/// métodos que cabem em seis palavras. Os outros devolvem `None` e vão pelo
+/// despacho de bytes.
+pub fn despacha_hello_palavras<S: Hello>(
+    s: &mut S,
+    rotulo: u64,
+    p: &[u64; 6],
+    ctx: &Contexto,
+) -> Option<(u64, [u64; 6])> {
+    if (rotulo >> 32) as u32 != ID_HELLO {
+        return None;
+    }
+    match (rotulo & 0xFFFF) as u16 {
+        1 => {
+            let p_a = p[0];
+            let p_b = p[1];
+            let p_c = p[2];
+            let p_d = p[3];
+            let p_e = p[4];
+            let p_f = p[5];
+            Some(match s.ping(ctx, p_a, p_b, p_c, p_d, p_e, p_f) {
+                Ok(x) => (rotulo_resposta(0, 0), [x.w0, x.w1, x.w2, x.w3, x.w4, x.w5]),
+                Err(e) => (rotulo_resposta(1, 0), [u64::from(e), 0, 0, 0, 0, 0]),
+            })
+        }
+        2 => {
+            let p_voltas = p[0];
+            let p_erros = p[1];
+            Some(match s.bye(ctx, p_voltas, p_erros) {
+                Ok(x) => (rotulo_resposta(0, 0), [0; 6]),
+                Err(e) => (rotulo_resposta(1, 0), [u64::from(e), 0, 0, 0, 0, 0]),
+            })
+        }
+        _ => None,
+    }
+}
