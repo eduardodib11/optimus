@@ -1,0 +1,20 @@
+[package]
+name = "logd"
+description = "logd: log do sistema em memória (T-357; ADR 0036), começando pelo anel do kernel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "logd"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+ologd = { path = "../../lib/ologd" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true

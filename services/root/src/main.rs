@@ -74,6 +74,8 @@ struct Boot {
     bootfs: Handle,
     /// `DebugLog` da tabela de partida, 0 se a tabela não a trouxer.
     log: Handle,
+    /// Anel do log do kernel (ADR 0036, item 6), 0 se não houver.
+    klog: Handle,
 }
 
 /// Sem ninguém no endpoint, receber com prazo vencido dá `TimedOut` e
@@ -334,11 +336,22 @@ fn spawn_svcmgr(b: Boot) -> Result<(Handle, Handle), Error> {
     // `kernel:debug` do pool (ADR 0036, item 5): o `svcmgr` escreve com ela
     // e a repassa a quem o manifesto pedir.
     let log = if b.log.raw() == 0 {
-        0
+        Handle::from_raw(0)
     } else {
-        u64::from(child.give(b.log, Rights::WRITE, SVCMGR_LOG_BADGE)?.raw())
+        child.give(b.log, Rights::WRITE, SVCMGR_LOG_BADGE)?
     };
-    child.start([u64::from(ep_child.raw()), handle_pair(bootfs, quota), log])?;
+    // `kernel:log` do pool: o anel do log do kernel, só leitura, para o
+    // `logd` (ADR 0036, item 6).
+    let klog = if b.klog.raw() == 0 {
+        Handle::from_raw(0)
+    } else {
+        child.give(b.klog, Rights::READ | Rights::MAP, 0)?
+    };
+    child.start([
+        u64::from(ep_child.raw()),
+        handle_pair(bootfs, quota),
+        handle_pair(log, klog),
+    ])?;
     Ok((ep, child.cspace))
 }
 
@@ -412,6 +425,8 @@ fn main(start: Start) -> ! {
         thread,
         bootfs,
         log: table_entry(handle(aspace), table, ostd::kabi::startup::KIND_DEBUG_LOG)
+            .unwrap_or(Handle::from_raw(0)),
+        klog: table_entry(handle(aspace), table, ostd::kabi::startup::KIND_KERNEL_LOG)
             .unwrap_or(Handle::from_raw(0)),
     };
     ostd::rt::init(ostd::rt::Env { quota: boot.quota });

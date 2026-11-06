@@ -41,6 +41,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("svcmgr", "services/svcmgr/src/main.rs", USER_TARGET),
     ("memd", "services/memd/src/lib.rs", USER_TARGET),
     ("timed", "services/timed/src/main.rs", USER_TARGET),
+    ("logd", "services/logd/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -77,7 +78,8 @@ const BOOT_MARKERS: &[&str] = &[
     "olá, root! aqui é o hello, pelo buffer de IPC",
     " ns por ida e volta com o hello",
     "svcmgr: timed em Running",
-    "svcmgr: 1 serviços em Running",
+    "svcmgr: logd em Running",
+    "svcmgr: 2 serviços em Running",
     "svcmgr: serviços encerrados",
     "root: o svcmgr terminou",
     "okernel: root terminou",
@@ -344,7 +346,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" | "svcmgr" | "timed" | "utest" | "okfuzz" => {
+        "root" | "hello" | "svcmgr" | "timed" | "logd" | "utest" | "okfuzz" => {
             &["-C", "relocation-model=static"]
         }
         _ => &[],
@@ -386,6 +388,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("hello", "hello"),
     ("svcmgr", "svcmgr"),
     ("timed", "timed"),
+    ("logd", "logd"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -1698,7 +1701,8 @@ mod tests {
                   info  root: 812 ns por ida e volta com o hello\r\n\
                   info  root: hello: 10000 idas e voltas sem erro\r\n\
                   info  [7376636d] svcmgr: timed em Running\r\n\
-                  info  [7376636d] svcmgr: 1 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: logd em Running\r\n\
+                  info  [7376636d] svcmgr: 2 serviços em Running\r\n\
                   info  [7376636d] svcmgr: serviços encerrados\r\n\
                   info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";
