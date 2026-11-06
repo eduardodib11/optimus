@@ -1,5 +1,5 @@
-# Manifesto do `hello` (ADR 0034, item 4). O `root` ainda não o usa:
-# o `svcmgr` (T-352) é quem o lê. Aqui só prova que o compilador entra no bootfs.
+# Exemplo de manifesto do `hello` (ADR 0034, item 4). Fica fora do bootfs
+# porque o `hello` ainda é partido pelo `root`, não pelo `svcmgr`.
 [service]
 name = "hello"
 binary = "hello"

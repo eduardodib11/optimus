@@ -19,6 +19,7 @@ ostd = { path = "../../lib/ostd" }
 kabi = { path = "../../kernel/kabi" }
 oman = { path = "../../lib/oman" }
 obfs = { path = "../../lib/obfs" }
+osvc = { path = "../../lib/osvc" }
 optcrypt = { path = "../../lib/optcrypt" }
 
 [dev-dependencies]

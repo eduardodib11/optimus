@@ -40,7 +40,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("hello", "services/hello/src/main.rs", USER_TARGET),
     ("svcmgr", "services/svcmgr/src/main.rs", USER_TARGET),
     ("memd", "services/memd/src/lib.rs", USER_TARGET),
-    ("timed", "services/timed/src/lib.rs", USER_TARGET),
+    ("timed", "services/timed/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -76,6 +76,8 @@ const BOOT_MARKERS: &[&str] = &[
     "root: o hello disse:",
     "olá, root! aqui é o hello, pelo buffer de IPC",
     " ns por ida e volta com o hello",
+    "svcmgr: timed em Running",
+    "svcmgr: 1 serviços em Running",
     "okernel: root terminou",
 ];
 /// Linha em que o kernel diz onde ficou o mapa direto (ADR 0026).
@@ -340,7 +342,9 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" | "svcmgr" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        "root" | "hello" | "svcmgr" | "timed" | "utest" | "okfuzz" => {
+            &["-C", "relocation-model=static"]
+        }
         _ => &[],
     }
 }
@@ -379,6 +383,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("root", "root"),
     ("hello", "hello"),
     ("svcmgr", "svcmgr"),
+    ("timed", "timed"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -1690,6 +1695,8 @@ mod tests {
                   info  olá, root! aqui é o hello, pelo buffer de IPC\r\n\
                   info  root: 812 ns por ida e volta com o hello\r\n\
                   info  root: hello: 10000 idas e voltas sem erro\r\n\
+                  info  [7376636d] svcmgr: timed em Running\r\n\
+                  info  [7376636d] svcmgr: 1 serviços em Running\r\n\
                   info  okernel: root terminou\r\n";
         let check = |serial: &str| check_serial(serial, BOOT_MARKERS, SCENARIOS[0].forbidden);
         assert_eq!(check(ok), Ok(()));
