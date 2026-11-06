@@ -1,0 +1,14 @@
+# Manifesto do `memd` (ADR 0034, item 4; ADR 0038): tratador de faltas de
+# página dos processos que o tomam como endpoint de exceções.
+[service]
+name = "memd"
+binary = "memd"
+priority = 160
+restart = "always"
+
+[capabilities]
+needs = ["mem:quota:1MiB", "kernel:debug"]
+provides = ["optimus.mem.Mem@1.0"]
+
+[limits]
+max_threads = 1

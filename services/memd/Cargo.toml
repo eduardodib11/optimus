@@ -10,6 +10,11 @@ test = false
 doctest = false
 bench = false
 
+[[bin]]
+name = "memd"
+test = false
+bench = false
+
 [dependencies]
 ostd = { path = "../../lib/ostd" }
 olz4 = { path = "../../lib/olz4" }
