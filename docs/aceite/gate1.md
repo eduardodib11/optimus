@@ -7,7 +7,7 @@ Fonte: SDD v1.0, seção 19 (Gate 1: processos isolados em SMP e IPC ≤ 1 µs) 
 | # | Item | Situação | Evidência |
 |---|---|---|---|
 | 1 | Processos isolados em `-smp 4` e caos verdes | Cumprido | `cargo xtask test integration` (smp 1 e 4, #125) e `cargo xtask test chaos` (100/100 rodadas, pior volta 146 ms em TCG, #126) |
-| 2 | `okfuzz` por 4 h em `-smp 4` sem pânico | Em execução | Rodada de 4 h com uma CPU já passou (T-214, `docs/aceite/m3-t213-t214.md`). A de `-smp 4` roda no workflow `fuzz-noturno.yml` (input `smp`, padrão 4 desde #127); o resultado entra aqui |
+| 2 | `okfuzz` por 4 h em `-smp 4` sem pânico | Cumprido | Run [42288159547](https://github.com/eduardodib11/optimus/actions/runs/42288159547), commit `65baccf`, 4 h (20:25 → 00:26 UTC, 2026-11-06/07), sucesso. A rodada com uma CPU já tinha passado (T-214) |
 | 3 | IPC ≤ 1 µs em KVM, par na mesma CPU, ou decisão sobre o plano B | Decisão registrada | Ver abaixo |
 | 4 | Integração verde no CI | Cumprido | Job `integration` do CI, obrigatório desde #125 |
 | 5 | Backlog do M4 publicado | Cumprido | `docs/backlog/m4.md` |
@@ -27,4 +27,4 @@ Decisão: o plano B (mudar o caminho do IPC) **não** é acionado sem medida em 
 
 ## Resultado
 
-Gate 1 aprovado com uma ressalva: item 3 depende de medida em KVM, e o item 2 em `-smp 4` está em execução no CI.
+Gate 1 aprovado com uma ressalva: o item 3 depende de medida em KVM (T-430 no M4).
