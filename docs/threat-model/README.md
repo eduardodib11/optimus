@@ -354,6 +354,12 @@ Pontos onde o SDD está silencioso ou ambíguo. Nenhum vira requisito sem ADR.
    variável UEFI) nem como se comporta em máquinas sem TPM.
 9. O `CODEOWNERS` atual (`* @eduardodib11`) não nomeia um responsável de
    segurança separado; ver seção 11.
+10. Revisão do Gate 1 (2026-11-06): no M3 o `svcmgr` passa a reiniciar
+    serviços e revoga as caps da instância antiga antes de relançar (T-354,
+    T-366). Um número de handle reaproveitado após `cap::destroy` chegou a
+    apagar a cap errada; corrigido no #126, e o caos cobre o caso. O `logd`
+    lê o anel do kernel só com READ|MAP, sem poder escrever nele. O `memd`
+    usa visões RAW, que exigem o direito EVICT; só ele o recebe.
 
 ## 11. Processo de revisão
 
