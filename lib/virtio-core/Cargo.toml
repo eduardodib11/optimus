@@ -1,0 +1,13 @@
+[package]
+name = "virtio-core"
+description = "Transporte virtio moderno (T-410, ADR 0046): no_std, sem alocação e sem unsafe, sobre os traits Mmio e DmaBuf."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true
