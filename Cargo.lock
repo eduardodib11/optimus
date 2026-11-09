@@ -132,6 +132,7 @@ name = "mkmanifest"
 version = "0.1.0"
 dependencies = [
  "kabi",
+ "odev",
  "optcrypt",
  "toml",
 ]
@@ -211,6 +212,7 @@ name = "oman"
 version = "0.1.0"
 dependencies = [
  "mkmanifest",
+ "odev",
 ]
 
 [[package]]
@@ -405,6 +407,10 @@ dependencies = [
  "ostd",
  "timed",
 ]
+
+[[package]]
+name = "virtio-core"
+version = "0.1.0"
 
 [[package]]
 name = "winnow"

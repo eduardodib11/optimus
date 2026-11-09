@@ -368,6 +368,43 @@ mod tests {
         assert_eq!(levels(&[a]), Err(Error::NoProvider));
     }
 
+    /// Aceite da T-401: um driver de teste, compilado pelo `mkmanifest` e
+    /// relido aqui, casa com o dispositivo certo e não com o errado.
+    #[test]
+    fn driver_de_teste_casa_so_com_o_seu_dispositivo() {
+        use odev::{Bus, Class, Driver, Node, Outcome, Rule, best_match};
+        let src = "[service]\nname = \"teste-blk\"\nbinary = \"drv/teste-blk\"\npriority = 120\n\
+             restart = \"on-failure\"\n[capabilities]\nneeds = [\"mem:quota:1MiB\"]\nprovides = []\n\
+             [match]\npci = [\"1af4:1042\"]\n[limits]\nmax_threads = 1\n";
+        let m = mkmanifest::parse(src).expect("manifesto");
+        let oman = parse(&mkmanifest::encode(&m, b"elf").expect("codifica")).expect("relê");
+        let rules: Vec<Rule> = oman
+            .needs
+            .iter()
+            .filter(|n| n.kind == NeedKind::Dev)
+            .filter_map(|n| Rule::parse(&n.name))
+            .collect();
+        let drivers = [Driver {
+            name: oman.name.clone(),
+            rules,
+        }];
+        let node = |device| Node {
+            id: 1,
+            bus: Bus::Pci,
+            pci_id: Some((0x1af4, device)),
+            class: Some(Class {
+                class: 1,
+                subclass: 0,
+                prog_if: 0,
+            }),
+            compatible: Vec::new(),
+        };
+        assert!(
+            matches!(best_match(&drivers, &node(0x1042)), Outcome::Driver(d) if d.name == "teste-blk")
+        );
+        assert_eq!(best_match(&drivers, &node(0x1041)), Outcome::None);
+    }
+
     #[test]
     fn aresta_fraca_nao_ordena() {
         let a = manifest("a", &["svc:optimus.b.B@1?"], &["optimus.a.A@1.0"]);

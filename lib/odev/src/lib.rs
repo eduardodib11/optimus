@@ -61,6 +61,53 @@ pub enum Rule {
     Compatible(String),
 }
 
+impl Rule {
+    /// Lê a regra do nome de uma necessidade `dev:` do manifesto (ADR
+    /// 0042, item 3; T-401): `pci:vvvv:dddd`, `class:cc:ss`,
+    /// `class:cc:ss:pp` ou `compatible:NOME`, com números em hexadecimal de
+    /// largura fixa. `None` para qualquer outra forma.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let (kind, rest) = text.split_once(':')?;
+        match kind {
+            "pci" => {
+                let (v, d) = rest.split_once(':')?;
+                Some(Self::Pci(hex16(v)?, hex16(d)?))
+            }
+            "class" => {
+                let mut it = rest.split(':');
+                let c = hex8(it.next()?)?;
+                let s = hex8(it.next()?)?;
+                let pi = match it.next() {
+                    Some(p) => Some(hex8(p)?),
+                    None => None,
+                };
+                if it.next().is_some() {
+                    return None;
+                }
+                Some(Self::Class(c, s, pi))
+            }
+            "compatible" if !rest.is_empty() && rest.len() <= 63 && rest.is_ascii() => {
+                Some(Self::Compatible(String::from(rest)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Confere que `text` tem exatamente `digits` dígitos hexadecimais.
+fn hex_digits(text: &str, digits: usize) -> Option<&str> {
+    (text.len() == digits && text.bytes().all(|b| b.is_ascii_hexdigit())).then_some(text)
+}
+
+fn hex16(text: &str) -> Option<u16> {
+    u16::from_str_radix(hex_digits(text, 4)?, 16).ok()
+}
+
+fn hex8(text: &str) -> Option<u8> {
+    u8::from_str_radix(hex_digits(text, 2)?, 16).ok()
+}
+
 /// Driver candidato: nome e regras.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Driver {

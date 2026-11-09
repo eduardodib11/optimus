@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 kabi = { path = "../../kernel/kabi" }
 optcrypt = { path = "../../lib/optcrypt" }
+odev = { path = "../../lib/odev" }
 toml = "0.8"
 
 [lints]
