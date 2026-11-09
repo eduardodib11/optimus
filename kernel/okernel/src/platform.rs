@@ -47,6 +47,11 @@ pub trait Platform: Sync {
     /// destruído (o resultado da espera já está gravado nela); não troca de
     /// thread. Pode ser chamada com a trava de um `CapSpace` na mão.
     fn wake(&self, thread: Arc<Thread>);
+    /// Verdadeiro se `[base, base + len)` pode virar `MemoryObject` de MMIO
+    /// (T-402): fora da RAM e das faixas do kernel, do bootfs e do ACPI, e
+    /// fora da MMIO que o próprio kernel usa (APIC, HPET, IOMMU, janela de
+    /// MSI).
+    fn device_range_ok(&self, base: u64, len: u64) -> bool;
 }
 
 /// Bytes da pilha de kernel de cada thread (seção 6.3).

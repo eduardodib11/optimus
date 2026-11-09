@@ -13,16 +13,19 @@ const RW: Perms = Perms {
     write: true,
     exec: false,
     raw: false,
+    uncached: false,
 };
 const RX: Perms = Perms {
     write: false,
     exec: true,
     raw: false,
+    uncached: false,
 };
 const ALL: Perms = Perms {
     write: true,
     exec: true,
     raw: false,
+    uncached: false,
 };
 
 fn setup(
@@ -246,4 +249,53 @@ fn syscalls_conferem_os_direitos() {
     };
     assert_eq!(vm_protect(&no_map, U, P, 0), Err(Error::AccessDenied));
     vm_unmap(&no_map, U, 2 * P).unwrap();
+}
+
+/// Objeto de MMIO (T-402): só da cota de dispositivo, só na faixa que a
+/// plataforma aceita, mapeado sem cache, nunca executável e sem frames.
+#[test]
+fn objeto_de_mmio() {
+    let (fake, p) = platform(1000);
+    let root = MemoryQuota::root(1 << 24);
+    let dev = MemoryQuota::device(&root, 1 << 16).unwrap();
+    assert_eq!(root.used(), 1 << 16);
+    let base = 0xC000_0000;
+    assert_eq!(
+        MemoryObject::new_device(&root, base, 2 * P, p).unwrap_err(),
+        Error::AccessDenied
+    );
+    for (b, len) in [
+        (0x1000, P),
+        (base + 1, P),
+        (base, 0),
+        (0xFEE0_0000 - P, 2 * P),
+    ] {
+        assert_eq!(
+            MemoryObject::new_device(&dev, b, len, p).unwrap_err(),
+            Error::InvalidArgument,
+            "{b:#x}+{len:#x}"
+        );
+    }
+    let mo = Arc::new(MemoryObject::new_device(&dev, base, 2 * P, p).unwrap());
+    assert!(mo.is_device() && dev.used() == mo.charged());
+    assert_eq!(fake.frames_live.load(Ordering::Relaxed), 0);
+    assert_eq!(mo.frame(1), Some(PhysAddr(base + P)));
+    assert_eq!(mo.frame(2), None);
+    let mut space = AddressSpace::new(&root, p).unwrap();
+    assert_eq!(
+        space.map(U, &mo, 0, 2 * P, RX, ALL),
+        Err(Error::InvalidArgument)
+    );
+    space.map(U, &mo, 0, 2 * P, RW, ALL).unwrap();
+    let mmio = Perms {
+        uncached: true,
+        ..RW
+    };
+    assert_eq!(space.query(U + P), Some((PhysAddr(base + P), mmio)));
+    // `vm_protect` mantém a página sem cache.
+    space.protect(U, P, Perms::default()).unwrap();
+    assert!(space.query(U).unwrap().1.uncached);
+    drop(space);
+    drop(mo);
+    assert_eq!(dev.used(), 0);
 }

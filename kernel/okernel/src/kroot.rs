@@ -324,6 +324,11 @@ fn start_table(p: &Image, fs: Handle) -> Result<Handle, &'static str> {
         push(KIND_PRESSURE, h);
     }
     push(KIND_KERNEL_LOG, kernel_log(p)?);
+    let (device_quota, ecam) = device_caps(p)?;
+    push(kabi::startup::KIND_DEVICE_QUOTA, device_quota);
+    if let Some(ecam) = ecam {
+        push(kabi::startup::KIND_ECAM, ecam);
+    }
     let mut bytes = [0u8; 4096];
     bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     let count = u32::try_from(n).map_err(|_| "entradas")?;
@@ -334,6 +339,57 @@ fn start_table(p: &Image, fs: Handle) -> Result<Handle, &'static str> {
         bytes[at + 4..at + 8].copy_from_slice(&handle.to_le_bytes());
     }
     read_only_copy(p, &bytes)
+}
+
+/// Orçamento da cota de dispositivo: só metadados (objetos de MMIO e,
+/// na T-404, `Interrupt`).
+const DEVICE_QUOTA_BYTES: u64 = 256 << 10;
+
+/// A cota de dispositivo (paga pela cota raiz) e, se o MCFG tiver o grupo
+/// 0 a partir do barramento 0, a janela ECAM criada com ela (ADR 0043,
+/// item 1; T-402).
+///
+/// # Errors
+///
+/// O passo que falhou.
+fn device_caps(p: &Image) -> Result<(Handle, Option<Handle>), &'static str> {
+    let root = kcap::root_quota().ok_or("root_quota")?;
+    let device = okernel::cap::MemoryQuota::device(&root, DEVICE_QUOTA_BYTES)
+        .map_err(|_| "cota de dispositivo")?;
+    let quota = p
+        .cspace
+        .lock()
+        .insert(Cap {
+            object: Object::MemoryQuota(device),
+            rights: Rights::CREATE,
+            badge: 0,
+        })
+        .map_err(|_| "cap(cota de dispositivo)")?;
+    let found = bootinfo::get()
+        .and_then(kabi::boot::BootInfo::acpi_rsdp)
+        .and_then(|rsdp| okernel::acpi::mcfg(&mut ktime::DirectRead, rsdp).ok());
+    let Some(e) = found else {
+        warn!("okernel: sem MCFG; o pcid cai nas portas 0xCF8/0xCFC");
+        return Ok((quota, None));
+    };
+    if e.start_bus != 0 {
+        warn!(
+            "okernel: ECAM começa no barramento {}; ignorada",
+            e.start_bus
+        );
+        return Ok((quota, None));
+    }
+    let bytes = (u64::from(e.end_bus) + 1) << 20;
+    let ecam = p
+        .cspace
+        .lock()
+        .obj_create_device(quota, e.base, bytes)
+        .map_err(|_| "ECAM")?;
+    info!(
+        "okernel: ECAM em {:#x}, barramentos 0 a {}",
+        e.base, e.end_bus
+    );
+    Ok((quota, Some(ecam)))
 }
 
 /// Cria o anel do log do kernel (cobrado da cota raiz), passa o `klog` a
