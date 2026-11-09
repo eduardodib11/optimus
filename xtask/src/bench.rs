@@ -357,6 +357,8 @@ pub fn line<'a>(serial: &'a str, name: &str) -> Option<&'a str> {
     serial.lines().find_map(|l| {
         l.split_once(prefix.as_str())
             .map(|(_, rest)| rest.trim_end())
+            // `bench: <nome> pulado: ...` é aviso, não medida (uma CPU só).
+            .filter(|rest| !rest.starts_with("pulado"))
     })
 }
 
@@ -523,5 +525,12 @@ mod tests {
         assert_eq!(civil_date(0), "1970-01-01");
         assert_eq!(civil_date(951_782_400), "2000-02-29");
         assert_eq!(civil_date(1_791_676_800), "2026-10-11");
+    }
+
+    #[test]
+    fn linha_pulada_nao_e_medida() {
+        let serial = format!("{SERIAL}info  bench: ipc_entre_cpus pulado: uma CPU só\r\n");
+        assert!(line(&serial, "ipc_entre_cpus").is_none());
+        assert!(report(&serial, &meta(), 1).is_ok());
     }
 }
