@@ -27,6 +27,7 @@ pub mod alloc;
 pub mod arch;
 pub mod cap;
 pub mod collections;
+pub mod dev;
 pub mod ipc;
 pub mod mem;
 pub mod port;

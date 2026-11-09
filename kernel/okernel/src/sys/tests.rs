@@ -372,7 +372,14 @@ fn notificacao_por_handles() {
         call(&space, Syscall::IrqAck, [irq, 0, 0, 0, 0, 0]),
         Ok([0; 3])
     );
-    // obj_create não cria interrupções.
+    // obj_create não cria interrupções com argumentos nem com cota comum.
+    let msi = |q| {
+        call(
+            &space,
+            Syscall::ObjCreate,
+            [q, ObjectType::Interrupt.to_raw(), 0, 0, 0, 0],
+        )
+    };
     assert_eq!(
         call(
             &space,
@@ -381,6 +388,22 @@ fn notificacao_por_handles() {
         ),
         Err(Error::NotSupported)
     );
+    assert_eq!(msi(q), Err(Error::AccessDenied));
+    // Com a cota de dispositivo: vetor de MSI (T-404), endereço e dado.
+    let device = MemoryQuota::device(&root, 1 << 16).unwrap();
+    let dq = space
+        .lock()
+        .insert(Cap {
+            object: Object::MemoryQuota(device),
+            rights: Rights::CREATE,
+            badge: 0,
+        })
+        .unwrap();
+    let [h, address, data] = msi(u64::from(dq.raw())).unwrap();
+    assert_eq!((address, data), (0xfee0_0000, 0x41));
+    let cap = get(&space, h);
+    assert_eq!(cap.rights, default_rights(ObjectType::Interrupt));
+    assert_eq!(cap.object.as_interrupt().unwrap().vector(), 0x41);
 }
 
 /// Cria um objeto de `ty` e devolve o handle cru.

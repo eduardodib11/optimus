@@ -362,8 +362,9 @@ pub const fn default_rights(ty: ObjectType) -> Rights {
 /// `MemoryObject`, o tamanho em bytes, múltiplo de 4 KiB; `Thread` e
 /// `SchedContext`, `Notification`, `Endpoint`, `Reply` e `Timer`, zero (o
 /// primeiro nasce sem configuração; o `Timer`, desarmado, e o criador recebe
-/// só `BIND`, ADR 0035, item 6). `Interrupt` só o kernel cria (o `root` as recebe), e
-/// `obj_create` a recusa com `NotSupported`.
+/// só `BIND`, ADR 0035, item 6). `Interrupt` só nasce de
+/// [`CapSpace::obj_create_msi`](super::space::CapSpace::obj_create_msi),
+/// com a cota de dispositivo (T-404); aqui, `NotSupported`.
 /// Os direitos sobre `quota`
 /// (`CREATE`, e `SPLIT` para cotas) são conferidos por quem chama, que tem a
 /// capability.

@@ -131,6 +131,13 @@ impl Platform for KernelPlatform {
     fn device_range_ok(&self, base: u64, len: u64) -> bool {
         device_range_ok(base, len)
     }
+
+    fn msi(
+        &self,
+        quota: &Arc<okernel::cap::MemoryQuota>,
+    ) -> Result<(Arc<okernel::notify::Interrupt>, u64, u64), kabi::Error> {
+        crate::kirq::create_msi(quota)
+    }
 }
 
 /// Janela de mensagens MSI do APIC local: escrever nela é interromper.

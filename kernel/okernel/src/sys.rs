@@ -192,6 +192,10 @@ pub fn invoke(
         }
         Syscall::ObjCreate => {
             let ty = ObjectType::try_from(a[1]).map_err(|_| Error::InvalidArgument)?;
+            if ty == ObjectType::Interrupt && a[2..4] == [0, 0] {
+                let (h, address, data) = space.lock().obj_create_msi(handle(a[0])?)?;
+                return Ok([u64::from(h.raw()), address, data]);
+            }
             let h = if ty == ObjectType::IoPortRange {
                 if a[4..] != [0, 0] {
                     return Err(Error::InvalidArgument);

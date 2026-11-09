@@ -48,6 +48,36 @@ pub fn create(quota: &Arc<MemoryQuota>, vector: u8) -> Result<Arc<Interrupt>, Er
     Ok(irq)
 }
 
+/// Último vetor entregue a MSI e MSI-X (acima ficam os IPIs do kernel).
+const LAST_VECTOR: u8 = 0xef;
+
+/// `Interrupt` de MSI ou MSI-X (T-404): o primeiro vetor livre, entregue
+/// ao BSP em modo fixo, por borda. Devolve o objeto e o endereço e o dado
+/// que o dispositivo escreve.
+///
+/// # Errors
+///
+/// [`Error::Busy`] sem vetor livre; [`Error::QuotaExceeded`] sem cota.
+pub fn create_msi(quota: &Arc<MemoryQuota>) -> Result<(Arc<Interrupt>, u64, u64), Error> {
+    let dest = crate::ksmp::apic_id(0).unwrap_or(0);
+    // Sem remapeamento de interrupção, o endereço só leva 8 bits de destino.
+    let dest = u8::try_from(dest).map_err(|_| Error::NotSupported)?;
+    for vector in FIRST_VECTOR..=LAST_VECTOR {
+        if vector == TIMER_VECTOR {
+            continue;
+        }
+        match create(quota, vector) {
+            Ok(irq) => {
+                let address = 0xfee0_0000 | u64::from(dest) << 12;
+                return Ok((irq, address, u64::from(vector)));
+            }
+            Err(Error::Busy) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Busy)
+}
+
 /// Disparo de `vector` vindo da IDT: devolve se o vetor é de um objeto
 /// `Interrupt` vivo (quem chama faz o EOI e o ponto de preempção).
 pub fn fire(vector: u64) -> bool {
