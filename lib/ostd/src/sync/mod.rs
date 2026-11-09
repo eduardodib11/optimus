@@ -5,16 +5,17 @@
 //! Todas as travas são uma ou duas palavras de 32 bits atômicas; o kernel
 //! confere a palavra com a trava do balde na mão (`futex.rs`), então nenhum
 //! despertar se perde entre o teste e a espera. As esperas
-//! comuns são sem prazo (o `futex_wait` do kernel não tem tempo-limite), e um
+//! comuns são sem prazo (prazo 0 no `futex_wait`), e um
 //! `futex_wait` que o kernel recusa por a palavra já ter mudado volta
 //! como um despertar espúrio: todo laço relê a palavra.
 //!
 //! **Prazos (T-338).** [`Condvar::wait_timeout`] e companhia não esperam no
 //! futex: a thread espera na `Notification` dela (com o `Timer` da thread
 //! armado no prazo; ver [`crate::time`]) e fica numa lista do `Condvar`;
-//! `notify_one`/`notify_all` acordam também os que estão nela. Mutex com
-//! prazo (`lock_timeout`) não existe: o `unlock` teria de conhecer os
-//! esperadores com prazo, e o caminho rápido dele hoje é um `swap`.
+//! `notify_one`/`notify_all` acordam também os que estão nela. **Prazo no
+//! `Mutex` (T-431, ADR 0048):** [`Mutex::lock_timeout`] usa o prazo do
+//! próprio `futex_wait` (argumento 2, ns absolutos do relógio do kernel);
+//! o caminho rápido do `unlock` não muda.
 //!
 //! **Envenenamento: não há.** O perfil do `ostd` é `panic = abort` (ADR 0039,
 //! item 5): um pânico encerra o processo, nenhuma guarda é largada no meio
@@ -56,6 +57,17 @@ use crate::time::{self, EVENT};
 fn futex_wait(word: &AtomicU32, expected: u32) {
     let addr = core::ptr::from_ref(word).addr() as u64;
     let _ = syscall(Syscall::FutexWait, [addr, u64::from(expected), 0, 0, 0, 0]);
+}
+
+/// Como [`futex_wait`], com prazo absoluto `deadline_ns` (relógio do
+/// kernel; 0 = sem prazo). Verdadeiro se o prazo venceu (ADR 0048).
+fn futex_wait_until(word: &AtomicU32, expected: u32, deadline_ns: u64) -> bool {
+    let addr = core::ptr::from_ref(word).addr() as u64;
+    let r = syscall(
+        Syscall::FutexWait,
+        [addr, u64::from(expected), deadline_ns, 0, 0, 0],
+    );
+    matches!(r, Err(kabi::Error::TimedOut))
 }
 
 /// Acorda até `n` threads esperando em `word`.
@@ -140,6 +152,33 @@ impl<T> Mutex<T> {
         // Daqui em diante marca CONTENDED: quem solta acorda uma thread.
         while self.state.swap(CONTENDED, Ordering::Acquire) != FREE {
             futex_wait(&self.state, CONTENDED);
+        }
+    }
+
+    /// Toma a trava esperando no máximo `timeout` (ADR 0048, T-431);
+    /// `None` se o prazo venceu com a trava ainda de outra thread.
+    pub fn lock_timeout(&self, timeout: Duration) -> Option<MutexGuard<'_, T>> {
+        let ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        self.lock_until(time::Instant::from_ns(time::now_ns().saturating_add(ns)))
+    }
+
+    /// Como [`lock_timeout`](Self::lock_timeout), com um prazo absoluto.
+    pub fn lock_until(&self, deadline: time::Instant) -> Option<MutexGuard<'_, T>> {
+        if let Some(g) = self.try_lock() {
+            return Some(g);
+        }
+        // 0 quer dizer "sem prazo" para o kernel: o piso é 1 ns.
+        let deadline_ns = deadline.as_ns().max(1);
+        // Como `lock_contended`: marca CONTENDED, para quem solta acordar uma.
+        loop {
+            if self.state.swap(CONTENDED, Ordering::Acquire) == FREE {
+                return Some(self.guard());
+            }
+            if futex_wait_until(&self.state, CONTENDED, deadline_ns) {
+                // Um despertar pode ter chegado junto com o prazo: última tentativa.
+                return (self.state.swap(CONTENDED, Ordering::Acquire) == FREE)
+                    .then(|| self.guard());
+            }
         }
     }
 

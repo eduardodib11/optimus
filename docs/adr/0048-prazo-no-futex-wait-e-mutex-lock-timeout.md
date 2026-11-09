@@ -69,5 +69,14 @@ ignorados). A ABI v1 tem 34 syscalls estáveis (SDD 6.8).
 - A ABI v1 ganha um significado para `a[2]` e `a[3]` do `futex_wait`; fica
   registrado na tabela. Programas que passavam lixo nesses registradores
   deixam de ser válidos (o `ostd` passa 0).
+- **Auditoria dos chamadores (2026-11-09).** Todos zeram `a[2]` e `a[3]`:
+  `ostd` (`futex_wait` e `futex_wait_until`, argumentos explícitos), `okfuzz`
+  (passa zeros), os dois laços de `kernel/okernel/src/arch/x86_64/user.S` e o
+  stub de `services/utest/src/vida.rs`. Os dois laços de `user.S` deixavam
+  lixo em `rdx` e `r10` e quebraram os testes de SMP na CI; foram corrigidos
+  no mesmo PR. Ressalva: binário fora do repositório que chame `futex_wait`
+  sem zerar `rdx` e `r10` passa a receber um prazo (ou `InvalidArgument`);
+  não há tal binário na imagem (o `ostd` é o único runtime, ADR 0039), e a
+  ABI v1 ainda não foi congelada para terceiros.
 - Custo no caminho lento: uma entrada a mais na fila de prazos por espera
   com prazo; sem prazo, nenhum custo.

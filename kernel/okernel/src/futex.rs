@@ -119,7 +119,12 @@ impl FutexTable {
         }
         t.waiters.try_reserve(1).map_err(|_| Error::QuotaExceeded)?;
         // Publicada no slot, para o encerramento achar a fila (T-348).
-        thread.ipc().lock().blocked = Blocked::Futex(key);
+        {
+            let mut slot = thread.ipc().lock();
+            slot.blocked = Blocked::Futex(key);
+            // Sem sobra de uma espera antiga: o prazo (T-431) escreve aqui.
+            slot.result = Ok(());
+        }
         thread.set_state(RunState::Blocked);
         t.waiters.push_back((key, Arc::clone(thread)));
         t.stats.blocked += 1;

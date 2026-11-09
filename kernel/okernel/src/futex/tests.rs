@@ -120,3 +120,31 @@ fn encerramento_tira_quem_espera() {
     assert!(matches!(t[1].ipc().lock().blocked, Blocked::None));
     assert!(!table.remove(0x1000, &t[1]));
 }
+
+/// O prazo do `futex_wait` (ADR 0048, T-431): `ipc::cancel(TimedOut)` tira
+/// quem espera da fila e deixa o erro no slot; um `futex_wake` que chegou
+/// antes vence (`cancel` falso e `wake` já o acordou).
+#[test]
+fn prazo_vencido_tira_da_fila_e_deixa_timed_out() {
+    use crate::ipc::{Blocked, cancel};
+    let t = threads(2);
+    let key = 0x7_7000;
+    for th in &t {
+        FUTEXES.wait(key, th, 7, || Some(7)).unwrap();
+    }
+    assert!(
+        cancel(&t[0], Error::TimedOut),
+        "tirou da fila: quem chama acorda"
+    );
+    assert_eq!(t[0].ipc().lock().result, Err(Error::TimedOut));
+    assert!(matches!(t[0].ipc().lock().blocked, Blocked::None));
+    assert_eq!(FUTEXES.waiting(key), 1, "só a outra segue na fila");
+    // Corrida: o wake chega primeiro; o prazo não acha mais nada.
+    assert_eq!(FUTEXES.wake(key, 1, &mut |_| {}), 1);
+    assert!(!cancel(&t[1], Error::TimedOut));
+    assert_eq!(t[1].ipc().lock().result, Ok(()));
+    // Nova espera zera o resultado velho.
+    FUTEXES.wait(key, &t[0], 7, || Some(7)).unwrap();
+    assert_eq!(t[0].ipc().lock().result, Ok(()));
+    assert!(FUTEXES.remove(key, &t[0]));
+}

@@ -614,11 +614,9 @@ sem mudar nenhuma decisão aceita:
   ainda tomada, então nenhum `notify` se perde; quem acha que o `notify` já
   a tirou da lista vale como acordada (`timed_out` falso). `Condvar` só
   vale dentro de um processo (os handles da lista são da tabela dele).
-- **Fica de fora: `Mutex::lock_timeout`.** O `unlock` teria de conhecer os
-  esperadores com prazo (a fila no futex do kernel não os acorda por
-  tempo); isso custaria o `swap` do caminho rápido ou pediria prazo no
-  `futex_wait` do kernel (decisão de Eduardo, mudaria a ABI v1). `RwLock` e
-  `Once` também seguem sem prazo.
+- **`Mutex::lock_timeout` (T-431, ADR 0048).** Entregue no M4 com o prazo
+  no `futex_wait` do kernel (argumento 2, ns absolutos; 0 = sem prazo), sem
+  mudar o caminho rápido do `unlock`. `RwLock` e `Once` seguem sem prazo.
 - **`unsafe`.** Nenhum bloco novo (`sync` segue em 18 de 28). `cap` ganhou
   `ntfy_signal`, `ntfy_wait` e `ntfy_poll`.
 - **Aceite.** `sleep(10 ms)`: o piso (10 ms) é rígido; o teto de 15 ms vale

@@ -956,3 +956,13 @@ fn debug_write_exige_debug_log_com_write() {
 }
 
 mod mem;
+
+/// `futex_wait` recusa flags diferentes de zero (ADR 0048).
+#[test]
+fn futex_wait_recusa_flags() {
+    let (_root, space, _q) = setup();
+    assert_eq!(
+        call(&space, Syscall::FutexWait, [0x1000, 0, 0, 1, 0, 0]),
+        Err(Error::InvalidArgument)
+    );
+}

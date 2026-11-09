@@ -121,6 +121,8 @@ user_mutex:
 3:  /* futex_wait(mutex, 2); depois tenta de novo marcando espera */
     mov rdi, r12
     mov esi, 2
+    xor edx, edx            /* prazo 0 e flags 0 (ADR 0048) */
+    xor r10d, r10d
     mov eax, 29
     syscall
     mov eax, 2
@@ -746,6 +748,8 @@ user_pingpong:
     je 2f
     mov rdi, r15
     mov esi, ebx
+    xor edx, edx            /* prazo 0 e flags 0 (ADR 0048) */
+    xor r10d, r10d
     mov eax, 29
     syscall
     jmp 1b

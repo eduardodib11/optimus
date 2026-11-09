@@ -244,6 +244,10 @@ const TESTS: &[Test] = &[
         run: tempo::condvar_sem_perda,
     },
     Test {
+        name: "sync.mutex_lock_timeout",
+        run: tempo::mutex_lock_timeout,
+    },
+    Test {
         name: "thread.join_com_prazo",
         run: tempo::join_com_prazo,
     },

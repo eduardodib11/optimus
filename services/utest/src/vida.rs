@@ -68,10 +68,13 @@ const STUBS: &[(Stub, &[u8])] = &[
         Stub::NtfyWait,
         &[0xB8, 0x17, 0, 0, 0, 0x0F, 0x05, 0xEB, 0xF7],
     ),
-    // 1: xor esi, esi; mov eax, 29; syscall; jmp 1b
+    // 1: xor esi, esi; xor edx, edx; xor r10d, r10d; mov eax, 29; syscall; jmp 1b
+    // (prazo 0 e flags 0, ADR 0048)
     (
         Stub::FutexWait,
-        &[0x31, 0xF6, 0xB8, 0x1D, 0, 0, 0, 0x0F, 0x05, 0xEB, 0xF5],
+        &[
+            0x31, 0xF6, 0x31, 0xD2, 0x45, 0x31, 0xD2, 0xB8, 0x1D, 0, 0, 0, 0x0F, 0x05, 0xEB, 0xF0,
+        ],
     ),
     // 1: mov eax, 20; syscall; jmp 1b
     (
