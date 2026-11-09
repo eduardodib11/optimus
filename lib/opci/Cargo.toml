@@ -1,0 +1,13 @@
+[package]
+name = "opci"
+description = "Varredura do espaço de configuração PCIe (ADR 0043; T-402): funções, BARs e capabilities, sem unsafe e sem pânico."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true
