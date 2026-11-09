@@ -6,7 +6,7 @@
 //! features ([`Transport`]) e a fila split ([`Queue`]). O dispositivo não é
 //! confiável: todo índice e tamanho que ele escreve é validado.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "fuzz")), no_std)]
 #![forbid(unsafe_code)]
 // Os casts truncam de propósito: N ≤ 32768 e as metades de endereços de 64 bits.
 #![allow(clippy::cast_possible_truncation)]
@@ -84,6 +84,9 @@ pub enum Error {
     /// Capability PCI malformada.
     BadCap,
 }
+
+#[cfg(any(test, feature = "fuzz"))]
+pub mod fuzz;
 
 #[cfg(test)]
 mod tests;

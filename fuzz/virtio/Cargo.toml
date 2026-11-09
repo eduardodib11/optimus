@@ -1,0 +1,32 @@
+[package]
+name = "virtio-fuzz"
+description = "Alvos de fuzz do virtio-core (capabilities e fila split, T-421; ADR 0046). Fora da imagem: só ferramenta de fuzzing, nightly."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Crate própria, fora do workspace principal: `libfuzzer-sys` nunca entra na
+# imagem do sistema nem no `cargo xtask build`.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+virtio-core = { path = "../../lib/virtio-core", features = ["fuzz"] }
+
+[[bin]]
+name = "caps"
+path = "fuzz_targets/caps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "queue"
+path = "fuzz_targets/queue.rs"
+test = false
+doc = false
+bench = false
