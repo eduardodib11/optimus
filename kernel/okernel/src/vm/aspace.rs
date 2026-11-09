@@ -192,6 +192,7 @@ impl AddressSpace {
                 write: m.flags.write,
                 exec: m.flags.exec,
                 raw: false,
+                uncached: m.flags.uncached,
             },
         ))
     }
@@ -267,6 +268,14 @@ impl AddressSpace {
         if !perms.within(max) {
             return Err(Error::AccessDenied);
         }
+        // MMIO (T-402): sem cache e nunca executável.
+        if object.is_device() && perms.exec {
+            return Err(Error::InvalidArgument);
+        }
+        let perms = Perms {
+            uncached: object.is_device(),
+            ..perms
+        };
         let (first, pages) = (offset / PAGE_SIZE, len / PAGE_SIZE);
         let fits = first
             .checked_add(pages)
@@ -506,15 +515,16 @@ impl AddressSpace {
             if start <= r.start && r.end() <= end {
                 r.perms = Perms {
                     raw: r.perms.raw,
+                    uncached: r.perms.uncached,
                     ..perms
                 };
+                // Toda página da faixa está mapeada (conferido acima).
+                for page in pages_of(r.start, r.end()) {
+                    let _ = self
+                        .tables
+                        .protect(page, PageSize::Size4K, r.perms.page_flags());
+                }
             }
-        }
-        for page in pages_of(start, end) {
-            // Toda página da faixa está mapeada (conferido acima).
-            let _ = self
-                .tables
-                .protect(page, PageSize::Size4K, perms.page_flags());
         }
         // Uma rodada para a faixa toda, mesmo quando só amplia: uma tradução
         // velha mais restrita daria falta espúria.

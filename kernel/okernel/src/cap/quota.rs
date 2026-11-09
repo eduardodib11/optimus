@@ -22,6 +22,9 @@ pub struct MemoryQuota {
     used: AtomicU64,
     /// O que esta cota custa à mãe (nada na raiz); devolvido ao morrer.
     parent: Option<Charge>,
+    /// Cota de dispositivo (ADR 0043, item 3; T-402): só ela cria
+    /// `MemoryObject` de MMIO. Só o kernel a cria; as filhas não herdam.
+    device: bool,
 }
 
 impl MemoryQuota {
@@ -32,7 +35,30 @@ impl MemoryQuota {
             limit,
             used: AtomicU64::new(0),
             parent: None,
+            device: false,
         })
+    }
+
+    /// Cota de dispositivo com orçamento `limit`, filha de `parent` (que
+    /// paga `limit`). Só o kernel chama: a capability vai ao `root` na
+    /// tabela de partida (`KIND_DEVICE_QUOTA`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QuotaExceeded`] se `parent` não tiver `limit` livres.
+    pub fn device(parent: &Arc<Self>, limit: u64) -> Result<Arc<Self>, Error> {
+        Ok(Arc::new(Self {
+            limit,
+            used: AtomicU64::new(0),
+            parent: Some(parent.charge(limit)?),
+            device: true,
+        }))
+    }
+
+    /// Verdadeiro para a cota de dispositivo.
+    #[must_use]
+    pub const fn is_device(&self) -> bool {
+        self.device
     }
 
     /// Cota filha com orçamento `limit`, pagando à mãe com `charge`.
@@ -41,6 +67,7 @@ impl MemoryQuota {
             limit,
             used: AtomicU64::new(0),
             parent: Some(charge),
+            device: false,
         }
     }
 

@@ -14,6 +14,7 @@ const RW: Perms = Perms {
     write: true,
     exec: false,
     raw: false,
+    uncached: false,
 };
 
 #[test]
@@ -116,6 +117,7 @@ const RAW: Perms = Perms {
     write: true,
     exec: false,
     raw: true,
+    uncached: false,
 };
 
 #[test]

@@ -33,6 +33,15 @@ pub mod startup {
     /// Entrada: o anel do log do kernel (`MemoryObject` com `READ | MAP`;
     /// ADR 0036, item 6; T-357).
     pub const KIND_KERNEL_LOG: u32 = 4;
+    /// Entrada: a cota de dispositivo (`MemoryQuota` com `CREATE`; ADR
+    /// 0043; T-402), a única que cria `MemoryObject` de MMIO
+    /// ([`mem::DEVICE`](crate::mem::DEVICE)).
+    pub const KIND_DEVICE_QUOTA: u32 = 5;
+    /// Entrada: a janela ECAM do grupo de segmentos 0 a partir do
+    /// barramento 0 (`MemoryObject` de MMIO com `READ | WRITE | MAP`; ADR
+    /// 0043, item 1; T-402). O kernel a lê do MCFG; o tamanho diz quantos
+    /// barramentos há (1 MiB cada). Ausente sem MCFG.
+    pub const KIND_ECAM: u32 = 6;
     /// Bytes do cabeçalho antes da primeira entrada.
     pub const HEADER_BYTES: usize = 8;
     /// Bytes de cada entrada.
@@ -237,6 +246,14 @@ pub mod mem {
     /// objeto nasce com todas as páginas ausentes (sem frame), cobrado só
     /// pelos metadados, e o criador recebe também `EVICT`.
     pub const LAZY: u64 = 1;
+    /// Flag de `obj_create(quota, MemoryObject, bytes, DEVICE, base)`
+    /// (`r10`, base física em `r8`; ADR 0043, item 3; T-402): objeto de
+    /// MMIO sobre `[base, base + bytes)`, mapeado sem cache, sem `EXEC` e
+    /// sem `mem_op` (`NotSupported`). Só a cota de dispositivo
+    /// ([`startup::KIND_DEVICE_QUOTA`](crate::startup::KIND_DEVICE_QUOTA))
+    /// cria (`AccessDenied` nas outras); faixa na RAM, no kernel, no bootfs,
+    /// no ACPI ou na MMIO do próprio kernel dá `InvalidArgument`.
+    pub const DEVICE: u64 = 2;
     /// Ausente → oculta (zerada); com [`PUBLISH_FLAG`], vai a presente e
     /// entra nos mapeamentos. Exige `WRITE`; debita a cota dona do objeto.
     pub const COMMIT: u64 = 0;

@@ -189,9 +189,13 @@ pub fn invoke(
         }
         Syscall::ObjCreate => {
             let ty = ObjectType::try_from(a[1]).map_err(|_| Error::InvalidArgument)?;
-            let h = space
-                .lock()
-                .obj_create_with(handle(a[0])?, ty, a[2], a[3])?;
+            let h = if ty == ObjectType::MemoryObject && a[3] == kabi::mem::DEVICE {
+                space.lock().obj_create_device(handle(a[0])?, a[4], a[2])?
+            } else {
+                space
+                    .lock()
+                    .obj_create_with(handle(a[0])?, ty, a[2], a[3])?
+            };
             Ok([u64::from(h.raw()), 0, 0])
         }
         Syscall::VmMap => {
@@ -261,6 +265,9 @@ fn mem_op(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<Valu
     use kabi::mem::{AGE, CACHE, COMMIT, DECOMMIT, HIDE, PUBLISH, PUBLISH_FLAG, ZERO};
     let cap = cap_with(space, a[0], Rights::NONE)?;
     let memory = cap.object.as_memory_object()?;
+    if memory.is_device() {
+        return Err(Error::NotSupported);
+    }
     let [_, op, offset, len, flags, _] = a;
     let need = match op {
         COMMIT | ZERO | CACHE => Rights::WRITE,

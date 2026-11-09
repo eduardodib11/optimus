@@ -310,9 +310,36 @@ pub fn protect(virt: u64, size: PageSize, flags: Flags) -> Result<(), MapError> 
     Ok(())
 }
 
+/// Páginas de MMIO que o próprio kernel usa ([`mmio`]); nenhuma vira
+/// `MemoryObject` de dispositivo (T-402). Zero é vaga livre.
+static KERNEL_MMIO: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+/// Verdadeiro se `[base, end)` toca uma página de MMIO do kernel. Uma
+/// página registrada depois de cheia a tabela conta como tocada sempre.
+pub fn touches_kernel_mmio(base: u64, end: u64) -> bool {
+    KERNEL_MMIO.iter().any(|slot| {
+        let page = slot.load(Ordering::Acquire);
+        page == u64::MAX || (page != 0 && page < end && base < page + 0x1000)
+    })
+}
+
+fn register_kernel_mmio(page: u64) {
+    for slot in &KERNEL_MMIO {
+        match slot.compare_exchange(0, page, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(p) if p == page => return,
+            Err(_) => {}
+        }
+    }
+    // Tabela cheia: daqui em diante nenhum objeto de dispositivo é criado.
+    KERNEL_MMIO[0].store(u64::MAX, Ordering::Release);
+}
+
 /// Deixa sem cache o apelido no mapa direto da página de MMIO em `phys`,
 /// para registradores de dispositivo (APIC, HPET); devolve o endereço virtual.
+/// A página fica fora do alcance dos objetos de dispositivo (T-402).
 pub fn mmio(phys: u64) -> Result<u64, MapError> {
+    register_kernel_mmio(phys & !0xfff);
     let virt = direct(PhysAddr(phys & !0xfff));
     let flags = Flags {
         uncached: true,

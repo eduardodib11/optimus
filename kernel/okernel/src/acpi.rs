@@ -155,6 +155,41 @@ pub fn hpet_base(mem: &mut impl PhysRead, rsdp: u64) -> Result<u64, AcpiError> {
     Ok(u64_at(&buf, 44))
 }
 
+/// Janela ECAM do MCFG (ADR 0043, item 1; T-402).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ecam {
+    /// Endereço físico do barramento 0 do grupo.
+    pub base: u64,
+    /// Grupo de segmentos.
+    pub segment: u16,
+    /// Primeiro barramento decodificado.
+    pub start_bus: u8,
+    /// Último barramento decodificado.
+    pub end_bus: u8,
+}
+
+/// Primeira janela ECAM do grupo de segmentos 0 no MCFG.
+///
+/// # Errors
+///
+/// Tabela MCFG ausente ou inválida, ou sem entrada do grupo 0.
+pub fn mcfg(mem: &mut impl PhysRead, rsdp: u64) -> Result<Ecam, AcpiError> {
+    let mut buf = [0u8; 4096];
+    let len = find(mem, rsdp, b"MCFG", &mut buf)?;
+    // Cabeçalho, 8 bytes reservados e entradas de 16 bytes.
+    let entries = buf.get(HEADER + 8..len).ok_or(AcpiError::BadLength)?;
+    entries
+        .chunks_exact(16)
+        .map(|e| Ecam {
+            base: u64_at(e, 0),
+            segment: u16::from_le_bytes([e[8], e[9]]),
+            start_bus: e[10],
+            end_bus: e[11],
+        })
+        .find(|e| e.segment == 0 && e.start_bus <= e.end_bus)
+        .ok_or(AcpiError::NotFound)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -258,6 +293,27 @@ pub(crate) mod tests {
         assert_eq!(hpet_base(&mut mem, 0x9000), Err(AcpiError::Unreadable));
         mem.0.get_mut(&0xe_0000).unwrap()[30] ^= 1;
         assert_eq!(hpet_base(&mut mem, 0xe_0000), Err(AcpiError::BadChecksum));
+    }
+
+    #[test]
+    fn mcfg_do_grupo_zero() {
+        let entry = |base: u64, seg: u16, start: u8, end: u8| {
+            let mut e = base.to_le_bytes().to_vec();
+            e.extend_from_slice(&seg.to_le_bytes());
+            e.extend_from_slice(&[start, end, 0, 0, 0, 0]);
+            e
+        };
+        let mut body = vec![0u8; 8];
+        body.extend(entry(0xc000_0000, 1, 0, 255));
+        body.extend(entry(0xb000_0000, 0, 0, 255));
+        let mut mem = machine_with(sdt(*b"MCFG", &body));
+        let ecam = mcfg(&mut mem, 0xe_0000).unwrap();
+        assert_eq!(
+            (ecam.base, ecam.segment, ecam.end_bus),
+            (0xb000_0000, 0, 255)
+        );
+        let mut mem = machine_with(sdt(*b"MCFG", &[0; 8]));
+        assert_eq!(mcfg(&mut mem, 0xe_0000), Err(AcpiError::NotFound));
     }
 
     #[test]

@@ -35,7 +35,7 @@ fn obj_create_lazy_da_evict_e_recusa_flags_estranhas() {
     assert!(rights.contains(Rights::EVICT | Rights::READ | Rights::WRITE | Rights::MAP));
     let ty = |t: ObjectType| t.to_raw();
     let bad = [
-        [q, ty(ObjectType::MemoryObject), PAGE_SIZE, 2, 0, 0],
+        [q, ty(ObjectType::MemoryObject), PAGE_SIZE, 4, 0, 0],
         [q, ty(ObjectType::Endpoint), 0, LAZY, 0, 0],
     ];
     for a in bad {
@@ -44,6 +44,19 @@ fn obj_create_lazy_da_evict_e_recusa_flags_estranhas() {
             Err(Error::InvalidArgument)
         );
     }
+    // `DEVICE` (T-402) só com a cota de dispositivo.
+    let device = [
+        q,
+        ty(ObjectType::MemoryObject),
+        PAGE_SIZE,
+        kabi::mem::DEVICE,
+        0xC000_0000,
+        0,
+    ];
+    assert_eq!(
+        call(&space, Syscall::ObjCreate, device),
+        Err(Error::AccessDenied)
+    );
     // Sem `LAZY`, o criador não recebe `EVICT`.
     let eager = call(
         &space,

@@ -471,6 +471,36 @@ impl<const N: usize> CapSpace<N, Object> {
     }
 }
 
+impl CapSpace {
+    /// `obj_create(quota, MemoryObject, bytes, mem::DEVICE, base)` (ADR
+    /// 0043, item 3; T-402): objeto de MMIO sobre `[base, base + bytes)`.
+    /// A cota tem de ser a de dispositivo; o objeto nasce sem `EXEC`.
+    ///
+    /// # Errors
+    ///
+    /// Os de `obj_create` e os de [`MemoryObject::new_device`].
+    pub fn obj_create_device(
+        &mut self,
+        quota: Handle,
+        base: u64,
+        bytes: u64,
+    ) -> Result<Handle, Error> {
+        let cap = self.get(quota)?;
+        let q = Arc::clone(cap.object.as_quota()?);
+        if !cap.rights.contains(Rights::CREATE) {
+            return Err(Error::AccessDenied);
+        }
+        let object = super::object::new_device_memory(&q, base, bytes)?;
+        let rights = default_rights(ObjectType::MemoryObject)
+            .intersection(Rights::READ | Rights::WRITE | Rights::MAP);
+        self.insert(Cap {
+            object,
+            rights,
+            badge: 0,
+        })
+    }
+}
+
 #[cfg(kani)]
 mod proofs;
 #[cfg(test)]

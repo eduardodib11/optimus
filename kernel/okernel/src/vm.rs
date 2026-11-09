@@ -41,6 +41,10 @@ mod aspace;
 pub use aspace::{AddressSpace, SharedAddressSpace, vm_map, vm_protect, vm_unmap};
 
 /// Permissões de uma página de usuário além da leitura.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "um bit de folha por campo, como nas flags da tabela"
+)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Perms {
     /// Gravável.
@@ -49,6 +53,9 @@ pub struct Perms {
     pub exec: bool,
     /// Visão crua de um objeto `LAZY` (mostra as páginas ocultas).
     pub raw: bool,
+    /// Sem cache: posto pelo kernel nas regiões de objetos de MMIO
+    /// (T-402), nunca vem das flags de quem chama.
+    pub uncached: bool,
 }
 
 impl Perms {
@@ -69,6 +76,7 @@ impl Perms {
             write: flags & WRITE != 0,
             exec: flags & EXEC != 0,
             raw: flags & RAW != 0,
+            uncached: false,
         })
     }
 
@@ -98,6 +106,7 @@ impl Perms {
             write: rights.contains(Rights::WRITE),
             exec: rights.contains(Rights::EXEC),
             raw: rights.contains(Rights::EVICT),
+            uncached: false,
         }
     }
 
@@ -114,6 +123,7 @@ impl Perms {
             write: self.write,
             exec: self.exec,
             user: true,
+            uncached: self.uncached,
             ..Flags::READ
         }
     }
@@ -176,6 +186,9 @@ enum Store {
     },
     /// Comprometido sob demanda (`mem_op`).
     Lazy(SpinLock<Lazy>),
+    /// Faixa física de MMIO (`mem::DEVICE`; T-402): contígua, sem cache,
+    /// fora da RAM; nenhum frame é do objeto.
+    Device { charge: Charge, base: PhysAddr },
 }
 
 /// Conjunto de páginas físicas: zeradas e todas presentes desde a criação
@@ -272,6 +285,45 @@ impl MemoryObject {
         })
     }
 
+    /// Objeto de MMIO com `bytes` a partir de `base` (`mem::DEVICE`; ADR
+    /// 0043, item 3; T-402), cobrado de `quota` só pelos metadados.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AccessDenied`] se `quota` não for a de dispositivo;
+    /// [`Error::InvalidArgument`] para tamanho ou base desalinhados, ou
+    /// faixa que a plataforma recusa (RAM, kernel, janela de MSI);
+    /// [`Error::QuotaExceeded`] sem cota.
+    pub fn new_device(
+        quota: &Arc<MemoryQuota>,
+        base: u64,
+        bytes: u64,
+        platform: &'static dyn Platform,
+    ) -> Result<Self, Error> {
+        if !quota.is_device() {
+            return Err(Error::AccessDenied);
+        }
+        let (pages, _, cost) = sized(bytes, 0)?;
+        if !base.is_multiple_of(PAGE_SIZE) || !platform.device_range_ok(base, bytes) {
+            return Err(Error::InvalidArgument);
+        }
+        let charge = quota.charge(cost)?;
+        Ok(Self {
+            pages,
+            store: Store::Device {
+                charge,
+                base: PhysAddr(base),
+            },
+            platform,
+        })
+    }
+
+    /// Verdadeiro para objeto de MMIO: mapeado sem cache e sem `mem_op`.
+    #[must_use]
+    pub const fn is_device(&self) -> bool {
+        matches!(self.store, Store::Device { .. })
+    }
+
     /// Verdadeiro para objeto `LAZY`.
     #[must_use]
     pub const fn is_lazy(&self) -> bool {
@@ -291,6 +343,9 @@ impl MemoryObject {
         match &self.store {
             Store::Eager { frames, .. } => frames.get(usize::try_from(page).ok()?).copied(),
             Store::Lazy(lazy) => lazy.lock().present(page),
+            Store::Device { base, .. } => {
+                (page < self.pages).then(|| PhysAddr(base.0 + page * PAGE_SIZE))
+            }
         }
     }
 
@@ -298,7 +353,7 @@ impl MemoryObject {
     #[must_use]
     pub fn charged(&self) -> u64 {
         match &self.store {
-            Store::Eager { charge, .. } => charge.bytes(),
+            Store::Eager { charge, .. } | Store::Device { charge, .. } => charge.bytes(),
             Store::Lazy(lazy) => lazy.lock().charge.bytes(),
         }
     }
@@ -522,6 +577,8 @@ impl MemoryObject {
                     }
                 }
             }
+            // Registradores de dispositivo: `mem_op` já recusa.
+            Store::Device { .. } => {}
         }
     }
 }
@@ -545,6 +602,8 @@ impl Drop for MemoryObject {
                 }
                 LAZY_COMMITTED.fetch_sub(freed, Ordering::Relaxed);
             }
+            // A faixa física não é do objeto: nada volta ao alocador.
+            Store::Device { .. } => {}
         }
     }
 }

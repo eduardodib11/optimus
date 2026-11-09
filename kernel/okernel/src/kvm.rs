@@ -127,6 +127,36 @@ impl Platform for KernelPlatform {
     fn wake(&self, thread: Arc<Thread>) {
         crate::kthread::wake(thread, 0);
     }
+
+    fn device_range_ok(&self, base: u64, len: u64) -> bool {
+        device_range_ok(base, len)
+    }
+}
+
+/// Janela de mensagens MSI do APIC local: escrever nela é interromper.
+const MSI_WINDOW: (u64, u64) = (0xFEE0_0000, 0xFEF0_0000);
+/// Fim dos endereços físicos que um objeto de dispositivo pode cobrir.
+const PHYS_LIMIT: u64 = 1 << 52;
+
+/// Faixa aceita como MMIO de dispositivo (T-402): dentro de 52 bits, fora
+/// da janela de MSI, da MMIO do próprio kernel e de toda faixa do mapa de
+/// memória que não seja `Mmio` ou `Reserved` (RAM, kernel, bootfs, ACPI).
+fn device_range_ok(base: u64, len: u64) -> bool {
+    use kabi::boot::MemKind;
+    let Some(end) = base.checked_add(len) else {
+        return false;
+    };
+    let Some(map) = crate::bootinfo::get().and_then(crate::bootinfo::memory_map) else {
+        return false;
+    };
+    let overlaps = |a: u64, b: u64| a < end && base < b;
+    len != 0
+        && end <= PHYS_LIMIT
+        && !overlaps(MSI_WINDOW.0, MSI_WINDOW.1)
+        && !kmem::touches_kernel_mmio(base, end)
+        && !map.iter().any(|r| {
+            !matches!(r.kind(), MemKind::Mmio | MemKind::Reserved) && overlaps(r.base, r.end())
+        })
 }
 
 /// Liga a FPU para o usuário e instala a plataforma; chamar depois de
