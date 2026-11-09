@@ -460,6 +460,10 @@ impl<const N: usize> CapSpace<N, Object> {
         let (object, rights) = if lazy {
             let object = super::object::new_memory_object(&q, args, true)?;
             (object, default_rights(ty) | Rights::EVICT)
+        } else if ty == ObjectType::DmaDomain && q.is_device() {
+            // `dma_attach` (`BIND`) só para quem tem a cota de dispositivo:
+            // o `devmgr` (ADR 0044, item 3). O driver recebe só `MAP`.
+            (obj_create(&q, ty, args)?, default_rights(ty) | Rights::BIND)
         } else {
             (obj_create(&q, ty, args)?, default_rights(ty))
         };

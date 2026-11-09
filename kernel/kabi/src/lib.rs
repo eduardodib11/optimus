@@ -279,6 +279,36 @@ pub mod mem {
     pub const PUBLISH_FLAG: u64 = 1;
 }
 
+/// `dma_map(domínio, objeto, iova, offset, len, flags)` (syscall 31; ADR
+/// 0044; T-403) em `rdi`, `rsi`, `rdx`, `r10`, `r8` e `r9`. A operação sai
+/// das flags; devolve `[endereço, 0, 0]`.
+///
+/// - Mapear ([`READ`], com [`WRITE`] opcional): `len` bytes do
+///   `MemoryObject` a partir de `offset` em `iova` (tudo alinhado a 4 KiB,
+///   `iova + len` até 2^39). Exige `MAP` no domínio e `MAP` + `READ` (e
+///   `WRITE`, se pedido) no objeto; objetos `LAZY` dão `NotSupported` e
+///   de MMIO, `InvalidArgument`. Devolve o endereço que o dispositivo usa:
+///   `iova` com IOMMU; sem IOMMU, o físico da primeira página, e a faixa
+///   tem de ser fisicamente contígua.
+/// - [`UNMAP`]: tira o mapeamento que começa em `iova` com `len` bytes e
+///   invalida o IOTLB antes de voltar (`objeto` = 0).
+/// - [`ATTACH`] / [`DETACH`]: liga ou desliga o dispositivo `iova` =
+///   `barramento << 8 | dispositivo << 3 | função` (ADR 0044, item 3). Exige
+///   `BIND`, que só o domínio criado com a cota de dispositivo tem; um
+///   dispositivo só fica num domínio (`Busy`).
+pub mod dma {
+    /// O dispositivo lê.
+    pub const READ: u64 = 1;
+    /// O dispositivo escreve.
+    pub const WRITE: u64 = 1 << 1;
+    /// Desfaz um mapeamento.
+    pub const UNMAP: u64 = 1 << 2;
+    /// Liga um dispositivo ao domínio.
+    pub const ATTACH: u64 = 1 << 3;
+    /// Desliga um dispositivo do domínio.
+    pub const DETACH: u64 = 1 << 4;
+}
+
 /// Flags de `thread_configure` (ADR 0029 e ADR 0039, item 3): o que muda
 /// além do `CapSpace` e do `AddressSpace`.
 ///

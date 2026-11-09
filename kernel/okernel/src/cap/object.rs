@@ -19,6 +19,7 @@ use kabi::{Error, ObjectType, Rights};
 
 use super::quota::MemoryQuota;
 use super::space::CapSpace;
+use crate::dma::DmaDomain;
 use crate::ipc::{Endpoint, Reply};
 use crate::notify::{Interrupt, Notification};
 use crate::platform;
@@ -61,6 +62,8 @@ pub enum Object {
     /// Capability de depuração (ADR 0036, item 5). Sem estado: só o kernel
     /// a cria, no boot, e `debug_write` escreve no registro dele.
     DebugLog(Arc<DebugLog>),
+    /// Domínio de DMA (ADR 0044; T-403).
+    DmaDomain(Arc<DmaDomain>),
 }
 
 /// Marca de identidade da [`Object::DebugLog`]; o estado é o registro do kernel.
@@ -82,6 +85,7 @@ impl fmt::Debug for Object {
             Self::Reply(r) => Arc::as_ptr(r).addr(),
             Self::Timer(t) => core::ptr::from_ref::<Timer>(t).addr(),
             Self::DebugLog(d) => Arc::as_ptr(d).addr(),
+            Self::DmaDomain(d) => Arc::as_ptr(d).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -104,6 +108,7 @@ impl Object {
             Self::Reply(_) => ObjectType::Reply,
             Self::Timer(_) => ObjectType::Timer,
             Self::DebugLog(_) => ObjectType::DebugLog,
+            Self::DmaDomain(_) => ObjectType::DmaDomain,
         }
     }
 
@@ -125,6 +130,7 @@ impl Object {
                 core::ptr::eq::<Timer>(&raw const **a, &raw const **b)
             }
             (Self::DebugLog(a), Self::DebugLog(b)) => Arc::ptr_eq(a, b),
+            (Self::DmaDomain(a), Self::DmaDomain(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -221,6 +227,18 @@ impl Object {
     pub fn as_interrupt(&self) -> Result<&Arc<Interrupt>, Error> {
         match self {
             Self::Interrupt(i) => Ok(i),
+            _ => Err(Error::WrongType),
+        }
+    }
+
+    /// O domínio de DMA, se o objeto for um.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_dma_domain(&self) -> Result<&Arc<DmaDomain>, Error> {
+        match self {
+            Self::DmaDomain(d) => Ok(d),
             _ => Err(Error::WrongType),
         }
     }
@@ -362,6 +380,8 @@ pub fn obj_create(quota: &Arc<MemoryQuota>, ty: ObjectType, args: u64) -> Result
         ObjectType::Endpoint => new_endpoint(quota),
         ObjectType::Reply => new_reply(quota),
         ObjectType::Timer => new_timer(quota),
+        ObjectType::DmaDomain if args != 0 => Err(Error::InvalidArgument),
+        ObjectType::DmaDomain => Ok(Object::DmaDomain(Arc::new(DmaDomain::new(quota)?))),
         _ => Err(Error::NotSupported),
     }
 }
