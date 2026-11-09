@@ -47,8 +47,9 @@ const HELLO_LOG_BADGE: u64 = 0x6865_6c6c;
 const HELLO_PRIORITY: u8 = 150;
 /// Badge da `DebugLog` do `svcmgr`: "svcm" em ASCII.
 const SVCMGR_LOG_BADGE: u64 = 0x7376_636d;
-/// Cota de partida do `svcmgr` (ADR 0034, item 2): fixa, 8 MiB no M3.
-const SVCMGR_QUOTA: u64 = 8 << 20;
+/// Cota de partida do `svcmgr` (ADR 0034, item 2): fixa, 8 MiB no M3 e 10
+/// MiB com o `pcid` (T-402).
+const SVCMGR_QUOTA: u64 = 10 << 20;
 /// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
 const SVCMGR_PRIORITY: u8 = 200;
 /// Badge com que o `root` identifica o `svcmgr` no próprio endpoint.
@@ -76,6 +77,10 @@ struct Boot {
     log: Handle,
     /// Anel do log do kernel (ADR 0036, item 6), 0 se não houver.
     klog: Handle,
+    /// Cota de dispositivo e janela ECAM da tabela de partida (T-402); 0
+    /// se ausentes.
+    device: Handle,
+    ecam: Handle,
 }
 
 /// Sem ninguém no endpoint, receber com prazo vencido dá `TimedOut` e
@@ -358,7 +363,7 @@ fn spawn_svcmgr(b: Boot) -> Result<(Handle, Handle), Error> {
 /// Atende o primeiro contato do `svcmgr` no endpoint do `root`. Só o badge
 /// [`ROOT_BADGE`] é aceito; qualquer outro recebe `AccessDenied` e o
 /// atendimento termina com erro.
-fn atende_svcmgr(ep: Handle, reply: Handle) -> Result<(), Error> {
+fn atende_svcmgr(b: Boot, ep: Handle, reply: Handle) -> Result<(), Error> {
     let deadline = ostd::time::now_ns() + SVCMGR_WAIT_NS;
     let rec = ipc::recv(ep, reply, deadline)?;
     if rec.badge != ROOT_BADGE || rec.msg.label != LABEL_OLA {
@@ -366,7 +371,18 @@ fn atende_svcmgr(ep: Handle, reply: Handle) -> Result<(), Error> {
         ostd::debug::print("root: chamada recusada no endpoint do svcmgr");
         return Err(Error::AccessDenied);
     }
-    ipc::send(reply, &Message::new(LABEL_OK, &[]), 0)?;
+    // A resposta leva a janela ECAM e a cota de dispositivo (T-402), que o
+    // `svcmgr` põe no pool como `kernel:ecam` e `kernel:device`.
+    let mut ok = Message::new(LABEL_OK, &[]);
+    let mut buffer = None;
+    if b.ecam.raw() != 0 && b.device.raw() != 0 {
+        let mut buf = Buffer::new(b.quota, b.aspace, b.thread, ipc::DEFAULT_BUFFER_VA)?;
+        buf.get().caps[..2].copy_from_slice(&[b.ecam.raw(), b.device.raw()]);
+        ok.info.caps = 2;
+        buffer = Some(buf);
+    }
+    ipc::send(reply, &ok, 0)?;
+    drop(buffer);
     ostd::debug::print("root: o svcmgr se anunciou e foi aceito");
     Ok(())
 }
@@ -401,7 +417,7 @@ fn espera_svcmgr(b: Boot, ep: Handle, reply: Handle, cspace: Handle) -> Result<(
 fn svcmgr(b: Boot) -> Result<(), Error> {
     let (ep, cspace) = spawn_svcmgr(b)?;
     let reply = create(b.quota, ObjectType::Reply, 0)?;
-    atende_svcmgr(ep, reply)?;
+    atende_svcmgr(b, ep, reply)?;
     espera_svcmgr(b, ep, reply, cspace)
 }
 
@@ -427,6 +443,14 @@ fn main(start: Start) -> ! {
         log: table_entry(handle(aspace), table, ostd::kabi::startup::KIND_DEBUG_LOG)
             .unwrap_or(Handle::from_raw(0)),
         klog: table_entry(handle(aspace), table, ostd::kabi::startup::KIND_KERNEL_LOG)
+            .unwrap_or(Handle::from_raw(0)),
+        device: table_entry(
+            handle(aspace),
+            table,
+            ostd::kabi::startup::KIND_DEVICE_QUOTA,
+        )
+        .unwrap_or(Handle::from_raw(0)),
+        ecam: table_entry(handle(aspace), table, ostd::kabi::startup::KIND_ECAM)
             .unwrap_or(Handle::from_raw(0)),
     };
     ostd::rt::init(ostd::rt::Env { quota: boot.quota });

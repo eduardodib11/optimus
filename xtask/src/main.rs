@@ -46,6 +46,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("memd", "services/memd/src/main.rs", USER_TARGET),
     ("timed", "services/timed/src/main.rs", USER_TARGET),
     ("logd", "services/logd/src/main.rs", USER_TARGET),
+    ("pcid", "services/pcid/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -97,7 +98,8 @@ const BOOT_MARKERS: &[&str] = &[
     "svcmgr: timed em Running",
     "svcmgr: logd em Running",
     "svcmgr: memd em Running",
-    "svcmgr: 3 serviços em Running",
+    "svcmgr: pcid em Running",
+    "svcmgr: 4 serviços em Running",
     "svcmgr: serviços encerrados",
     "root: o svcmgr terminou",
     "okernel: root terminou",
@@ -368,7 +370,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "utest" | "okfuzz" => {
+        "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "utest" | "okfuzz" => {
             &["-C", "relocation-model=static"]
         }
         _ => &[],
@@ -412,6 +414,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("timed", "timed"),
     ("logd", "logd"),
     ("memd", "memd"),
+    ("pcid", "pcid"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -1231,7 +1234,21 @@ fn test(opts: &Options) -> Result {
 
 /// O que o cenário de integração (T-365) exige além do boot normal: cada
 /// serviço do plano sai pelo desligamento ordenado do `svcmgr`.
-const INTEGRATION_MARKERS: &[&str] = &["logd: encerrado", "memd: encerrado"];
+const INTEGRATION_MARKERS: &[&str] = &[
+    "logd: encerrado",
+    "memd: encerrado",
+    // Aceite da T-402: a varredura do `pcid` bate com a lista que o QEMU
+    // monta para o q35 com os dispositivos de [`qemu`] (a mesma do
+    // `lspci -n` num convidado Linux).
+    "pcid: 00:00.0 0600: 8086:29c0",
+    "pcid: 00:01.0 0300: 1234:1111 (rev 02)",
+    "pcid: 00:02.0 0200: 8086:10d3",
+    "pcid: 00:03.0 00ff: 1af4:1005",
+    "pcid: 00:1f.0 0601: 8086:2918 (rev 02)",
+    "pcid: 00:1f.2 0106: 8086:2922 (rev 02)",
+    "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
+    "pcid: 7 funções",
+];
 
 /// CPUs do cenário de integração sem `--smp`.
 const INTEGRATION_COUNTS: &[u32] = &[1, 4];
@@ -1843,7 +1860,8 @@ mod tests {
                   info  [7376636d] svcmgr: timed em Running\r\n\
                   info  [7376636d] svcmgr: logd em Running\r\n\
                   info  [7376636d] svcmgr: memd em Running\r\n\
-                  info  [7376636d] svcmgr: 3 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: pcid em Running\r\n\
+                  info  [7376636d] svcmgr: 4 serviços em Running\r\n\
                   info  [7376636d] svcmgr: serviços encerrados\r\n\
                   info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";

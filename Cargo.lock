@@ -252,6 +252,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcid"
+version = "0.1.0"
+dependencies = [
+ "opci",
+ "optcrypt",
+ "ostd",
+ "osvc",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
