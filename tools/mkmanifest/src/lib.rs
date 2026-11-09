@@ -63,7 +63,7 @@ pub enum NeedKind {
     Svc = 1,
     /// Cota de memória (`mem:quota:`).
     Mem = 2,
-    /// Dispositivo (`dev:`), sem efeito no M3.
+    /// Dispositivo (`dev:`); as regras de `[match]` de um driver (T-401).
     Dev = 3,
     /// Diretório (`fs:`), fora do M3.
     Fs = 4,
@@ -124,6 +124,7 @@ pub struct Manifest {
 const SERVICE_KEYS: &[&str] = &["name", "binary", "priority", "restart"];
 const CAP_KEYS: &[&str] = &["needs", "provides"];
 const LIMIT_KEYS: &[&str] = &["max_threads", "ipc_rate"];
+const MATCH_KEYS: &[&str] = &["pci", "class", "compatible"];
 
 /// Lê um manifesto TOML e valida tudo o que dá para validar sem o grafo.
 ///
@@ -131,7 +132,7 @@ const LIMIT_KEYS: &[&str] = &["max_threads", "ipc_rate"];
 /// Chave desconhecida, valor fora do limite ou nome de capability antigo.
 pub fn parse(src: &str) -> Result<Manifest, Error> {
     let table: toml::Table = src.parse().map_err(|e| Error(format!("TOML: {e}")))?;
-    check_keys(&table, &["service", "capabilities", "limits"])?;
+    check_keys(&table, &["service", "capabilities", "limits", "match"])?;
 
     let svc = section(&table, "service")?;
     check_keys(svc, SERVICE_KEYS)?;
@@ -179,6 +180,12 @@ pub fn parse(src: &str) -> Result<Manifest, Error> {
     for item in strings(caps, "needs")? {
         needs.push(parse_need(&name, &item)?);
     }
+    if let Some(rules) = table.get("match") {
+        let rules = rules
+            .as_table()
+            .ok_or_else(|| Error(format!("{name}: `match` não é uma seção")))?;
+        needs.extend(match_needs(&name, rules)?);
+    }
     let mut provides = Vec::new();
     for item in strings(caps, "provides")? {
         provides.push(parse_provide(&name, &item)?);
@@ -207,6 +214,38 @@ pub fn parse(src: &str) -> Result<Manifest, Error> {
         needs,
         provides,
     })
+}
+
+/// Seção `[match]` de um driver (ADR 0042, item 3; T-401): cada regra
+/// vira uma necessidade `dev:` com o nome `pci:vvvv:dddd`,
+/// `class:cc:ss[:pp]` ou `compatible:NOME`, que o `devmgr` lê com
+/// `odev::Rule::parse`. O formato `OMAN` v1 não muda.
+fn match_needs(service: &str, t: &toml::Table) -> Result<Vec<Need>, Error> {
+    check_keys(t, MATCH_KEYS)?;
+    let mut out = Vec::new();
+    for key in MATCH_KEYS {
+        if t.get(*key).is_none() {
+            continue;
+        }
+        for item in strings(t, key)? {
+            let name = format!("{key}:{item}");
+            if odev::Rule::parse(&name).is_none() {
+                return err(format!("{service}: regra de `match` inválida: {name:?}"));
+            }
+            out.push(Need {
+                kind: NeedKind::Dev,
+                optional: false,
+                major: 0,
+                minor: 0,
+                name,
+                value: 0,
+            });
+        }
+    }
+    if out.is_empty() {
+        return err(format!("{service}: `match` sem regras"));
+    }
+    Ok(out)
 }
 
 fn check_keys(t: &toml::Table, allowed: &[&str]) -> Result<(), Error> {
@@ -651,6 +690,34 @@ ipc_rate = 10000
     fn falta_provedor_obrigatorio() {
         let a = svc("a", &["svc:optimus.z.Z@1"], &[]);
         assert!(check_graph(&[a]).unwrap_err().0.contains("nenhum provedor"));
+    }
+
+    #[test]
+    fn match_vira_dev() {
+        let src = LOG.replace(
+            "[limits]",
+            "[match]\npci = [\"1af4:1042\"]\nclass = [\"01:00:00\"]\ncompatible = [\"PNP0B00\"]\n[limits]",
+        );
+        let m = parse(&src).expect("válido");
+        let devs: Vec<&str> = m
+            .needs
+            .iter()
+            .filter(|n| n.kind == NeedKind::Dev)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(
+            devs,
+            ["pci:1af4:1042", "class:01:00:00", "compatible:PNP0B00"]
+        );
+        for ruim in [
+            "pci = [\"1af4\"]",
+            "class = [\"1:0\"]",
+            "usb = [\"1:2\"]",
+            "",
+        ] {
+            let src = LOG.replace("[limits]", &format!("[match]\n{ruim}\n[limits]"));
+            assert!(parse(&src).is_err(), "{ruim}");
+        }
     }
 
     #[test]

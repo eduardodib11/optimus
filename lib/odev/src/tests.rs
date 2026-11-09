@@ -95,3 +95,33 @@ fn compatible_casa_no_acpi() {
 fn sem_drivers_nao_casa() {
     assert_eq!(best_match(&[], &blk_node()), Outcome::None);
 }
+
+#[test]
+fn regras_do_manifesto() {
+    assert_eq!(
+        Rule::parse("pci:1af4:1042"),
+        Some(Rule::Pci(0x1af4, 0x1042))
+    );
+    assert_eq!(Rule::parse("class:01:00"), Some(Rule::Class(1, 0, None)));
+    assert_eq!(
+        Rule::parse("class:0c:03:30"),
+        Some(Rule::Class(0xc, 3, Some(0x30)))
+    );
+    assert_eq!(
+        Rule::parse("compatible:PNP0B00"),
+        Some(Rule::Compatible("PNP0B00".to_string()))
+    );
+    for bad in [
+        "pci:1af4",
+        "pci:1af4:42",
+        "pci:1af4:10420",
+        "pci:zzzz:1042",
+        "class:1:0",
+        "class:01:00:00:00",
+        "compatible:",
+        "usb:1234:5678",
+        "",
+    ] {
+        assert_eq!(Rule::parse(bad), None, "{bad}");
+    }
+}
