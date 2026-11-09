@@ -1,0 +1,15 @@
+[package]
+name = "odev"
+description = "Optimus Driver Framework: nós de dispositivo e casamento com drivers (ADR 0042)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[dependencies]
+
+[lints]
+workspace = true
