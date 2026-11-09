@@ -13,6 +13,7 @@ bench = false
 [dependencies]
 ostd = { path = "../../lib/ostd" }
 opci = { path = "../../lib/opci" }
+odev = { path = "../../lib/odev" }
 osvc = { path = "../../lib/osvc" }
 optcrypt = { path = "../../lib/optcrypt" }
 
