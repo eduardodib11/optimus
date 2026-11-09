@@ -41,6 +41,12 @@ pub trait Hw: TableMemory + Send {
     /// Tira da cache as linhas de `len` bytes em `phys`, para unidades que
     /// leem as tabelas sem coerência.
     fn flush(&mut self, phys: PhysAddr, len: usize);
+    /// `2^order` frames contíguos e zerados (a tabela de dispositivos do
+    /// AMD-Vi); `None` sem memória.
+    fn alloc_contiguous(&mut self, order: u32) -> Option<PhysAddr> {
+        let _ = order;
+        None
+    }
 }
 
 pub(crate) const CAP: usize = 0x08;
