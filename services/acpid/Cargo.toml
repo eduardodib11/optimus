@@ -1,0 +1,13 @@
+[package]
+name = "acpid"
+description = "acpid: leitura das tabelas ACPI e interpretador AML próprio e limitado (T-405; ADR 0045), núcleo testado no host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

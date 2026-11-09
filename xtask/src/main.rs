@@ -33,6 +33,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("oalloc", "lib/oalloc/src/lib.rs", KERNEL_TARGET),
     ("ocoll", "lib/ocoll/src/lib.rs", KERNEL_TARGET),
     ("olz4", "lib/olz4/src/lib.rs", KERNEL_TARGET),
+    ("acpid", "services/acpid/src/lib.rs", KERNEL_TARGET),
     ("oidl-rt", "lib/oidl-rt/src/lib.rs", KERNEL_TARGET),
     ("osvc", "lib/osvc/src/lib.rs", KERNEL_TARGET),
     ("odev", "lib/odev/src/lib.rs", KERNEL_TARGET),
@@ -62,6 +63,7 @@ const HOST_TESTED: &[&str] = &[
     "svcmgr",
     "timed",
     "virtio-core",
+    "acpid",
 ];
 
 const PROFILES: &[&str] = &["lite", "basic", "default", "premium", "server"];
