@@ -13,6 +13,7 @@ bench = false
 
 [dev-dependencies]
 mkmanifest = { path = "../../tools/mkmanifest" }
+odev = { path = "../../lib/odev" }
 
 [lints]
 workspace = true
