@@ -127,6 +127,10 @@ impl Platform for Leaked {
     fn fpu_area_bytes(&self) -> usize {
         832
     }
+    fn device_range_ok(&self, base: u64, len: u64) -> bool {
+        // MMIO falsa: de 3 GiB à janela de MSI.
+        base >= 0xC000_0000 && base.checked_add(len).is_some_and(|e| e <= 0xFEE0_0000)
+    }
     fn wake(&self, _: Arc<Thread>) {
         self.0.woken.fetch_add(1, Ordering::Relaxed);
     }
@@ -186,6 +190,7 @@ fn flags_recusam_w_e_x_juntos() {
             write: false,
             exec: true,
             raw: false,
+            uncached: false,
         })
     );
     // `RAW` nunca com execução, e exige `EVICT`.

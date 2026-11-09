@@ -414,6 +414,17 @@ pub(crate) fn new_memory_object(
     Ok(Object::MemoryObject(Arc::new(memory)))
 }
 
+/// `MemoryObject` de MMIO (T-402); ver [`MemoryObject::new_device`].
+pub(crate) fn new_device_memory(
+    quota: &Arc<MemoryQuota>,
+    base: u64,
+    bytes: u64,
+) -> Result<Object, Error> {
+    let platform = platform::get().ok_or(Error::NotSupported)?;
+    let memory = MemoryObject::new_device(quota, base, bytes, platform)?;
+    Ok(Object::MemoryObject(Arc::new(memory)))
+}
+
 #[inline(never)]
 fn new_thread(quota: &Arc<MemoryQuota>) -> Result<Object, Error> {
     let platform = platform::get().ok_or(Error::NotSupported)?;
