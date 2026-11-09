@@ -2,6 +2,10 @@
 //! bootfs (`manifest/<nome>.oman`) viram o [`Broker`] e a ordem de partida
 //! por níveis de dependência.
 //!
+//! Um driver (manifesto com necessidades `dev:`, as regras de `[match]`)
+//! não entra nos níveis: ele só parte quando o `devmgr` casa um nó com ele
+//! (ADR 0042, itens 1 e 5). Fica em [`Plan::drivers`].
+//!
 //! Um manifesto ilegível, um binário ausente, um provedor duplicado, uma
 //! dependência obrigatória sem provedor ou um ciclo recusam o plano
 //! inteiro: o `svcmgr` não sobe um sistema pela metade sem dizer por quê.
@@ -33,8 +37,11 @@ pub enum PlanError {
 pub struct Plan {
     /// O corretor, com um serviço por manifesto, na ordem dos nomes.
     pub broker: Broker,
-    /// Ids por nível; os de um nível só dependem dos anteriores.
+    /// Ids por nível; os de um nível só dependem dos anteriores. Sem os
+    /// drivers.
     pub levels: Vec<Vec<u32>>,
+    /// Ids dos drivers, na ordem dos nomes.
+    pub drivers: Vec<u32>,
 }
 
 /// Monta o plano a partir das entradas `(nome, dados)` do bootfs.
@@ -57,16 +64,27 @@ pub fn build(entries: &[(&str, &[u8])]) -> Result<Plan, PlanError> {
         manifests.push(m);
     }
     let order = oman::levels(&manifests).map_err(PlanError::Graph)?;
+    let drivers: Vec<u32> = (0u32..)
+        .zip(&manifests)
+        .filter(|(_, m)| m.needs.iter().any(|n| n.kind == oman::NeedKind::Dev))
+        .map(|(id, _)| id)
+        .collect();
     let broker = Broker::new(manifests).map_err(PlanError::Broker)?;
     let levels = order
         .into_iter()
-        .map(|l| {
+        .map(|l| -> Vec<u32> {
             l.into_iter()
                 .filter_map(|i| u32::try_from(i).ok())
+                .filter(|id| !drivers.contains(id))
                 .collect()
         })
+        .filter(|l| !l.is_empty())
         .collect();
-    Ok(Plan { broker, levels })
+    Ok(Plan {
+        broker,
+        levels,
+        drivers,
+    })
 }
 
 #[cfg(test)]

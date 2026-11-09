@@ -49,6 +49,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("logd", "services/logd/src/main.rs", USER_TARGET),
     ("pcid", "services/pcid/src/main.rs", USER_TARGET),
     ("devmgr", "services/devmgr/src/main.rs", USER_TARGET),
+    ("drvteste", "services/drvteste/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -379,8 +380,8 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "devmgr" | "utest"
-        | "okfuzz" => &["-C", "relocation-model=static"],
+        "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "devmgr"
+        | "drvteste" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -424,6 +425,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("memd", "memd"),
     ("pcid", "pcid"),
     ("devmgr", "devmgr"),
+    ("drvteste", "drvteste"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -1316,6 +1318,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
+    "devmgr: 1 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
 ];

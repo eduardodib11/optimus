@@ -23,7 +23,12 @@ pub enum Method {
     Connect = 2,
     /// `name_of(id) -> string<31>`.
     NameOf = 3,
+    /// `driver(index) -> DriverInfo` (1.1; só para o `devmgr`).
+    Driver = 4,
 }
+
+/// Versão menor do protocolo.
+pub const MINOR: u16 = 1;
 
 /// `SvcError` no fio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,16 +65,22 @@ pub fn interface_id() -> u32 {
     u32::from_le_bytes([h[0], h[1], h[2], h[3]])
 }
 
-/// Rótulo do pedido de `m` (`minor_min` 0 em todos os métodos da 1.0).
+/// Rótulo do pedido de `m`, com o `minor_min` da versão que trouxe o
+/// método (0 nos da 1.0, 1 no `driver`).
 #[must_use]
 pub fn label(m: Method) -> u64 {
-    (u64::from(interface_id()) << 32) | m as u64
+    let minor = match m {
+        Method::Driver => 1,
+        _ => 0,
+    };
+    (u64::from(interface_id()) << 32) | (minor << 16) | m as u64
 }
 
-/// Método de um rótulo de pedido, se for desta interface.
+/// Método de um rótulo de pedido, se for desta interface e de uma versão
+/// menor até [`MINOR`].
 #[must_use]
 pub fn method_of(label: u64) -> Option<Method> {
-    if label >> 32 != u64::from(interface_id()) || (label >> 16) & 0xFFFF != 0 {
+    if label >> 32 != u64::from(interface_id()) || (label >> 16) & 0xFFFF > u64::from(MINOR) {
         return None;
     }
     Some(match label & 0xFFFF {
@@ -77,6 +88,7 @@ pub fn method_of(label: u64) -> Option<Method> {
         1 => Method::Ready,
         2 => Method::Connect,
         3 => Method::NameOf,
+        4 => Method::Driver,
         _ => return None,
     })
 }
@@ -277,6 +289,122 @@ pub fn decode_name(body: &[u8]) -> oidl_rt::Result<&str> {
     let s = r.string(MAX_NAME)?;
     r.finish()?;
     Ok(s)
+}
+
+/// Cabeça de `driver(index: u16)`.
+const DRIVER_HEAD: usize = 2;
+/// Cabeça de `DriverInfo`: `id`, `total` e os ponteiros de `name` e `rules`.
+const DRIVER_INFO_HEAD: usize = 24;
+/// Teto de regras `[match]` de um driver em `DriverInfo`.
+pub const MAX_RULES: usize = 16;
+/// Teto de cada regra (o nome da necessidade `dev:`).
+pub const MAX_RULE: usize = 63;
+/// Maior corpo de `DriverInfo`.
+pub const MAX_DRIVER_BYTES: usize = DRIVER_INFO_HEAD + 32 + MAX_RULES * (8 + 64);
+/// Maior corpo de resposta do `svcmgr`.
+pub const MAX_REPLY_BYTES: usize = if MAX_BOOT_BYTES > MAX_DRIVER_BYTES {
+    MAX_BOOT_BYTES
+} else {
+    MAX_DRIVER_BYTES
+};
+
+/// Um driver do conjunto compilado (ADR 0042, item 3), para o `devmgr`
+/// casar: o id do serviço, quantos drivers há, o nome e as regras.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverInfo<'a> {
+    /// Id do serviço no `svcmgr`.
+    pub id: u32,
+    /// Quantos drivers o `svcmgr` tem.
+    pub total: u16,
+    /// Nome do serviço.
+    pub name: &'a str,
+    rules: [&'a str; MAX_RULES],
+    count: usize,
+}
+
+impl<'a> DriverInfo<'a> {
+    /// Monta o valor; `None` acima de [`MAX_RULES`].
+    #[must_use]
+    pub fn new(id: u32, total: u16, name: &'a str, rules: &[&'a str]) -> Option<Self> {
+        let mut out = [""; MAX_RULES];
+        out.get_mut(..rules.len())?.copy_from_slice(rules);
+        Some(Self {
+            id,
+            total,
+            name,
+            rules: out,
+            count: rules.len(),
+        })
+    }
+
+    /// As regras, como os nomes das necessidades `dev:` do manifesto.
+    #[must_use]
+    pub fn rules(&self) -> &[&'a str] {
+        &self.rules[..self.count]
+    }
+}
+
+/// Codifica o pedido de `driver`.
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] sem espaço em `out`.
+pub fn encode_driver(index: u16, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    let mut w = Writer::new(out, DRIVER_HEAD)?;
+    w.u16(index)?;
+    Ok(w.finish())
+}
+
+/// Decodifica o pedido de `driver`.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_driver(body: &[u8]) -> oidl_rt::Result<u16> {
+    let mut r = Reader::new(body, DRIVER_HEAD)?;
+    let index = r.u16()?;
+    r.finish()?;
+    Ok(index)
+}
+
+/// Codifica a resposta de `driver`.
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] acima dos tetos ou sem espaço.
+pub fn encode_driver_info(info: &DriverInfo<'_>, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    let mut w = Writer::new(out, DRIVER_INFO_HEAD)?;
+    w.u32(info.id)?;
+    w.u16(info.total)?;
+    w.string(info.name, MAX_NAME)?;
+    let off = w.vec(info.count, 8, MAX_RULES)?;
+    for (i, rule) in info.rules().iter().enumerate() {
+        w.seek(off + i * 8);
+        w.string(rule, MAX_RULE)?;
+    }
+    Ok(w.finish())
+}
+
+/// Decodifica a resposta de `driver`.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_driver_info(body: &[u8]) -> oidl_rt::Result<DriverInfo<'_>> {
+    let mut r = Reader::new(body, DRIVER_INFO_HEAD)?;
+    let id = r.u32()?;
+    let total = r.u16()?;
+    let name = r.string(MAX_NAME)?;
+    let elems = r.vec(MAX_RULES, 8)?;
+    let mut rules = [""; MAX_RULES];
+    for (i, rule) in rules.iter_mut().take(elems.count()).enumerate() {
+        r.seek(elems.off() + i * 8);
+        *rule = r.string(MAX_RULE)?;
+    }
+    r.finish()?;
+    Ok(DriverInfo {
+        id,
+        total,
+        name,
+        rules,
+        count: elems.count(),
+    })
 }
 
 /// Codifica um `SvcError` (corpo de uma resposta [`REPLY_ERR`]).

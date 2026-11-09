@@ -44,6 +44,9 @@ pub const KIND_PROVIDE: u8 = 6;
 /// `CapDesc.index` da cota do processo.
 pub const QUOTA_INDEX: u16 = 0xFFFF;
 
+/// Interface do `devmgr` (ADR 0042, item 1).
+pub const DEVICE_BUS: &str = "optimus.dev.DeviceBus";
+
 /// Direitos do cliente sobre o endpoint de um provedor.
 pub const CLIENT_RIGHTS: Rights = Rights::SEND;
 /// Direitos do provedor sobre o próprio endpoint.
@@ -223,6 +226,14 @@ impl Broker {
     #[must_use]
     pub fn manifest(&self, id: u32) -> Option<&Oman> {
         self.entry(id).map(|e| &e.manifest)
+    }
+
+    /// `id` é o `devmgr`: provê `optimus.dev.DeviceBus@1`, o único que
+    /// pode ler a lista de drivers e pedir a partida de um (ADR 0042).
+    #[must_use]
+    pub fn is_device_manager(&self, id: u32) -> bool {
+        let bus = interface_id(DEVICE_BUS, 1);
+        self.entry(id).is_some_and(|e| e.provide_ids.contains(&bus))
     }
 
     /// Badge da instância atual de `id`.

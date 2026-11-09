@@ -88,3 +88,25 @@ fn recusas() {
     let vazio = build(&[]).expect("sem manifestos");
     assert!(vazio.levels.is_empty());
 }
+
+#[test]
+fn drivers_ficam_fora_dos_niveis() {
+    let files = fs(&[
+        ("devmgr", b"elf".to_vec()),
+        ("drv", b"elf".to_vec()),
+        (
+            "manifest/devmgr.oman",
+            oman("devmgr", &[], &["optimus.dev.DeviceBus@1.0"]),
+        ),
+        (
+            "manifest/drv.oman",
+            oman("drv", &["dev:pci:1234:11e8"], &[]),
+        ),
+    ]);
+    let p = run(&files).expect("plano");
+    assert_eq!(p.levels, [vec![0]]);
+    assert_eq!(p.drivers, [1]);
+    assert!(p.broker.is_device_manager(0));
+    assert!(!p.broker.is_device_manager(1));
+    assert!(!p.broker.is_device_manager(9));
+}
