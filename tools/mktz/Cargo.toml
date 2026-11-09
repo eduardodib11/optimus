@@ -1,0 +1,12 @@
+[package]
+name = "mktz"
+description = "Ferramenta de host que converte TZif (tzdata) para o formato OTZ1 do timed (T-359; ADR 0037, item 5)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+timed = { path = "../../services/timed" }
+
+[lints]
+workspace = true

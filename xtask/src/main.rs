@@ -66,6 +66,7 @@ const HOST_TESTED: &[&str] = &[
     "timed",
     "virtio-core",
     "acpid",
+    "mktz",
 ];
 
 const PROFILES: &[&str] = &["lite", "basic", "default", "premium", "server"];
