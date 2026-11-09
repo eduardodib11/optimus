@@ -298,3 +298,21 @@ fn capabilities_malformadas() {
     assert_eq!(cap::find(&c), Err(Error::BadCap));
     assert_eq!(cap::find(&c[..0x20]), Err(Error::BadCap));
 }
+
+/// Fuzz no host (T-421): bytes pseudoaleatórios não derrubam o transporte.
+#[test]
+fn fuzz_pseudoaleatorio_sem_panico() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for _ in 0..20_000 {
+        let n = (rnd() % 300) as usize;
+        let data: std::vec::Vec<u8> = (0..n).map(|_| rnd() as u8).collect();
+        crate::fuzz::caps(&data);
+        crate::fuzz::queue(&data);
+    }
+}

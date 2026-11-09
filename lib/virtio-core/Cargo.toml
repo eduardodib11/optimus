@@ -9,5 +9,9 @@ license.workspace = true
 doctest = false
 bench = false
 
+[features]
+# Harness de fuzzing (T-421): usa `std`, só para `fuzz/virtio` e os testes.
+fuzz = []
+
 [lints]
 workspace = true
