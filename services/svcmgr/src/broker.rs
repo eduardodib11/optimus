@@ -37,6 +37,8 @@ pub const KIND_CONTROL: u8 = 0;
 pub const KIND_SVC: u8 = 1;
 /// `CapDesc.kind` da cota (`mem:quota:`).
 pub const KIND_MEM: u8 = 2;
+/// `CapDesc.kind` de um recurso de dispositivo de um driver.
+pub const KIND_DEV: u8 = 3;
 /// `CapDesc.kind` de um `kernel:`.
 pub const KIND_KERNEL: u8 = 5;
 /// `CapDesc.kind` de um `provide`.
@@ -262,12 +264,15 @@ impl Broker {
     }
 
     /// Confere o manifesto de `id` e monta os passos, sem efeito.
+    /// `devices` são os recursos de um driver (só em
+    /// [`Broker::deliver_driver`]); sem eles, `dev:` é recusado.
     fn plan(
         &self,
         id: u32,
         control: Handle,
         quota: Handle,
         pool: &[(&str, Handle)],
+        devices: Option<&[(Handle, u32)]>,
     ) -> Result<Vec<Step>, DeliverError> {
         let e = self.entry(id).ok_or(DeliverError::NoSuchService)?;
         if !e.roots.is_empty() {
@@ -283,13 +288,23 @@ impl Broker {
             name_hash,
         };
         let mut steps = Vec::new();
-        steps.push(mint(control, Rights::SEND, b, KIND_CONTROL, 0, 0));
+        // O `devmgr` manda ao `svcmgr` os recursos dos drivers, então o
+        // canal de controle dele leva `GRANT` (ADR 0042, item 4).
+        let control_rights = if self.is_device_manager(id) {
+            Rights::SEND.union(Rights::GRANT)
+        } else {
+            Rights::SEND
+        };
+        steps.push(mint(control, control_rights, b, KIND_CONTROL, 0, 0));
         steps.push(mint(quota, QUOTA_RIGHTS, 0, KIND_MEM, QUOTA_INDEX, 0));
         let mut quotas = 0;
         for (i, need) in e.manifest.needs.iter().enumerate() {
             let index = u16::try_from(i).map_err(|_| DeliverError::NotSupported)?;
             match need.kind {
                 NeedKind::Mem => quotas += 1,
+                // `dev:` são as regras de `[match]`: o driver recebe os
+                // recursos do nó casado, não uma capability por regra.
+                NeedKind::Dev if devices.is_some() => {}
                 NeedKind::Dev | NeedKind::Fs => return Err(DeliverError::NotSupported),
                 NeedKind::Svc => {
                     let iid = interface_id(&need.name, need.major);
@@ -329,6 +344,10 @@ impl Broker {
         if quotas != 1 {
             return Err(DeliverError::NotSupported);
         }
+        for (i, &(src, name)) in devices.unwrap_or(&[]).iter().enumerate() {
+            let index = u16::try_from(i).map_err(|_| DeliverError::NotSupported)?;
+            steps.push(mint(src, Rights::ALL, 0, KIND_DEV, index, name));
+        }
         for j in 0..e.provide_ids.len() {
             let j = u16::try_from(j).map_err(|_| DeliverError::NotSupported)?;
             steps.push(Step::Provide(j));
@@ -356,12 +375,48 @@ impl Broker {
         pool: &[(&str, Handle)],
         caps: &mut C,
     ) -> Result<Boot, DeliverError> {
-        let steps = self.plan(id, control, quota, pool)?;
+        let steps = self.plan(id, control, quota, pool, None)?;
+        self.run(id, child, quota, &steps, caps)
+    }
+
+    /// Como [`Broker::deliver`], para um driver: as necessidades `dev:`
+    /// não viram capability, e `devices` (os recursos do nó que o `devmgr`
+    /// mandou, com o hash do nome) entram com `kind` [`KIND_DEV`], com os
+    /// mesmos direitos que chegaram.
+    ///
+    /// # Errors
+    /// Ver [`DeliverError`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "o deliver com os recursos do driver"
+    )]
+    pub fn deliver_driver<C: Caps>(
+        &mut self,
+        id: u32,
+        child: Handle,
+        control: Handle,
+        quota: Handle,
+        pool: &[(&str, Handle)],
+        devices: &[(Handle, u32)],
+        caps: &mut C,
+    ) -> Result<Boot, DeliverError> {
+        let steps = self.plan(id, control, quota, pool, Some(devices))?;
+        self.run(id, child, quota, &steps, caps)
+    }
+
+    fn run<C: Caps>(
+        &mut self,
+        id: u32,
+        child: Handle,
+        quota: Handle,
+        steps: &[Step],
+        caps: &mut C,
+    ) -> Result<Boot, DeliverError> {
         let i = usize::try_from(id).map_err(|_| DeliverError::NoSuchService)?;
         let mut roots = Vec::new();
         let mut out = Vec::with_capacity(steps.len());
         let mut run = || -> Result<(), KError> {
-            for step in &steps {
+            for step in steps {
                 let desc = match *step {
                     Step::Mint {
                         src,

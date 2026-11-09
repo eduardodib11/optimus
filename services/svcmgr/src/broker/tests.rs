@@ -348,3 +348,37 @@ fn reinicio_revoga_e_o_cliente_reconecta() {
     let last = caps.mints.last().copied().expect("mint");
     assert_eq!((last.0, last.1, last.2), (new, CLIENT_RIGHTS, badge(1, 1)));
 }
+
+#[test]
+fn driver_recebe_os_recursos_do_no() {
+    let mut b = Broker::new(vec![
+        manifest("devmgr", &[], &["optimus.dev.DeviceBus@1.0"]),
+        manifest("drv", &["dev:pci:1234:11e8"], &[]),
+    ])
+    .expect("corretor");
+    let mut caps = Fake::default();
+    // O canal de controle do `devmgr` leva `GRANT`; o do driver, não.
+    sobe(&mut b, 0, &mut caps);
+    assert_eq!(
+        caps.sent_to(child(0))[0],
+        (CONTROL, Rights::SEND.union(Rights::GRANT), badge(0, 1))
+    );
+    // Sem os recursos, um driver não parte pelo `deliver` comum.
+    let r = b.deliver(1, child(1), CONTROL, QUOTA, &[], &mut caps);
+    assert_eq!(r, Err(DeliverError::NotSupported));
+    let (bar, irq) = (Handle::from_raw(40), Handle::from_raw(41));
+    let devices = [(bar, 0xB0), (irq, 0x10)];
+    let boot = b
+        .deliver_driver(1, child(1), CONTROL, QUOTA, &[], &devices, &mut caps)
+        .expect("entrega do driver");
+    let sent = caps.sent_to(child(1));
+    assert_eq!(sent[0], (CONTROL, Rights::SEND, badge(1, 1)));
+    assert_eq!(sent[2..], [(bar, Rights::ALL, 0), (irq, Rights::ALL, 0)]);
+    let dev: Vec<(u8, u16, u32)> = boot
+        .caps
+        .iter()
+        .filter(|c| c.kind == KIND_DEV)
+        .map(|c| (c.kind, c.index, c.name_hash))
+        .collect();
+    assert_eq!(dev, [(KIND_DEV, 0, 0xB0), (KIND_DEV, 1, 0x10)]);
+}

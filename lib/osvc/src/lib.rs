@@ -25,10 +25,15 @@ pub enum Method {
     NameOf = 3,
     /// `driver(index) -> DriverInfo` (1.1; só para o `devmgr`).
     Driver = 4,
+    /// `driver_give(id, names)` com até 4 capabilities (1.2; só para o
+    /// `devmgr`).
+    DriverGive = 5,
+    /// `driver_start(id)` (1.2; só para o `devmgr`).
+    DriverStart = 6,
 }
 
 /// Versão menor do protocolo.
-pub const MINOR: u16 = 1;
+pub const MINOR: u16 = 2;
 
 /// `SvcError` no fio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +76,7 @@ pub fn interface_id() -> u32 {
 pub fn label(m: Method) -> u64 {
     let minor = match m {
         Method::Driver => 1,
+        Method::DriverGive | Method::DriverStart => 2,
         _ => 0,
     };
     (u64::from(interface_id()) << 32) | (minor << 16) | m as u64
@@ -89,6 +95,8 @@ pub fn method_of(label: u64) -> Option<Method> {
         2 => Method::Connect,
         3 => Method::NameOf,
         4 => Method::Driver,
+        5 => Method::DriverGive,
+        6 => Method::DriverStart,
         _ => return None,
     })
 }
@@ -405,6 +413,66 @@ pub fn decode_driver_info(body: &[u8]) -> oidl_rt::Result<DriverInfo<'_>> {
         rules,
         count: elems.count(),
     })
+}
+
+/// Capabilities por mensagem (ADR 0033).
+pub const MAX_MSG_CAPS: usize = 4;
+/// Cabeça de `driver_give(id: u32, names: vec<u32, 4>)`.
+const DRIVER_GIVE_HEAD: usize = 12;
+/// `kind` de um recurso de dispositivo no descritor (como `dev:` em
+/// `needs`); `name_hash` diz qual (`bar0`, `irq0`, `dma`...).
+pub const KIND_DEV: u8 = 3;
+
+/// Codifica o pedido de `driver_give`: o hash do nome de cada capability
+/// anexada, na mesma ordem.
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] acima de [`MAX_MSG_CAPS`] ou sem espaço.
+pub fn encode_driver_give(id: u32, names: &[u32], out: &mut [u8]) -> oidl_rt::Result<usize> {
+    let mut w = Writer::new(out, DRIVER_GIVE_HEAD)?;
+    w.u32(id)?;
+    let off = w.vec(names.len(), 4, MAX_MSG_CAPS)?;
+    for (i, n) in names.iter().enumerate() {
+        w.seek(off + i * 4);
+        w.u32(*n)?;
+    }
+    Ok(w.finish())
+}
+
+/// Decodifica o pedido de `driver_give` em `names`; devolve o id e quantos
+/// nomes vieram.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_driver_give(
+    body: &[u8],
+    names: &mut [u32; MAX_MSG_CAPS],
+) -> oidl_rt::Result<(u32, usize)> {
+    let mut r = Reader::new(body, DRIVER_GIVE_HEAD)?;
+    let id = r.u32()?;
+    let elems = r.vec(MAX_MSG_CAPS, 4)?;
+    for (i, n) in names.iter_mut().take(elems.count()).enumerate() {
+        r.seek(elems.off() + i * 4);
+        *n = r.u32()?;
+    }
+    r.finish()?;
+    Ok((id, elems.count()))
+}
+
+/// Codifica o pedido de `driver_start(id)`: o mesmo corpo de `name_of`.
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] sem espaço em `out`.
+pub fn encode_driver_start(id: u32, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    encode_name_of(id, out)
+}
+
+/// Decodifica o pedido de `driver_start`.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_driver_start(body: &[u8]) -> oidl_rt::Result<u32> {
+    decode_name_of(body)
 }
 
 /// Codifica um `SvcError` (corpo de uma resposta [`REPLY_ERR`]).

@@ -81,6 +81,9 @@ fn plan(fs: &obfs::Image<'_>) -> Result<Plan, Error> {
 struct Started {
     desc: Desc,
     child: process::Child,
+    /// Recursos de dispositivo que o `devmgr` deu (só num driver): as
+    /// cópias do `svcmgr` ficam até o fim da instância.
+    devices: Vec<Handle>,
 }
 
 /// Parte o serviço `id`: carrega, entrega as capabilities e inicia.
@@ -90,6 +93,7 @@ fn spawn(
     id: u32,
     boot: &Boot,
     control: Handle,
+    devices: Option<&[(Handle, u32)]>,
 ) -> Result<Started, Error> {
     let m = plan.broker.manifest(id).ok_or(Error::InvalidArgument)?;
     let elf = fs.find(&m.binary).ok_or(Error::InvalidArgument)?;
@@ -119,20 +123,21 @@ fn spawn(
     if boot.device.raw() != 0 {
         pool.push(("device", boot.device));
     }
-    let desc = plan
-        .broker
-        .deliver(
-            id,
-            child.cspace,
-            control,
-            child.quota,
-            &pool,
-            &mut svcmgr::kernel::Kernel,
-        )
-        .map_err(|e| {
-            ostd::debug::print_fmt(format_args!("svcmgr: entrega recusada: {e:?}"));
-            Error::InvalidArgument
-        })?;
+    let kernel = &mut svcmgr::kernel::Kernel;
+    let delivered = match devices {
+        Some(d) => {
+            let (cs, q) = (child.cspace, child.quota);
+            plan.broker
+                .deliver_driver(id, cs, control, q, &pool, d, kernel)
+        }
+        None => plan
+            .broker
+            .deliver(id, child.cspace, control, child.quota, &pool, kernel),
+    };
+    let desc = delivered.map_err(|e| {
+        ostd::debug::print_fmt(format_args!("svcmgr: entrega recusada: {e:?}"));
+        Error::InvalidArgument
+    })?;
     let find = |kind: u8, index: u16| {
         desc.caps
             .iter()
@@ -145,7 +150,11 @@ fn spawn(
         0,
     ];
     child.start(args)?;
-    Ok(Started { desc, child })
+    Ok(Started {
+        desc,
+        child,
+        devices: Vec::new(),
+    })
 }
 
 /// Quanto o laço espera por mensagem antes de olhar as mortes, em ns.
@@ -168,7 +177,12 @@ struct Svcmgr<'a> {
     live: Vec<Option<Started>>,
     /// Mortes que o próprio `svcmgr` causou (teste de caos).
     induced: Vec<u32>,
+    /// Recursos que o `devmgr` deu a cada driver, até o `driver_start`.
+    pending: Vec<(u32, Vec<(Handle, u32)>)>,
 }
+
+/// Teto de recursos de dispositivo de um driver.
+const MAX_DEVICE_CAPS: usize = 16;
 
 /// O erro do corretor no fio.
 const fn wire(e: svcmgr::broker::SvcError) -> SvcError {
@@ -188,8 +202,24 @@ fn name(plan: &Plan, id: u32) -> &str {
 impl Svcmgr<'_> {
     /// Parte `id` e liga a morte do processo ao bit dele em `deaths`.
     fn launch(&mut self, id: u32) -> bool {
-        match spawn(&mut self.plan, &self.fs, id, &self.boot, self.control) {
-            Ok(s) => {
+        self.launch_with(id, None)
+    }
+
+    /// Como [`Svcmgr::launch`]; um driver leva os recursos `devices`, que
+    /// ficam com a instância (ou são apagados se ela não partir).
+    fn launch_with(&mut self, id: u32, devices: Option<&[(Handle, u32)]>) -> bool {
+        let r = spawn(
+            &mut self.plan,
+            &self.fs,
+            id,
+            &self.boot,
+            self.control,
+            devices,
+        );
+        let handles: Vec<Handle> = devices.unwrap_or(&[]).iter().map(|d| d.0).collect();
+        match r {
+            Ok(mut s) => {
+                s.devices = handles;
                 let bit = 1u64 << (id % 64);
                 if let Err(e) = ostd::cap::bind_notify(s.child.cspace, self.deaths, bit) {
                     ostd::debug::print_fmt(format_args!("svcmgr: sem aviso de morte: {e:?}"));
@@ -203,6 +233,9 @@ impl Svcmgr<'_> {
             Err(e) => {
                 let n = name(&self.plan, id);
                 ostd::debug::print_fmt(format_args!("svcmgr: {n} não partiu: {e:?}"));
+                for h in handles {
+                    let _ = ostd::cap::delete(h);
+                }
                 false
             }
         }
@@ -228,6 +261,9 @@ impl Svcmgr<'_> {
             id,
             &mut svcmgr::kernel::Kernel,
         );
+        for &h in &s.devices {
+            let _ = ostd::cap::delete(h);
+        }
         let c = s.child;
         for h in [c.thread, c.aspace, c.cspace, c.quota] {
             if h.raw() != 0 {
@@ -305,6 +341,84 @@ impl Svcmgr<'_> {
         }
     }
 
+    /// `driver_give(id, names)`: guarda os recursos que chegaram com a
+    /// mensagem para o driver `id`. Só o `devmgr`, e só para um driver
+    /// parado; o que for recusado é apagado.
+    fn driver_give(&mut self, caller: u32, req: &[u8], got: &[Handle]) -> Result<(), SvcError> {
+        let mut names = [0u32; osvc::MAX_MSG_CAPS];
+        let (id, n) =
+            osvc::decode_driver_give(req, &mut names).map_err(|_| SvcError::NotInManifest)?;
+        if n != got.len() || !self.may_drive(caller, id) {
+            return Err(SvcError::NotInManifest);
+        }
+        let i = if let Some(i) = self.pending.iter().position(|p| p.0 == id) {
+            i
+        } else {
+            self.pending.push((id, Vec::new()));
+            self.pending.len() - 1
+        };
+        let list = &mut self.pending[i].1;
+        if list.len() + n > MAX_DEVICE_CAPS {
+            return Err(SvcError::Busy);
+        }
+        list.extend(got.iter().copied().zip(names));
+        Ok(())
+    }
+
+    /// `driver_start(id)`: parte o driver com os recursos guardados.
+    fn driver_start(&mut self, caller: u32, id: u32) -> Result<(), SvcError> {
+        if !self.may_drive(caller, id) {
+            return Err(SvcError::NotInManifest);
+        }
+        let devices = match self.pending.iter().position(|p| p.0 == id) {
+            Some(i) => self.pending.swap_remove(i).1,
+            None => Vec::new(),
+        };
+        if self.launch_with(id, Some(&devices)) {
+            Ok(())
+        } else {
+            Err(SvcError::Busy)
+        }
+    }
+
+    /// Os métodos do `devmgr` (1.1 e 1.2); devolve a resposta e se os
+    /// recursos que chegaram ficaram guardados.
+    fn serve_driver(
+        &mut self,
+        id: u32,
+        m: Method,
+        req: &[u8],
+        got: &[Handle],
+        body: &mut [u8],
+    ) -> ((u64, usize), bool) {
+        let err = |e, body: &mut [u8]| (osvc::REPLY_ERR, osvc::encode_error(e, body).unwrap_or(0));
+        match m {
+            Method::Driver => match osvc::decode_driver(req) {
+                Ok(index) => (self.driver_answer(id, index, body), false),
+                Err(_) => ((osvc::REPLY_BAD_MESSAGE, 0), false),
+            },
+            Method::DriverGive => match self.driver_give(id, req, got) {
+                Ok(()) => ((osvc::REPLY_OK, 0), true),
+                Err(e) => (err(e, body), false),
+            },
+            Method::DriverStart => match osvc::decode_driver_start(req) {
+                Ok(driver) => match self.driver_start(id, driver) {
+                    Ok(()) => ((osvc::REPLY_OK, 0), false),
+                    Err(e) => (err(e, body), false),
+                },
+                Err(_) => ((osvc::REPLY_BAD_MESSAGE, 0), false),
+            },
+            _ => ((osvc::REPLY_UNKNOWN_METHOD, 0), false),
+        }
+    }
+
+    /// `caller` é o `devmgr` e `id` é um driver parado.
+    fn may_drive(&self, caller: u32, id: u32) -> bool {
+        self.plan.broker.is_device_manager(caller)
+            && self.plan.drivers.contains(&id)
+            && self.started(id).is_none()
+    }
+
     /// Resposta de `driver(index)`: só o `devmgr` lê a lista de drivers.
     fn driver_answer(&self, id: u32, index: u16, body: &mut [u8]) -> (u64, usize) {
         let err = |e, body: &mut [u8]| (osvc::REPLY_ERR, osvc::encode_error(e, body).unwrap_or(0));
@@ -327,6 +441,38 @@ impl Svcmgr<'_> {
         match encoded {
             Some(n) => (osvc::REPLY_OK, n),
             None => err(SvcError::Busy, body),
+        }
+    }
+
+    /// Responde pelo `Reply` (com a capability de um `connect`, se houver)
+    /// e apaga as capabilities recebidas que não ficaram guardadas.
+    fn respond(
+        &mut self,
+        answer: (u64, usize),
+        body: &[u8],
+        cap: Option<Handle>,
+        drop: Vec<Handle>,
+    ) {
+        for h in drop {
+            let _ = ostd::cap::delete(h);
+        }
+        match cap {
+            Some(h) => {
+                let mut msg = Message::new(answer.0, &[]);
+                msg.info.caps = 1;
+                self.buffer.get().caps[0] = h.raw();
+                let _ = ipc::send(self.reply, &msg, 0);
+                let _ = ostd::cap::delete(h);
+            }
+            None => {
+                let _ = ipc::responde_corpo(
+                    self.reply,
+                    &mut self.buffer,
+                    answer.0,
+                    &body[..answer.1],
+                    0,
+                );
+            }
         }
     }
 
@@ -353,6 +499,16 @@ impl Svcmgr<'_> {
         };
         let id = u32::try_from(r.badge & 0xFFFF_FFFF).unwrap_or(u32::MAX);
         let live = self.plan.broker.badge_of(id) == Some(r.badge) && self.started(id).is_some();
+        // Capabilities só valem num `driver_give`; nas outras mensagens são
+        // apagadas aqui.
+        let got: Vec<Handle> = {
+            let caps = &self.buffer.get().caps;
+            caps.iter()
+                .take(r.caps.min(caps.len()))
+                .map(|&h| Handle::from_raw(h))
+                .collect()
+        };
+        let mut kept = false;
         let mut ready = None;
         let mut cap = None;
         let err = |e, body: &mut [u8]| match osvc::encode_error(e, body) {
@@ -397,30 +553,14 @@ impl Svcmgr<'_> {
                 },
                 Err(_) => (osvc::REPLY_BAD_MESSAGE, 0),
             },
-            (true, Some(Method::Driver)) => match osvc::decode_driver(&req[..r.corpo]) {
-                Ok(index) => self.driver_answer(id, index, &mut body),
-                Err(_) => (osvc::REPLY_BAD_MESSAGE, 0),
-            },
+            (true, Some(m @ (Method::Driver | Method::DriverGive | Method::DriverStart))) => {
+                let (answer, keep) = self.serve_driver(id, m, &req[..r.corpo], &got, &mut body);
+                kept = keep;
+                answer
+            }
             (true, None) => (osvc::REPLY_UNKNOWN_METHOD, 0),
         };
-        match cap {
-            Some(h) => {
-                let mut msg = Message::new(answer.0, &[]);
-                msg.info.caps = 1;
-                self.buffer.get().caps[0] = h.raw();
-                let _ = ipc::send(self.reply, &msg, 0);
-                let _ = ostd::cap::delete(h);
-            }
-            None => {
-                let _ = ipc::responde_corpo(
-                    self.reply,
-                    &mut self.buffer,
-                    answer.0,
-                    &body[..answer.1],
-                    0,
-                );
-            }
-        }
+        self.respond(answer, &body, cap, if kept { Vec::new() } else { got });
         self.reap();
         ready
     }
@@ -563,6 +703,7 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
         sup: Supervisor::new(&policies),
         live,
         induced: Vec::new(),
+        pending: Vec::new(),
     };
     let levels = s.plan.levels.clone();
     let t0 = ostd::time::now_ns();

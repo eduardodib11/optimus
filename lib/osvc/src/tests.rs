@@ -73,11 +73,14 @@ fn rotulos() {
         Method::Connect,
         Method::NameOf,
         Method::Driver,
+        Method::DriverGive,
+        Method::DriverStart,
     ] {
         assert_eq!(method_of(label(m)), Some(m));
     }
     assert_eq!(label(Method::Driver) >> 16 & 0xFFFF, 1, "driver é da 1.1");
-    assert_eq!(method_of(label(Method::Ready) | 2 << 16), None);
+    assert_eq!(label(Method::DriverStart) >> 16 & 0xFFFF, 2);
+    assert_eq!(method_of(label(Method::Ready) | 3 << 16), None);
     assert_eq!(method_of(4), None);
     assert_eq!(SvcError::from_u8(3), Some(SvcError::Busy));
     assert_eq!(SvcError::from_u8(4), None);
@@ -118,4 +121,23 @@ fn driver_vai_e_volta() {
     let full = DriverInfo::new(1, 1, &name, &[rule.as_str(); MAX_RULES]).unwrap();
     assert!(encode_driver_info(&full, &mut b).is_ok());
     assert!(decode_driver_info(&b[..8]).is_err());
+}
+
+#[test]
+fn driver_give_e_start_vao_e_voltam() {
+    let mut b = [0u8; MAX_SHORT_BYTES];
+    let n = encode_driver_give(5, &[0xAA, 0xBB, 0xCC], &mut b).unwrap();
+    assert_eq!(
+        n,
+        16 + 16,
+        "cabeça de 12 arredondada a 16 e 12 bytes de nomes"
+    );
+    let mut names = [0; MAX_MSG_CAPS];
+    assert_eq!(decode_driver_give(&b[..n], &mut names), Ok((5, 3)));
+    assert_eq!(names[..3], [0xAA, 0xBB, 0xCC]);
+    assert!(encode_driver_give(5, &[1; MAX_MSG_CAPS + 1], &mut b).is_err());
+    b[4] = 99;
+    assert!(decode_driver_give(&b[..n], &mut names).is_err());
+    let n = encode_driver_start(9, &mut b).unwrap();
+    assert_eq!(decode_driver_start(&b[..n]), Ok(9));
 }
