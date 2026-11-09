@@ -84,6 +84,28 @@ pub unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+/// Escreve 32 bits numa porta de E/S.
+///
+/// # Safety
+///
+/// A escrita precisa ser válida para o dispositivo em `port`.
+pub unsafe fn outl(port: u16, value: u32) {
+    // SAFETY: contrato do chamador; OUT não acessa memória.
+    unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack)) };
+}
+
+/// Lê 32 bits de uma porta de E/S.
+///
+/// # Safety
+///
+/// A leitura precisa ser válida (e sem efeito indesejado) para `port`.
+pub unsafe fn inl(port: u16) -> u32 {
+    let value;
+    // SAFETY: contrato do chamador; IN não acessa memória.
+    unsafe { asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack)) };
+    value
+}
+
 /// Para a CPU para sempre, com interrupções desligadas.
 pub fn halt() -> ! {
     loop {

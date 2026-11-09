@@ -24,6 +24,7 @@ mod kcap;
 mod kfault;
 mod kfuzz;
 mod kheap;
+mod kiommu;
 mod kipc;
 mod kirq;
 mod klogring;
@@ -97,6 +98,7 @@ extern "sysv64" fn kernel_main(info: &'static mut BootInfo) -> ! {
             kheap::init(cmdline);
             kcap::init();
             ktime::init(info);
+            kiommu::init();
             ksmp::init(info, cmdline);
             ksmp::start::start_aps();
         }
