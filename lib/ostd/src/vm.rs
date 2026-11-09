@@ -73,10 +73,26 @@ impl Mapping {
         len: u64,
         flags: u64,
     ) -> Result<Self, Error> {
+        Self::new_at(aspace, object, va, 0, len, flags)
+    }
+
+    /// Como [`new`](Self::new), a partir do byte `offset` do objeto.
+    ///
+    /// # Errors
+    ///
+    /// Os de [`new`](Self::new).
+    pub fn new_at(
+        aspace: Handle,
+        object: Handle,
+        va: u64,
+        offset: u64,
+        len: u64,
+        flags: u64,
+    ) -> Result<Self, Error> {
         if len == 0 || !len.is_multiple_of(PAGE_SIZE) || usize::try_from(len).is_err() {
             return Err(Error::InvalidArgument);
         }
-        map(aspace, object, va, 0, len, flags)?;
+        map(aspace, object, va, offset, len, flags)?;
         Ok(Self {
             aspace,
             va,
@@ -112,6 +128,26 @@ impl Mapping {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         crate::arch::mem::bytes(self)
+    }
+
+    /// Leitura volátil de 32 bits em `off` (MMIO; T-402); `None` fora da
+    /// faixa ou desalinhada.
+    #[must_use]
+    pub fn read32(&self, off: usize) -> Option<u32> {
+        let ok = off.is_multiple_of(4) && off.checked_add(4).is_some_and(|e| e <= self.size());
+        ok.then(|| crate::arch::mem::read32(self, off))
+    }
+
+    /// Escrita volátil de 32 bits em `off`; `false` fora da faixa,
+    /// desalinhada ou sem escrita.
+    pub fn write32(&mut self, off: usize, value: u32) -> bool {
+        let ok = self.writable
+            && off.is_multiple_of(4)
+            && off.checked_add(4).is_some_and(|e| e <= self.size());
+        if ok {
+            crate::arch::mem::write32(self, off, value);
+        }
+        ok
     }
 
     /// Os bytes mapeados, para escrita; `None` se o mapeamento não for

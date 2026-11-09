@@ -405,6 +405,9 @@ fn parse_need(service: &str, item: &str) -> Result<Need, Error> {
 /// - `mem-pressure`: `Interrupt` de pressão com `BIND` e `ACK` (ADR 0038).
 /// - `log`: o anel do log do kernel, `MemoryObject` com `READ` e `MAP`
 ///   (ADR 0036, item 6).
+/// - `ecam`: a janela ECAM, `MemoryObject` de MMIO com `READ`, `WRITE` e
+///   `MAP` (ADR 0043, item 1; T-402).
+/// - `device`: a cota de dispositivo, `MemoryQuota` só com `CREATE` (T-402).
 #[must_use]
 pub fn kernel_rights(name: &str) -> Option<kabi::Rights> {
     use kabi::Rights;
@@ -412,6 +415,9 @@ pub fn kernel_rights(name: &str) -> Option<kabi::Rights> {
         "debug" => Some(Rights::WRITE.union(Rights::BIND)),
         "mem-pressure" => Some(Rights::BIND.union(Rights::ACK)),
         "log" => Some(Rights::READ.union(Rights::MAP)),
+        // T-402: a janela ECAM (para o `pcid`) e a cota de dispositivo.
+        "ecam" => Some(Rights::READ.union(Rights::WRITE).union(Rights::MAP)),
+        "device" => Some(Rights::CREATE),
         _ => None,
     }
 }
