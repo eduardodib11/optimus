@@ -363,3 +363,53 @@ pub fn join_com_prazo(_: &Ctx) -> Outcome {
     }
     Ok(())
 }
+
+/// `Mutex::lock_timeout` (T-431, ADR 0048): estoura com a trava presa,
+/// pega a trava solta dentro do prazo e com prazo zero.
+pub fn mutex_lock_timeout(_: &Ctx) -> Outcome {
+    let m = Arc::new(Mutex::new(0u32));
+    let g = m.lock();
+    // Presa por esta thread: a outra estoura, no prazo.
+    let m2 = Arc::clone(&m);
+    let h = thread::spawn(move || {
+        let t0 = Instant::now();
+        let r = m2.lock_timeout(20 * MS).is_some();
+        (r, t0.elapsed())
+    });
+    let Ok((got, took)) = h.join() else {
+        return Err("a thread do lock_timeout morreu");
+    };
+    if got {
+        return Err("lock_timeout(20 ms) com a trava presa devia estourar");
+    }
+    if took < 20 * MS || took > 20 * MS + SLACK {
+        return Err("lock_timeout(20 ms) fora da faixa");
+    }
+    // Solta durante a espera: a outra thread pega a trava, bem antes do prazo.
+    let m3 = Arc::clone(&m);
+    let h = thread::spawn(move || {
+        let t0 = Instant::now();
+        let r = m3.lock_timeout(Duration::from_secs(20)).is_some();
+        (r, t0.elapsed())
+    });
+    sleep(30 * MS);
+    drop(g);
+    let Ok((got, took)) = h.join() else {
+        return Err("a thread do lock_timeout largo morreu");
+    };
+    if !got || took > Duration::from_secs(15) {
+        return Err("lock_timeout largo devia pegar a trava solta");
+    }
+    // Livre: pega com prazo zero; presa: prazo zero devolve None.
+    let Some(g) = m.lock_timeout(Duration::ZERO) else {
+        return Err("trava livre devia ser tomada com prazo zero");
+    };
+    if m.lock_timeout(Duration::ZERO).is_some() {
+        return Err("trava presa com prazo zero devia devolver None");
+    }
+    drop(g);
+    if m.try_lock().is_none() {
+        return Err("a trava devia estar livre no fim");
+    }
+    Ok(())
+}

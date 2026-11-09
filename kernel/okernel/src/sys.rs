@@ -634,12 +634,18 @@ fn invoke_sync(
             Ok([0; 3])
         }
         Syscall::FutexWait => {
+            // `a[2]`: prazo absoluto em ns do `clock_get`, 0 = sem prazo;
+            // `a[3]`: flags, reservadas (ADR 0048).
+            if a[3] != 0 {
+                return Err(Error::InvalidArgument);
+            }
             let me = env.current().ok_or(Error::NotSupported)?;
             let key = futex_key(&me, a[0])?;
             let expected = u32::try_from(a[1]).map_err(|_| Error::InvalidArgument)?;
             FUTEXES.wait(key, &me, expected, || env.read_u32(a[0]))?;
-            env.block();
-            Ok([0; 3])
+            env.block_until(a[2]);
+            // `TimedOut` do prazo (ou `Cancelled`): escrito no slot por quem a tirou da fila.
+            crate::ipc::ops::finish(&me).map(|_| [0; 3])
         }
         Syscall::FutexWake => {
             let me = env.current().ok_or(Error::NotSupported)?;

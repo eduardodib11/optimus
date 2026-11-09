@@ -543,15 +543,11 @@ impl Drop for Reply {
 
 /// Interrompe a espera de IPC de `t` com `why` (prazo vencido): tira-a da
 /// fila ou do `Reply` e solta a mensagem de saída. Falso se `t` não estava
-/// bloqueada por IPC (já foi atendida, ou espera numa notificação ou num
-/// futex); quem chama a acorda se verdadeiro.
+/// bloqueada por IPC ou futex (já foi atendida, ou espera numa notificação); quem chama a acorda se verdadeiro.
 pub fn cancel(t: &Arc<Thread>, why: Error) -> bool {
     let (blocked, out) = {
         let mut slot = t.ipc().lock();
-        if matches!(
-            slot.blocked,
-            Blocked::None | Blocked::Notify(_) | Blocked::Futex(_)
-        ) {
+        if matches!(slot.blocked, Blocked::None | Blocked::Notify(_)) {
             return false;
         }
         slot.result = Err(why);

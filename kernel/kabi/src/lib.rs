@@ -132,7 +132,7 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     IrqAck = 26 => "`irq_ack`.",
     ClockGet = 27 => "`clock_get`.",
     Yield = 28 => "`yield`.",
-    FutexWait = 29 => "`futex_wait`.",
+    FutexWait = 29 => "`futex_wait(addr, esperado, prazo_ns, flags)`: `prazo_ns` absoluto no `clock_get`, 0 = sem prazo; `flags` deve ser 0 (ADR 0048); vencido, `TimedOut`.",
     FutexWake = 30 => "`futex_wake`.",
     DmaMap = 31 => "`dma_map` / `dma_unmap`, escolhidos por flag.",
     SysInfo = 32 => "`sys_info(classe, arg)`: CPUs, morte (classe 2, handle em `rsi`) e entropia.",
