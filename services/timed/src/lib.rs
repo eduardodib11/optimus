@@ -18,6 +18,8 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod zone;
+
 /// Taxa máxima de ajuste, em ppm.
 pub const MAX_PPM: i64 = 500;
 /// Incerteza inicial: a resolução do RTC.
