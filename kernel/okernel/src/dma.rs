@@ -24,6 +24,8 @@ use crate::mm::PhysAddr;
 use crate::sync::{LockClass, SpinLock};
 use crate::vm::MemoryObject;
 
+pub mod vtd;
+
 /// Primeiro endereço fora da faixa de IOVA aceita (39 bits: as tabelas de
 /// três níveis que toda IOMMU suportada aceita).
 pub const IOVA_END: u64 = 1 << 39;
