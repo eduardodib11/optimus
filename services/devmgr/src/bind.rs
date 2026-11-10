@@ -214,7 +214,7 @@ fn build(
         let count = usize::from(x.entries).min(MAX_VECTORS);
         let mut vectors = Vec::with_capacity(count);
         for _ in 0..count {
-            let m = ostd::dev::msi(device)?;
+            let m = ostd::dev::msi(device, bdf)?;
             originals.push(m.irq);
             vectors.push(m);
         }
@@ -224,7 +224,7 @@ fn build(
         }
         command |= INTX_DISABLE;
     } else if let Some(at) = caps.msi.filter(|_| res.msi) {
-        let m = ostd::dev::msi(device)?;
+        let m = ostd::dev::msi(device, bdf)?;
         originals.push(m.irq);
         program_msi(&mut f, at, m.address, m.data);
         give.push((m.irq, name_hash("irq0")));

@@ -15,12 +15,15 @@ struct Seen {
     iotlb: Vec<(usize, u64)>,
     tables: HashMap<u64, Box<Table>>,
     next: u64,
+    /// Descritores executados da fila: unidade, `u64` baixo e alto.
+    queued: Vec<(usize, u64, u64)>,
 }
 
 #[derive(Clone)]
 struct Fake(Arc<Mutex<Seen>>);
 
 const IOTLB_REG: usize = 0xf8;
+const IQH: usize = 0x80;
 const FAULTS: usize = 0x220;
 /// ND = 2 (256 domínios), SAGAW de 3 níveis, faltas em 0x220, 4 delas.
 const CAP_3: u64 = 2 | 2 << 8 | 0x22 << 24 | 3 << 40;
@@ -29,14 +32,36 @@ const ECAP_C: u64 = 1 | 0x0f << 8;
 
 impl Fake {
     fn new(caps: &[u64]) -> Self {
+        Self::with_ecap(caps, ECAP_C)
+    }
+
+    fn with_ecap(caps: &[u64], ecap: u64) -> Self {
         let mut seen = Seen {
             next: 0x10_0000,
             ..Seen::default()
         };
         for &cap in caps {
-            seen.regs.push(HashMap::from([(CAP, cap), (ECAP, ECAP_C)]));
+            seen.regs.push(HashMap::from([(CAP, cap), (ECAP, ecap)]));
         }
         Self(Arc::new(Mutex::new(seen)))
+    }
+
+    /// Executa a fila da unidade `u` até `tail`: o descritor de espera
+    /// escreve o dado no endereço de estado.
+    fn run_queue(seen: &mut Seen, u: usize, tail: u64) {
+        let base = seen.regs[u][&ir::IQA] & ADDR;
+        let mut head = seen.regs[u].get(&IQH).copied().unwrap_or(0);
+        while head != tail {
+            let i = (head / 8) as usize;
+            let (lo, hi) = (seen.tables[&base][i], seen.tables[&base][i + 1]);
+            if lo & 0xf == 5 {
+                seen.tables.get_mut(&(hi & ADDR)).unwrap()[0] = lo >> 32;
+            } else {
+                seen.queued.push((u, lo, hi));
+            }
+            head = (head + 16) % 4096;
+        }
+        seen.regs[u].insert(IQH, head);
     }
 
     fn reg(&self, unit: usize, off: usize) -> u64 {
@@ -90,9 +115,10 @@ impl Hw for Fake {
         let mut seen = self.0.lock().unwrap();
         let regs = &mut seen.regs[unit];
         if off == GCMD {
-            // TE espelha; SRTP acende RTPS; WBF termina na hora.
-            let sts = u64::from(value & (TE | SRTP));
-            regs.insert(GSTS, sts);
+            // TE, QIE e IRE espelham; SRTP e SIRTP acendem o status; WBF
+            // termina na hora.
+            let mirrored = TE | SRTP | ir::QIE | ir::IRE | ir::SIRTP;
+            regs.insert(GSTS, u64::from(value & mirrored));
         } else {
             regs.insert(off, value.into());
         }
@@ -102,6 +128,14 @@ impl Hw for Fake {
         let mut seen = self.0.lock().unwrap();
         if off == IOTLB_REG {
             seen.iotlb.push((unit, value));
+        }
+        let queue_on = seen.regs[unit]
+            .get(&GSTS)
+            .is_some_and(|s| *s as u32 & ir::QIE != 0);
+        if off == ir::IQT && queue_on {
+            seen.regs[unit].insert(off, value);
+            Self::run_queue(&mut seen, unit, value);
+            return;
         }
         // Invalidações terminam na hora; o F das faltas é RW1C.
         let stored = match off {
@@ -253,4 +287,41 @@ fn recusas() {
     let mut deny = || Err(Error::QuotaExceeded);
     assert_eq!(vtd.create(&mut deny), Err(Error::QuotaExceeded));
     assert_eq!(fake.live(), live);
+}
+
+#[test]
+fn remapeamento_de_interrupcoes_pela_fila() {
+    let fake = Fake::with_ecap(&[CAP_3], ECAP_C | ir::ECAP_QI | ir::ECAP_IR);
+    let vtd = VtD::new(Box::new(fake.clone()), dmar_with(&[(1, vec![])])).unwrap();
+    assert!(vtd.remapping());
+    let sts = fake.reg(0, GSTS) as u32;
+    assert_eq!(sts & (TE | ir::QIE | ir::IRE), TE | ir::QIE | ir::IRE);
+    let irt = fake.reg(0, ir::IRTA) & ADDR;
+    assert_eq!(fake.reg(0, ir::IRTA) & 0xf, 7, "256 entradas");
+    {
+        let seen = fake.0.lock().unwrap();
+        // Com a fila ligada, nada passa pelos registradores de IOTLB.
+        assert!(seen.iotlb.is_empty());
+        let kinds: Vec<u64> = seen.queued.iter().map(|q| q.1).collect();
+        assert_eq!(kinds, [1 | 1 << 4, 2 | 1 << 4 | 3 << 6, 4]);
+    }
+    // MSI do vetor 0x41 ao APIC 2, só do 00:03.0.
+    let address = vtd.remap(0x41, 2, Some(0x18)).unwrap();
+    assert_eq!(address, 0xfee0_0000 | 0x41 << 5 | 1 << 4);
+    let (lo, hi) = (fake.entry(irt, 0x82), fake.entry(irt, 0x83));
+    assert_eq!(lo, 1 | 0x41 << 16 | 2 << 40);
+    assert_eq!(hi, 0x18 | 1 << 18);
+    let last = *fake.0.lock().unwrap().queued.last().unwrap();
+    assert_eq!(last, (0, 4 | 1 << 4 | 0x41 << 32, 0));
+    // O IOTLB de um domínio também vai pela fila.
+    let id = vtd.create(&mut no_quota()).unwrap();
+    vtd.map(id, 0x1000, PhysAddr(0x5000), true, &mut no_quota())
+        .unwrap();
+    vtd.unmap(id, 0x1000, 1);
+    let last = *fake.0.lock().unwrap().queued.last().unwrap();
+    assert_eq!(last, (0, 2 | 2 << 4 | 3 << 6 | u64::from(id) << 16, 0));
+    // Sem fila ou sem IR, nada de remapeamento.
+    let (_, plain) = one_unit(CAP_3);
+    assert!(!plain.remapping());
+    assert_eq!(plain.remap(0x41, 2, None), None);
 }

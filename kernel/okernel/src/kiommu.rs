@@ -132,6 +132,9 @@ pub fn init() {
         okernel::dma::install(vtd);
         let (units, levels) = vtd.shape();
         info!("okernel: VT-d ligado: {units} unidade(s), tabelas de {levels} níveis");
+        if vtd.remapping() {
+            info!("okernel: remapeamento de interrupções ligado");
+        }
         // Faltas por interrupção, entregues ao BSP. Sem remapeamento de
         // interrupção o destino tem 8 bits.
         if let Some(dest) = crate::ksmp::apic_id(0).and_then(|d| u8::try_from(d).ok()) {
@@ -163,6 +166,24 @@ pub fn kind() -> Option<&'static str> {
         Unit::Vtd(_) => "VT-d",
         Unit::Amd(_) => "AMD-Vi",
     })
+}
+
+/// Entrada de remapeamento do vetor `vector` de MSI (ADR 0044, item 6):
+/// o endereço remapeável que `source` escreve (dado 0). `None` sem
+/// remapeamento (AMD-Vi ainda não remapeia).
+pub fn remap_msi(vector: u8, dest: u8, source: Option<u16>) -> Option<u64> {
+    // A trava de `UNIT` sai antes: a IRT fica sob a trava do backend.
+    let unit = (*UNIT.lock())?;
+    match unit {
+        Unit::Vtd(v) => v.remap(vector, dest, source),
+        Unit::Amd(_) => None,
+    }
+}
+
+/// O remapeamento de interrupções está ligado.
+pub fn remap_msi_on() -> bool {
+    let unit = *UNIT.lock();
+    matches!(unit, Some(Unit::Vtd(v)) if v.remapping())
 }
 
 /// Tratador da interrupção de falta: registra as faltas no log.

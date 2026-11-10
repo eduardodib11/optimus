@@ -53,14 +53,19 @@ const LAST_VECTOR: u8 = 0xef;
 
 /// `Interrupt` de MSI ou MSI-X (T-404): o primeiro vetor livre, entregue
 /// ao BSP em modo fixo, por borda. Devolve o objeto e o endereço e o dado
-/// que o dispositivo escreve.
+/// que o dispositivo escreve: com remapeamento de interrupções, a entrada
+/// da IRT do vetor, presa a `source` (ADR 0044, item 6).
 ///
 /// # Errors
 ///
 /// [`Error::Busy`] sem vetor livre; [`Error::QuotaExceeded`] sem cota.
-pub fn create_msi(quota: &Arc<MemoryQuota>) -> Result<(Arc<Interrupt>, u64, u64), Error> {
+pub fn create_msi(
+    quota: &Arc<MemoryQuota>,
+    source: Option<u16>,
+) -> Result<(Arc<Interrupt>, u64, u64), Error> {
     let dest = crate::ksmp::apic_id(0).unwrap_or(0);
-    // Sem remapeamento de interrupção, o endereço só leva 8 bits de destino.
+    // O endereço de compatibilidade só leva 8 bits de destino (e a IRT do
+    // VT-d em modo xAPIC também).
     let dest = u8::try_from(dest).map_err(|_| Error::NotSupported)?;
     for vector in FIRST_VECTOR..=LAST_VECTOR {
         if vector == TIMER_VECTOR {
@@ -68,8 +73,11 @@ pub fn create_msi(quota: &Arc<MemoryQuota>) -> Result<(Arc<Interrupt>, u64, u64)
         }
         match create(quota, vector) {
             Ok(irq) => {
-                let address = 0xfee0_0000 | u64::from(dest) << 12;
-                return Ok((irq, address, u64::from(vector)));
+                let msi = crate::kiommu::remap_msi(vector, dest, source).map_or(
+                    (0xfee0_0000 | u64::from(dest) << 12, u64::from(vector)),
+                    |address| (address, 0),
+                );
+                return Ok((irq, msi.0, msi.1));
             }
             Err(Error::Busy) => {}
             Err(e) => return Err(e),

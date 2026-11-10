@@ -58,14 +58,19 @@ pub trait Platform: Sync {
     fn device_range_ok(&self, base: u64, len: u64) -> bool;
     /// `Interrupt` de MSI ou MSI-X (T-404): um vetor livre, cobrado de
     /// `quota`, e o endereço e o dado que o dispositivo escreve para
-    /// dispará-lo.
+    /// dispará-lo. Com remapeamento de interrupções, só `source` (o BDF)
+    /// consegue (ADR 0044, item 6).
     ///
     /// # Errors
     ///
     /// [`Error::Busy`] sem vetor livre; [`Error::QuotaExceeded`] sem cota;
     /// [`Error::NotSupported`] onde não há MSI.
-    fn msi(&self, quota: &Arc<MemoryQuota>) -> Result<(Arc<Interrupt>, u64, u64), Error> {
-        let _ = quota;
+    fn msi(
+        &self,
+        quota: &Arc<MemoryQuota>,
+        source: Option<u16>,
+    ) -> Result<(Arc<Interrupt>, u64, u64), Error> {
+        let _ = (quota, source);
         Err(Error::NotSupported)
     }
 }

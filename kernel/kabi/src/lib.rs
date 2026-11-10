@@ -117,7 +117,7 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     CapDelete = 2 => "`cap_delete(handle, flags)`; com [`cap_delete::DESTROY`] também destrói o objeto (ADR 0035).",
     CapRevoke = 3 => "`cap_revoke`: apaga todos os descendentes.",
     CapInfo = 4 => "`cap_info`.",
-    ObjCreate = 5 => "`obj_create(quota, tipo, args)`; `IoPortRange` recebe base e quantidade de portas ([`io`]; ADR 0049); `Interrupt` com a cota de dispositivo devolve `[handle, endereço MSI, dado MSI]` (T-404).",
+    ObjCreate = 5 => "`obj_create(quota, tipo, args)`; `IoPortRange` recebe base e quantidade de portas ([`io`]; ADR 0049); `Interrupt` com a cota de dispositivo devolve `[handle, endereço MSI, dado MSI]`, e o quinto argumento é a fonte de [`irq`] (T-404).",
     VmMap = 6 => "`vm_map`; `aspace = 0` é o espaço de quem chama (ADR 0039).",
     VmUnmap = 7 => "`vm_unmap`; `aspace = 0` é o espaço de quem chama (ADR 0039).",
     VmProtect = 8 => "`vm_protect`.",
@@ -287,6 +287,15 @@ pub mod mem {
 pub mod io {
     /// Faixas ligadas a uma thread ao mesmo tempo.
     pub const MAX_RANGES: usize = 4;
+}
+
+/// `obj_create(cota de dispositivo, Interrupt, 0, 0, fonte)` (T-404): o
+/// quinto argumento diz que dispositivo dispara o vetor.
+pub mod irq {
+    /// Com este bit, os 16 bits baixos de `fonte` são o BDF da função, e o
+    /// remapeamento de interrupções (quando ligado) só aceita a MSI dela
+    /// (ADR 0044, item 6). Sem o bit, `fonte` tem de ser 0.
+    pub const SOURCE: u64 = 1 << 16;
 }
 
 /// `dma_map(domínio, objeto, iova, offset, len, flags)` (syscall 31; ADR

@@ -134,6 +134,7 @@ impl Platform for Leaked {
     fn msi(
         &self,
         quota: &Arc<crate::cap::MemoryQuota>,
+        _: Option<u16>,
     ) -> Result<(Arc<crate::notify::Interrupt>, u64, u64), Error> {
         // Vetor fixo: os testes de host não têm tabela de vetores.
         let irq = crate::notify::Interrupt::new(quota, 0x41)?;
