@@ -207,6 +207,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "olegacy"
+version = "0.1.0"
+
+[[package]]
 name = "ologd"
 version = "0.1.0"
 
