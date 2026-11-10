@@ -74,6 +74,9 @@ pub struct PerCpu {
     panic_dump: [AtomicU64; 6],
     gdt: UnsafeCell<Gdt>,
     tss: UnsafeCell<Tss>,
+    /// Faixas de E/S abertas no mapa da TSS (como `Thread::io_ranges`),
+    /// só tocadas por esta CPU em [`PerCpu::set_io`].
+    io_open: UnsafeCell<[u32; kabi::io::MAX_RANGES]>,
     /// Cache de frames de 4 KiB (T-328): só esta CPU o toca, por
     /// [`with_frame_cache`].
     frames: UnsafeCell<FrameCache>,
@@ -102,8 +105,8 @@ const _: () = assert!(offset_of!(PerCpu, cpu_id) == 24);
 const _: () = assert!(offset_of!(PerCpu, apic_id) == 28);
 
 // SAFETY: os campos compartilháveis são atômicos; GDT e TSS (as células)
-// só são tocadas pela própria CPU, com interrupções desligadas (`load` e
-// `set_kernel_stack`), e a CPU as lê pelo hardware; os caches de frames e
+// só são tocadas pela própria CPU, com interrupções desligadas (`load`,
+// `set_kernel_stack` e `set_io`, que também é a única a tocar `io_open`), e a CPU as lê pelo hardware; os caches de frames e
 // de objetos e o DRBG, só pela própria CPU em `with_frame_cache`,
 // `with_object_cache` e `with_drbg` (e o DRBG por `set_drbg`, com `&mut`,
 // antes de a área ser publicada).
@@ -143,6 +146,7 @@ impl PerCpu {
             panic_dump: [const { AtomicU64::new(0) }; 6],
             gdt: UnsafeCell::new(gdt::GDT_TEMPLATE),
             tss: UnsafeCell::new(Tss::new()),
+            io_open: UnsafeCell::new([0; kabi::io::MAX_RANGES]),
             frames: UnsafeCell::new(FrameCache::new()),
             frames_cached: AtomicU32::new(0),
             frames_busy: AtomicBool::new(false),
@@ -266,6 +270,37 @@ impl PerCpu {
         self.kernel_rsp.store(top, Ordering::Relaxed);
         // SAFETY: contrato acima.
         unsafe { gdt::set_kernel_stack(self.tss.get(), top) };
+    }
+
+    /// Deixa abertas no mapa de E/S só as faixas `ranges` (as da thread
+    /// que vai rodar; ADR 0049, item 3). Sem mudança, não toca o mapa.
+    ///
+    /// # Safety
+    ///
+    /// Na CPU dona, com interrupções desligadas, depois de
+    /// [`install`](Self::install).
+    pub unsafe fn set_io(&self, ranges: [u32; kabi::io::MAX_RANGES]) {
+        // SAFETY: contrato acima: só esta CPU toca `io_open` e a TSS, e
+        // nada mais as empresta agora.
+        unsafe {
+            let open = &mut *self.io_open.get();
+            if *open == ranges {
+                return;
+            }
+            for (r, allow) in open
+                .iter()
+                .map(|&r| (r, false))
+                .chain(ranges.map(|r| (r, true)))
+            {
+                if r != 0 {
+                    let [b1, b0, c1, c0] = r.to_be_bytes();
+                    let (base, count) =
+                        (u16::from_be_bytes([b1, b0]), u16::from_be_bytes([c1, c0]));
+                    gdt::io_allow(self.tss.get(), base, count, allow);
+                }
+            }
+            *open = ranges;
+        }
     }
 }
 

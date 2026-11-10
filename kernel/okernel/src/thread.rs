@@ -24,6 +24,7 @@ use kabi::{Error, Handle};
 
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota, SharedCapSpace};
+use crate::ioport::IoPortRange;
 use crate::ipc::IpcSlot;
 use crate::notify::Notification;
 use crate::platform::{KERNEL_STACK_BYTES, KernelStack, Platform};
@@ -171,6 +172,12 @@ pub struct Thread {
     /// `FS_BASE` do usuário (T-333; ADR 0039, item 3): a troca de contexto
     /// o põe na CPU ao entrar a thread.
     fs_base: AtomicU64,
+    /// Faixas de portas de E/S ligadas (ADR 0049, item 2), como
+    /// [`IoPortRange::packed`] (0: vaga): a troca de contexto as lê sem
+    /// trava.
+    io: [AtomicU32; kabi::io::MAX_RANGES],
+    /// Os objetos das faixas, vivos enquanto ligados.
+    io_hold: SpinLock<[Option<Arc<IoPortRange>>; kabi::io::MAX_RANGES]>,
     /// Registro de morte (ADR 0035, item 2): causa (`kabi::exit::CAUSE_*`;
     /// zero: viva), código e auxiliar. A causa é gravada por último.
     death_cause: AtomicU8,
@@ -228,6 +235,11 @@ impl Thread {
             ipc_buffer: AtomicU64::new(0),
             exception: AtomicU32::new(0),
             fs_base: AtomicU64::new(0),
+            io: [const { AtomicU32::new(0) }; kabi::io::MAX_RANGES],
+            io_hold: SpinLock::with_class(
+                LockClass::Object,
+                [const { None }; kabi::io::MAX_RANGES],
+            ),
             death_cause: AtomicU8::new(0),
             death: [const { AtomicU64::new(0) }; 2],
             kill: AtomicBool::new(false),
@@ -518,6 +530,36 @@ impl Thread {
     #[inline]
     pub fn tls(&self) -> u64 {
         self.fs_base.load(Ordering::Acquire)
+    }
+
+    /// Liga a faixa `range` (ADR 0049, item 2). A CPU a recebe na próxima
+    /// vez que a thread entrar nela (ou já, pela própria thread).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] com todas as vagas ocupadas.
+    pub fn add_io(&self, range: Arc<IoPortRange>) -> Result<(), Error> {
+        let mut hold = self.io_hold.lock();
+        let slot = hold.iter().position(Option::is_none).ok_or(Error::Busy)?;
+        self.io[slot].store(range.packed(), Ordering::Release);
+        hold[slot] = Some(range);
+        Ok(())
+    }
+
+    /// Tira todas as faixas de portas.
+    pub fn clear_io(&self) {
+        let mut hold = self.io_hold.lock();
+        for (slot, held) in self.io.iter().zip(hold.iter_mut()) {
+            slot.store(0, Ordering::Release);
+            *held = None;
+        }
+    }
+
+    /// As faixas ligadas, como [`IoPortRange::packed`] (0: vaga).
+    #[must_use]
+    #[inline]
+    pub fn io_ranges(&self) -> [u32; kabi::io::MAX_RANGES] {
+        core::array::from_fn(|i| self.io[i].load(Ordering::Acquire))
     }
 
     /// Grava o registro de morte (ADR 0035, item 2): `cause` é uma de

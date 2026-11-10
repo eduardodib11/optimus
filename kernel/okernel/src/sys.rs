@@ -88,6 +88,9 @@ pub trait Env {
     /// Põe `va` no `FS_BASE` desta CPU: `thread_configure` mudou o TLS da
     /// própria thread, que o vê ao voltar da syscall (ADR 0039, item 3).
     fn load_tls(&mut self, _va: u64) {}
+    /// Põe na CPU as faixas de portas da thread atual (ADR 0049, item 3),
+    /// como [`Thread::io_ranges`] as dá.
+    fn load_io(&mut self, _ranges: [u32; kabi::io::MAX_RANGES]) {}
     /// `t` teve o encerramento pedido (ADR 0035, item 4): se ela roda
     /// noutra CPU, essa CPU recebe a IPI de reescalonar e a traz ao kernel,
     /// onde ela morre. Volta sem esperar.
@@ -189,7 +192,12 @@ pub fn invoke(
         }
         Syscall::ObjCreate => {
             let ty = ObjectType::try_from(a[1]).map_err(|_| Error::InvalidArgument)?;
-            let h = if ty == ObjectType::MemoryObject && a[3] == kabi::mem::DEVICE {
+            let h = if ty == ObjectType::IoPortRange {
+                if a[4..] != [0, 0] {
+                    return Err(Error::InvalidArgument);
+                }
+                space.lock().obj_create_io(handle(a[0])?, a[2], a[3])?
+            } else if ty == ObjectType::MemoryObject && a[3] == kabi::mem::DEVICE {
                 space.lock().obj_create_device(handle(a[0])?, a[4], a[2])?
             } else {
                 space
@@ -551,14 +559,15 @@ fn mint(space: &Arc<SharedCapSpace>, a: [u64; 6]) -> Result<Values, Error> {
 /// `CapSpace` nem `AddressSpace`.
 fn thread_configure(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result<(), Error> {
     use kabi::thread::{
-        CONFIGURE_ALL, CONFIGURE_BIND_SELF, CONFIGURE_EXCEPTION, CONFIGURE_IPC_BUFFER,
-        CONFIGURE_TLS,
+        CONFIGURE_ALL, CONFIGURE_BIND_SELF, CONFIGURE_EXCEPTION, CONFIGURE_IO_PORTS,
+        CONFIGURE_IPC_BUFFER, CONFIGURE_TLS,
     };
     let flags = a[5];
     let buffer = flags & CONFIGURE_IPC_BUFFER != 0;
     let tls = flags & CONFIGURE_TLS != 0;
-    // As duas usam `r10`.
-    if flags & !CONFIGURE_ALL != 0 || (buffer && tls) {
+    let io = flags & CONFIGURE_IO_PORTS != 0;
+    // As duas primeiras usam `r10`; as duas últimas, `r8`.
+    if flags & !CONFIGURE_ALL != 0 || (buffer && tls) || (io && flags & CONFIGURE_EXCEPTION != 0) {
         return Err(Error::InvalidArgument);
     }
     let me = env.current();
@@ -605,6 +614,14 @@ fn thread_configure(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> R
     } else {
         None
     };
+    // A faixa vem da tabela de quem chama e exige os dois direitos: o mapa
+    // de E/S não separa leitura de escrita (ADR 0049, item 2).
+    let range = if io && a[4] != 0 {
+        let cap = cap_with(space, a[4], Rights::READ | Rights::WRITE)?;
+        Some(Arc::clone(cap.object.as_io_port_range()?))
+    } else {
+        None
+    };
     if let Some((cspace, aspace)) = bind {
         t.configure(cspace, aspace)?;
     }
@@ -614,10 +631,20 @@ fn thread_configure(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> R
     if let Some(h) = exception {
         t.set_exception_handler(h);
     }
+    let is_me = me.is_some_and(|m| Arc::ptr_eq(&m, &t));
     if tls {
         t.set_tls(a[3])?;
-        if me.is_some_and(|m| Arc::ptr_eq(&m, &t)) {
+        if is_me {
             env.load_tls(a[3]);
+        }
+    }
+    if io {
+        match range {
+            Some(r) => t.add_io(r)?,
+            None => t.clear_io(),
+        }
+        if is_me {
+            env.load_io(t.io_ranges());
         }
     }
     Ok(())

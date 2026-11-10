@@ -29,6 +29,7 @@ pub mod cap;
 pub mod collections;
 pub mod ipc;
 pub mod mem;
+pub mod port;
 pub mod process;
 pub mod rand;
 pub mod ring;

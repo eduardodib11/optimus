@@ -55,10 +55,18 @@ pub struct Tss {
     reserved2: u64,
     reserved3: u16,
     iomap_base: u16,
+    /// Mapa de permissões de E/S (ADR 0049, item 3): um bit por porta, 1
+    /// nega. [`load`] o enche de 1 e [`io_allow`] abre as faixas da thread.
+    io_map: [u8; IO_MAP_BYTES],
+    /// Byte final do mapa, todo 1 (Intel SDM vol. 1, 19.5.2).
+    io_end: u8,
 }
 
+/// Bytes do mapa de E/S: 65536 portas.
+const IO_MAP_BYTES: usize = 8192;
+
 impl Tss {
-    /// TSS vazia, sem mapa de permissões de E/S.
+    /// TSS vazia; o mapa de E/S nega tudo depois de [`load`].
     pub const fn new() -> Self {
         Self {
             reserved0: 0,
@@ -67,8 +75,9 @@ impl Tss {
             ist: [0; 7],
             reserved2: 0,
             reserved3: 0,
-            // Sem mapa de permissões de E/S: base além do limite do segmento.
-            iomap_base: size_of::<Self>() as u16,
+            iomap_base: core::mem::offset_of!(Self, io_map) as u16,
+            io_map: [0; IO_MAP_BYTES],
+            io_end: 0,
         }
     }
 }
@@ -134,6 +143,9 @@ pub unsafe fn load(gdt: *mut Gdt, tss: *mut Tss, ist_tops: [u64; 3]) {
                 .add(usize::from(slot - 1))
                 .write_unaligned(top);
         }
+        // Tudo negado (a área pode ter vindo zerada do buddy).
+        let map = &raw mut (*tss).io_map;
+        map.cast::<u8>().write_bytes(0xff, IO_MAP_BYTES + 1);
         gdt.write(GDT_TEMPLATE);
         let [low, high] = tss_descriptor(tss.addr() as u64);
         (*gdt)[6] = low;
@@ -163,6 +175,27 @@ pub unsafe fn load(gdt: *mut Gdt, tss: *mut Tss, ist_tops: [u64; 3]) {
             tss = in(reg) TSS_SELECTOR,
             tmp = out(reg) _,
         );
+    }
+}
+
+/// Abre (`allow`) ou fecha as portas `base..base + count` no mapa de E/S
+/// de `tss` (ADR 0049, item 3).
+///
+/// # Safety
+///
+/// Só com interrupções desligadas, na CPU dona de `tss`, depois de [`load`].
+pub unsafe fn io_allow(tss: *mut Tss, base: u16, count: u16, allow: bool) {
+    let end = (usize::from(base) + usize::from(count)).min(IO_MAP_BYTES * 8);
+    // SAFETY: contrato acima; os índices ficam dentro do mapa (`end` é
+    // limitado), e bytes não têm alinhamento.
+    unsafe {
+        let map = (&raw mut (*tss).io_map).cast::<u8>();
+        for port in usize::from(base)..end {
+            let byte = map.add(port / 8);
+            let bit = 1u8 << (port % 8);
+            let old = byte.read();
+            byte.write(if allow { old & !bit } else { old | bit });
+        }
     }
 }
 

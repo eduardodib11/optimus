@@ -505,6 +505,29 @@ impl CapSpace {
     }
 }
 
+impl CapSpace {
+    /// `obj_create(quota, IoPortRange, base, count)` (ADR 0049, item 1):
+    /// só com a cota de dispositivo; nasce com `READ | WRITE`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AccessDenied`] sem `CREATE` ou com cota comum; os de
+    /// [`IoPortRange::new`](crate::ioport::IoPortRange::new).
+    pub fn obj_create_io(&mut self, quota: Handle, base: u64, count: u64) -> Result<Handle, Error> {
+        let cap = self.get(quota)?;
+        let q = Arc::clone(cap.object.as_quota()?);
+        if !cap.rights.contains(Rights::CREATE) || !q.is_device() {
+            return Err(Error::AccessDenied);
+        }
+        let range = crate::ioport::IoPortRange::new(&q, base, count)?;
+        self.insert(Cap {
+            object: super::Object::IoPortRange(Arc::new(range)),
+            rights: default_rights(ObjectType::IoPortRange),
+            badge: 0,
+        })
+    }
+}
+
 #[cfg(kani)]
 mod proofs;
 #[cfg(test)]

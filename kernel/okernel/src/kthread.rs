@@ -1043,6 +1043,8 @@ struct Incoming {
     root: Option<u64>,
     /// `FS_BASE` dela (ADR 0039, item 3); o ocioso não usa FS.
     fs_base: Option<u64>,
+    /// Faixas de portas dela (ADR 0049); o ocioso não tem.
+    io: [u32; kabi::io::MAX_RANGES],
     /// Ponteiro dela, para `current` e o dump do pânico (0 é o ocioso).
     thread: u64,
 }
@@ -1056,6 +1058,7 @@ impl Incoming {
                 stack_top: None,
                 root: None,
                 fs_base: None,
+                io: [0; kabi::io::MAX_RANGES],
                 thread: 0,
             },
             |t| Self {
@@ -1064,6 +1067,7 @@ impl Incoming {
                 stack_top: Some(t.stack().top),
                 root: t.root(),
                 fs_base: Some(t.tls()),
+                io: t.io_ranges(),
                 thread: Arc::as_ptr(t).expose_provenance() as u64,
             },
         )
@@ -1102,6 +1106,8 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
         if let Some(top) = incoming.stack_top {
             syscall::set_kernel_stack(top);
         }
+        // O mapa de E/S da CPU passa a ser o dela (ADR 0049, item 3).
+        percpu::with(|p| p.set_io(incoming.io));
     }
     let root = incoming.root.or_else(|| kmem::kernel_root().map(|r| r.0));
     // Para o dump do pânico (ADR 0031, item 8) e para `current`: quem roda
@@ -1449,6 +1455,12 @@ impl sys::Env for KernelEnv {
 
     fn load_tls(&mut self, va: u64) {
         cpu::load_user_fs_base(va);
+    }
+
+    fn load_io(&mut self, ranges: [u32; kabi::io::MAX_RANGES]) {
+        // SAFETY: a syscall roda com interrupções desligadas, na CPU da
+        // thread atual, que é a dona destas faixas.
+        percpu::with(|p| unsafe { p.set_io(ranges) });
     }
 
     fn kick(&mut self, t: &Thread) {

@@ -14,6 +14,7 @@ pub mod console;
 pub mod dma;
 pub mod fault;
 pub mod futex;
+pub mod ioport;
 pub mod ipc;
 pub mod ipi;
 pub mod log;
