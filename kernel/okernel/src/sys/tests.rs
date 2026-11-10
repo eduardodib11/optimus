@@ -187,6 +187,7 @@ fn as_outras_nao_sao_suportadas_aqui() {
                 | Syscall::SchedBind
                 | Syscall::ThreadConfigure
                 | Syscall::MemOp
+                | Syscall::DmaMap
         );
         // Precisam de capability válida ou da thread atual.
         let sync = matches!(
@@ -955,6 +956,7 @@ fn debug_write_exige_debug_log_com_write() {
     assert_eq!(debug_cap(&space, 0xFFFF_FFFF), Err(Error::InvalidHandle));
 }
 
+mod dma;
 mod mem;
 
 /// `futex_wait` recusa flags diferentes de zero (ADR 0048).

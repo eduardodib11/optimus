@@ -365,6 +365,10 @@ fn device_caps(p: &Image) -> Result<(Handle, Option<Handle>), &'static str> {
             badge: 0,
         })
         .map_err(|_| "cap(cota de dispositivo)")?;
+    if okernel::dma::iommu().is_none() {
+        // ADR 0044, item 5: o driver roda, sem proteção de hardware.
+        warn!("okernel: isolamento de DMA ausente");
+    }
     let found = bootinfo::get()
         .and_then(kabi::boot::BootInfo::acpi_rsdp)
         .and_then(|rsdp| okernel::acpi::mcfg(&mut ktime::DirectRead, rsdp).ok());

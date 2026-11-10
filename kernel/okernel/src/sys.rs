@@ -248,7 +248,41 @@ pub fn invoke(
         }
         Syscall::ThreadConfigure => thread_configure(space, a, env).map(|()| [0; 3]),
         Syscall::MemOp => mem_op(space, a, env),
+        Syscall::DmaMap => dma_map(space, a),
         _ => invoke_sync(space, call, a, env),
+    }
+}
+
+/// `dma_map` (ADR 0044; T-403): mapear, desmapear, ligar ou desligar,
+/// conforme as flags de [`kabi::dma`].
+fn dma_map(space: &SharedCapSpace, a: [u64; 6]) -> Result<Values, Error> {
+    use kabi::dma::{ATTACH, DETACH, READ, UNMAP, WRITE};
+    let [domain, object, iova, offset, len, flags] = a;
+    let bind = |need| -> Result<_, Error> {
+        let cap = cap_with(space, domain, need)?;
+        Ok(Arc::clone(cap.object.as_dma_domain()?))
+    };
+    let bdf = || u16::try_from(iova).map_err(|_| Error::InvalidArgument);
+    match flags {
+        ATTACH if object == 0 && offset == 0 && len == 0 => {
+            bind(Rights::BIND)?.attach(bdf()?).map(|()| [0; 3])
+        }
+        DETACH if object == 0 && offset == 0 && len == 0 => {
+            bind(Rights::BIND)?.detach(bdf()?).map(|()| [0; 3])
+        }
+        UNMAP if object == 0 && offset == 0 => bind(Rights::MAP)?.unmap(iova, len).map(|()| [0; 3]),
+        READ | 3 => {
+            let write = flags & WRITE != 0;
+            let d = bind(Rights::MAP)?;
+            let mut need = Rights::MAP | Rights::READ;
+            if write {
+                need = need | Rights::WRITE;
+            }
+            let cap = cap_with(space, object, need)?;
+            let memory = cap.object.as_memory_object()?;
+            Ok([d.map(memory, iova, offset, len, write)?, 0, 0])
+        }
+        _ => Err(Error::InvalidArgument),
     }
 }
 
