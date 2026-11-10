@@ -4,7 +4,7 @@
 name = "drvteste"
 binary = "drvteste"
 priority = 120
-restart = "on-failure"
+restart = "never"
 
 [capabilities]
 needs = ["mem:quota:1MiB", "kernel:debug"]

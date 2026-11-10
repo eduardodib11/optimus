@@ -1,5 +1,7 @@
 # Manifesto do `devmgr` (ADR 0042, item 1; T-401): recebe os nós do `pcid`
-# e do `acpid` pelo `DeviceBus`.
+# e do `acpid` pelo `DeviceBus` e parte os drivers com os recursos do nó,
+# criados pela cota de dispositivo; a janela ECAM serve para programar o
+# MSI e ligar bus master (ADR 0043, item 4).
 [service]
 name = "devmgr"
 binary = "devmgr"
@@ -7,7 +9,12 @@ priority = 140
 restart = "on-failure"
 
 [capabilities]
-needs = ["mem:quota:3MiB", "kernel:debug"]
+needs = [
+    "mem:quota:3MiB",
+    "kernel:debug",
+    "kernel:device?",
+    "kernel:ecam?",
+]
 provides = ["optimus.dev.DeviceBus@1.0"]
 
 [limits]

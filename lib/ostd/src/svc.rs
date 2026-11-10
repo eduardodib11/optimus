@@ -183,4 +183,59 @@ impl Session {
         }
         osvc::decode_driver_info(&out[..m]).map_err(|_| Error::InvalidArgument)
     }
+
+    /// `driver_give(id, names)` (1.2): manda ao `svcmgr` até
+    /// [`osvc::MAX_MSG_CAPS`] recursos do driver `id`, cada um com o hash
+    /// do nome. O `svcmgr` recebe cópias filhas das capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel, `AccessDenied` se o `svcmgr` recusar e
+    /// `InvalidArgument` acima do teto.
+    pub fn driver_give(&mut self, id: u32, caps: &[(Handle, u32)]) -> Result<(), Error> {
+        let mut names = [0u32; osvc::MAX_MSG_CAPS];
+        let dst = names.get_mut(..caps.len()).ok_or(Error::InvalidArgument)?;
+        for (n, c) in dst.iter_mut().zip(caps) {
+            *n = c.1;
+        }
+        let mut req = [0u8; osvc::MAX_SHORT_BYTES];
+        let n = osvc::encode_driver_give(id, &names[..caps.len()], &mut req)
+            .map_err(|_| Error::InvalidArgument)?;
+        let label = osvc::label(Method::DriverGive);
+        let mut msg = ipc::monta(&mut self.buffer, label, &req[..n])?;
+        msg.info.caps = u8::try_from(caps.len()).map_err(|_| Error::InvalidArgument)?;
+        for (slot, c) in self.buffer.get().caps.iter_mut().zip(caps) {
+            *slot = c.0.raw();
+        }
+        let r = ipc::call(self.control, &msg, deadline())?;
+        if r.msg.label == osvc::REPLY_OK {
+            Ok(())
+        } else {
+            Err(Error::AccessDenied)
+        }
+    }
+
+    /// `driver_start(id)` (1.2): parte o driver `id` com os recursos dados.
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel e `AccessDenied` se o `svcmgr` recusar.
+    pub fn driver_start(&mut self, id: u32) -> Result<(), Error> {
+        let mut req = [0u8; osvc::MAX_SHORT_BYTES];
+        let n = osvc::encode_driver_start(id, &mut req).map_err(|_| Error::InvalidArgument)?;
+        let mut body = [0u8; osvc::MAX_SHORT_BYTES];
+        let (label, _) = ipc::call_corpo(
+            self.control,
+            &mut self.buffer,
+            osvc::label(Method::DriverStart),
+            &req[..n],
+            &mut body,
+            deadline(),
+        )?;
+        if label == osvc::REPLY_OK {
+            Ok(())
+        } else {
+            Err(Error::AccessDenied)
+        }
+    }
 }
