@@ -1,0 +1,64 @@
+name: Fuzzing dos parsers de dispositivo (noturno)
+
+# T-421 (backlog M4): cada alvo de libFuzzer roda 30 min por noite, sem
+# pânico (AML do acpid, varredura PCIe do opci, capabilities e fila do virtio-core). A campanha de 4 h
+# fica para o Gate 2 (`minutes` = 240). Alvos novos entram na matriz.
+# Uma falha grava o artefato em `crash-*` e sai com código diferente de zero.
+
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Duração de cada alvo, em minutos
+        required: false
+        default: "30"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dir: fuzz/acpid
+            target: aml
+          - dir: fuzz/virtio
+            target: caps
+          - dir: fuzz/virtio
+            target: queue
+          - dir: fuzz/opci
+            target: scan
+    steps:
+      - uses: actions/checkout@v5
+      - name: Nightly e cargo-fuzz (só ferramenta de fuzzing)
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - name: ${{ matrix.target }} por 30 min (ou o tempo pedido)
+        working-directory: ${{ matrix.dir }}
+        env:
+          MINUTES_IN: ${{ inputs.minutes }}
+        run: |
+          set -o pipefail
+          secs=$(( ${MINUTES_IN:-30} * 60 ))
+          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time="$secs" 2>&1 | tee fuzz.log
+      - name: Resumo da rodada
+        if: always()
+        working-directory: ${{ matrix.dir }}
+        run: |
+          {
+            echo "## Fuzz de ${{ matrix.dir }} / ${{ matrix.target }}"
+            echo
+            echo "Commit: \`$GITHUB_SHA\`"
+            echo
+            tail -n 8 fuzz.log | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: ${{ matrix.dir }}/fuzz/artifacts/
+          if-no-files-found: ignore

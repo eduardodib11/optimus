@@ -1,0 +1,14 @@
+# Manifesto do `pcid` (ADR 0043; T-402): só a janela ECAM e o log de
+# depuração. Lê o espaço de configuração e nunca liga bus master.
+[service]
+name = "pcid"
+binary = "pcid"
+priority = 140
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:1MiB", "kernel:debug", "kernel:ecam"]
+provides = []
+
+[limits]
+max_threads = 1

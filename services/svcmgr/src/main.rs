@@ -6,6 +6,9 @@
 //! - `rdx`: a `DebugLog` do `kernel:debug` e o anel do `kernel:log` (0 se o
 //!   `root` não tiver).
 //!
+//! A resposta do `root` ao anúncio traz, no buffer de IPC, a janela ECAM
+//! (`kernel:ecam`) e a cota de dispositivo (`kernel:device`) (T-402).
+//!
 //! O `svcmgr` não recebe a capability da própria thread (ADR 0034, item 2):
 //! ela fecharia o ciclo thread ↔ `CapSpace` da ADR 0029 e prenderia o
 //! processo na cota do `root` depois da saída. Para configurar a si mesmo,
@@ -109,6 +112,12 @@ fn spawn(
     }
     if boot.klog.raw() != 0 {
         pool.push(("log", boot.klog));
+    }
+    if boot.ecam.raw() != 0 {
+        pool.push(("ecam", boot.ecam));
+    }
+    if boot.device.raw() != 0 {
+        pool.push(("device", boot.device));
     }
     let desc = plan
         .broker
@@ -491,7 +500,7 @@ impl Svcmgr<'_> {
 }
 
 /// Parte todos os serviços do plano, nível a nível, supervisiona e desliga.
-fn start_all(boot: &Boot) -> Result<(), Error> {
+fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
     let map = map_bootfs(boot.bootfs)?;
     let fs = obfs::Image::parse(map.bytes()).map_err(|_| Error::InvalidArgument)?;
     let plan = plan(&fs)?;
@@ -512,7 +521,6 @@ fn start_all(boot: &Boot) -> Result<(), Error> {
     let control = ostd::cap::create(boot.quota, ObjectType::Endpoint, 0)?;
     let reply = ostd::cap::create(boot.quota, ObjectType::Reply, 0)?;
     let deaths = ostd::cap::create(boot.quota, ObjectType::Notification, 0)?;
-    let buffer = Buffer::new(boot.quota, SELF, Handle::from_raw(0), BUFFER_VA)?;
     let mut live = Vec::new();
     live.resize_with(count, || None);
     let mut s = Svcmgr {
@@ -565,6 +573,10 @@ struct Boot {
     quota: Handle,
     log: Handle,
     klog: Handle,
+    /// `kernel:ecam` e `kernel:device` (T-402), que o `root` manda na
+    /// resposta ao anúncio; 0 se não vierem.
+    ecam: Handle,
+    device: Handle,
 }
 
 fn main(start: Start) -> ! {
@@ -578,7 +590,10 @@ fn main(start: Start) -> ! {
         quota,
         log,
         klog,
+        ecam: Handle::from_raw(0),
+        device: Handle::from_raw(0),
     };
+    let mut boot = boot;
     if boot.log.raw() != 0 {
         ostd::debug::set_log(boot.log);
     }
@@ -593,13 +608,29 @@ fn main(start: Start) -> ! {
     // Prazo: se o `root` não responder, o `svcmgr` sai em vez de ficar preso
     // e segurar a cota de partida (ADR 0034, item 2).
     let deadline = ostd::time::now_ns() + CALL_WAIT_NS;
+    // O buffer vem antes do anúncio: a resposta traz as capabilities de
+    // dispositivo (T-402).
+    let mut buffer = match Buffer::new(boot.quota, SELF, Handle::from_raw(0), BUFFER_VA) {
+        Ok(b) => b,
+        Err(e) => {
+            ostd::debug::print_fmt(format_args!("svcmgr: sem buffer de IPC: {e:?}"));
+            ostd::thread::exit()
+        }
+    };
     match ipc::call(boot.root_ep, &Message::new(LABEL_OLA, &[]), deadline) {
-        Ok(r) if r.msg.label == 0 => ostd::debug::print("svcmgr: o root aceitou o anúncio"),
+        Ok(r) if r.msg.label == 0 => {
+            let caps = buffer.get().caps;
+            if r.msg.info.caps >= 2 {
+                boot.ecam = Handle::from_raw(caps[0]);
+                boot.device = Handle::from_raw(caps[1]);
+            }
+            ostd::debug::print("svcmgr: o root aceitou o anúncio");
+        }
         Ok(_) => ostd::debug::print("svcmgr: o root respondeu com erro"),
         Err(Error::AccessDenied) => ostd::debug::print("svcmgr: o root recusou o anúncio"),
         Err(_) => ostd::debug::print("svcmgr: falha ao falar com o root"),
     }
-    if let Err(e) = start_all(&boot) {
+    if let Err(e) = start_all(&boot, buffer) {
         ostd::debug::print_fmt(format_args!("svcmgr: partida falhou: {e:?}"));
     }
     ostd::thread::exit()
