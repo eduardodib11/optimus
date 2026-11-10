@@ -57,6 +57,9 @@ pub(crate) const RTADDR: usize = 0x20;
 pub(crate) const CCMD: usize = 0x28;
 const FSTS: usize = 0x34;
 const FECTL: usize = 0x38;
+const FEDATA: usize = 0x3c;
+const FEADDR: usize = 0x40;
+const FEUADDR: usize = 0x44;
 
 pub(crate) const TE: u32 = 1 << 31;
 pub(crate) const SRTP: u32 = 1 << 30;
@@ -215,7 +218,8 @@ impl VtD {
             }
             hw.write64(u, RTADDR, unit.root.0);
             command(&mut *hw, u, sts & !TE | SRTP, SRTP, SRTP);
-            // Faltas só registradas; o kernel as lê com [`VtD::faults`].
+            // Faltas registradas e mascaradas até
+            // [`VtD::enable_fault_irq`]; o kernel as lê com [`VtD::faults`].
             hw.write32(u, FECTL, 1 << 31);
             invalidate(&mut *hw, unit, GLOBAL_CTX, GLOBAL_IOTLB);
             command(&mut *hw, u, sts | TE, TE, TE);
@@ -239,6 +243,25 @@ impl VtD {
     pub fn shape(&self) -> (usize, u32) {
         let i = self.inner.lock();
         (i.units.len(), i.levels)
+    }
+
+    /// Liga a interrupção de falta de todas as unidades: cada falta
+    /// registrada manda a MSI `address`/`data`, e o kernel lê as faltas
+    /// com [`VtD::faults`] no tratador.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "o endereço vai em duas metades de 32 bits"
+    )]
+    pub fn enable_fault_irq(&self, address: u64, data: u32) {
+        let mut i = self.inner.lock();
+        let Inner { hw, units, .. } = &mut *i;
+        for unit in units.iter() {
+            let u = unit.index;
+            hw.write32(u, FEDATA, data);
+            hw.write32(u, FEADDR, address as u32);
+            hw.write32(u, FEUADDR, (address >> 32) as u32);
+            hw.write32(u, FECTL, 0);
+        }
     }
 
     /// Lê e limpa as faltas registradas em todas as unidades.

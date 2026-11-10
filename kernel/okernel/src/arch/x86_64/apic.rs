@@ -23,6 +23,8 @@ pub const RESCHED_VECTOR: u8 = 0xf0;
 pub const CALL_VECTOR: u8 = 0xf1;
 /// IPI de TLB shootdown (T-326).
 pub const TLB_VECTOR: u8 = 0xf2;
+/// Interrupção de falta da IOMMU (ADR 0044, item 4).
+pub const IOMMU_FAULT_VECTOR: u8 = 0xf3;
 /// Vetores reservados ao kernel no topo da tabela (IPIs e futuros), que
 /// nenhum objeto `Interrupt` pode usar.
 pub const KERNEL_VECTORS: core::ops::RangeInclusive<u8> = 0xf0..=0xfe;
