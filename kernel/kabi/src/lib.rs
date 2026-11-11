@@ -515,11 +515,13 @@ mod tests {
             (
                 thread::CONFIGURE_IPC_BUFFER,
                 thread::CONFIGURE_EXCEPTION,
-                thread::CONFIGURE_TLS
+                thread::CONFIGURE_TLS,
+                thread::CONFIGURE_BIND_SELF,
+                thread::CONFIGURE_IO_PORTS
             ),
-            (1, 2, 4)
+            (1, 2, 4, 8, 16)
         );
-        assert_eq!(thread::CONFIGURE_ALL, 0b1111);
+        assert_eq!(thread::CONFIGURE_ALL, 0b1_1111);
         assert_eq!((thread::SELF, vm::SELF), (0, 0));
         assert_eq!(
             (exit::GROUP, exit::ALL_FLAGS, exit::PANIC_CODE),
