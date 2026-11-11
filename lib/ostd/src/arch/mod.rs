@@ -1,5 +1,5 @@
-//! Código de máquina do `ostd`: a instrução `syscall`, a entrada `_start`
-//! e o acesso à memória que o processo mapeou. Único lugar da crate com
+//! Código de máquina do `ostd`: a instrução `syscall`, a entrada `_start`,
+//! o acesso à memória que o processo mapeou e as portas de E/S. Único lugar da crate com
 //! assembly (seção 17.1); o outro módulo com `unsafe` é [`crate::alloc`].
 //!
 //! # Unsafe
@@ -18,10 +18,13 @@
 //! - **`mem`:** o acesso à memória mapeada parte de um [`Mapping`]
 //!   (`crate::vm`), que mapeou a faixa no `new` e só desmapeia no `Drop`; o
 //!   empréstimo do `Mapping` impede um acesso mutável concorrente.
+//! - **`port`:** `in` e `out` não tocam a memória; numa porta que a thread
+//!   não ligou, a CPU dá `#GP` e o kernel encerra a thread (ADR 0049).
 
 #![allow(unsafe_code)]
 
 pub(crate) mod mem;
+pub(crate) mod port;
 mod x86_64;
 
 pub use x86_64::{entry, ipc, syscall, thread_pointer};

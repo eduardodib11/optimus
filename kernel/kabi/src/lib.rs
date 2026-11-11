@@ -117,7 +117,7 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     CapDelete = 2 => "`cap_delete(handle, flags)`; com [`cap_delete::DESTROY`] também destrói o objeto (ADR 0035).",
     CapRevoke = 3 => "`cap_revoke`: apaga todos os descendentes.",
     CapInfo = 4 => "`cap_info`.",
-    ObjCreate = 5 => "`obj_create(quota, tipo, args)`.",
+    ObjCreate = 5 => "`obj_create(quota, tipo, args)`; `IoPortRange` recebe base e quantidade de portas ([`io`]; ADR 0049).",
     VmMap = 6 => "`vm_map`; `aspace = 0` é o espaço de quem chama (ADR 0039).",
     VmUnmap = 7 => "`vm_unmap`; `aspace = 0` é o espaço de quem chama (ADR 0039).",
     VmProtect = 8 => "`vm_protect`.",
@@ -279,6 +279,16 @@ pub mod mem {
     pub const PUBLISH_FLAG: u64 = 1;
 }
 
+/// Portas de E/S (ADR 0049): `obj_create(cota de dispositivo,
+/// IoPortRange, base, quantidade)` cria a faixa `base..base + quantidade`
+/// (até 0x10000), recusando com `InvalidArgument` as portas do kernel (PIC,
+/// PIT, COM1, 0xcf9 e 0xf4); a thread a liga com
+/// [`thread::CONFIGURE_IO_PORTS`].
+pub mod io {
+    /// Faixas ligadas a uma thread ao mesmo tempo.
+    pub const MAX_RANGES: usize = 4;
+}
+
 /// `dma_map(domínio, objeto, iova, offset, len, flags)` (syscall 31; ADR
 /// 0044; T-403) em `rdi`, `rsi`, `rdx`, `r10`, `r8` e `r9`. A operação sai
 /// das flags; devolve `[endereço, 0, 0]`.
@@ -339,9 +349,20 @@ pub mod thread {
     /// (`Busy` depois da partida), e `thread = `[`SELF`] também dá
     /// `InvalidArgument`.
     pub const CONFIGURE_BIND_SELF: u64 = 1 << 3;
+    /// Liga à thread a `IoPortRange` de `r8` (handle no `CapSpace` de quem
+    /// chama, com `READ` e `WRITE`; 0 tira todas): ela passa a usar `in` e
+    /// `out` nessas portas (ADR 0049, item 2). Até [`io::MAX_RANGES`]
+    /// faixas (`Busy` além disso). Junto com `CONFIGURE_EXCEPTION`, que
+    /// também usa `r8`, é `InvalidArgument`.
+    ///
+    /// [`io::MAX_RANGES`]: crate::io::MAX_RANGES
+    pub const CONFIGURE_IO_PORTS: u64 = 1 << 4;
     /// Flags definidas; as demais são recusadas com `InvalidArgument`.
-    pub const CONFIGURE_ALL: u64 =
-        CONFIGURE_IPC_BUFFER | CONFIGURE_EXCEPTION | CONFIGURE_TLS | CONFIGURE_BIND_SELF;
+    pub const CONFIGURE_ALL: u64 = CONFIGURE_IPC_BUFFER
+        | CONFIGURE_EXCEPTION
+        | CONFIGURE_TLS
+        | CONFIGURE_BIND_SELF
+        | CONFIGURE_IO_PORTS;
 }
 
 /// Flags de `cap_delete(handle, flags)` (`rsi`; ADR 0035, item 4).
@@ -494,11 +515,13 @@ mod tests {
             (
                 thread::CONFIGURE_IPC_BUFFER,
                 thread::CONFIGURE_EXCEPTION,
-                thread::CONFIGURE_TLS
+                thread::CONFIGURE_TLS,
+                thread::CONFIGURE_BIND_SELF,
+                thread::CONFIGURE_IO_PORTS
             ),
-            (1, 2, 4)
+            (1, 2, 4, 8, 16)
         );
-        assert_eq!(thread::CONFIGURE_ALL, 0b1111);
+        assert_eq!(thread::CONFIGURE_ALL, 0b1_1111);
         assert_eq!((thread::SELF, vm::SELF), (0, 0));
         assert_eq!(
             (exit::GROUP, exit::ALL_FLAGS, exit::PANIC_CODE),

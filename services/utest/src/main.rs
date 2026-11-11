@@ -46,6 +46,7 @@ use ostd::rt::{Env, Start};
 
 mod anel;
 mod paginador;
+mod portas;
 mod tempo;
 mod timer;
 mod vida;
@@ -58,6 +59,8 @@ struct Ctx {
     quota: Handle,
     /// `MemoryObject` do bootfs (o `rdx` inicial, parte alta).
     bootfs: Handle,
+    /// Cota de dispositivo, se o kernel a deu (ADR 0042, item 4).
+    device: Option<Handle>,
 }
 
 /// Bloco com alinhamento de página.
@@ -90,6 +93,10 @@ const TESTS: &[Test] = &[
     Test {
         name: "memd.comprimida_1_5x",
         run: paginador::comprimida_1_5x,
+    },
+    Test {
+        name: "dev.portas_de_es",
+        run: portas::portas_de_es,
     },
     Test {
         name: "cap.criar_e_apagar",
@@ -1437,6 +1444,7 @@ fn main(start: Start) -> ! {
         ostd::debug::set_log(log);
     }
     let ctx = Ctx {
+        device: table_entry(aspace, table, ostd::kabi::startup::KIND_DEVICE_QUOTA),
         quota: handle(start.args[0]),
         bootfs: bootfs_from_table(aspace, table).unwrap_or(table),
     };

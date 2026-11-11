@@ -20,6 +20,7 @@ use kabi::{Error, ObjectType, Rights};
 use super::quota::MemoryQuota;
 use super::space::CapSpace;
 use crate::dma::DmaDomain;
+use crate::ioport::IoPortRange;
 use crate::ipc::{Endpoint, Reply};
 use crate::notify::{Interrupt, Notification};
 use crate::platform;
@@ -64,6 +65,8 @@ pub enum Object {
     DebugLog(Arc<DebugLog>),
     /// Domínio de DMA (ADR 0044; T-403).
     DmaDomain(Arc<DmaDomain>),
+    /// Portas de E/S (ADR 0049).
+    IoPortRange(Arc<IoPortRange>),
 }
 
 /// Marca de identidade da [`Object::DebugLog`]; o estado é o registro do kernel.
@@ -86,6 +89,7 @@ impl fmt::Debug for Object {
             Self::Timer(t) => core::ptr::from_ref::<Timer>(t).addr(),
             Self::DebugLog(d) => Arc::as_ptr(d).addr(),
             Self::DmaDomain(d) => Arc::as_ptr(d).addr(),
+            Self::IoPortRange(r) => Arc::as_ptr(r).addr(),
         };
         write!(f, "{:?}@{ptr:#x}", self.object_type())
     }
@@ -109,6 +113,7 @@ impl Object {
             Self::Timer(_) => ObjectType::Timer,
             Self::DebugLog(_) => ObjectType::DebugLog,
             Self::DmaDomain(_) => ObjectType::DmaDomain,
+            Self::IoPortRange(_) => ObjectType::IoPortRange,
         }
     }
 
@@ -131,6 +136,7 @@ impl Object {
             }
             (Self::DebugLog(a), Self::DebugLog(b)) => Arc::ptr_eq(a, b),
             (Self::DmaDomain(a), Self::DmaDomain(b)) => Arc::ptr_eq(a, b),
+            (Self::IoPortRange(a), Self::IoPortRange(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -239,6 +245,18 @@ impl Object {
     pub fn as_dma_domain(&self) -> Result<&Arc<DmaDomain>, Error> {
         match self {
             Self::DmaDomain(d) => Ok(d),
+            _ => Err(Error::WrongType),
+        }
+    }
+
+    /// A faixa de portas, se o objeto for uma.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] para outro tipo de objeto.
+    pub fn as_io_port_range(&self) -> Result<&Arc<IoPortRange>, Error> {
+        match self {
+            Self::IoPortRange(r) => Ok(r),
             _ => Err(Error::WrongType),
         }
     }
