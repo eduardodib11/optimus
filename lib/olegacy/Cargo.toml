@@ -1,0 +1,13 @@
+[package]
+name = "olegacy"
+description = "Lógica pura dos drivers legados (T-406): leitura do RTC CMOS e decodificadores do teclado e do mouse PS/2. no_std, sem unsafe; o acesso a portas fica no processo do driver."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

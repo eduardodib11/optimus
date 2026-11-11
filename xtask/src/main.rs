@@ -37,6 +37,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("oidl-rt", "lib/oidl-rt/src/lib.rs", KERNEL_TARGET),
     ("osvc", "lib/osvc/src/lib.rs", KERNEL_TARGET),
     ("odev", "lib/odev/src/lib.rs", KERNEL_TARGET),
+    ("olegacy", "lib/olegacy/src/lib.rs", KERNEL_TARGET),
     ("opci", "lib/opci/src/lib.rs", KERNEL_TARGET),
     ("virtio-core", "lib/virtio-core/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
@@ -68,6 +69,7 @@ const HOST_TESTED: &[&str] = &[
     "virtio-core",
     "acpid",
     "mktz",
+    "olegacy",
 ];
 
 const PROFILES: &[&str] = &["lite", "basic", "default", "premium", "server"];
