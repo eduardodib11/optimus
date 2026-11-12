@@ -135,6 +135,7 @@ fn node(f: &opci::Function) -> (Node, Resources) {
         bars,
         msi: f.caps.msi.is_some(),
         msix: f.caps.msix.map_or(0, |m| m.entries),
+        ..Resources::default()
     };
     (node, res)
 }
