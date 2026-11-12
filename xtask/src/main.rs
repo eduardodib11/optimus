@@ -713,6 +713,32 @@ const IOMMU_SCENARIO: Scenario = Scenario {
     ..KERNEL_SCENARIO
 };
 
+/// Aceite de ponta a ponta do M4 (T-401, T-403 e T-404): boot normal com
+/// `intel-iommu` e `edu`. O `pcid` publica o `edu`, o `devmgr` casa com o
+/// `drvteste`, cria `bar0`, `irq0` e `dma`, liga bus master e o parte; o
+/// driver faz DMA de ida e volta com MSI e um DMA fora do domínio, que a
+/// IOMMU barra.
+const DRIVER_SCENARIO: Scenario = Scenario {
+    name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
+    markers: &[
+        "devmgr: 1 drivers no conjunto",
+        "1234:11e8 1 BARs: drvteste",
+        "devmgr: driver partiu com",
+        "svcmgr: drvteste em Running",
+        "drvteste: DMA e MSI pelo edu ok",
+        "drvteste: DMA fora do domínio pedido",
+        "iova=0x200000",
+        "okernel: desligando",
+    ],
+    forbidden: &[
+        "okernel: FALTA",
+        "PÂNICO",
+        "drvteste: falhou",
+        "driver não partiu",
+    ],
+    ..SCENARIOS[0]
+};
+
 /// O mesmo aceite com `-device amd-iommu` (T-403), sem conferir o log de
 /// faltas: o `amd-iommu` do QEMU grava eventos fora do formato da AMD.
 const AMD_IOMMU_SCENARIO: Scenario = Scenario {
@@ -1256,7 +1282,7 @@ fn test(opts: &Options) -> Result {
             devices: vec!["intel-iommu", "edu"],
             ..opts.clone()
         };
-        smoke(&iommu, &[IOMMU_SCENARIO])?;
+        smoke(&iommu, &[IOMMU_SCENARIO, DRIVER_SCENARIO])?;
         let amd = Options {
             devices: vec!["amd-iommu", "edu"],
             ..opts.clone()

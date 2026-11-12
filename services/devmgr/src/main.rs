@@ -5,9 +5,10 @@
 //!
 //! Na partida, o `devmgr` lê do `svcmgr` a lista de drivers do conjunto
 //! compilado, com as regras de `[match]` (`Supervisor.driver`, 1.1), e casa
-//! cada nó com o mais específico (ADR 0042, item 3). A partida do driver
-//! casado vem na próxima etapa da T-401. Quando o `svcmgr` revoga o
-//! endpoint no desligamento, o `devmgr` sai.
+//! cada nó com o mais específico (ADR 0042, item 3). Depois de responder a
+//! quem publicou, parte o driver casado com os recursos do nó
+//! ([`bind`]). Quando o `svcmgr` revoga o endpoint no desligamento, o
+//! `devmgr` sai.
 
 #![no_std]
 #![no_main]
@@ -17,12 +18,14 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use odev::wire::{self, DevError, Method};
+use odev::wire::{self, Method, Resources};
 use odev::{Bus, Driver, Node, Outcome, Registry, Rule};
-use ostd::ipc::{self, Buffer};
+use ostd::ipc;
 use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::Start;
 use ostd::svc::Session;
+
+mod bind;
 
 ostd::entry!(main);
 
@@ -59,10 +62,10 @@ fn log(node: &Node, res: &wire::Resources, outcome: &Outcome<'_>) {
     }
 }
 
-/// Os drivers do conjunto compilado, pela ordem do `svcmgr`. Uma regra
-/// ilegível fica de fora (o `mkmanifest` já as confere).
-fn drivers(s: &mut Session) -> Vec<Driver> {
-    let mut out = Vec::new();
+/// Os drivers do conjunto compilado, pela ordem do `svcmgr`, com o id de
+/// cada um. Uma regra ilegível fica de fora (o `mkmanifest` já as confere).
+fn drivers(s: &mut Session) -> (Vec<Driver>, Vec<u32>) {
+    let (mut out, mut ids) = (Vec::new(), Vec::new());
     let mut buf = [0u8; osvc::MAX_DRIVER_BYTES];
     let mut index = 0u16;
     while let Ok(info) = s.driver(index, &mut buf) {
@@ -70,52 +73,103 @@ fn drivers(s: &mut Session) -> Vec<Driver> {
             name: String::from(info.name),
             rules: info.rules().iter().filter_map(|r| Rule::parse(r)).collect(),
         });
+        ids.push(info.id);
         index += 1;
         if index >= info.total {
             break;
         }
     }
-    out
+    (out, ids)
 }
 
-/// Atende um `publish`; devolve o rótulo e o corpo da resposta.
-fn publish(reg: &mut Registry, drivers: &[Driver], req: &[u8], out: &mut [u8]) -> (u64, usize) {
-    let Ok((node, res)) = wire::decode_publish(req) else {
-        return (osvc::REPLY_BAD_MESSAGE, 0);
-    };
-    let err =
-        |e: DevError, out: &mut [u8]| (osvc::REPLY_ERR, wire::encode_error(e, out).unwrap_or(0));
-    match reg.publish(node, res) {
-        Ok(node) => {
-            log(node, &res, &odev::best_match(drivers, node));
-            (osvc::REPLY_OK, 0)
-        }
-        Err(e) => err(e, out),
-    }
+/// O `devmgr` em serviço.
+struct Devmgr {
+    s: Session,
+    /// Cota de dispositivo (`kernel:device`) e janela ECAM (`kernel:ecam`).
+    device: Option<Handle>,
+    ecam: Option<Handle>,
+    drivers: Vec<Driver>,
+    ids: Vec<u32>,
+    reg: Registry,
+    bound: Vec<bind::Bound>,
 }
 
-fn serve(ep: Handle, quota: Handle, buffer: &mut Buffer, drivers: &[Driver]) -> Error {
-    let reply = match ostd::cap::create(quota, ObjectType::Reply, 0) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    let mut reg = Registry::new(MAX_NODES);
-    let mut req = [0u8; wire::MAX_PUBLISH_BYTES];
-    let mut out = [0u8; 8];
-    loop {
-        let r = match ipc::recv_corpo(ep, reply, buffer, &mut req, 0) {
-            Ok(r) => r,
-            Err(Error::InvalidArgument) => {
-                let _ = ipc::send(reply, &ipc::Message::new(osvc::REPLY_BAD_MESSAGE, &[]), 0);
-                continue;
+impl Devmgr {
+    /// Atende um `publish`: o rótulo e o corpo da resposta e, se casou, o
+    /// driver a partir com os recursos do nó.
+    fn publish(&mut self, req: &[u8], out: &mut [u8]) -> ((u64, usize), Option<(u32, Resources)>) {
+        let Ok((node, res)) = wire::decode_publish(req) else {
+            return ((osvc::REPLY_BAD_MESSAGE, 0), None);
+        };
+        match self.reg.publish(node, res) {
+            Ok(node) => {
+                let outcome = odev::best_match(&self.drivers, node);
+                log(node, &res, &outcome);
+                let id = match outcome {
+                    Outcome::Driver(d) => self
+                        .drivers
+                        .iter()
+                        .position(|x| core::ptr::eq(x, d))
+                        .and_then(|i| self.ids.get(i).copied()),
+                    _ => None,
+                };
+                ((osvc::REPLY_OK, 0), id.map(|id| (id, res)))
             }
+            Err(e) => (
+                (osvc::REPLY_ERR, wire::encode_error(e, out).unwrap_or(0)),
+                None,
+            ),
+        }
+    }
+
+    /// Parte o driver `id` com os recursos do nó (depois de responder a
+    /// quem publicou).
+    fn start(&mut self, id: u32, res: &Resources) {
+        let (Some(device), Some(ecam)) = (self.device, self.ecam) else {
+            ostd::debug::print("devmgr: sem kernel:device ou kernel:ecam, driver não parte");
+            return;
+        };
+        if self.bound.iter().any(|b| b.driver == id) {
+            ostd::debug::print("devmgr: driver já ligado a outro nó");
+            return;
+        }
+        match bind::start(&mut self.s, device, ecam, id, res) {
+            Ok(b) => {
+                ostd::debug::print_fmt(format_args!(
+                    "devmgr: driver partiu com {} recursos",
+                    b.originals.len()
+                ));
+                self.bound.push(b);
+            }
+            Err(e) => ostd::debug::print_fmt(format_args!("devmgr: driver não partiu: {e:?}")),
+        }
+    }
+
+    fn serve(&mut self, ep: Handle, quota: Handle) -> Error {
+        let reply = match ostd::cap::create(quota, ObjectType::Reply, 0) {
+            Ok(r) => r,
             Err(e) => return e,
         };
-        let (label, n) = match wire::method_of(r.rotulo) {
-            Some(Method::Publish) => publish(&mut reg, drivers, &req[..r.corpo], &mut out),
-            None => (osvc::REPLY_UNKNOWN_METHOD, 0),
-        };
-        let _ = ipc::responde_corpo(reply, buffer, label, &out[..n], 0);
+        let mut req = [0u8; wire::MAX_PUBLISH_BYTES];
+        let mut out = [0u8; 8];
+        loop {
+            let r = match ipc::recv_corpo(ep, reply, &mut self.s.buffer, &mut req, 0) {
+                Ok(r) => r,
+                Err(Error::InvalidArgument) => {
+                    let _ = ipc::send(reply, &ipc::Message::new(osvc::REPLY_BAD_MESSAGE, &[]), 0);
+                    continue;
+                }
+                Err(e) => return e,
+            };
+            let ((label, n), start) = match wire::method_of(r.rotulo) {
+                Some(Method::Publish) => self.publish(&req[..r.corpo], &mut out),
+                None => ((osvc::REPLY_UNKNOWN_METHOD, 0), None),
+            };
+            let _ = ipc::responde_corpo(reply, &mut self.s.buffer, label, &out[..n], 0);
+            if let Some((id, res)) = start {
+                self.start(id, &res);
+            }
+        }
     }
 }
 
@@ -136,13 +190,30 @@ fn main(start: Start) -> ! {
         ostd::debug::print("devmgr: descritor sem o endpoint do DeviceBus");
         ostd::thread::exit()
     };
-    let drivers = drivers(&mut s);
+    let kernel_cap = |name: &[u8]| {
+        s.boot
+            .caps()
+            .iter()
+            .find(|c| c.kind == KIND_KERNEL && c.name_hash == hash(name))
+            .map(|c| Handle::from_raw(c.handle))
+    };
+    let (device, ecam) = (kernel_cap(b"device"), kernel_cap(b"ecam"));
+    let (drivers, ids) = drivers(&mut s);
     ostd::debug::print_fmt(format_args!(
         "devmgr: {} drivers no conjunto",
         drivers.len()
     ));
     if s.ready().is_ok() {
-        let end = serve(ep, quota, &mut s.buffer, &drivers);
+        let mut d = Devmgr {
+            s,
+            device,
+            ecam,
+            drivers,
+            ids,
+            reg: Registry::new(MAX_NODES),
+            bound: Vec::new(),
+        };
+        let end = d.serve(ep, quota);
         ostd::debug::print_fmt(format_args!("devmgr: encerrado ({end:?})"));
     }
     ostd::thread::exit()

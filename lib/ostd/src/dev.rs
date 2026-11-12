@@ -93,3 +93,13 @@ pub fn dma_bind(domain: Handle, bdf: u16, attach: bool) -> Result<(), Error> {
     let args = [raw(domain), 0, u64::from(bdf), 0, 0, flags];
     syscall(Syscall::DmaMap, args).map(drop)
 }
+
+/// `irq_ack`: o driver terminou de atender o `Interrupt`, que volta a
+/// sinalizar (um disparo guardado sinaliza já).
+///
+/// # Errors
+///
+/// `AccessDenied` sem `ACK`.
+pub fn irq_ack(irq: Handle) -> Result<(), Error> {
+    syscall(Syscall::IrqAck, [raw(irq), 0, 0, 0, 0, 0]).map(drop)
+}
