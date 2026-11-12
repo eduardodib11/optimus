@@ -131,6 +131,14 @@ impl Platform for Leaked {
         // MMIO falsa: de 3 GiB à janela de MSI.
         base >= 0xC000_0000 && base.checked_add(len).is_some_and(|e| e <= 0xFEE0_0000)
     }
+    fn msi(
+        &self,
+        quota: &Arc<crate::cap::MemoryQuota>,
+    ) -> Result<(Arc<crate::notify::Interrupt>, u64, u64), Error> {
+        // Vetor fixo: os testes de host não têm tabela de vetores.
+        let irq = crate::notify::Interrupt::new(quota, 0x41)?;
+        Ok((Arc::new(irq), 0xfee0_0000, 0x41))
+    }
     fn wake(&self, _: Arc<Thread>) {
         self.0.woken.fetch_add(1, Ordering::Relaxed);
     }

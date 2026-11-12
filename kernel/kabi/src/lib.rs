@@ -117,7 +117,7 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     CapDelete = 2 => "`cap_delete(handle, flags)`; com [`cap_delete::DESTROY`] também destrói o objeto (ADR 0035).",
     CapRevoke = 3 => "`cap_revoke`: apaga todos os descendentes.",
     CapInfo = 4 => "`cap_info`.",
-    ObjCreate = 5 => "`obj_create(quota, tipo, args)`; `IoPortRange` recebe base e quantidade de portas ([`io`]; ADR 0049).",
+    ObjCreate = 5 => "`obj_create(quota, tipo, args)`; `IoPortRange` recebe base e quantidade de portas ([`io`]; ADR 0049); `Interrupt` com a cota de dispositivo devolve `[handle, endereço MSI, dado MSI]` (T-404).",
     VmMap = 6 => "`vm_map`; `aspace = 0` é o espaço de quem chama (ADR 0039).",
     VmUnmap = 7 => "`vm_unmap`; `aspace = 0` é o espaço de quem chama (ADR 0039).",
     VmProtect = 8 => "`vm_protect`.",

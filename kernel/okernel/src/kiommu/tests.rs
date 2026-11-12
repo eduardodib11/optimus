@@ -1,11 +1,20 @@
-//! Aceite do T-403 no QEMU (`cargo xtask test iommu`: `-device intel-iommu`
-//! e `-device edu`): o DMA do `edu` passa pela IOMMU só enquanto ele está
-//! ligado ao domínio; desligado, a escrita vira falta e a RAM fica intacta.
+//! Aceites do T-403 e do T-404 no QEMU (`cargo xtask test iommu`:
+//! `-device intel-iommu` e `-device edu`): o DMA do `edu` passa pela IOMMU
+//! só enquanto ele está ligado ao domínio (desligado, a escrita vira falta
+//! e a RAM fica intacta), e a MSI dele chega a um `Interrupt` e acorda a
+//! notificação ligada.
+
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "campos de registradores PCI e do edu têm largura fixa"
+)]
 
 use alloc::sync::Arc;
 use core::ptr;
 
+use okernel::cap::MemoryQuota;
 use okernel::dma::DmaDomain;
+use okernel::notify::Notification;
 use okernel::vm::MemoryObject;
 
 use crate::arch::x86_64::{inl, outl};
@@ -15,10 +24,16 @@ use crate::ktest::{Outcome, Test};
 use crate::ktime;
 
 /// Testes do VT-d.
-pub const TESTS: &[Test] = &[Test {
-    name: "iommu.vtd_isola_o_edu",
-    run: vtd_isola_o_edu,
-}];
+pub const TESTS: &[Test] = &[
+    Test {
+        name: "dev.vtd_isola_o_edu",
+        run: vtd_isola_o_edu,
+    },
+    Test {
+        name: "dev.msi_do_edu_acorda_a_notificacao",
+        run: msi_do_edu,
+    },
+];
 
 /// Lê o registrador de configuração `off` de `bdf` pelas portas 0xCF8/0xCFC.
 fn config(bdf: u16, off: u8) -> u32 {
@@ -52,6 +67,12 @@ impl Edu {
         // SAFETY: `off` é um registrador de DMA do `edu` (0x80 a 0x98), na
         // primeira página do BAR 0, mapeada por `kmem::mmio`.
         unsafe { ptr::write_volatile((self.0 + off) as *mut u64, value) };
+    }
+
+    fn write32(&self, off: u64, value: u32) {
+        // SAFETY: `off` é um registrador de 32 bits do `edu` (abaixo de
+        // 0x80), na primeira página do BAR 0, mapeada por `kmem::mmio`.
+        unsafe { ptr::write_volatile((self.0 + off) as *mut u32, value) };
     }
 
     fn read(&self, off: u64) -> u64 {
@@ -143,5 +164,85 @@ fn vtd_isola_o_edu() -> Outcome {
     ensure!(fault_of(bdf, 0x10_1000, true));
     drop((domain, mo));
     ensure!(quota.used() == used);
+    Ok(())
+}
+
+/// O `edu` com memória e bus master ligados e o BAR 0 mapeado.
+fn edu() -> Result<Option<(u16, Edu)>, &'static str> {
+    let Some(bdf) = find_edu() else {
+        return Ok(None);
+    };
+    let bar = u64::from(config(bdf, 0x10) & !0xf);
+    ensure!(bar != 0);
+    set_config(bdf, 0x04, config(bdf, 0x04) | 0x6);
+    Ok(Some((bdf, Edu(kmem::mmio(bar).map_err(|_| "BAR do edu")?))))
+}
+
+/// Deslocamento da capability `id` de `bdf`.
+fn capability(bdf: u16, id: u8) -> Option<u8> {
+    let mut at = (config(bdf, 0x34) & 0xfc) as u8;
+    for _ in 0..48 {
+        if at == 0 {
+            return None;
+        }
+        let head = config(bdf, at);
+        if head as u8 == id {
+            return Some(at);
+        }
+        at = (head >> 8) as u8 & 0xfc;
+    }
+    None
+}
+
+/// Espera até 1 s pelo bit 0 de `ntfy`.
+fn signalled(ntfy: &Notification) -> bool {
+    let end = ktime::now_ns() + 1_000_000_000;
+    while ktime::now_ns() < end {
+        if ntfy.pending() & 1 != 0 {
+            return true;
+        }
+        // O kernel roda com interrupções desligadas: abre-as até a MSI ou
+        // o timer de 1 ms.
+        ktime::set_timer_at(ktime::now_ns() + 1_000_000);
+        crate::arch::x86_64::cpu::wait_for_interrupt();
+    }
+    false
+}
+
+/// T-404: `Interrupt` de MSI da cota de dispositivo; a MSI do `edu` (que
+/// o próprio `edu` dispara ao escrever em 0x60) sinaliza o bit ligado, a
+/// linha fica mascarada até o `ack` e o disparo guardado sai nele.
+fn msi_do_edu() -> Outcome {
+    let Some((bdf, edu)) = edu()? else {
+        info!("ktest: sem edu; o aceite roda em `cargo xtask test iommu`");
+        return Ok(());
+    };
+    let root = root_quota().ok_or("sem cota raiz")?;
+    let used = root.used();
+    {
+        let device = MemoryQuota::device(&root, 64 << 10).map_err(|_| "cota")?;
+        let (irq, address, data) = crate::kirq::create_msi(&device).map_err(|_| "vetor")?;
+        ensure!(address >> 20 == 0xfee && data == u64::from(irq.vector()));
+        let ntfy = Arc::new(Notification::new(&root).map_err(|_| "notificação")?);
+        irq.bind(Arc::clone(&ntfy), 0).map_err(|_| "bind")?;
+        // MSI de 64 bits: endereço em +4 e +8, dado em +12, liga no bit 16.
+        let msi = capability(bdf, 5).ok_or("edu sem MSI")?;
+        set_config(bdf, msi + 4, address as u32);
+        set_config(bdf, msi + 8, (address >> 32) as u32);
+        set_config(bdf, msi + 12, data as u32);
+        set_config(bdf, msi, config(bdf, msi) | 1 << 16);
+        edu.write32(0x60, 1);
+        ensure!(signalled(&ntfy));
+        edu.write32(0x64, 1);
+        // Mascarada até o `ack`: o segundo disparo fica guardado.
+        ensure!(ntfy.poll() == 1);
+        edu.write32(0x60, 1);
+        ensure!(!signalled(&ntfy));
+        let (again, bits) = irq.ack().ok_or("disparo guardado perdido")?;
+        ensure!(Arc::ptr_eq(&again, &ntfy) && bits == 1);
+        edu.write32(0x64, 1);
+        set_config(bdf, msi, config(bdf, msi) & !(1 << 16));
+    }
+    ensure!(root.used() == used);
     Ok(())
 }

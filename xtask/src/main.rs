@@ -686,12 +686,13 @@ const KERNEL_SCENARIO: Scenario = Scenario {
     timeout: KTEST_TIMEOUT,
 };
 
-/// Aceite do T-403 (`cargo xtask test iommu`, também no `all`): com
-/// `-device intel-iommu` e `-device edu`, o DMA do `edu` só passa ligado ao
-/// domínio; desligado, vira falta registrada.
+/// Aceites do T-403 e do T-404 (`cargo xtask test iommu`, também no
+/// `all`): com `-device intel-iommu` e `-device edu`, o DMA do `edu` só
+/// passa ligado ao domínio (desligado, vira falta registrada), e a MSI dele
+/// acorda a notificação ligada ao `Interrupt`.
 const IOMMU_SCENARIO: Scenario = Scenario {
-    name: "VT-d isola o DMA do edu",
-    cmdline: "test=kernel ktest=iommu.",
+    name: "VT-d isola o DMA do edu e a MSI dele acorda a notificação",
+    cmdline: "test=kernel ktest=dev.",
     markers: &[
         KTEST_START,
         "okernel: VT-d ligado: 1 unidade(s)",
@@ -703,6 +704,7 @@ const IOMMU_SCENARIO: Scenario = Scenario {
         "okernel: FALTA",
         "PÂNICO",
         "sem edu ou sem VT-d",
+        "sem edu;",
     ],
     ..KERNEL_SCENARIO
 };

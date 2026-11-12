@@ -11,8 +11,12 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
+use kabi::Error;
+
+use crate::cap::MemoryQuota;
 use crate::mm::PhysAddr;
 use crate::mm::paging::TableMemory;
+use crate::notify::Interrupt;
 use crate::sync::{LockClass, SpinLock};
 use crate::thread::Thread;
 
@@ -52,6 +56,18 @@ pub trait Platform: Sync {
     /// fora da MMIO que o próprio kernel usa (APIC, HPET, IOMMU, janela de
     /// MSI).
     fn device_range_ok(&self, base: u64, len: u64) -> bool;
+    /// `Interrupt` de MSI ou MSI-X (T-404): um vetor livre, cobrado de
+    /// `quota`, e o endereço e o dado que o dispositivo escreve para
+    /// dispará-lo.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] sem vetor livre; [`Error::QuotaExceeded`] sem cota;
+    /// [`Error::NotSupported`] onde não há MSI.
+    fn msi(&self, quota: &Arc<MemoryQuota>) -> Result<(Arc<Interrupt>, u64, u64), Error> {
+        let _ = quota;
+        Err(Error::NotSupported)
+    }
 }
 
 /// Bytes da pilha de kernel de cada thread (seção 6.3).

@@ -503,6 +503,30 @@ impl CapSpace {
             badge: 0,
         })
     }
+
+    /// `obj_create(quota, Interrupt)` (ADR 0042, item 4; T-404): um vetor
+    /// de MSI ou MSI-X, só com a cota de dispositivo. Devolve o handle e o
+    /// endereço e o dado que o dispositivo escreve para disparar o vetor.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AccessDenied`] sem `CREATE` ou com cota comum; os de
+    /// [`Platform::msi`](crate::platform::Platform::msi).
+    pub fn obj_create_msi(&mut self, quota: Handle) -> Result<(Handle, u64, u64), Error> {
+        let cap = self.get(quota)?;
+        let q = Arc::clone(cap.object.as_quota()?);
+        if !cap.rights.contains(Rights::CREATE) || !q.is_device() {
+            return Err(Error::AccessDenied);
+        }
+        let platform = crate::platform::get().ok_or(Error::NotSupported)?;
+        let (irq, address, data) = platform.msi(&q)?;
+        let h = self.insert(Cap {
+            object: super::Object::Interrupt(irq),
+            rights: default_rights(ObjectType::Interrupt),
+            badge: 0,
+        })?;
+        Ok((h, address, data))
+    }
 }
 
 impl CapSpace {
