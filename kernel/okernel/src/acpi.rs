@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dmar;
+pub mod ivrs;
 pub mod madt;
 
 /// Leitura de memória física.
