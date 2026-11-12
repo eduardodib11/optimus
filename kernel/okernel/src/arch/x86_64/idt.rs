@@ -225,6 +225,10 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
             // IPI (ADR 0031, item 5): EOI e atendimento da caixa.
             super::apic::eoi();
             crate::ksmp::ipi::on_ipi();
+        } else if frame.vector == u64::from(super::apic::IOMMU_FAULT_VECTOR) {
+            // Falta de DMA (ADR 0044, item 4): o log registra cada uma.
+            super::apic::eoi();
+            crate::kiommu::on_fault_irq();
         } else if crate::kirq::fire(frame.vector) {
             // Linha de um objeto `Interrupt` (T-209): a notificação ligada
             // pode ter acordado alguém mais prioritário.

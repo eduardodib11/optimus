@@ -132,6 +132,15 @@ pub fn init() {
         okernel::dma::install(vtd);
         let (units, levels) = vtd.shape();
         info!("okernel: VT-d ligado: {units} unidade(s), tabelas de {levels} níveis");
+        // Faltas por interrupção, entregues ao BSP. Sem remapeamento de
+        // interrupção o destino tem 8 bits.
+        if let Some(dest) = crate::ksmp::apic_id(0).and_then(|d| u8::try_from(d).ok()) {
+            let address = 0xfee0_0000 | u64::from(dest) << 12;
+            vtd.enable_fault_irq(
+                address,
+                u32::from(crate::arch::x86_64::apic::IOMMU_FAULT_VECTOR),
+            );
+        }
     } else if let Ok(table) = ivrs::read(&mut ktime::DirectRead, rsdp) {
         // Três páginas: cabeças e caudas dos anéis ficam em 0x2000.
         let Some(regs) = map_units(table.units().iter().map(|u| u.base), 3) else {
@@ -154,6 +163,11 @@ pub fn kind() -> Option<&'static str> {
         Unit::Vtd(_) => "VT-d",
         Unit::Amd(_) => "AMD-Vi",
     })
+}
+
+/// Tratador da interrupção de falta: registra as faltas no log.
+pub fn on_fault_irq() {
+    faults(&mut |_| {});
 }
 
 /// Lê e limpa as faltas de DMA; cada uma vira um registro no log (ADR
