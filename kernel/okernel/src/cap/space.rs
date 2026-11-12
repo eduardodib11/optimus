@@ -535,6 +535,32 @@ impl CapSpace {
 }
 
 impl CapSpace {
+    /// `obj_create(quota, Interrupt, 0, 0, irq::ISA | n)` (ADR 0049, item
+    /// 5): a IRQ ISA `irq`, só com a cota de dispositivo.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] para a IRQ 0 e a 2; [`Error::AccessDenied`]
+    /// sem `CREATE` ou com cota comum; os de
+    /// [`Platform::isa_irq`](crate::platform::Platform::isa_irq).
+    pub fn obj_create_isa(&mut self, quota: Handle, irq: u8) -> Result<Handle, Error> {
+        if irq == 0 || irq == 2 || irq > 15 {
+            return Err(Error::InvalidArgument);
+        }
+        let cap = self.get(quota)?;
+        let q = Arc::clone(cap.object.as_quota()?);
+        if !cap.rights.contains(Rights::CREATE) || !q.is_device() {
+            return Err(Error::AccessDenied);
+        }
+        let platform = crate::platform::get().ok_or(Error::NotSupported)?;
+        let object = super::Object::Interrupt(platform.isa_irq(&q, irq)?);
+        self.insert(Cap {
+            object,
+            rights: default_rights(ObjectType::Interrupt),
+            badge: 0,
+        })
+    }
+
     /// `obj_create(quota, IoPortRange, base, count)` (ADR 0049, item 1):
     /// só com a cota de dispositivo; nasce com `READ | WRITE`.
     ///

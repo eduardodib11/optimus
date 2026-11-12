@@ -30,6 +30,18 @@ enum Unit {
 
 static UNIT: SpinLock<Option<Unit>> = SpinLock::with_class(LockClass::Diagnostic, None);
 
+/// `source-id` de cada IOAPIC, pelo id, como a DMAR os lista (0xffff: não
+/// listado).
+static IOAPIC_SOURCES: [core::sync::atomic::AtomicU32; 256] =
+    [const { core::sync::atomic::AtomicU32::new(0xffff_ffff) }; 256];
+
+/// `source-id` do IOAPIC `id` para o remapeamento de interrupções (ADR
+/// 0049, item 7).
+pub fn ioapic_source(id: u8) -> Option<u16> {
+    let v = IOAPIC_SOURCES[usize::from(id)].load(core::sync::atomic::Ordering::Relaxed);
+    u16::try_from(v).ok()
+}
+
 /// Registradores das unidades (endereço virtual sem cache de cada uma) e as
 /// tabelas, no mapa direto. As tabelas da IOMMU são só do backend, que as
 /// toca com a trava dele: nenhuma é tabela de CPU guardada por `KERNEL_PT`.
@@ -123,6 +135,11 @@ pub fn init() {
             return;
         };
         let units = table.units().len();
+        for (id, slot) in (0u8..=255).zip(&IOAPIC_SOURCES) {
+            if let Some(sid) = table.ioapic_source(id) {
+                slot.store(u32::from(sid), core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let Some(vtd) = VtD::new(Box::new(regs), table) else {
             warn!("okernel: VT-d sem formato de tabela aceito ({units} unidades)");
             return;

@@ -296,6 +296,11 @@ pub mod irq {
     /// remapeamento de interrupções (quando ligado) só aceita a MSI dela
     /// (ADR 0044, item 6). Sem o bit, `fonte` tem de ser 0.
     pub const SOURCE: u64 = 1 << 16;
+    /// Com este bit, os 4 bits baixos de `fonte` são uma IRQ ISA (de 1 a
+    /// 15, menos a 2), entregue pelo IOAPIC (ADR 0049, item 5): devolve
+    /// `[handle, 0, 0]`. `Busy` se a IRQ já tem um `Interrupt` vivo;
+    /// `NotSupported` para linha por nível.
+    pub const ISA: u64 = 1 << 17;
 }
 
 /// `dma_map(domínio, objeto, iova, offset, len, flags)` (syscall 31; ADR

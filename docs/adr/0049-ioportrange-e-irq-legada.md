@@ -50,9 +50,11 @@ programa. Toda IRQ de dispositivo é MSI ou MSI-X (T-404).
    `[handle, 0, 0]`: não há endereço nem dado de MSI. Uma IRQ só tem um
    `Interrupt` vivo (`Busy`). Quando o objeto morre, a entrada volta a ficar
    mascarada.
-6. **Nível e máscara.** Uma linha por nível (um override com o SCI, por
-   exemplo) fica mascarada no IOAPIC do disparo até o `irq_ack`. Uma linha
-   por borda só usa a máscara de software do `Interrupt`, como a MSI.
+6. **Nível e máscara.** Uma linha por borda só usa a máscara de software
+   do `Interrupt`, como a MSI. Uma linha por nível (um override com o SCI,
+   por exemplo) teria de ficar mascarada no IOAPIC do disparo até o
+   `irq_ack`. Nesta entrega ela dá `NotSupported`: RTC e PS/2 são por
+   borda, e o SCI entra quando o `acpid` precisar dele.
 7. **Com remapeamento de interrupções.** O VT-d bloqueia o formato de
    compatibilidade (ADR 0044, item 6). Com ele ligado, a entrada do IOAPIC
    vai no formato remapeável, com a entrada da IRT presa ao `source-id` do

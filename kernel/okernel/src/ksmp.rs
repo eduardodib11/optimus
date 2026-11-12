@@ -61,6 +61,7 @@ pub fn init(info: &BootInfo, cmdline: &str) {
 }
 
 fn publish(t: &Topology) {
+    crate::kioapic::init(t);
     for (cpu, &id) in t.apic_ids().iter().enumerate() {
         APIC_IDS[cpu].store(id, Ordering::Relaxed);
     }
