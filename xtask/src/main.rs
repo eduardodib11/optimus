@@ -693,13 +693,15 @@ const KERNEL_SCENARIO: Scenario = Scenario {
 /// Aceites do T-403 e do T-404 (`cargo xtask test iommu`, também no
 /// `all`): com `-device intel-iommu` e `-device edu`, o DMA do `edu` só
 /// passa ligado ao domínio (desligado, vira falta registrada), e a MSI dele
-/// acorda a notificação ligada ao `Interrupt`.
+/// acorda a notificação ligada ao `Interrupt`, pela entrada de remapeamento
+/// presa ao BDF dele (o QEMU com TCG liga `intremap` por padrão).
 const IOMMU_SCENARIO: Scenario = Scenario {
     name: "VT-d isola o DMA do edu e a MSI dele acorda a notificação",
     cmdline: "test=kernel ktest=dev.",
     markers: &[
         KTEST_START,
         "okernel: VT-d ligado: 1 unidade(s)",
+        "okernel: remapeamento de interrupções ligado",
         "okernel: falta de DMA: dev=00:",
         KTEST_END,
     ],
@@ -716,11 +718,12 @@ const IOMMU_SCENARIO: Scenario = Scenario {
 /// Aceite de ponta a ponta do M4 (T-401, T-403 e T-404): boot normal com
 /// `intel-iommu` e `edu`. O `pcid` publica o `edu`, o `devmgr` casa com o
 /// `drvteste`, cria `bar0`, `irq0` e `dma`, liga bus master e o parte; o
-/// driver faz DMA de ida e volta com MSI e um DMA fora do domínio, que a
-/// IOMMU barra.
+/// driver faz DMA de ida e volta com MSI (remapeada) e um DMA fora do
+/// domínio, que a IOMMU barra.
 const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
+        "okernel: remapeamento de interrupções ligado",
         "devmgr: 1 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",

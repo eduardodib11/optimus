@@ -135,8 +135,9 @@ impl Platform for KernelPlatform {
     fn msi(
         &self,
         quota: &Arc<okernel::cap::MemoryQuota>,
+        source: Option<u16>,
     ) -> Result<(Arc<okernel::notify::Interrupt>, u64, u64), kabi::Error> {
-        crate::kirq::create_msi(quota)
+        crate::kirq::create_msi(quota, source)
     }
 }
 

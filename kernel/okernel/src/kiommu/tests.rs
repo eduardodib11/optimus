@@ -220,7 +220,8 @@ fn signalled(ntfy: &Notification) -> bool {
 
 /// T-404: `Interrupt` de MSI da cota de dispositivo; a MSI do `edu` (que
 /// o próprio `edu` dispara ao escrever em 0x60) sinaliza o bit ligado, a
-/// linha fica mascarada até o `ack` e o disparo guardado sai nele.
+/// linha fica mascarada até o `ack` e o disparo guardado sai nele. Com
+/// remapeamento de interrupções, a MSI vai no formato remapeável.
 fn msi_do_edu() -> Outcome {
     let Some((bdf, edu)) = edu()? else {
         info!("ktest: sem edu; o aceite roda em `cargo xtask test iommu`");
@@ -230,8 +231,16 @@ fn msi_do_edu() -> Outcome {
     let used = root.used();
     {
         let device = MemoryQuota::device(&root, 64 << 10).map_err(|_| "cota")?;
-        let (irq, address, data) = crate::kirq::create_msi(&device).map_err(|_| "vetor")?;
-        ensure!(address >> 20 == 0xfee && data == u64::from(irq.vector()));
+        let (irq, address, data) =
+            crate::kirq::create_msi(&device, Some(bdf)).map_err(|_| "vetor")?;
+        ensure!(address >> 20 == 0xfee);
+        if crate::kiommu::remap_msi_on() {
+            // Índice da IRT = vetor, formato remapeável (bit 4), dado 0.
+            let index = (address >> 5) & 0x7fff;
+            ensure!(address & 1 << 4 != 0 && index == u64::from(irq.vector()) && data == 0);
+        } else {
+            ensure!(data == u64::from(irq.vector()));
+        }
         let ntfy = Arc::new(Notification::new(&root).map_err(|_| "notificação")?);
         irq.bind(Arc::clone(&ntfy), 0).map_err(|_| "bind")?;
         // MSI de 64 bits: endereço em +4 e +8, dado em +12, liga no bit 16.

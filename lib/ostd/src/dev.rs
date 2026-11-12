@@ -32,14 +32,18 @@ pub struct Msi {
     pub data: u32,
 }
 
-/// Aloca um vetor de MSI ou MSI-X. Só com a cota de dispositivo.
+/// Aloca um vetor de MSI ou MSI-X para a função `bdf` (`bus << 8 | dev
+/// << 3 | fn`), que é a única que consegue dispará-lo quando o kernel
+/// remapeia interrupções. Só com a cota de dispositivo.
 ///
 /// # Errors
 ///
 /// `AccessDenied` com cota comum; `Busy` sem vetor livre.
-pub fn msi(device_quota: Handle) -> Result<Msi, Error> {
+pub fn msi(device_quota: Handle, bdf: u16) -> Result<Msi, Error> {
     let ty = ObjectType::Interrupt.to_raw();
-    let [h, address, data] = syscall(Syscall::ObjCreate, [raw(device_quota), ty, 0, 0, 0, 0])?;
+    let source = kabi::irq::SOURCE | u64::from(bdf);
+    let args = [raw(device_quota), ty, 0, 0, source, 0];
+    let [h, address, data] = syscall(Syscall::ObjCreate, args)?;
     Ok(Msi {
         irq: handle(h)?,
         address,

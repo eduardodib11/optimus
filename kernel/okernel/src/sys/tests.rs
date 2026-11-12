@@ -372,6 +372,12 @@ fn notificacao_por_handles() {
         call(&space, Syscall::IrqAck, [irq, 0, 0, 0, 0, 0]),
         Ok([0; 3])
     );
+}
+
+#[test]
+fn msi_pela_cota_de_dispositivo() {
+    platform::install(fake_platform(1000).1);
+    let (root, space, q) = setup();
     // obj_create não cria interrupções com argumentos nem com cota comum.
     let msi = |q| {
         call(
@@ -389,6 +395,17 @@ fn notificacao_por_handles() {
         Err(Error::NotSupported)
     );
     assert_eq!(msi(q), Err(Error::AccessDenied));
+    // A fonte (quinto argumento) é 0 ou `irq::SOURCE | bdf`.
+    for bad in [1, kabi::irq::SOURCE << 1, kabi::irq::SOURCE | 1 << 20] {
+        assert_eq!(
+            call(
+                &space,
+                Syscall::ObjCreate,
+                [q, ObjectType::Interrupt.to_raw(), 0, 0, bad, 0]
+            ),
+            Err(Error::InvalidArgument)
+        );
+    }
     // Com a cota de dispositivo: vetor de MSI (T-404), endereço e dado.
     let device = MemoryQuota::device(&root, 1 << 16).unwrap();
     let dq = space
@@ -401,6 +418,20 @@ fn notificacao_por_handles() {
         .unwrap();
     let [h, address, data] = msi(u64::from(dq.raw())).unwrap();
     assert_eq!((address, data), (0xfee0_0000, 0x41));
+    let source = u64::from(dq.raw());
+    let with_source = call(
+        &space,
+        Syscall::ObjCreate,
+        [
+            source,
+            ObjectType::Interrupt.to_raw(),
+            0,
+            0,
+            kabi::irq::SOURCE | 0x18,
+            0,
+        ],
+    );
+    assert_eq!(with_source.map(|[_, a, d]| (a, d)), Ok((0xfee0_0000, 0x41)));
     let cap = get(&space, h);
     assert_eq!(cap.rights, default_rights(ObjectType::Interrupt));
     assert_eq!(cap.object.as_interrupt().unwrap().vector(), 0x41);

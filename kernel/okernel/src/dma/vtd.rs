@@ -5,8 +5,9 @@
 //! domínio, de 3 níveis (IOVA de 39 bits) ou 4, conforme o `SAGAW` que
 //! todas as unidades aceitam. Dispositivo sem entrada de contexto tem o DMA
 //! bloqueado: ligar a tradução fecha tudo, e só o `dma_attach` abre. As
-//! invalidações são pelos registradores (`CCMD` e `IOTLB`), sem fila, e
-//! esperam a unidade antes de voltar.
+//! invalidações são pelos registradores (`CCMD` e `IOTLB`) ou, quando o
+//! remapeamento de interrupções liga, pela fila ([`ir`]), e esperam a
+//! unidade antes de voltar.
 //!
 //! O acesso aos registradores e à cache fica atrás de [`Hw`]; a lógica é
 //! testável no host. A trava é de nível 5 (a de um espaço de endereços):
@@ -107,6 +108,8 @@ struct Unit {
     iotlb: usize,
     /// Primeiro registrador de falta e quantos há.
     faults: (usize, usize),
+    /// Fila de invalidação, com o remapeamento de interrupções.
+    queue: Option<ir::Queue>,
 }
 
 struct Domain {
@@ -122,6 +125,8 @@ struct Inner {
     dmar: Dmar,
     /// Níveis das tabelas de segundo nível (3 ou 4).
     levels: u32,
+    /// Tabela de remapeamento de interrupções, se ligado.
+    irt: Option<PhysAddr>,
 }
 
 /// As unidades de VT-d da máquina.
@@ -152,12 +157,17 @@ fn flush(hw: &mut dyn Hw, units: &[Unit], phys: u64, len: usize) {
 }
 
 /// Esvazia o buffer de escrita (se a unidade pede) e invalida o cache de
-/// contexto (`ctx` ≠ 0) e o IOTLB (`iotlb`) da unidade.
-fn invalidate(hw: &mut dyn Hw, unit: &Unit, ctx: u64, iotlb: u64) {
-    let u = unit.index;
+/// contexto (`ctx` ≠ 0) e o IOTLB (`iotlb`) da unidade `u`, pela fila
+/// quando ela existe.
+fn invalidate(hw: &mut dyn Hw, units: &[Unit], u: usize, ctx: u64, iotlb: u64) {
+    let unit = &units[u];
     if unit.write_buffer {
         let sts = hw.read32(u, GSTS) & PERSISTENT;
         command(hw, u, sts | WBF, WBF, 0);
+    }
+    if unit.queue.is_some() {
+        ir::submit(hw, units, unit, &ir::invalidation(ctx != 0, iotlb));
+        return;
     }
     if ctx != 0 {
         hw.write64(u, CCMD, ICC | ctx);
@@ -207,23 +217,42 @@ impl VtD {
                 write_buffer: cap & (1 << 4) != 0,
                 iotlb: field(ecap, 8, 0x3ff) * 16 + 8,
                 faults: (field(cap, 24, 0x3ff) * 16, field(cap, 40, 0xff) + 1),
+                queue: None,
             });
         }
-        for unit in &units {
-            let u = unit.index;
-            flush(&mut *hw, &units, unit.root.0, 4096);
+        // Remapeamento de interrupções só se todas as unidades o têm.
+        let remap = caps
+            .iter()
+            .all(|(_, e)| e & ir::ECAP_QI != 0 && e & ir::ECAP_IR != 0);
+        for u in 0..units.len() {
+            let root = units[u].root;
+            flush(&mut *hw, &units, root.0, 4096);
             let sts = hw.read32(u, GSTS) & PERSISTENT;
             if sts & TE != 0 {
                 command(&mut *hw, u, sts & !TE, TE, 0);
             }
-            hw.write64(u, RTADDR, unit.root.0);
+            hw.write64(u, RTADDR, root.0);
             command(&mut *hw, u, sts & !TE | SRTP, SRTP, SRTP);
             // Faltas registradas e mascaradas até
             // [`VtD::enable_fault_irq`]; o kernel as lê com [`VtD::faults`].
             hw.write32(u, FECTL, 1 << 31);
-            invalidate(&mut *hw, unit, GLOBAL_CTX, GLOBAL_IOTLB);
+            if remap {
+                units[u].queue = Some(ir::Queue::enable(&mut *hw, u, sts & !TE)?);
+            }
+            invalidate(&mut *hw, &units, u, GLOBAL_CTX, GLOBAL_IOTLB);
+            let sts = hw.read32(u, GSTS) & PERSISTENT;
             command(&mut *hw, u, sts | TE, TE, TE);
         }
+        let irt = if remap {
+            let irt = hw.alloc_table()?;
+            flush(&mut *hw, &units, irt.0, 4096);
+            for unit in &units {
+                ir::enable(&mut *hw, &units, unit, irt);
+            }
+            Some(irt)
+        } else {
+            None
+        };
         let mut domains = Vec::new();
         domains.resize_with(ids.min(MAX_DOMAINS), || None);
         let inner = Inner {
@@ -232,10 +261,37 @@ impl VtD {
             domains,
             dmar,
             levels,
+            irt,
         };
         Some(Self {
             inner: SpinLock::with_class(LockClass::AddressSpace, inner),
         })
+    }
+
+    /// O remapeamento de interrupções está ligado.
+    #[must_use]
+    pub fn remapping(&self) -> bool {
+        self.inner.lock().irt.is_some()
+    }
+
+    /// Programa a entrada da IRT do vetor `vector` (entrega ao APIC `dest`;
+    /// com `source`, só aquele BDF a usa) e devolve o endereço de MSI no
+    /// formato remapeável, com dado 0. `None` sem remapeamento.
+    pub fn remap(&self, vector: u8, dest: u8, source: Option<u16>) -> Option<u64> {
+        let mut i = self.inner.lock();
+        let irt = i.irt?;
+        let (lo, hi) = ir::entry(vector, dest, source);
+        let Inner { hw, units, .. } = &mut *i;
+        let at = usize::from(vector) * 2;
+        // Presença por último: a unidade nunca vê metade velha.
+        hw.table(irt)[at] = 0;
+        hw.table(irt)[at + 1] = hi;
+        hw.table(irt)[at] = lo;
+        flush(&mut **hw, units, irt.0 + u64::from(vector) * 16, 16);
+        for unit in units.iter() {
+            ir::submit(&mut **hw, units, unit, &[ir::invalidate_entry(vector)]);
+        }
+        Some(ir::address(vector))
     }
 
     /// Unidades e níveis das tabelas de segundo nível.
@@ -307,8 +363,8 @@ impl Inner {
 
     /// Invalida o IOTLB do domínio `id` em todas as unidades.
     fn flush_domain(&mut self, id: u32) {
-        for unit in &self.units {
-            invalidate(&mut *self.hw, unit, 0, domain_iotlb(id));
+        for u in 0..self.units.len() {
+            invalidate(&mut *self.hw, &self.units, u, 0, domain_iotlb(id));
         }
     }
 
@@ -457,7 +513,7 @@ impl Iommu for VtD {
         i.hw.table(table)[e] = root.0 | PRESENT;
         i.flush(table.0 + e as u64 * 8, 16);
         let Inner { hw, units, .. } = &mut *i;
-        invalidate(&mut **hw, &units[u], GLOBAL_CTX, domain_iotlb(id));
+        invalidate(&mut **hw, units, u, GLOBAL_CTX, domain_iotlb(id));
         i.domain(id).devices.push((u, bdf));
         Ok(())
     }
@@ -475,11 +531,13 @@ impl Iommu for VtD {
             i.hw.table(table)[e + 1] = 0;
             i.flush(table.0 + e as u64 * 8, 16);
             let Inner { hw, units, .. } = &mut *i;
-            invalidate(&mut **hw, &units[u], GLOBAL_CTX, domain_iotlb(id));
+            invalidate(&mut **hw, units, u, GLOBAL_CTX, domain_iotlb(id));
         }
         i.domain(id).devices.retain(|&(_, b)| b != bdf);
     }
 }
+
+mod ir;
 
 #[cfg(test)]
 mod tests;
