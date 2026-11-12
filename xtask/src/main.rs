@@ -181,6 +181,9 @@ struct Options {
     /// Rodadas do teste de caos do `svcmgr` (entrada `svcmgr.caos` do
     /// bootfs, T-366); `None` não liga o caos.
     chaos: Option<u64>,
+    /// Dispositivos extras do QEMU, antes dos de sempre (a `intel-iommu`
+    /// precisa vir antes dos dispositivos PCI).
+    devices: Vec<&'static str>,
 }
 
 impl Default for Options {
@@ -200,6 +203,7 @@ impl Default for Options {
             minutes: STRESS_MINUTES,
             fail_on_purpose: false,
             chaos: None,
+            devices: Vec::new(),
         }
     }
 }
@@ -252,7 +256,7 @@ fn parse(args: &[String]) -> Result<Options> {
                 );
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
-            | "integration" | "chaos" | "all" => {
+            | "integration" | "chaos" | "iommu" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -533,20 +537,23 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
         "-smp",
         &opts.smp.to_string(),
     ])
-    .args(["-display", "none", "-serial", "stdio", "-no-reboot"])
-    // Fonte do EFI_RNG_PROTOCOL do OVMF; a semente do optboot vem dele.
-    .args(["-device", "virtio-rng-pci"])
-    // Porta 0xf4: o kernel desliga o QEMU com um código de saída.
-    .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
-    .arg("-drive")
-    .arg(format!(
-        "if=pflash,format=raw,readonly=on,file={}",
-        code.display()
-    ))
-    .arg("-drive")
-    .arg(format!("if=pflash,format=raw,file={}", vars_copy.display()))
-    .arg("-drive")
-    .arg(format!("format=raw,file=fat:rw:{}", esp.display()));
+    .args(["-display", "none", "-serial", "stdio", "-no-reboot"]);
+    for device in &opts.devices {
+        cmd.args(["-device", device]);
+    }
+    cmd // Fonte do EFI_RNG_PROTOCOL do OVMF; a semente do optboot vem dele.
+        .args(["-device", "virtio-rng-pci"])
+        // Porta 0xf4: o kernel desliga o QEMU com um código de saída.
+        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,format=raw,readonly=on,file={}",
+            code.display()
+        ))
+        .arg("-drive")
+        .arg(format!("if=pflash,format=raw,file={}", vars_copy.display()))
+        .arg("-drive")
+        .arg(format!("format=raw,file=fat:rw:{}", esp.display()));
     if kvm_usable() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
     } else {
@@ -677,6 +684,27 @@ const KERNEL_SCENARIO: Scenario = Scenario {
     rounds: Some(KTEST_ROUNDS),
     hello: false,
     timeout: KTEST_TIMEOUT,
+};
+
+/// Aceite do T-403 (`cargo xtask test iommu`, também no `all`): com
+/// `-device intel-iommu` e `-device edu`, o DMA do `edu` só passa ligado ao
+/// domínio; desligado, vira falta registrada.
+const IOMMU_SCENARIO: Scenario = Scenario {
+    name: "VT-d isola o DMA do edu",
+    cmdline: "test=kernel ktest=iommu.",
+    markers: &[
+        KTEST_START,
+        "okernel: VT-d ligado: 1 unidade(s)",
+        "okernel: falta de DMA: dev=00:",
+        KTEST_END,
+    ],
+    forbidden: &[
+        "ktest: FALHOU",
+        "okernel: FALTA",
+        "PÂNICO",
+        "sem edu ou sem VT-d",
+    ],
+    ..KERNEL_SCENARIO
 };
 
 /// Aceite do T-324 (`cargo xtask test smp`): dois processos alternam 10⁶
@@ -1196,6 +1224,13 @@ fn test(opts: &Options) -> Result {
     }
     if matches!(opts.suite.as_str(), "kernel" | "all") {
         smoke(opts, &[KERNEL_SCENARIO])?;
+    }
+    if matches!(opts.suite.as_str(), "iommu" | "all") {
+        let iommu = Options {
+            devices: vec!["intel-iommu", "edu"],
+            ..opts.clone()
+        };
+        smoke(&iommu, &[IOMMU_SCENARIO])?;
     }
     if opts.suite == "smp" {
         smp(opts)?;

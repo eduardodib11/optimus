@@ -269,6 +269,19 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
+/// Tira da cache as linhas de `len` bytes a partir de `virt` e espera as
+/// escritas chegarem à memória (para quem lê a RAM sem coerência, como uma
+/// IOMMU sem `ECAP.C`).
+pub fn clflush(virt: u64, len: usize) {
+    for line in (virt & !63..virt + len as u64).step_by(64) {
+        // SAFETY: CLFLUSH só escreve de volta e invalida a linha; quem chama
+        // passa memória mapeada do kernel.
+        unsafe { asm!("clflush [{}]", in(reg) line, options(nostack, preserves_flags)) };
+    }
+    // SAFETY: MFENCE só ordena acessos.
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+}
+
 /// Invalida a entrada da TLB de `virt` nesta CPU.
 pub fn invlpg(virt: u64) {
     // SAFETY: INVLPG só descarta uma tradução em cache; a próxima consulta
