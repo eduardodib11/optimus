@@ -1,5 +1,6 @@
-# Manifesto do `pcid` (ADR 0043; T-402): só a janela ECAM e o log de
-# depuração. Lê o espaço de configuração e nunca liga bus master.
+# Manifesto do `pcid` (ADR 0043; T-402): a janela ECAM, o log de depuração
+# e o `DeviceBus` do `devmgr`. Lê o espaço de configuração e nunca liga bus
+# master.
 [service]
 name = "pcid"
 binary = "pcid"
@@ -7,7 +8,7 @@ priority = 140
 restart = "never"
 
 [capabilities]
-needs = ["mem:quota:1MiB", "kernel:debug", "kernel:ecam"]
+needs = ["mem:quota:1MiB", "kernel:debug", "kernel:ecam", "svc:optimus.dev.DeviceBus@1"]
 provides = []
 
 [limits]

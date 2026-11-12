@@ -1,0 +1,21 @@
+[package]
+name = "devmgr"
+description = "devmgr: dono dos nós de dispositivo e do casamento com drivers (T-401; ADR 0042)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "devmgr"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+odev = { path = "../../lib/odev" }
+oidl-rt = { path = "../../lib/oidl-rt" }
+osvc = { path = "../../lib/osvc" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true

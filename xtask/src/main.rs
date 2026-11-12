@@ -48,6 +48,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("timed", "services/timed/src/main.rs", USER_TARGET),
     ("logd", "services/logd/src/main.rs", USER_TARGET),
     ("pcid", "services/pcid/src/main.rs", USER_TARGET),
+    ("devmgr", "services/devmgr/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -101,8 +102,9 @@ const BOOT_MARKERS: &[&str] = &[
     "svcmgr: timed em Running",
     "svcmgr: logd em Running",
     "svcmgr: memd em Running",
+    "svcmgr: devmgr em Running",
     "svcmgr: pcid em Running",
-    "svcmgr: 4 serviços em Running",
+    "svcmgr: 5 serviços em Running",
     "svcmgr: serviços encerrados",
     "root: o svcmgr terminou",
     "okernel: root terminou",
@@ -377,9 +379,8 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "utest" | "okfuzz" => {
-            &["-C", "relocation-model=static"]
-        }
+        "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "devmgr" | "utest"
+        | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -422,6 +423,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("logd", "logd"),
     ("memd", "memd"),
     ("pcid", "pcid"),
+    ("devmgr", "devmgr"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -1313,6 +1315,9 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.2 0106: 8086:2922 (rev 02)",
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
+    // T-401: cada função vira nó no `devmgr`.
+    "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
+    "pcid: 7 nós publicados ao devmgr",
 ];
 
 /// CPUs do cenário de integração sem `--smp`.
@@ -1925,8 +1930,9 @@ mod tests {
                   info  [7376636d] svcmgr: timed em Running\r\n\
                   info  [7376636d] svcmgr: logd em Running\r\n\
                   info  [7376636d] svcmgr: memd em Running\r\n\
+                  info  [7376636d] svcmgr: devmgr em Running\r\n\
                   info  [7376636d] svcmgr: pcid em Running\r\n\
-                  info  [7376636d] svcmgr: 4 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: 5 serviços em Running\r\n\
                   info  [7376636d] svcmgr: serviços encerrados\r\n\
                   info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";
