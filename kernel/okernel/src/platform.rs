@@ -73,6 +73,16 @@ pub trait Platform: Sync {
         let _ = (quota, source);
         Err(Error::NotSupported)
     }
+    /// `Interrupt` da IRQ ISA `irq` (ADR 0049, item 5), cobrado de `quota`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] se a IRQ já tem objeto vivo ou sem vetor livre;
+    /// [`Error::NotSupported`] sem IOAPIC para ela ou para linha por nível.
+    fn isa_irq(&self, quota: &Arc<MemoryQuota>, irq: u8) -> Result<Arc<Interrupt>, Error> {
+        let _ = (quota, irq);
+        Err(Error::NotSupported)
+    }
 }
 
 /// Bytes da pilha de kernel de cada thread (seção 6.3).

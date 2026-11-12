@@ -30,6 +30,18 @@ pub struct IoApic {
     pub gsi_base: u32,
 }
 
+/// Para onde vai uma IRQ ISA (override de tipo 2; sem override, a GSI de
+/// mesmo número, por borda e ativa em alto).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IsaRoute {
+    /// GSI da linha.
+    pub gsi: u32,
+    /// Disparo por nível.
+    pub level: bool,
+    /// Ativa em baixo.
+    pub active_low: bool,
+}
+
 /// O que a MADT diz das CPUs e dos controladores de interrupção.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Topology {
@@ -55,6 +67,8 @@ pub struct Topology {
     ioapic_count: usize,
     /// Overrides de fonte de interrupção (tipo 2).
     pub overrides: u32,
+    /// Rota de cada IRQ ISA, com os overrides aplicados.
+    isa: [IsaRoute; 16],
     /// Entradas de NMI (tipos 4 e 0xA).
     pub nmis: u32,
 }
@@ -70,6 +84,12 @@ impl Topology {
     #[must_use]
     pub const fn count(&self) -> usize {
         self.count
+    }
+
+    /// Rota das IRQs ISA, pelo número.
+    #[must_use]
+    pub const fn isa(&self) -> &[IsaRoute; 16] {
+        &self.isa
     }
 
     /// IOAPICs da tabela.
@@ -104,6 +124,28 @@ pub struct Options {
 const ENABLED: u32 = 1;
 const ONLINE_CAPABLE: u32 = 1 << 1;
 
+/// Cada IRQ ISA na GSI de mesmo número, por borda e ativa em alto.
+fn identity_isa() -> [IsaRoute; 16] {
+    let mut isa = [IsaRoute::default(); 16];
+    for (gsi, route) in (0u32..).zip(&mut isa) {
+        route.gsi = gsi;
+    }
+    isa
+}
+
+/// Aplica um override (tipo 2, já com 10 bytes) do barramento 0 (ISA):
+/// polaridade nos bits 0 e 1 das flags e disparo nos bits 2 e 3 (3 = baixo e
+/// nível; o resto segue o ISA).
+fn isa_override(isa: &mut [IsaRoute; 16], e: &[u8]) {
+    if let (0, Some(route)) = (e[2], isa.get_mut(usize::from(e[3]))) {
+        *route = IsaRoute {
+            gsi: u32_at(e, 4),
+            level: (e[8] >> 2) & 3 == 3,
+            active_low: e[8] & 3 == 3,
+        };
+    }
+}
+
 /// Lê a topologia de uma MADT já conferida (`table` inteira, cabeçalho
 /// incluído).
 ///
@@ -132,6 +174,7 @@ pub fn parse(table: &[u8], opts: Options) -> Result<Topology, AcpiError> {
         ioapics: [IoApic::default(); MAX_IOAPICS],
         ioapic_count: 0,
         overrides: 0,
+        isa: identity_isa(),
         nmis: 0,
     };
     t.apic_ids[0] = opts.bsp_apic_id;
@@ -172,7 +215,9 @@ pub fn parse(table: &[u8], opts: Options) -> Result<Topology, AcpiError> {
                 None
             }
             2 => {
+                need(10)?;
                 t.overrides += 1;
+                isa_override(&mut t.isa, e);
                 None
             }
             4 | 0xa => {

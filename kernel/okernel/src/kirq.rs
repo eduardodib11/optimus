@@ -23,6 +23,10 @@ pub const FIRST_VECTOR: u8 = 0x30;
 static LINES: SpinLock<[Option<Weak<Interrupt>>; 256]> =
     SpinLock::with_class(LockClass::Object, [const { None }; 256]);
 
+/// O `Interrupt` de cada IRQ ISA (ADR 0049, item 5): uma só tem um vivo.
+static ISA: SpinLock<[Option<Weak<Interrupt>>; 16]> =
+    SpinLock::with_class(LockClass::Object, [const { None }; 16]);
+
 /// Cria o `Interrupt` do vetor `vector`, cobrado de `quota`.
 ///
 /// # Errors
@@ -63,9 +67,20 @@ pub fn create_msi(
     quota: &Arc<MemoryQuota>,
     source: Option<u16>,
 ) -> Result<(Arc<Interrupt>, u64, u64), Error> {
+    let (irq, dest) = allocate(quota)?;
+    let vector = irq.vector();
+    let msi = crate::kiommu::remap_msi(vector, dest, source).map_or(
+        (0xfee0_0000 | u64::from(dest) << 12, u64::from(vector)),
+        |address| (address, 0),
+    );
+    Ok((irq, msi.0, msi.1))
+}
+
+/// Um `Interrupt` no primeiro vetor livre, e o APIC de destino (o BSP).
+fn allocate(quota: &Arc<MemoryQuota>) -> Result<(Arc<Interrupt>, u8), Error> {
     let dest = crate::ksmp::apic_id(0).unwrap_or(0);
     // O endereço de compatibilidade só leva 8 bits de destino (e a IRT do
-    // VT-d em modo xAPIC também).
+    // VT-d em modo xAPIC e a entrada do IOAPIC também).
     let dest = u8::try_from(dest).map_err(|_| Error::NotSupported)?;
     for vector in FIRST_VECTOR..=LAST_VECTOR {
         if vector == TIMER_VECTOR {
@@ -73,17 +88,38 @@ pub fn create_msi(
         }
         match create(quota, vector) {
             Ok(irq) => {
-                let msi = crate::kiommu::remap_msi(vector, dest, source).map_or(
-                    (0xfee0_0000 | u64::from(dest) << 12, u64::from(vector)),
-                    |address| (address, 0),
-                );
-                return Ok((irq, msi.0, msi.1));
+                // Uma IRQ legada de um objeto morto não fica no vetor.
+                let _ = crate::kioapic::release_vector(vector);
+                return Ok((irq, dest));
             }
             Err(Error::Busy) => {}
             Err(e) => return Err(e),
         }
     }
     Err(Error::Busy)
+}
+
+/// `Interrupt` da IRQ ISA `irq` (ADR 0049, item 5): um vetor livre, com a
+/// entrada do IOAPIC da linha apontada para ele, no BSP.
+///
+/// # Errors
+///
+/// [`Error::Busy`] se a IRQ já tem objeto vivo ou sem vetor livre;
+/// [`Error::QuotaExceeded`] sem cota; os de [`crate::kioapic::route`].
+pub fn create_isa(quota: &Arc<MemoryQuota>, irq: u8) -> Result<Arc<Interrupt>, Error> {
+    let (object, dest) = allocate(quota)?;
+    {
+        let mut isa = ISA.lock();
+        let slot = isa
+            .get_mut(usize::from(irq))
+            .ok_or(Error::InvalidArgument)?;
+        if slot.as_ref().is_some_and(|w| w.strong_count() > 0) {
+            return Err(Error::Busy);
+        }
+        *slot = Some(Arc::downgrade(&object));
+    }
+    crate::kioapic::route(irq, object.vector(), dest)?;
+    Ok(object)
 }
 
 /// Disparo de `vector` vindo da IDT: devolve se o vetor é de um objeto
@@ -96,7 +132,10 @@ pub fn fire(vector: u64) -> bool {
             .and_then(|v| lines.get(v)?.as_ref()?.upgrade())
     };
     let Some(irq) = irq else {
-        return false;
+        // Sem dono: se for uma IRQ legada cujo `Interrupt` morreu (um
+        // disparo que já estava a caminho), ela é mascarada e o disparo
+        // acaba aqui, sem contar como vetor inesperado.
+        return u8::try_from(vector).is_ok_and(crate::kioapic::release_vector);
     };
     if let Some((ntfy, bits)) = irq.fire()
         && let Some((thread, word)) = ntfy.signal(bits)

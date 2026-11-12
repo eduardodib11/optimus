@@ -190,31 +190,7 @@ pub fn invoke(
                 info.badge,
             ])
         }
-        Syscall::ObjCreate => {
-            let ty = ObjectType::try_from(a[1]).map_err(|_| Error::InvalidArgument)?;
-            if ty == ObjectType::Interrupt && a[2..4] == [0, 0] {
-                let source = match a[4] {
-                    0 => None,
-                    s if s & !0xFFFF == kabi::irq::SOURCE => Some((s & 0xFFFF) as u16),
-                    _ => return Err(Error::InvalidArgument),
-                };
-                let (h, address, data) = space.lock().obj_create_msi(handle(a[0])?, source)?;
-                return Ok([u64::from(h.raw()), address, data]);
-            }
-            let h = if ty == ObjectType::IoPortRange {
-                if a[4..] != [0, 0] {
-                    return Err(Error::InvalidArgument);
-                }
-                space.lock().obj_create_io(handle(a[0])?, a[2], a[3])?
-            } else if ty == ObjectType::MemoryObject && a[3] == kabi::mem::DEVICE {
-                space.lock().obj_create_device(handle(a[0])?, a[4], a[2])?
-            } else {
-                space
-                    .lock()
-                    .obj_create_with(handle(a[0])?, ty, a[2], a[3])?
-            };
-            Ok([u64::from(h.raw()), 0, 0])
-        }
+        Syscall::ObjCreate => obj_create(space, a),
         Syscall::VmMap => {
             let object = space.lock().get(handle(a[1])?)?.clone();
             let aspace = aspace_of(space, a[0], env)?;
@@ -268,6 +244,40 @@ pub fn invoke(
         Syscall::DmaMap => dma_map(space, a),
         _ => invoke_sync(space, call, a, env),
     }
+}
+
+/// `obj_create(quota, tipo, args)`, com as formas da cota de dispositivo:
+/// `Interrupt` de MSI ou de IRQ ISA, `IoPortRange` e MMIO.
+fn obj_create(space: &SharedCapSpace, a: [u64; 6]) -> Result<Values, Error> {
+    let ty = ObjectType::try_from(a[1]).map_err(|_| Error::InvalidArgument)?;
+    if ty == ObjectType::Interrupt && a[2..4] == [0, 0] {
+        let source = match a[4] {
+            0 => None,
+            s if s & !0xF == kabi::irq::ISA => {
+                let h = space
+                    .lock()
+                    .obj_create_isa(handle(a[0])?, (s & 0xF) as u8)?;
+                return Ok([u64::from(h.raw()), 0, 0]);
+            }
+            s if s & !0xFFFF == kabi::irq::SOURCE => Some((s & 0xFFFF) as u16),
+            _ => return Err(Error::InvalidArgument),
+        };
+        let (h, address, data) = space.lock().obj_create_msi(handle(a[0])?, source)?;
+        return Ok([u64::from(h.raw()), address, data]);
+    }
+    let h = if ty == ObjectType::IoPortRange {
+        if a[4..] != [0, 0] {
+            return Err(Error::InvalidArgument);
+        }
+        space.lock().obj_create_io(handle(a[0])?, a[2], a[3])?
+    } else if ty == ObjectType::MemoryObject && a[3] == kabi::mem::DEVICE {
+        space.lock().obj_create_device(handle(a[0])?, a[4], a[2])?
+    } else {
+        space
+            .lock()
+            .obj_create_with(handle(a[0])?, ty, a[2], a[3])?
+    };
+    Ok([u64::from(h.raw()), 0, 0])
 }
 
 /// `dma_map` (ADR 0044; T-403): mapear, desmapear, ligar ou desligar,

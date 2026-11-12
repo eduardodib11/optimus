@@ -418,6 +418,27 @@ fn msi_pela_cota_de_dispositivo() {
         .unwrap();
     let [h, address, data] = msi(u64::from(dq.raw())).unwrap();
     assert_eq!((address, data), (0xfee0_0000, 0x41));
+    // IRQ ISA (ADR 0049): sem a 0 e a 2, e só com a cota de dispositivo.
+    let isa = |q, n: u64| {
+        let args = [
+            q,
+            ObjectType::Interrupt.to_raw(),
+            0,
+            0,
+            kabi::irq::ISA | n,
+            0,
+        ];
+        call(&space, Syscall::ObjCreate, args)
+    };
+    assert_eq!(isa(u64::from(dq.raw()), 0), Err(Error::InvalidArgument));
+    assert_eq!(isa(u64::from(dq.raw()), 2), Err(Error::InvalidArgument));
+    assert_eq!(isa(q, 8), Err(Error::AccessDenied));
+    let [legacy, a, d] = isa(u64::from(dq.raw()), 8).unwrap();
+    assert_eq!((a, d), (0, 0));
+    assert_eq!(
+        get(&space, legacy).object.as_interrupt().unwrap().vector(),
+        0x58
+    );
     let source = u64::from(dq.raw());
     let with_source = call(
         &space,

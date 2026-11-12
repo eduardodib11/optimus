@@ -140,6 +140,13 @@ impl Platform for Leaked {
         let irq = crate::notify::Interrupt::new(quota, 0x41)?;
         Ok((Arc::new(irq), 0xfee0_0000, 0x41))
     }
+    fn isa_irq(
+        &self,
+        quota: &Arc<crate::cap::MemoryQuota>,
+        irq: u8,
+    ) -> Result<Arc<crate::notify::Interrupt>, Error> {
+        Ok(Arc::new(crate::notify::Interrupt::new(quota, 0x50 + irq)?))
+    }
     fn wake(&self, _: Arc<Thread>) {
         self.0.woken.fetch_add(1, Ordering::Relaxed);
     }

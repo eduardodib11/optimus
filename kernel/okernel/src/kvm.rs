@@ -139,6 +139,14 @@ impl Platform for KernelPlatform {
     ) -> Result<(Arc<okernel::notify::Interrupt>, u64, u64), kabi::Error> {
         crate::kirq::create_msi(quota, source)
     }
+
+    fn isa_irq(
+        &self,
+        quota: &Arc<okernel::cap::MemoryQuota>,
+        irq: u8,
+    ) -> Result<Arc<okernel::notify::Interrupt>, kabi::Error> {
+        crate::kirq::create_isa(quota, irq)
+    }
 }
 
 /// Janela de mensagens MSI do APIC local: escrever nela é interromper.

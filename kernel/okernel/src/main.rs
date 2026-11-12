@@ -24,6 +24,7 @@ mod kcap;
 mod kfault;
 mod kfuzz;
 mod kheap;
+mod kioapic;
 mod kiommu;
 mod kipc;
 mod kirq;

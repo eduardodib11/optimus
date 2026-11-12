@@ -51,6 +51,20 @@ pub fn msi(device_quota: Handle, bdf: u16) -> Result<Msi, Error> {
     })
 }
 
+/// O `Interrupt` da IRQ ISA `irq` (1 a 15, menos a 2), entregue pelo
+/// IOAPIC (ADR 0049). Só com a cota de dispositivo; liga-se com
+/// `obj_bind_notify` e confirma-se com `irq_ack`, como a MSI.
+///
+/// # Errors
+///
+/// `Busy` se a IRQ já tem dono; `NotSupported` para linha por nível.
+pub fn isa_irq(device_quota: Handle, irq: u8) -> Result<Handle, Error> {
+    let ty = ObjectType::Interrupt.to_raw();
+    let source = kabi::irq::ISA | u64::from(irq);
+    let [h, ..] = syscall(Syscall::ObjCreate, [raw(device_quota), ty, 0, 0, source, 0])?;
+    handle(h)
+}
+
 /// `dma_map`: `len` bytes de `object` a partir de `offset` em `iova` no
 /// domínio; devolve o endereço que o dispositivo usa (`iova` com IOMMU, o
 /// físico sem ela).

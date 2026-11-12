@@ -18,7 +18,7 @@ use okernel::dma::DmaDomain;
 use okernel::notify::Notification;
 use okernel::vm::MemoryObject;
 
-use crate::arch::x86_64::{inl, outl};
+use crate::arch::x86_64::{inb, inl, outb, outl};
 use crate::kcap::root_quota;
 use crate::kmem;
 use crate::ktest::{Outcome, Test};
@@ -34,7 +34,60 @@ pub const TESTS: &[Test] = &[
         name: "dev.msi_do_edu_acorda_a_notificacao",
         run: msi_do_edu,
     },
+    Test {
+        name: "dev.irq_do_rtc_pelo_ioapic",
+        run: irq_do_rtc,
+    },
 ];
+
+/// Lê o registrador `reg` do RTC (CMOS).
+fn cmos(reg: u8) -> u8 {
+    // SAFETY: 0x70 e 0x71 são o índice e o dado do RTC; ler um registrador
+    // dele não tem efeito além de limpar as flags do C.
+    unsafe {
+        outb(0x70, reg);
+        inb(0x71)
+    }
+}
+
+/// Escreve o registrador `reg` do RTC.
+fn set_cmos(reg: u8, value: u8) {
+    // SAFETY: como em `cmos`; quem chama só mexe na interrupção periódica.
+    unsafe {
+        outb(0x70, reg);
+        outb(0x71, value);
+    }
+}
+
+/// ADR 0049, item 5: a IRQ 8 (RTC) vira um `Interrupt` pelo IOAPIC e a
+/// interrupção periódica do RTC acorda a notificação ligada; com
+/// remapeamento de interrupções, pela entrada da IRT presa ao IOAPIC. Uma
+/// IRQ só tem um `Interrupt` vivo.
+fn irq_do_rtc() -> Outcome {
+    let root = root_quota().ok_or("sem cota raiz")?;
+    let used = root.used();
+    {
+        let device = MemoryQuota::device(&root, 64 << 10).map_err(|_| "cota")?;
+        let irq = crate::kirq::create_isa(&device, 8).map_err(|_| "IRQ 8")?;
+        ensure!(matches!(
+            crate::kirq::create_isa(&device, 8),
+            Err(kabi::Error::Busy)
+        ));
+        let ntfy = Arc::new(Notification::new(&root).map_err(|_| "notificação")?);
+        irq.bind(Arc::clone(&ntfy), 0).map_err(|_| "bind")?;
+        // Registrador B, bit 6: interrupção periódica (1024 Hz no QEMU); ler
+        // o C limpa as flags e libera a próxima.
+        let b = cmos(0x0b);
+        set_cmos(0x0b, b | 0x40);
+        cmos(0x0c);
+        let fired = signalled(&ntfy);
+        set_cmos(0x0b, b & !0x40);
+        cmos(0x0c);
+        ensure!(fired);
+    }
+    ensure!(root.used() == used);
+    Ok(())
+}
 
 /// Lê o registrador de configuração `off` de `bdf` pelas portas 0xCF8/0xCFC.
 fn config(bdf: u16, off: u8) -> u32 {

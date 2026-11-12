@@ -31,9 +31,22 @@ pub struct Scope {
     /// [`MAX_SCOPE`]. IOAPIC e HPET (remapeamento de interrupção) não
     /// contam.
     pub skipped: u32,
+    /// IOAPICs do escopo: id e `source-id` (ADR 0049, item 7).
+    ioapics: [(u8, u16); MAX_SCOPE_IOAPICS],
+    ioapic_count: usize,
 }
 
+/// IOAPICs guardados por escopo.
+const MAX_SCOPE_IOAPICS: usize = 4;
+
 impl Scope {
+    /// `source-id` do IOAPIC de id `id`, se o escopo o lista.
+    #[must_use]
+    pub fn ioapic_source(&self, id: u8) -> Option<u16> {
+        let listed = &self.ioapics[..self.ioapic_count];
+        listed.iter().find(|&&(i, _)| i == id).map(|&(_, sid)| sid)
+    }
+
     /// Os dispositivos guardados.
     #[must_use]
     pub fn bdfs(&self) -> &[u16] {
@@ -55,7 +68,14 @@ impl Scope {
                     self.bdfs[self.count] = bdf;
                     self.count += 1;
                 }
-                // IOAPIC e HPET: assunto do remapeamento de interrupção.
+                // IOAPIC: o `source-id` que o remapeamento de interrupções
+                // confere.
+                (3, &[_, 8, _, _, id, bus, dev, func]) if self.ioapic_count < MAX_SCOPE_IOAPICS => {
+                    let bdf = u16::from(bus) << 8 | u16::from(dev & 31) << 3 | u16::from(func & 7);
+                    self.ioapics[self.ioapic_count] = (id, bdf);
+                    self.ioapic_count += 1;
+                }
+                // HPET: assunto do remapeamento de interrupção.
                 (3 | 4, _) => {}
                 _ => self.skipped += 1,
             }
@@ -105,6 +125,12 @@ pub struct Dmar {
 }
 
 impl Dmar {
+    /// `source-id` do IOAPIC de id `id` (escopo de alguma unidade).
+    #[must_use]
+    pub fn ioapic_source(&self, id: u8) -> Option<u16> {
+        self.units().iter().find_map(|u| u.scope.ioapic_source(id))
+    }
+
     /// As unidades, na ordem da tabela.
     #[must_use]
     pub fn units(&self) -> &[Unit] {
