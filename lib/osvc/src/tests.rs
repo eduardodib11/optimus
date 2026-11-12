@@ -72,10 +72,12 @@ fn rotulos() {
         Method::Ready,
         Method::Connect,
         Method::NameOf,
+        Method::Driver,
     ] {
         assert_eq!(method_of(label(m)), Some(m));
     }
-    assert_eq!(method_of(label(Method::Ready) | 1 << 16), None);
+    assert_eq!(label(Method::Driver) >> 16 & 0xFFFF, 1, "driver é da 1.1");
+    assert_eq!(method_of(label(Method::Ready) | 2 << 16), None);
     assert_eq!(method_of(4), None);
     assert_eq!(SvcError::from_u8(3), Some(SvcError::Busy));
     assert_eq!(SvcError::from_u8(4), None);
@@ -94,4 +96,26 @@ fn connect_name_of_e_erro_vao_e_voltam() {
     let n = encode_error(SvcError::NotRunning, &mut b).unwrap();
     assert_eq!(decode_error(&b[..n]), Ok(SvcError::NotRunning));
     assert!(decode_connect(&b[..4]).is_err());
+}
+
+#[test]
+fn driver_vai_e_volta() {
+    let mut b = [0u8; MAX_SHORT_BYTES];
+    let n = encode_driver(3, &mut b).unwrap();
+    assert_eq!(decode_driver(&b[..n]), Ok(3));
+    let info = DriverInfo::new(7, 2, "drvteste", &["pci:1234:11e8", "class:00:ff"]).unwrap();
+    let mut b = [0u8; MAX_DRIVER_BYTES];
+    let n = encode_driver_info(&info, &mut b).unwrap();
+    let back = decode_driver_info(&b[..n]).unwrap();
+    assert_eq!(back, info);
+    assert_eq!(back.rules(), ["pci:1234:11e8", "class:00:ff"]);
+    // Tetos.
+    assert!(DriverInfo::new(1, 1, "x", &["r"; MAX_RULES + 1]).is_none());
+    let long = "r".repeat(MAX_RULE + 1);
+    let bad = DriverInfo::new(1, 1, "x", &[long.as_str()]).unwrap();
+    assert!(encode_driver_info(&bad, &mut b).is_err());
+    let (name, rule) = ("n".repeat(MAX_NAME), "r".repeat(MAX_RULE));
+    let full = DriverInfo::new(1, 1, &name, &[rule.as_str(); MAX_RULES]).unwrap();
+    assert!(encode_driver_info(&full, &mut b).is_ok());
+    assert!(decode_driver_info(&b[..8]).is_err());
 }

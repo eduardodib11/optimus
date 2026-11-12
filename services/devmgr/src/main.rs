@@ -3,16 +3,22 @@
 //! nó publicado no [`odev::Registry`] e escreve no log o nó e o driver que
 //! casa com ele.
 //!
-//! Os drivers ainda não chegam ao `devmgr` (a lista vem do `svcmgr` na
-//! próxima etapa da T-401), então todo nó sai "sem driver". Quando o
-//! `svcmgr` revoga o endpoint no desligamento, o `devmgr` sai.
+//! Na partida, o `devmgr` lê do `svcmgr` a lista de drivers do conjunto
+//! compilado, com as regras de `[match]` (`Supervisor.driver`, 1.1), e casa
+//! cada nó com o mais específico (ADR 0042, item 3). A partida do driver
+//! casado vem na próxima etapa da T-401. Quando o `svcmgr` revoga o
+//! endpoint no desligamento, o `devmgr` sai.
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 use odev::wire::{self, DevError, Method};
-use odev::{Bus, Node, Outcome, Registry};
+use odev::{Bus, Driver, Node, Outcome, Registry, Rule};
 use ostd::ipc::{self, Buffer};
 use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::Start;
@@ -53,8 +59,27 @@ fn log(node: &Node, res: &wire::Resources, outcome: &Outcome<'_>) {
     }
 }
 
+/// Os drivers do conjunto compilado, pela ordem do `svcmgr`. Uma regra
+/// ilegível fica de fora (o `mkmanifest` já as confere).
+fn drivers(s: &mut Session) -> Vec<Driver> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; osvc::MAX_DRIVER_BYTES];
+    let mut index = 0u16;
+    while let Ok(info) = s.driver(index, &mut buf) {
+        out.push(Driver {
+            name: String::from(info.name),
+            rules: info.rules().iter().filter_map(|r| Rule::parse(r)).collect(),
+        });
+        index += 1;
+        if index >= info.total {
+            break;
+        }
+    }
+    out
+}
+
 /// Atende um `publish`; devolve o rótulo e o corpo da resposta.
-fn publish(reg: &mut Registry, req: &[u8], out: &mut [u8]) -> (u64, usize) {
+fn publish(reg: &mut Registry, drivers: &[Driver], req: &[u8], out: &mut [u8]) -> (u64, usize) {
     let Ok((node, res)) = wire::decode_publish(req) else {
         return (osvc::REPLY_BAD_MESSAGE, 0);
     };
@@ -62,14 +87,14 @@ fn publish(reg: &mut Registry, req: &[u8], out: &mut [u8]) -> (u64, usize) {
         |e: DevError, out: &mut [u8]| (osvc::REPLY_ERR, wire::encode_error(e, out).unwrap_or(0));
     match reg.publish(node, res) {
         Ok(node) => {
-            log(node, &res, &odev::best_match(&[], node));
+            log(node, &res, &odev::best_match(drivers, node));
             (osvc::REPLY_OK, 0)
         }
         Err(e) => err(e, out),
     }
 }
 
-fn serve(ep: Handle, quota: Handle, buffer: &mut Buffer) -> Error {
+fn serve(ep: Handle, quota: Handle, buffer: &mut Buffer, drivers: &[Driver]) -> Error {
     let reply = match ostd::cap::create(quota, ObjectType::Reply, 0) {
         Ok(r) => r,
         Err(e) => return e,
@@ -87,7 +112,7 @@ fn serve(ep: Handle, quota: Handle, buffer: &mut Buffer) -> Error {
             Err(e) => return e,
         };
         let (label, n) = match wire::method_of(r.rotulo) {
-            Some(Method::Publish) => publish(&mut reg, &req[..r.corpo], &mut out),
+            Some(Method::Publish) => publish(&mut reg, drivers, &req[..r.corpo], &mut out),
             None => (osvc::REPLY_UNKNOWN_METHOD, 0),
         };
         let _ = ipc::responde_corpo(reply, buffer, label, &out[..n], 0);
@@ -111,8 +136,13 @@ fn main(start: Start) -> ! {
         ostd::debug::print("devmgr: descritor sem o endpoint do DeviceBus");
         ostd::thread::exit()
     };
+    let drivers = drivers(&mut s);
+    ostd::debug::print_fmt(format_args!(
+        "devmgr: {} drivers no conjunto",
+        drivers.len()
+    ));
     if s.ready().is_ok() {
-        let end = serve(ep, quota, &mut s.buffer);
+        let end = serve(ep, quota, &mut s.buffer, &drivers);
         ostd::debug::print_fmt(format_args!("devmgr: encerrado ({end:?})"));
     }
     ostd::thread::exit()

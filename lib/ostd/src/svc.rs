@@ -10,7 +10,7 @@
 use kabi::{Error, Handle};
 
 use crate::ipc::{self, Buffer, DEFAULT_BUFFER_VA};
-pub use osvc::{Boot, CapDesc, Method, SvcError};
+pub use osvc::{Boot, CapDesc, DriverInfo, Method, SvcError};
 
 /// Quanto esperar o `svcmgr` em cada chamada, em ns.
 const WAIT_NS: u64 = 5_000_000_000;
@@ -156,5 +156,31 @@ impl Session {
         let dst = out.get_mut(..name.len()).ok_or(Error::InvalidArgument)?;
         dst.copy_from_slice(name.as_bytes());
         Ok(name.len())
+    }
+
+    /// `driver(index)` (1.1): o driver `index` do conjunto compilado, com
+    /// as regras de `[match]`, decodificado de `out` (que precisa de
+    /// [`osvc::MAX_DRIVER_BYTES`]). Só o `devmgr` recebe resposta.
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel, `AccessDenied` se o `svcmgr` recusar (fora da lista
+    /// ou quem chama não é o `devmgr`) e `InvalidArgument` para resposta
+    /// fora do protocolo.
+    pub fn driver<'b>(&mut self, index: u16, out: &'b mut [u8]) -> Result<DriverInfo<'b>, Error> {
+        let mut req = [0u8; osvc::MAX_SHORT_BYTES];
+        let n = osvc::encode_driver(index, &mut req).map_err(|_| Error::InvalidArgument)?;
+        let (label, m) = ipc::call_corpo(
+            self.control,
+            &mut self.buffer,
+            osvc::label(Method::Driver),
+            &req[..n],
+            out,
+            deadline(),
+        )?;
+        if label != osvc::REPLY_OK {
+            return Err(Error::AccessDenied);
+        }
+        osvc::decode_driver_info(&out[..m]).map_err(|_| Error::InvalidArgument)
     }
 }

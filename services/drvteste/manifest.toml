@@ -1,0 +1,17 @@
+# Driver de teste do `devmgr` (ADR 0042; T-401): casa só com o dispositivo
+# `edu` do QEMU (1234:11e8). Não parte no boot; o `devmgr` o pede.
+[service]
+name = "drvteste"
+binary = "drvteste"
+priority = 120
+restart = "on-failure"
+
+[capabilities]
+needs = ["mem:quota:1MiB", "kernel:debug"]
+provides = []
+
+[match]
+pci = ["1234:11e8"]
+
+[limits]
+max_threads = 1

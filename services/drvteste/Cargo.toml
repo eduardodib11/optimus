@@ -1,0 +1,18 @@
+[package]
+name = "drvteste"
+description = "drvteste: driver de teste do devmgr para o dispositivo edu do QEMU (T-401)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "drvteste"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true

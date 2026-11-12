@@ -305,10 +305,35 @@ impl Svcmgr<'_> {
         }
     }
 
+    /// Resposta de `driver(index)`: só o `devmgr` lê a lista de drivers.
+    fn driver_answer(&self, id: u32, index: u16, body: &mut [u8]) -> (u64, usize) {
+        let err = |e, body: &mut [u8]| (osvc::REPLY_ERR, osvc::encode_error(e, body).unwrap_or(0));
+        let drivers = &self.plan.drivers;
+        let found = drivers
+            .get(usize::from(index))
+            .and_then(|&d| Some((d, self.plan.broker.manifest(d)?)));
+        let (Some((driver, m)), true) = (found, self.plan.broker.is_device_manager(id)) else {
+            return err(SvcError::NotInManifest, body);
+        };
+        let rules: Vec<&str> = m
+            .needs
+            .iter()
+            .filter(|n| n.kind == oman::NeedKind::Dev)
+            .map(|n| n.name.as_str())
+            .collect();
+        let total = u16::try_from(drivers.len()).unwrap_or(u16::MAX);
+        let encoded = osvc::DriverInfo::new(driver, total, &m.name, &rules)
+            .and_then(|info| osvc::encode_driver_info(&info, body).ok());
+        match encoded {
+            Some(n) => (osvc::REPLY_OK, n),
+            None => err(SvcError::Busy, body),
+        }
+    }
+
     /// Atende uma mensagem do canal de controle (ou nada, até `until`).
     /// Devolve o id que chamou `ready`, se foi isso.
     fn serve_one(&mut self, until: u64) -> Option<u32> {
-        let mut body = [0u8; osvc::MAX_BOOT_BYTES];
+        let mut body = [0u8; osvc::MAX_REPLY_BYTES];
         let mut req = [0u8; osvc::MAX_SHORT_BYTES];
         let tick = ostd::time::now_ns().saturating_add(TICK_NS);
         let deadline = match self.sup.next_due() {
@@ -370,6 +395,10 @@ impl Svcmgr<'_> {
                     },
                     None => err(SvcError::NotInManifest, &mut body),
                 },
+                Err(_) => (osvc::REPLY_BAD_MESSAGE, 0),
+            },
+            (true, Some(Method::Driver)) => match osvc::decode_driver(&req[..r.corpo]) {
+                Ok(index) => self.driver_answer(id, index, &mut body),
                 Err(_) => (osvc::REPLY_BAD_MESSAGE, 0),
             },
             (true, None) => (osvc::REPLY_UNKNOWN_METHOD, 0),
