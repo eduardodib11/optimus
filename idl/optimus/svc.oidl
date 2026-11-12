@@ -1,6 +1,6 @@
 // Protocolo entre os serviços e o `svcmgr` (ADR 0034, item 6). O código
 // à mão em lib/osvc segue esta especificação até os stubs gerados.
-package optimus.svc @1.1;
+package optimus.svc @1.2;
 
 struct CapDesc { kind: u8, index: u16, handle: u32, name_hash: u32 }
 struct Boot { caps: vec<CapDesc, 96>, generation: u16 }
@@ -17,4 +17,9 @@ interface Supervisor {
     // Nasce na 1.1 (`minor_min` 1): só o `devmgr` (quem provê
     // `optimus.dev.DeviceBus`) recebe.
     driver(index: u16) -> result<DriverInfo, SvcError>;
+    // Nascem na 1.2, também só para o `devmgr`: os recursos de um driver
+    // vão com a mensagem (até 4 capabilities, na ordem de `names`, o hash
+    // de cada nome) e depois o pedido de partida.
+    driver_give(id: u32, names: vec<u32, 4>) -> result<(), SvcError>;
+    driver_start(id: u32) -> result<(), SvcError>;
 }

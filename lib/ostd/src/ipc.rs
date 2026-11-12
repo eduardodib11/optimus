@@ -230,6 +230,8 @@ pub struct Recebido {
     pub rotulo: u64,
     /// Bytes do corpo copiados para `saida`.
     pub corpo: usize,
+    /// Capabilities que chegaram (os handles estão no buffer de IPC).
+    pub caps: usize,
 }
 
 /// `ipc_recv` com corpo: recebe do `ep` (a chamada fica em `reply`) e copia
@@ -251,6 +253,7 @@ pub fn recv_corpo(
         badge: rec.badge,
         rotulo: rec.msg.label,
         corpo,
+        caps: usize::from(rec.msg.info.caps),
     })
 }
 
@@ -292,6 +295,7 @@ pub fn responde_recebe_corpo(
         badge: rec.badge,
         rotulo: rec.msg.label,
         corpo,
+        caps: usize::from(rec.msg.info.caps),
     })
 }
 
