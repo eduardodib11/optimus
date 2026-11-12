@@ -703,7 +703,27 @@ const IOMMU_SCENARIO: Scenario = Scenario {
         "ktest: FALHOU",
         "okernel: FALTA",
         "PÂNICO",
-        "sem edu ou sem VT-d",
+        "sem edu ou sem IOMMU",
+        "sem edu;",
+    ],
+    ..KERNEL_SCENARIO
+};
+
+/// O mesmo aceite com `-device amd-iommu` (T-403), sem conferir o log de
+/// faltas: o `amd-iommu` do QEMU grava eventos fora do formato da AMD.
+const AMD_IOMMU_SCENARIO: Scenario = Scenario {
+    name: "AMD-Vi isola o DMA do edu e a MSI dele acorda a notificação",
+    cmdline: "test=kernel ktest=dev.",
+    markers: &[
+        KTEST_START,
+        "okernel: AMD-Vi ligado: 1 unidade(s)",
+        KTEST_END,
+    ],
+    forbidden: &[
+        "ktest: FALHOU",
+        "okernel: FALTA",
+        "PÂNICO",
+        "sem edu ou sem IOMMU",
         "sem edu;",
     ],
     ..KERNEL_SCENARIO
@@ -1233,6 +1253,11 @@ fn test(opts: &Options) -> Result {
             ..opts.clone()
         };
         smoke(&iommu, &[IOMMU_SCENARIO])?;
+        let amd = Options {
+            devices: vec!["amd-iommu", "edu"],
+            ..opts.clone()
+        };
+        smoke(&amd, &[AMD_IOMMU_SCENARIO])?;
     }
     if opts.suite == "smp" {
         smp(opts)?;

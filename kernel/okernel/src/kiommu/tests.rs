@@ -1,5 +1,6 @@
 //! Aceites do T-403 e do T-404 no QEMU (`cargo xtask test iommu`:
-//! `-device intel-iommu` e `-device edu`): o DMA do `edu` passa pela IOMMU
+//! `-device intel-iommu` ou `amd-iommu` e `-device edu`): o DMA do `edu`
+//! passa pela IOMMU
 //! só enquanto ele está ligado ao domínio (desligado, a escrita vira falta
 //! e a RAM fica intacta), e a MSI dele chega a um `Interrupt` e acorda a
 //! notificação ligada.
@@ -26,8 +27,8 @@ use crate::ktime;
 /// Testes do VT-d.
 pub const TESTS: &[Test] = &[
     Test {
-        name: "dev.vtd_isola_o_edu",
-        run: vtd_isola_o_edu,
+        name: "dev.iommu_isola_o_edu",
+        run: iommu_isola_o_edu,
     },
     Test {
         name: "dev.msi_do_edu_acorda_a_notificacao",
@@ -120,9 +121,9 @@ fn fault_of(bdf: u16, iova: u64, write: bool) -> bool {
     seen
 }
 
-fn vtd_isola_o_edu() -> Outcome {
+fn iommu_isola_o_edu() -> Outcome {
     let (Some(bdf), Some(_)) = (find_edu(), okernel::dma::iommu()) else {
-        info!("ktest: sem edu ou sem VT-d; o aceite roda em `cargo xtask test iommu`");
+        info!("ktest: sem edu ou sem IOMMU; o aceite roda em `cargo xtask test iommu`");
         return Ok(());
     };
     let bar = u64::from(config(bdf, 0x10) & !0xf);
@@ -145,10 +146,17 @@ fn vtd_isola_o_edu() -> Outcome {
     }
     let domain = Arc::new(DmaDomain::new(&quota).map_err(|_| "domínio")?);
     ensure!(domain.map(&mo, 0x10_0000, 0, 2 * 4096, true) == Ok(0x10_0000));
-    // Desligado: nada passa, e a leitura vira falta. O `intel-iommu` do
-    // QEMU tem um só registrador de falta: lê-se uma por vez.
+    // Desligado: a escrita não chega à RAM, e a leitura vira falta. O
+    // `intel-iommu` do QEMU tem um só registrador de falta: lê-se uma por
+    // vez. O `amd-iommu` do QEMU bloqueia mas grava o evento fora do
+    // formato da AMD (e nada para PTE zerada): lá as faltas não se conferem.
+    let records = super::kind() == Some("VT-d");
+    ensure!(edu.dma(0x10_1000, true));
+    // SAFETY: como acima.
+    ensure!((0..64).all(|i| unsafe { dst.add(i).read_volatile() } == 0));
+    ensure!(!records || fault_of(bdf, 0x10_1000, true));
     ensure!(edu.dma(0x10_0000, false));
-    ensure!(fault_of(bdf, 0x10_0000, false));
+    ensure!(!records || fault_of(bdf, 0x10_0000, false));
     domain.attach(bdf).map_err(|_| "attach")?;
     ensure!(edu.dma(0x10_0000, false) && edu.dma(0x10_1000, true));
     // SAFETY: como acima.
@@ -161,7 +169,8 @@ fn vtd_isola_o_edu() -> Outcome {
     ensure!(edu.dma(0x10_1000, true));
     // SAFETY: como acima.
     ensure!((0..64).all(|i| unsafe { dst.add(i).read_volatile() } == 0));
-    ensure!(fault_of(bdf, 0x10_1000, true));
+    ensure!(!records || fault_of(bdf, 0x10_1000, true));
+    super::faults(&mut |_| {});
     drop((domain, mo));
     ensure!(quota.used() == used);
     Ok(())

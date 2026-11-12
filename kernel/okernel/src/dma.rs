@@ -24,6 +24,7 @@ use crate::mm::PhysAddr;
 use crate::sync::{LockClass, SpinLock};
 use crate::vm::MemoryObject;
 
+pub mod amdvi;
 pub mod vtd;
 
 /// Primeiro endereço fora da faixa de IOVA aceita (39 bits: as tabelas de
