@@ -7,9 +7,12 @@ enum BusKind : u8 { Pci, Acpi }
 enum DevError : u8 { Duplicate, Full }
 
 struct Bar { index: u8, io: bool, prefetch: bool, base: u64, size: u64 }
+// Faixa de portas de E/S de um nó legado (ADR 0049, item 8).
+struct Ports { base: u16, count: u16 }
 
 // `flags`: 1 = `vendor:device` válido, 2 = classe válida, 4 = MSI,
 // 8 = `bdf` válido. `msix` é o número de entradas da tabela MSI-X.
+// `ports` e `irqs` (IRQs ISA) são os recursos `_CRS` de um nó do `acpid`.
 struct Node {
     id: u32,
     bus: BusKind,
@@ -22,6 +25,8 @@ struct Node {
     bdf: u16,
     msix: u16,
     bars: vec<Bar, 6>,
+    ports: vec<Ports, 4>,
+    irqs: vec<u8, 4>,
     compatible: vec<string<63>, 8>
 }
 

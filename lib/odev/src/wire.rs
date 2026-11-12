@@ -5,7 +5,8 @@
 //! Cabeça de `publish(node: Node)`, na ordem da declaração: `id: u32`,
 //! `bus: u8`, `flags: u8`, `vendor: u16`, `device: u16`, `class: u8`,
 //! `subclass: u8`, `prog_if: u8`, `bdf: u16`, `msix: u16`,
-//! `bars: vec<Bar, 6>` e `compatible: vec<string<63>, 8>`.
+//! `bars: vec<Bar, 6>`, `ports: vec<Ports, 4>`, `irqs: vec<u8, 4>` e
+//! `compatible: vec<string<63>, 8>`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -82,6 +83,15 @@ pub struct Bar {
     pub size: u64,
 }
 
+/// Uma faixa de portas de E/S do nó (ADR 0049, item 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ports {
+    /// Primeira porta.
+    pub base: u16,
+    /// Quantidade de portas.
+    pub count: u16,
+}
+
 /// Recursos do nó (ADR 0042, item 2) e o que o `devmgr` precisa para
 /// montar as capabilities do driver. Não aloca, para o `pcid` publicar
 /// sem heap.
@@ -95,7 +105,14 @@ pub struct Resources {
     pub msi: bool,
     /// Entradas da tabela MSI-X (0 = sem MSI-X).
     pub msix: u16,
+    /// Faixas de portas de E/S (nós legados), sem buracos.
+    pub ports: [Option<Ports>; MAX_LEGACY],
+    /// IRQs ISA (nós legados), sem buracos.
+    pub irqs: [Option<u8>; MAX_LEGACY],
 }
+
+/// Teto de faixas de portas e de IRQs ISA.
+pub const MAX_LEGACY: usize = 4;
 
 /// Teto de BARs.
 pub const MAX_BARS: usize = 6;
@@ -104,11 +121,12 @@ pub const MAX_COMPATIBLE: usize = 8;
 /// Teto de cada string `compatible`.
 pub const MAX_NAME: usize = 63;
 /// Cabeça de `Node`.
-const NODE_HEAD: usize = 36;
+const NODE_HEAD: usize = 52;
 /// Bytes de um `Bar` no fio.
 const BAR_BYTES: usize = 24;
 /// Maior corpo de `publish`.
-pub const MAX_PUBLISH_BYTES: usize = 40 + MAX_BARS * BAR_BYTES + MAX_COMPATIBLE * (8 + 64);
+pub const MAX_PUBLISH_BYTES: usize =
+    56 + MAX_BARS * BAR_BYTES + MAX_LEGACY * 4 + 8 + MAX_COMPATIBLE * (8 + 64);
 
 const HAS_PCI_ID: u8 = 1;
 const HAS_CLASS: u8 = 2;
@@ -147,6 +165,8 @@ pub fn encode_publish(node: &Node, res: &Resources, out: &mut [u8]) -> Result<us
     w.u16(res.msix)?;
     let present = res.bars.iter().flatten().count();
     let bars = w.vec(present, BAR_BYTES, MAX_BARS)?;
+    let ports = w.vec(res.ports.iter().flatten().count(), 4, MAX_LEGACY)?;
+    let irqs = w.vec(res.irqs.iter().flatten().count(), 1, MAX_LEGACY)?;
     let names = w.vec(node.compatible.len(), 8, MAX_COMPATIBLE)?;
     let indexed = (0u8..).zip(res.bars).filter_map(|(i, b)| Some((i, b?)));
     for (k, (index, b)) in indexed.enumerate() {
@@ -156,6 +176,15 @@ pub fn encode_publish(node: &Node, res: &Resources, out: &mut [u8]) -> Result<us
         w.bool(b.prefetch)?;
         w.u64(b.base)?;
         w.u64(b.size)?;
+    }
+    for (k, p) in res.ports.iter().flatten().enumerate() {
+        w.seek(ports + k * 4);
+        w.u16(p.base)?;
+        w.u16(p.count)?;
+    }
+    for (k, irq) in res.irqs.iter().flatten().enumerate() {
+        w.seek(irqs + k);
+        w.u8(*irq)?;
     }
     for (i, c) in node.compatible.iter().enumerate() {
         w.seek(names + i * 8);
@@ -185,6 +214,8 @@ pub fn decode_publish(body: &[u8]) -> Result<(Node, Resources)> {
     let (class, subclass, prog_if) = (r.u8()?, r.u8()?, r.u8()?);
     let (bdf, msix) = (r.u16()?, r.u16()?);
     let bar_elems = r.vec(MAX_BARS, BAR_BYTES)?;
+    let port_elems = r.vec(MAX_LEGACY, 4)?;
+    let irq_elems = r.vec(MAX_LEGACY, 1)?;
     let name_elems = r.vec(MAX_COMPATIBLE, 8)?;
     let mut bars = [None; MAX_BARS];
     for i in 0..bar_elems.count() {
@@ -199,6 +230,19 @@ pub fn decode_publish(body: &[u8]) -> Result<(Node, Resources)> {
             base: r.u64()?,
             size: r.u64()?,
         });
+    }
+    let mut ports = [None; MAX_LEGACY];
+    for (i, slot) in ports.iter_mut().enumerate().take(port_elems.count()) {
+        r.seek(port_elems.off() + i * 4);
+        *slot = Some(Ports {
+            base: r.u16()?,
+            count: r.u16()?,
+        });
+    }
+    let mut irqs = [None; MAX_LEGACY];
+    for (i, slot) in irqs.iter_mut().enumerate().take(irq_elems.count()) {
+        r.seek(irq_elems.off() + i);
+        *slot = Some(r.u8()?);
     }
     let mut compatible = Vec::with_capacity(name_elems.count());
     for i in 0..name_elems.count() {
@@ -222,6 +266,8 @@ pub fn decode_publish(body: &[u8]) -> Result<(Node, Resources)> {
         bars,
         msi: flags & HAS_MSI != 0,
         msix,
+        ports,
+        irqs,
     };
     Ok((node, res))
 }

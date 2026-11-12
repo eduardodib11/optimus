@@ -8,7 +8,9 @@
 //! - `barN`: o `MemoryObject` de MMIO de cada BAR de memória;
 //! - `irq0`...: um `Interrupt` por vetor, já programado na função: até
 //!   [`MAX_VECTORS`] entradas de MSI-X, quando existe, senão o vetor MSI;
-//! - `dma`: uma cópia só com `MAP` do `DmaDomain` ligado ao BDF.
+//! - `dma`: uma cópia só com `MAP` do `DmaDomain` ligado ao BDF;
+//! - `ioN`: a `IoPortRange` de cada faixa de portas de um nó legado, e as
+//!   IRQs ISA dele como `irqN` (ADR 0049, item 8).
 //!
 //! O `devmgr` fica com as originais (o domínio com `BIND`). Revogá-las tira
 //! os recursos do driver (item 5).
@@ -146,22 +148,22 @@ pub struct Bound {
     pub originals: Vec<Handle>,
 }
 
-/// Cria os recursos do nó, liga a função e parte o driver `driver`.
+/// Cria os recursos do nó, liga a função (se for PCI) e parte o driver
+/// `driver`.
 ///
 /// # Errors
 ///
-/// Os do kernel; `InvalidArgument` para nó sem BDF. Os recursos já
-/// criados são apagados.
+/// Os do kernel; `NotSupported` para nó PCI sem a janela ECAM. Os recursos
+/// já criados são apagados.
 pub fn start(
     s: &mut Session,
     device: Handle,
-    ecam: Handle,
+    ecam: Option<Handle>,
     driver: u32,
     res: &Resources,
 ) -> Result<Bound, Error> {
-    let bdf = res.bdf.ok_or(Error::InvalidArgument)?;
     let mut originals = Vec::new();
-    let r = build(s, device, ecam, driver, bdf, res, &mut originals);
+    let r = build(s, device, ecam, driver, res, &mut originals);
     match r {
         Ok(()) => Ok(Bound { driver, originals }),
         Err(e) => {
@@ -173,16 +175,18 @@ pub fn start(
     }
 }
 
+/// O que vai ao driver: capability e hash do nome.
+type Give = Vec<(Handle, u32)>;
+
 fn build(
     s: &mut Session,
     device: Handle,
-    ecam: Handle,
+    ecam: Option<Handle>,
     driver: u32,
-    bdf: u16,
     res: &Resources,
     originals: &mut Vec<Handle>,
 ) -> Result<(), Error> {
-    let mut give: Vec<(Handle, u32)> = Vec::new();
+    let mut give = Give::new();
     let mut bars = [None; 6];
     for (i, bar) in res.bars.iter().enumerate() {
         if let Some(b) = bar.filter(|b| !b.io) {
@@ -192,6 +196,39 @@ fn build(
             give.push((h, name_hash(&format!("bar{i}"))));
         }
     }
+    let mut irqs = 0;
+    if let Some(bdf) = res.bdf {
+        let ecam = ecam.ok_or(Error::NotSupported)?;
+        irqs = pci(device, ecam, bdf, res, &bars, originals, &mut give)?;
+    }
+    // Nó legado (ADR 0049, item 8): portas de E/S e IRQs ISA.
+    for (i, p) in res.ports.iter().flatten().enumerate() {
+        let h = ostd::port::create(device, p.base, p.count)?;
+        originals.push(h);
+        give.push((h, name_hash(&format!("io{i}"))));
+    }
+    for (i, irq) in res.irqs.iter().flatten().enumerate() {
+        let h = ostd::dev::isa_irq(device, *irq)?;
+        originals.push(h);
+        give.push((h, name_hash(&format!("irq{}", irqs + i))));
+    }
+    for chunk in give.chunks(osvc::MAX_MSG_CAPS) {
+        s.driver_give(driver, chunk)?;
+    }
+    s.driver_start(driver)
+}
+
+/// A parte PCI: `DmaDomain` ligado ao BDF, MSI-X ou MSI programados e bus
+/// master. Devolve quantos `irqN` entregou.
+fn pci(
+    device: Handle,
+    ecam: Handle,
+    bdf: u16,
+    res: &Resources,
+    bars: &[Option<Handle>; 6],
+    originals: &mut Vec<Handle>,
+    give: &mut Give,
+) -> Result<usize, Error> {
     let domain = ostd::cap::create(device, ObjectType::DmaDomain, 0)?;
     originals.push(domain);
     ostd::dev::dma_bind(domain, bdf, true)?;
@@ -204,6 +241,7 @@ fn build(
         .map(|p| p.caps)
         .unwrap_or_default();
     let mut command = MEMORY_ENABLE | BUS_MASTER;
+    let mut irqs = 0;
     if let Some(x) = caps.msix {
         // MSI-X primeiro, quando existe (virtio moderno só tem ele).
         let table = bars
@@ -222,19 +260,18 @@ fn build(
         for (i, m) in vectors.iter().enumerate() {
             give.push((m.irq, name_hash(&format!("irq{i}"))));
         }
+        irqs = count;
         command |= INTX_DISABLE;
     } else if let Some(at) = caps.msi.filter(|_| res.msi) {
         let m = ostd::dev::msi(device, bdf)?;
         originals.push(m.irq);
         program_msi(&mut f, at, m.address, m.data);
         give.push((m.irq, name_hash("irq0")));
+        irqs = 1;
         command |= INTX_DISABLE;
     }
     // Bus master só agora, com o domínio já ligado (ADR 0043, item 4).
     let old = opci::Config::read(&mut f, fbdf, COMMAND);
     opci::Config::write(&mut f, fbdf, COMMAND, (old & 0xFFFF) | command);
-    for chunk in give.chunks(osvc::MAX_MSG_CAPS) {
-        s.driver_give(driver, chunk)?;
-    }
-    s.driver_start(driver)
+    Ok(irqs)
 }

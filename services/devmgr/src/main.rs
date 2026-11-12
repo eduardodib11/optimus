@@ -125,10 +125,11 @@ impl Devmgr {
     /// Parte o driver `id` com os recursos do nó (depois de responder a
     /// quem publicou).
     fn start(&mut self, id: u32, res: &Resources) {
-        let (Some(device), Some(ecam)) = (self.device, self.ecam) else {
-            ostd::debug::print("devmgr: sem kernel:device ou kernel:ecam, driver não parte");
+        let Some(device) = self.device else {
+            ostd::debug::print("devmgr: sem kernel:device, driver não parte");
             return;
         };
+        let ecam = self.ecam;
         if self.bound.iter().any(|b| b.driver == id) {
             ostd::debug::print("devmgr: driver já ligado a outro nó");
             return;

@@ -35,7 +35,7 @@ fn publish_ida_e_volta() {
     let mut buf = [0u8; MAX_PUBLISH_BYTES];
     let (node, res) = edu();
     let n = encode_publish(&node, &res, &mut buf).unwrap();
-    assert_eq!(n, 40 + 24, "cabeça de 36 arredondada a 40 e um BAR");
+    assert_eq!(n, 56 + 24, "cabeça de 52 arredondada a 56 e um BAR");
     assert_eq!(decode_publish(&buf[..n]).unwrap(), (node, res));
     // Nó do ACPI: sem ids PCI, com dois `compatible`.
     let acpi = Node {
@@ -53,7 +53,21 @@ fn publish_ida_e_volta() {
         size: 8,
     });
     let n = encode_publish(&acpi, &ports, &mut buf).unwrap();
-    assert_eq!(decode_publish(&buf[..n]).unwrap(), (acpi, ports));
+    assert_eq!(decode_publish(&buf[..n]).unwrap(), (acpi.clone(), ports));
+    // Nó legado (ADR 0049, item 8): portas e IRQs ISA do PS/2.
+    let mut ps2 = Resources::default();
+    ps2.ports[0] = Some(Ports {
+        base: 0x60,
+        count: 1,
+    });
+    ps2.ports[1] = Some(Ports {
+        base: 0x64,
+        count: 1,
+    });
+    ps2.irqs[0] = Some(1);
+    ps2.irqs[1] = Some(12);
+    let n = encode_publish(&acpi, &ps2, &mut buf).unwrap();
+    assert_eq!(decode_publish(&buf[..n]).unwrap(), (acpi, ps2));
 }
 
 #[test]
@@ -68,7 +82,7 @@ fn recusa_o_que_esta_fora_do_formato() {
     bad[5] |= 0x10; // bit de `flags` desconhecido
     assert_eq!(decode_publish(&bad[..n]), Err(Error::BadMessage));
     let mut bad = buf;
-    bad[40] = 6; // índice de BAR
+    bad[56] = 6; // índice de BAR
     assert_eq!(decode_publish(&bad[..n]), Err(Error::BadMessage));
     assert_eq!(decode_publish(&buf[..n + 8]), Err(Error::BadMessage));
     // BAR repetido e tetos.
@@ -76,7 +90,7 @@ fn recusa_o_que_esta_fora_do_formato() {
     two.bars[1] = two.bars[0];
     let n = encode_publish(&node, &two, &mut buf).unwrap();
     let mut bad = buf;
-    bad[40 + 24] = 0;
+    bad[56 + 24] = 0;
     assert_eq!(decode_publish(&bad[..n]), Err(Error::BadMessage));
     let long = Node {
         compatible: vec!["x".repeat(MAX_NAME + 1)],
