@@ -10,6 +10,8 @@ doctest = false
 bench = false
 
 [dependencies]
+oidl-rt = { path = "../oidl-rt" }
+optcrypt = { path = "../optcrypt" }
 
 [lints]
 workspace = true

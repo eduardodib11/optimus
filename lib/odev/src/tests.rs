@@ -125,3 +125,22 @@ fn regras_do_manifesto() {
         assert_eq!(Rule::parse(bad), None, "{bad}");
     }
 }
+
+#[test]
+fn registro_recusa_repetido_e_acima_do_teto() {
+    let mut reg = Registry::new(1);
+    assert!(reg.publish(blk_node(), wire::Resources::default()).is_ok());
+    assert_eq!(
+        reg.publish(blk_node(), wire::Resources::default()).err(),
+        Some(wire::DevError::Duplicate)
+    );
+    let other = Node {
+        id: 2,
+        ..blk_node()
+    };
+    assert_eq!(
+        reg.publish(other, wire::Resources::default()).err(),
+        Some(wire::DevError::Full)
+    );
+    assert_eq!(reg.nodes().count(), 1);
+}

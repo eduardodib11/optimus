@@ -1,0 +1,30 @@
+// Barramento de dispositivos (ADR 0042, itens 1 e 2): o `pcid` e o
+// `acpid` publicam os nós ao `devmgr`. O código à mão em lib/odev/src/wire.rs
+// segue esta especificação até os stubs gerados.
+package optimus.dev @1.0;
+
+enum BusKind : u8 { Pci, Acpi }
+enum DevError : u8 { Duplicate, Full }
+
+struct Bar { index: u8, io: bool, prefetch: bool, base: u64, size: u64 }
+
+// `flags`: 1 = `vendor:device` válido, 2 = classe válida, 4 = MSI,
+// 8 = `bdf` válido. `msix` é o número de entradas da tabela MSI-X.
+struct Node {
+    id: u32,
+    bus: BusKind,
+    flags: u8,
+    vendor: u16,
+    device: u16,
+    class: u8,
+    subclass: u8,
+    prog_if: u8,
+    bdf: u16,
+    msix: u16,
+    bars: vec<Bar, 6>,
+    compatible: vec<string<63>, 8>
+}
+
+interface DeviceBus {
+    publish(node: Node) -> result<(), DevError>;
+}

@@ -6,6 +6,9 @@
 //! classe com subclasse (sem `prog_if`) vale 1 e `compatible` vale 1. O
 //! driver de maior pontuação vence; empate entre drivers distintos é erro e
 //! nenhum é carregado.
+//!
+//! O [`wire`] tem o protocolo `optimus.dev.DeviceBus@1` e o [`Registry`]
+//! guarda os nós publicados.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -188,6 +191,47 @@ pub fn best_match<'a>(drivers: &'a [Driver], node: &Node) -> Outcome<'a> {
         (Some((d, _)), Some(t)) => Outcome::Tie(d, t),
     }
 }
+
+/// Os nós publicados ao `devmgr`, com teto.
+#[derive(Debug, Default)]
+pub struct Registry {
+    nodes: Vec<(Node, wire::Resources)>,
+    max: usize,
+}
+
+impl Registry {
+    /// Registro que guarda até `max` nós.
+    #[must_use]
+    pub const fn new(max: usize) -> Self {
+        Self {
+            nodes: Vec::new(),
+            max,
+        }
+    }
+
+    /// Guarda o nó publicado.
+    ///
+    /// # Errors
+    /// [`wire::DevError::Duplicate`] se o id já existe;
+    /// [`wire::DevError::Full`] acima do teto.
+    pub fn publish(&mut self, node: Node, res: wire::Resources) -> Result<&Node, wire::DevError> {
+        if self.nodes.iter().any(|(n, _)| n.id == node.id) {
+            return Err(wire::DevError::Duplicate);
+        }
+        if self.nodes.len() >= self.max {
+            return Err(wire::DevError::Full);
+        }
+        self.nodes.push((node, res));
+        Ok(&self.nodes[self.nodes.len() - 1].0)
+    }
+
+    /// Os nós, na ordem de publicação.
+    pub fn nodes(&self) -> impl Iterator<Item = &(Node, wire::Resources)> {
+        self.nodes.iter()
+    }
+}
+
+pub mod wire;
 
 #[cfg(test)]
 mod tests;
