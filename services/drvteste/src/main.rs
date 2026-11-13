@@ -159,9 +159,13 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
         // parte de novo. Passar de 5 s aqui é falha.
         ostd::cap::arm_timer(timer, ntfy, TIMEOUT_BIT, 5_000_000_000, 0, timer::RELATIVE)
             .map_err(|_| "armar o prazo de contenção")?;
-        let bits = ostd::cap::ntfy_wait(ntfy).map_err(|_| "esperar a contenção")?;
-        if bits & TIMEOUT_BIT != 0 {
-            return Err("não foi contido em 5 s");
+        // Qualquer outro bit (a MSI do `edu`) é ignorado: só o `devmgr` ou o
+        // prazo acordam este laço para valer.
+        loop {
+            let bits = ostd::cap::ntfy_wait(ntfy).map_err(|_| "esperar a contenção")?;
+            if bits & TIMEOUT_BIT != 0 {
+                return Err("não foi contido em 5 s");
+            }
         }
     }
     Ok(())
