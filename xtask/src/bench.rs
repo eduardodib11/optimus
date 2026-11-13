@@ -39,6 +39,7 @@ const BENCH_SCENARIO: Scenario = Scenario {
     rounds: None,
     hello: false,
     timeout: Duration::from_mins(10),
+    key: None,
 };
 
 /// Benchmarks na ordem do relatório: nome na serial, descrição e meta do

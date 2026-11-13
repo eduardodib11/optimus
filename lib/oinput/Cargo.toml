@@ -1,0 +1,16 @@
+[package]
+name = "oinput"
+description = "Fio de optimus.input.Sink@1 (T-406): os eventos de teclado e de ponteiro que os drivers de entrada mandam ao inputd. no_std, sem unsafe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[dependencies]
+optcrypt = { path = "../optcrypt" }
+
+[lints]
+workspace = true

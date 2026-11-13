@@ -37,6 +37,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("osvc", "lib/osvc/src/lib.rs", KERNEL_TARGET),
     ("odev", "lib/odev/src/lib.rs", KERNEL_TARGET),
     ("olegacy", "lib/olegacy/src/lib.rs", KERNEL_TARGET),
+    ("oinput", "lib/oinput/src/lib.rs", KERNEL_TARGET),
     ("opci", "lib/opci/src/lib.rs", KERNEL_TARGET),
     ("virtio-core", "lib/virtio-core/src/lib.rs", KERNEL_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
@@ -51,6 +52,8 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("devmgr", "services/devmgr/src/main.rs", USER_TARGET),
     ("drvteste", "services/drvteste/src/main.rs", USER_TARGET),
     ("rtcd", "services/rtcd/src/main.rs", USER_TARGET),
+    ("inputd", "services/inputd/src/main.rs", USER_TARGET),
+    ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -73,6 +76,7 @@ const HOST_TESTED: &[&str] = &[
     "acpid",
     "mktz",
     "olegacy",
+    "oinput",
 ];
 
 const PROFILES: &[&str] = &["lite", "basic", "default", "premium", "server"];
@@ -107,7 +111,7 @@ const BOOT_MARKERS: &[&str] = &[
     "svcmgr: devmgr em Running",
     "svcmgr: pcid em Running",
     "svcmgr: acpid em Running",
-    "svcmgr: 6 serviços em Running",
+    "svcmgr: 7 serviços em Running",
     "svcmgr: serviços encerrados",
     "root: o svcmgr terminou",
     "okernel: root terminou",
@@ -383,7 +387,9 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
-        | "drvteste" | "rtcd" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        | "drvteste" | "rtcd" | "inputd" | "i8042d" | "utest" | "okfuzz" => {
+            &["-C", "relocation-model=static"]
+        }
         _ => &[],
     }
 }
@@ -430,6 +436,8 @@ const BOOTFS: &[(&str, &str)] = &[
     ("devmgr", "devmgr"),
     ("drvteste", "drvteste"),
     ("rtcd", "rtcd"),
+    ("inputd", "inputd"),
+    ("i8042d", "i8042d"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -635,7 +643,17 @@ struct Scenario {
     hello: bool,
     /// Quanto esperar o QEMU.
     timeout: Duration,
+    /// Tecla que o xtask injeta pelo monitor do QEMU (`sendkey`) quando o
+    /// `i8042d` avisa que está pronto (T-406).
+    key: Option<&'static str>,
 }
+
+/// Linha do `i8042d` que libera a tecla injetada.
+const KEY_READY: &str = "i8042d: teclado pronto";
+/// Linha do `inputd` que encerra a injeção.
+const KEY_SEEN: &str = "inputd: tecla ";
+/// Intervalo entre injeções enquanto o `inputd` não mostra a tecla.
+const KEY_RETRY: Duration = Duration::from_millis(300);
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
@@ -649,6 +667,7 @@ const SCENARIOS: &[Scenario] = &[
         rounds: Some(BOOT_ROUNDS),
         hello: true,
         timeout: SMOKE_TIMEOUT,
+        key: None,
     },
     Scenario {
         name: "falta proposital",
@@ -661,6 +680,7 @@ const SCENARIOS: &[Scenario] = &[
         rounds: None,
         hello: false,
         timeout: SMOKE_TIMEOUT,
+        key: None,
     },
     PANIC_SCENARIO,
 ];
@@ -677,6 +697,7 @@ const PANIC_SCENARIO: Scenario = Scenario {
     rounds: None,
     hello: false,
     timeout: SMOKE_TIMEOUT,
+    key: None,
 };
 
 /// Testes de kernel (T-111): o kernel roda os testes registrados e sai com 33
@@ -692,6 +713,7 @@ const KERNEL_SCENARIO: Scenario = Scenario {
     rounds: Some(KTEST_ROUNDS),
     hello: false,
     timeout: KTEST_TIMEOUT,
+    key: None,
 };
 
 /// Aceites do T-403 e do T-404 (`cargo xtask test iommu`, também no
@@ -728,7 +750,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 2 drivers no conjunto",
+        "devmgr: 3 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -774,6 +796,7 @@ const ALTERNATE_SCENARIO: Scenario = Scenario {
     name: "dois processos alternando 10⁶ vezes em CPUs distintas",
     cmdline: "test=kernel ktest=smp.dois_processos smp.alternate=1000000",
     timeout: Duration::from_mins(15),
+    key: None,
     ..KERNEL_SCENARIO
 };
 
@@ -784,6 +807,7 @@ const IPC_SCENARIO: Scenario = Scenario {
     name: "10⁶ idas e voltas de IPC com o servidor seguindo quem chama",
     cmdline: "test=kernel ktest=smp.ipc_servidor smp.ipc=1000000",
     timeout: Duration::from_mins(15),
+    key: None,
     ..KERNEL_SCENARIO
 };
 
@@ -794,6 +818,7 @@ const SHOOTDOWN_SCENARIO: Scenario = Scenario {
     name: "10⁵ shootdowns sem tradução velha",
     cmdline: "test=kernel ktest=smp.shootdown_sem smp.shootdown=100000",
     timeout: Duration::from_mins(15),
+    key: None,
     ..KERNEL_SCENARIO
 };
 
@@ -816,6 +841,7 @@ const HELLO_SCENARIO: Scenario = Scenario {
     rounds: Some(HELLO_ROUNDS),
     hello: true,
     timeout: HELLO_TIMEOUT,
+    key: None,
 };
 /// Limite dos testes de usuário: o anel SPSC passa 10⁷ itens entre dois
 /// processos (T-339), 3,5 min em TCG com 2 CPUs.
@@ -842,6 +868,7 @@ const USER_SCENARIO: Scenario = Scenario {
     rounds: None,
     hello: false,
     timeout: USER_TIMEOUT,
+    key: None,
 };
 
 /// Primeira linha do harness: `ktest: início, N testes`.
@@ -1021,6 +1048,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let (wall_seen, reader) = spawn_reader(stdout, tx);
     let mut raw = Vec::new();
     let start = Instant::now();
+    let mut last_key: Option<Instant> = None;
     let seen_all = |raw: &[u8]| {
         let text = String::from_utf8_lossy(raw);
         sc.markers.iter().all(|m| text.contains(m))
@@ -1039,6 +1067,9 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
                 let _ = stdin.write_all(b"\n").and_then(|()| stdin.flush());
             }
             screen = Some(shot);
+        }
+        if let Some(key) = sc.key {
+            inject_key(&monitor, key, &raw, &mut last_key);
         }
         let frozen = sc.exit.is_none() && seen_all(&raw);
         if frozen || start.elapsed() > sc.timeout {
@@ -1141,6 +1172,40 @@ fn check_panic_screen(monitor: &Path) -> Result {
 
 /// Registradores de todas as CPUs e o APIC local da primeira, pelo monitor
 /// do QEMU: onde um boot travado parou.
+/// Injeta `key` pelo monitor quando o `i8042d` está pronto, e de novo a
+/// cada [`KEY_RETRY`] enquanto o `inputd` não mostrar a tecla (ela pode
+/// chegar antes de o driver ligar a IRQ).
+fn inject_key(monitor: &Path, key: &str, raw: &[u8], last: &mut Option<Instant>) {
+    let text = String::from_utf8_lossy(raw);
+    if text.contains(KEY_READY)
+        && !text.contains(KEY_SEEN)
+        && last.is_none_or(|t| t.elapsed() > KEY_RETRY)
+    {
+        monitor_command(monitor, &format!("sendkey {key}"));
+        *last = Some(Instant::now());
+    }
+}
+
+/// Manda um comando ao monitor do QEMU, sem esperar resposta.
+fn monitor_command(monitor: &Path, command: &str) {
+    if let Ok(mut sock) = UnixStream::connect(monitor) {
+        let _ = writeln!(sock, "{command}");
+        let _ = sock.flush();
+        // O QEMU executa o comando depois do banner e ecoa a linha; fechar
+        // antes disso perde o comando.
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
+        let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(1) {
+            if let Ok(n @ 1..) = sock.read(&mut chunk) {
+                seen.extend_from_slice(&chunk[..n]);
+            } else if seen.windows(command.len()).any(|w| w == command.as_bytes()) {
+                break;
+            }
+        }
+    }
+}
+
 fn monitor_dump(monitor: &Path) -> String {
     let run = || -> std::io::Result<String> {
         let mut sock = UnixStream::connect(monitor)?;
@@ -1351,7 +1416,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 2 drivers no conjunto",
+    "devmgr: 3 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
@@ -1363,6 +1428,13 @@ const INTEGRATION_MARKERS: &[&str] = &[
     // que lê a hora pelas portas do CMOS ([`check_rtcd`] confere o valor).
     "[\"PNP0B00\"]: rtcd",
     "rtcd: RTC em ",
+    // Aceite da T-406 (PS/2): o `i8042d` parte pelo nó `PNP0303` e a tecla
+    // "a" (código 0x1e) que o xtask injeta pelo monitor chega ao `inputd`.
+    "[\"PNP0303\"]: i8042d",
+    "i8042d: teclado pronto",
+    "inputd: tecla 0x1e apertada",
+    "inputd: tecla 0x1e solta",
+    "inputd: encerrado",
 ];
 
 /// CPUs do cenário de integração sem `--smp`.
@@ -1396,6 +1468,7 @@ fn integration(opts: &Options) -> Result {
             &Scenario {
                 name: "integração",
                 markers,
+                key: Some("a"),
                 ..SCENARIOS[0]
             },
         )?;
@@ -1468,6 +1541,7 @@ fn chaos(opts: &Options) -> Result {
             name: "caos",
             markers,
             timeout: Duration::from_mins(20),
+            key: None,
             ..SCENARIOS[0]
         },
     )?;
@@ -1611,6 +1685,7 @@ fn stress(opts: &Options) -> Result {
             cmdline,
             // Poucas épocas por minuto na depuração, com folga de um quarto.
             timeout: Duration::from_secs(seconds + seconds / 4 + 600),
+            key: None,
             ..KERNEL_SCENARIO
         },
     )?;
@@ -2003,7 +2078,7 @@ mod tests {
                   info  [7376636d] svcmgr: devmgr em Running\r\n\
                   info  [7376636d] svcmgr: pcid em Running\r\n\
                   info  [7376636d] svcmgr: acpid em Running\r\n\
-                  info  [7376636d] svcmgr: 6 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: 7 serviços em Running\r\n\
                   info  [7376636d] svcmgr: serviços encerrados\r\n\
                   info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";

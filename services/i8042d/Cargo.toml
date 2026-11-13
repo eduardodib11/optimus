@@ -1,0 +1,21 @@
+[package]
+name = "i8042d"
+description = "i8042d: driver do teclado PS/2 em processo isolado (T-406; ADR 0042 e 0049)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "i8042d"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+olegacy = { path = "../../lib/olegacy" }
+oinput = { path = "../../lib/oinput" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true

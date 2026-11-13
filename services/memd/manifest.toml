@@ -7,7 +7,7 @@ priority = 160
 restart = "always"
 
 [capabilities]
-needs = ["mem:quota:1MiB", "kernel:debug"]
+needs = ["mem:quota:768KiB", "kernel:debug"]
 provides = ["optimus.mem.Mem@1.0"]
 
 [limits]

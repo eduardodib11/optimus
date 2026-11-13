@@ -1,0 +1,18 @@
+# Driver do teclado PS/2 (T-406; ADR 0042 e 0049): casa com o nó `PNP0303`
+# que o `acpid` publica. O `devmgr` o parte com as portas 0x60 (`io0`) e
+# 0x64 (`io1`) e a IRQ 1 (`irq0`); as teclas vão ao `inputd`.
+[service]
+name = "i8042d"
+binary = "i8042d"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:512KiB", "kernel:debug", "svc:optimus.input.Sink@1"]
+provides = []
+
+[match]
+compatible = ["PNP0303"]
+
+[limits]
+max_threads = 1

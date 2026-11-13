@@ -661,6 +661,17 @@ impl Svcmgr<'_> {
     /// Desligamento ordenado: encerra os serviços em ordem inversa de
     /// partida, para a cota voltar ao `root`.
     fn shutdown(&mut self) {
+        // Os drivers primeiro: dependem dos serviços, e um driver que
+        // espera uma IRQ não sai sozinho.
+        for id in self.plan.drivers.clone().into_iter().rev() {
+            // `DESTROY` no `CapSpace` mata a thread parada na notificação
+            // da própria tabela; só apagar deixaria o processo preso na
+            // cota (o ciclo da ADR 0029).
+            if let Some(cspace) = self.started(id).map(|s| s.child.cspace) {
+                let _ = ostd::cap::destroy(cspace);
+            }
+            self.retire(id);
+        }
         let levels = self.plan.levels.clone();
         for level in levels.iter().rev() {
             for &id in level.iter().rev() {

@@ -7,7 +7,7 @@ priority = 150
 restart = "always"
 
 [capabilities]
-needs = ["mem:quota:3MiB", "kernel:debug", "kernel:log"]
+needs = ["mem:quota:2816KiB", "kernel:debug", "kernel:log"]
 provides = ["optimus.log.Log@1.0"]
 
 [limits]
