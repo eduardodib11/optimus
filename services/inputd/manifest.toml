@@ -1,0 +1,14 @@
+# Manifesto do `inputd` (T-406; ADR 0042, item 4): recebe os eventos dos
+# drivers de entrada por `optimus.input.Sink@1`. Não toca em hardware.
+[service]
+name = "inputd"
+binary = "inputd"
+priority = 130
+restart = "on-failure"
+
+[capabilities]
+needs = ["mem:quota:512KiB", "kernel:debug"]
+provides = ["optimus.input.Sink@1.0"]
+
+[limits]
+max_threads = 1

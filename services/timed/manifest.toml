@@ -7,7 +7,7 @@ priority = 140
 restart = "on-failure"
 
 [capabilities]
-needs = ["mem:quota:1MiB"]
+needs = ["mem:quota:512KiB"]
 provides = ["optimus.time.Clock@1.0"]
 
 [limits]

@@ -609,7 +609,13 @@ impl Svcmgr<'_> {
             seed ^= seed << 17;
             let alive: Vec<u32> = (0..self.live.len())
                 .filter_map(|i| u32::try_from(i).ok())
-                .filter(|&id| self.started(id).is_some() && self.plan.broker.badge_of(id).is_some())
+                // Driver fica de fora: os recursos dele são do `devmgr`, e
+                // só um novo `driver_start` o parte de novo.
+                .filter(|&id| {
+                    self.started(id).is_some()
+                        && self.plan.broker.badge_of(id).is_some()
+                        && !self.plan.drivers.contains(&id)
+                })
                 .collect();
             let Some(&id) =
                 alive.get(usize::try_from(seed % alive.len().max(1) as u64).unwrap_or(0))
@@ -661,6 +667,17 @@ impl Svcmgr<'_> {
     /// Desligamento ordenado: encerra os serviços em ordem inversa de
     /// partida, para a cota voltar ao `root`.
     fn shutdown(&mut self) {
+        // Os drivers primeiro: dependem dos serviços, e um driver que
+        // espera uma IRQ não sai sozinho.
+        for id in self.plan.drivers.clone().into_iter().rev() {
+            // `DESTROY` no `CapSpace` mata a thread parada na notificação
+            // da própria tabela; só apagar deixaria o processo preso na
+            // cota (o ciclo da ADR 0029).
+            if let Some(cspace) = self.started(id).map(|s| s.child.cspace) {
+                let _ = ostd::cap::destroy(cspace);
+            }
+            self.retire(id);
+        }
         let levels = self.plan.levels.clone();
         for level in levels.iter().rev() {
             for &id in level.iter().rev() {

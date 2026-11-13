@@ -1,0 +1,20 @@
+[package]
+name = "inputd"
+description = "inputd: recebe os eventos dos drivers de entrada por optimus.input.Sink@1 (T-406)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "inputd"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+oinput = { path = "../../lib/oinput" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true
