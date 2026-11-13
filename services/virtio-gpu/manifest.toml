@@ -1,0 +1,18 @@
+# Driver do virtio-gpu 2D (T-416; ADR 0042, 0046 e 0047): casa com o
+# dispositivo virtio moderno de vídeo (`1af4:1050`). Não parte no boot; o
+# `devmgr` o parte com `bar4`, `irq0`, `dma` e `cfg` do nó.
+[service]
+name = "virtio-gpu"
+binary = "virtio-gpu"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:768KiB", "kernel:debug"]
+provides = []
+
+[match]
+pci = ["1af4:1050"]
+
+[limits]
+max_threads = 1

@@ -535,6 +535,16 @@ name = "virtio-core"
 version = "0.1.0"
 
 [[package]]
+name = "virtio-gpu"
+version = "0.1.0"
+dependencies = [
+ "optcrypt",
+ "ostd",
+ "vdrv",
+ "virtio-core",
+]
+
+[[package]]
 name = "virtio-input"
 version = "0.1.0"
 dependencies = [

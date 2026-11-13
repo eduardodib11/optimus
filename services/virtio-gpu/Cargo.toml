@@ -1,0 +1,20 @@
+[package]
+name = "virtio-gpu"
+description = "virtio-gpu: driver de vídeo virtio 2D em processo de usuário (T-416; ADR 0046 e 0047)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-gpu"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+optcrypt = { path = "../../lib/optcrypt" }
+virtio-core = { path = "../../lib/virtio-core" }
+vdrv = { path = "../../lib/vdrv" }
+
+[lints]
+workspace = true
