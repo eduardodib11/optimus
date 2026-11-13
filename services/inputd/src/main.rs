@@ -37,7 +37,11 @@ fn serve(ep: Handle, quota: Handle) -> Error {
         let r = match ipc::recv(ep, reply, 0) {
             Ok(r) => r,
             Err(e) => {
-                ostd::debug::print_fmt(format_args!("inputd: {keys} teclas e {moves} movimentos"));
+                // Uma linha só: o `svcmgr` apaga o processo logo depois de
+                // revogar o endpoint.
+                ostd::debug::print_fmt(format_args!(
+                    "inputd: encerrado ({e:?}); {keys} teclas e {moves} movimentos"
+                ));
                 return e;
             }
         };
@@ -84,8 +88,7 @@ fn main(start: Start) -> ! {
         ostd::thread::exit()
     };
     if s.ready().is_ok() {
-        let end = serve(ep, quota);
-        ostd::debug::print_fmt(format_args!("inputd: encerrado ({end:?})"));
+        let _ = serve(ep, quota);
     }
     ostd::thread::exit()
 }
