@@ -7,7 +7,7 @@ priority = 120
 restart = "never"
 
 [capabilities]
-needs = ["mem:quota:1MiB", "kernel:debug"]
+needs = ["mem:quota:512KiB", "kernel:debug"]
 provides = []
 
 [match]
