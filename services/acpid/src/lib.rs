@@ -14,7 +14,9 @@
 //! `Device` e [`eval`] os executa (inteiros, locais, argumentos, controle de
 //! fluxo, aritmética e chamadas). O `_PRT` (rotas de interrupção `INTx` do
 //! PCI) sai por [`Device::routes`], depois de [`pic_mode`] escolher o modo
-//! APIC. Campos de `OperationRegion` ainda dão [`Error::Unsupported`].
+//! APIC. Campos de `OperationRegion` de `SystemMemory` e `SystemIO` são
+//! lidos por [`Regions`], que só atende os intervalos entregues ao processo;
+//! sem ela, ou fora deles, o método dá [`Error::Unsupported`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -41,13 +43,30 @@ pub enum Error {
     Unsupported,
 }
 
-/// Limites duros do interpretador (ADR 0045, item 2).
-#[derive(Clone, Copy, Debug)]
+/// Acesso às regiões de operação (ADR 0045, item 3): quem implementa só
+/// atende os intervalos que o processo recebeu.
+pub trait Regions: Sync {
+    /// Lê `bytes` (1, 2, 4 ou 8) em `addr` do espaço `space`
+    /// ([`SPACE_MEMORY`] ou [`SPACE_IO`]); `None` fora dos intervalos
+    /// entregues.
+    fn read(&self, space: u8, addr: u64, bytes: u8) -> Option<u64>;
+}
+
+/// Espaço `SystemMemory` de uma `OperationRegion`.
+pub const SPACE_MEMORY: u8 = 0;
+/// Espaço `SystemIO`.
+pub const SPACE_IO: u8 = 1;
+
+/// Limites duros do interpretador (ADR 0045, item 2) e o acesso que ele
+/// tem ao hardware.
+#[derive(Clone, Copy)]
 pub struct Limits {
     /// Aninhamento máximo de `Scope`/`Device` (até [`MAX_DEPTH`]).
     pub max_depth: usize,
     /// Operações lidas no total.
     pub max_ops: u32,
+    /// Leitura das regiões de operação; `None`: nenhum intervalo entregue.
+    pub regions: Option<&'static dyn Regions>,
 }
 
 impl Default for Limits {
@@ -55,6 +74,7 @@ impl Default for Limits {
         Self {
             max_depth: MAX_DEPTH,
             max_ops: 200_000,
+            regions: None,
         }
     }
 }
@@ -207,6 +227,7 @@ impl<'a> Device<'a> {
         let v = match found {
             Some(Item::Name(v)) => v,
             Some(Item::Method(m)) => eval::run(aml, path, m, &[], width32, limits, state)?,
+            Some(Item::Region(..) | Item::Field(_)) => return Err(Error::Unsupported),
             None => return Ok(None),
         };
         match v {
@@ -289,6 +310,23 @@ enum Event<'a> {
 enum Item<'a> {
     Name(Value<'a>),
     Method(Method),
+    /// `OperationRegion`: espaço, base e tamanho em bytes (`None` quando
+    /// não são constantes).
+    Region(u8, Option<(u64, u64)>),
+    Field(Field),
+}
+
+/// Um campo de uma `OperationRegion`.
+#[derive(Clone, Copy)]
+struct Field {
+    /// Caminho da região.
+    region: Scope,
+    /// Primeiro bit dentro da região.
+    bit: u64,
+    /// Largura em bits.
+    bits: u64,
+    /// Bytes de cada acesso (1, 2, 4 ou 8).
+    access: u8,
 }
 
 struct Cur<'a> {
@@ -322,6 +360,16 @@ impl<'a> Cur<'a> {
     /// campo), já dentro de `limit`.
     fn pkg_end(&mut self, limit: usize) -> Result<usize, Error> {
         let start = self.p;
+        let len = self.pkg_value()?;
+        let end = start.checked_add(len).ok_or(Error::Malformed)?;
+        if end > limit || end < self.p {
+            return Err(Error::Malformed);
+        }
+        Ok(end)
+    }
+
+    /// O número codificado como `PkgLength` (até 28 bits).
+    fn pkg_value(&mut self) -> Result<usize, Error> {
         let lead = self.u8()?;
         let extra = usize::from(lead >> 6);
         let mut len = if extra == 0 {
@@ -332,11 +380,7 @@ impl<'a> Cur<'a> {
         for i in 0..extra {
             len |= usize::from(self.u8()?) << (4 + 8 * i);
         }
-        let end = start.checked_add(len).ok_or(Error::Malformed)?;
-        if end > limit || end < self.p {
-            return Err(Error::Malformed);
-        }
-        Ok(end)
+        Ok(len)
     }
 
     fn seg(&mut self) -> Result<NameSeg, Error> {
@@ -638,10 +682,71 @@ impl<'a, F: FnMut(Event<'a>)> Walker<'a, F> {
                 let at = scope.child(root, up, &segs[..n])?;
                 (self.f)(Event::Object(at, Item::Method(m)));
                 self.cur.p = pend;
+            } else if (op, ext) == (0x5B, 0x80) {
+                let (root, up, segs, n) = self.cur.name()?;
+                let space = self.cur.u8()?;
+                let base = self.cur.value(end, &mut self.budget)?;
+                let len = self.cur.value(end, &mut self.budget)?;
+                let range = match (base, len) {
+                    (Value::Int(b), Value::Int(l)) => Some((b, l)),
+                    _ => None,
+                };
+                let at = scope.child(root, up, &segs[..n])?;
+                (self.f)(Event::Object(at, Item::Region(space, range)));
+            } else if (op, ext) == (0x5B, 0x81) {
+                let pend = self.cur.pkg_end(end)?;
+                self.fields(pend, &scope)?;
+                self.cur.p = pend;
             } else {
                 self.cur.p = start;
                 self.cur.term(end, &mut self.budget, 0)?;
             }
+        }
+        Ok(())
+    }
+}
+
+impl<'a, F: FnMut(Event<'a>)> Walker<'a, F> {
+    /// Lista de campos de um `Field` até `pend`: cada nome vira um
+    /// [`Item::Field`] no escopo atual. Para, sem erro, numa entrada que não
+    /// conhece (conexão); o chamador salta o resto.
+    fn fields(&mut self, pend: usize, scope: &Scope) -> Result<(), Error> {
+        let (root, up, segs, n) = self.cur.name()?;
+        let region = scope.child(root, up, &segs[..n])?;
+        let mut access = self.cur.u8()? & 0x0F;
+        let mut bit = 0u64;
+        while self.cur.p < pend {
+            self.budget.step(scope.depth)?;
+            match self.cur.u8()? {
+                0x00 => bit = bit.saturating_add(self.cur.pkg_value()? as u64),
+                0x01 => access = self.cur.take(2)?[0] & 0x0F,
+                0x03 => access = self.cur.take(3)?[0] & 0x0F,
+                0x02 => return Ok(()),
+                _ => {
+                    self.cur.p -= 1;
+                    let seg = self.cur.seg()?;
+                    let bits = self.cur.pkg_value()? as u64;
+                    let field = Field {
+                        region,
+                        bit,
+                        bits,
+                        // AnyAcc e ByteAcc leem byte a byte.
+                        access: match access {
+                            0 | 1 => 1,
+                            2 => 2,
+                            3 => 4,
+                            4 => 8,
+                            _ => 0,
+                        },
+                    };
+                    let at = scope.child(false, 0, &[seg])?;
+                    (self.f)(Event::Object(at, Item::Field(field)));
+                    bit = bit.saturating_add(bits);
+                }
+            }
+        }
+        if self.cur.p > pend {
+            return Err(Error::Malformed);
         }
         Ok(())
     }

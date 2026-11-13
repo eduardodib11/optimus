@@ -162,6 +162,8 @@ fn run(s: &mut Session) -> Result<(), &'static str> {
     let (mut found, mut sent) = (0u32, 0u32);
     // Métodos `_STA` e `_CRS` executados e os que saem do subconjunto.
     let (mut ran, mut skipped) = (0u32, 0u32);
+    // Sem `regions`: o processo ainda não recebe faixas de portas nem de
+    // memória, então método que lê campo de região fica fora do subconjunto.
     let (wide, limits) = (header.width32(), Limits::default());
     let result = acpid::scan(aml, limits, |d| {
         found += 1;

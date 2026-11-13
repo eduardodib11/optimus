@@ -151,6 +151,7 @@ fn limites_e_lixo_nao_entram_em_panico() {
         Limits {
             max_depth: 4,
             max_ops: 2,
+            ..Limits::default()
         },
         |_| {},
     );
@@ -376,6 +377,98 @@ fn prt_muda_com_o_pic_e_resolve_a_ligacao() {
     assert_eq!(route_gsi(&aml, &sem, false, l), None);
 }
 
+/// Hardware de mentira: quatro portas a partir de 0x100 e um registrador
+/// de 32 bits em `0xFED0_0000`.
+struct Fake;
+
+impl Regions for Fake {
+    fn read(&self, space: u8, addr: u64, bytes: u8) -> Option<u64> {
+        const PORTS: [u8; 4] = [0x5A, 0xA5, 0x0F, 0xF0];
+        match (space, addr, bytes) {
+            (SPACE_IO, 0x100..=0x103, 1) => {
+                Some(u64::from(PORTS[usize::try_from(addr - 0x100).unwrap()]))
+            }
+            (SPACE_MEMORY, 0xFED0_0000, 4) => Some(0x8086_A201),
+            _ => None,
+        }
+    }
+}
+
+/// `OperationRegion (nome, espaço, base, tamanho)`.
+fn region(seg: [u8; 4], space: u8, base: u32, len: u16) -> Vec<u8> {
+    [
+        &[0x5B, 0x80][..],
+        &seg,
+        &[space, 0x0C],
+        &base.to_le_bytes(),
+        &[0x0B],
+        &len.to_le_bytes(),
+    ]
+    .concat()
+}
+
+/// `Field (região, acesso) { lista }`.
+fn field(reg: [u8; 4], access: u8, list: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x5B, 0x81];
+    v.extend(pkg(&[&reg[..], &[access], list].concat()));
+    v
+}
+
+#[test]
+fn campos_de_regiao_so_dentro_do_entregue() {
+    let com = Limits {
+        regions: Some(&Fake),
+        ..Limits::default()
+    };
+    let sta = |aml: &[u8], l: Limits| collect(aml).0[0].status(aml, false, l);
+    // FLD0 de 8 bits, 4 reservados e FLD1 de 12 bits (bits 12 a 23),
+    // lidos byte a byte: 0x0FA5 >> 4 = 0xFA.
+    let lista = b"FLD0\x08\x00\x04FLD1\x0C";
+    let io = |len: u16, ret: &[u8]| {
+        dev(
+            *b"DEV_",
+            &[
+                &region(*b"REG0", SPACE_IO, 0x100, len),
+                &field(*b"REG0", 1, lista),
+                &method(*b"_STA", 0, ret),
+            ],
+        )
+    };
+    assert_eq!(sta(&io(4, b"\xA4FLD1"), com), Ok(0xFA));
+    assert_eq!(sta(&io(4, b"\xA4FLD0"), com), Ok(0x5A));
+    // Sem acesso entregue, campo além da região, gravação e porta que o
+    // processo não recebeu.
+    assert_eq!(
+        sta(&io(4, b"\xA4FLD1"), Limits::default()),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(sta(&io(2, b"\xA4FLD1"), com), Err(Error::Unsupported));
+    assert_eq!(sta(&io(4, b"\x70\x01FLD0"), com), Err(Error::Unsupported));
+    let fora = dev(
+        *b"DEV_",
+        &[
+            &region(*b"REG0", SPACE_IO, 0x200, 4),
+            &field(*b"REG0", 1, lista),
+            &method(*b"_STA", 0, b"\xA4FLD0"),
+        ],
+    );
+    assert_eq!(sta(&fora, com), Err(Error::Unsupported));
+    // Memória com acesso de 32 bits: Return (VEND >> 16). No espaço
+    // PCI_Config (2), fora do subconjunto.
+    let mem = |space: u8| {
+        dev(
+            *b"HPET",
+            &[
+                &region(*b"HPTM", space, 0xFED0_0000, 0x400),
+                &field(*b"HPTM", 3, b"VEND\x20"),
+                &method(*b"_STA", 0, b"\xA4\x7AVEND\x0A\x10\x00"),
+            ],
+        )
+    };
+    assert_eq!(sta(&mem(SPACE_MEMORY), com), Ok(0x8086));
+    assert_eq!(sta(&mem(2), com), Err(Error::Unsupported));
+}
+
 #[test]
 fn limites_da_execucao() {
     // While (One) {}: estoura as operações.
@@ -410,6 +503,8 @@ fn mutacao_dos_metodos_sem_panico() {
     ]
     .concat();
     let base = [
+        region(*b"FLAG", SPACE_IO, 0x100, 4),
+        field(*b"FLAG", 1, b"FLAG\x08"),
         name(*b"FLAG", &[1]),
         method(*b"DBL_", 1, &[0xA4, 0x79, 0x68, 0x01, 0x00]),
         dev(*b"KBD_", &[&method(*b"_STA", 0, &sta)]),
@@ -417,6 +512,7 @@ fn mutacao_dos_metodos_sem_panico() {
     .concat();
     let limits = Limits {
         max_ops: 2_000,
+        regions: Some(&Fake),
         ..Limits::default()
     };
     let mut x: u64 = 0x2545_F491_4F6C_DD1D;

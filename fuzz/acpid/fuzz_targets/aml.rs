@@ -1,16 +1,27 @@
 #![no_main]
 
-use acpid::{Limits, State, pic_mode, route_gsi, scan, table_body};
+use acpid::{Limits, Regions, State, pic_mode, route_gsi, scan, table_body};
 use libfuzzer_sys::fuzz_target;
 
 // O AML vem do firmware: qualquer entrada deve terminar em `Ok` ou em um
 // `Error`, nunca em pânico. Também exercita o `_CRS` de cada dispositivo e
 // executa os métodos `_STA`, `_CRS`, `_PIC` e `_PRT`, com poucas operações
 // por execução.
+/// Hardware de mentira: responde a quase todo endereço com um valor que
+/// depende dele, para os campos de região entrarem no fuzz.
+struct Any;
+
+impl Regions for Any {
+    fn read(&self, _space: u8, addr: u64, bytes: u8) -> Option<u64> {
+        (addr % 7 != 0).then_some(addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(bytes))
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let aml = table_body(data).map_or(data, |(_, body)| body);
     let limits = Limits {
         max_ops: 4_000,
+        regions: Some(&Any),
         ..Limits::default()
     };
     let _ = scan(aml, Limits::default(), |d| {

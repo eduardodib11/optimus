@@ -10,7 +10,7 @@ restart = "on-failure"
 
 [capabilities]
 needs = [
-    "mem:quota:2816KiB",
+    "mem:quota:2688KiB",
     "kernel:debug",
     "kernel:device?",
     "kernel:ecam?",
