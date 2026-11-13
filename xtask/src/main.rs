@@ -65,6 +65,7 @@ const CRATES: &[(&str, &str, &str)] = &[
         USER_TARGET,
     ),
     ("virtio-net", "services/virtio-net/src/main.rs", USER_TARGET),
+    ("virtio-gpu", "services/virtio-gpu/src/main.rs", USER_TARGET),
     ("rtcd", "services/rtcd/src/main.rs", USER_TARGET),
     ("inputd", "services/inputd/src/main.rs", USER_TARGET),
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
@@ -402,7 +403,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input"
-        | "virtio-net" | "rtcd" | "inputd" | "i8042d" | "utest" | "okfuzz" => {
+        | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "utest" | "okfuzz" => {
             &["-C", "relocation-model=static"]
         }
         _ => &[],
@@ -455,6 +456,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("virtio-console", "virtio-console"),
     ("virtio-input", "virtio-input"),
     ("virtio-net", "virtio-net"),
+    ("virtio-gpu", "virtio-gpu"),
     ("rtcd", "rtcd"),
     ("inputd", "inputd"),
     ("i8042d", "i8042d"),
@@ -790,7 +792,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 8 drivers no conjunto",
+        "devmgr: 9 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -812,7 +814,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
 /// driver, que negocia o transporte moderno, monta a fila 0 e escreve e lê
 /// um setor com MSI-X.
 const VIRTIO_SCENARIO: Scenario = Scenario {
-    name: "drivers virtio: blk, rng, console, input e net",
+    name: "drivers virtio: blk, rng, console, input, net e gpu",
     markers: &[
         "1af4:1042 ",
         "1af4:1044 ",
@@ -827,6 +829,8 @@ const VIRTIO_SCENARIO: Scenario = Scenario {
         "virtio-input: tecla 0x1e encaminhada",
         "1af4:1041 ",
         "virtio-net: ARP enviado e resposta recebida",
+        "1af4:1050 ",
+        "virtio-gpu: quadro de cor sólida enviado",
         "okernel: desligando",
     ],
     forbidden: &[
@@ -837,6 +841,7 @@ const VIRTIO_SCENARIO: Scenario = Scenario {
         "virtio-console: falhou",
         "virtio-input: falhou",
         "virtio-net: falhou",
+        "virtio-gpu: falhou",
         "driver não partiu",
     ],
     key: Some("a"),
@@ -1133,6 +1138,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
         .spawn()
         .map_err(|e| format!("falha ao iniciar o QEMU: {e}"))?;
     let mut screen: Option<Result> = None;
+    let mut gpu_shot: Option<Result> = None;
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     let (wall_seen, reader) = spawn_reader(stdout, tx);
@@ -1161,6 +1167,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
         if let Some(key) = sc.key {
             inject_key(&monitor, key, &raw, &mut last_key);
         }
+        shoot_gpu(&monitor, &raw, &mut gpu_shot);
         let frozen = sc.exit.is_none() && seen_all(&raw);
         if frozen || start.elapsed() > sc.timeout {
             if !frozen {
@@ -1192,6 +1199,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
             (true, Some(shot)) => shot,
             (true, None) => Err("a tela de pânico não foi capturada".into()),
         })
+        .and_then(|()| gpu_shot.unwrap_or(Ok(())))
         .and_then(|()| match end {
             Ok(code) if code.is_some() && code == sc.exit => Ok(()),
             Ok(code) => Err(format!(
@@ -1228,6 +1236,44 @@ fn check_hello(serial: &str, sc: &Scenario) -> Result {
         println!("xtask: {}", line.trim().trim_start_matches("info  "));
     }
     Ok(())
+}
+
+/// Linha do `virtio-gpu` depois do `RESOURCE_FLUSH` do quadro de cor sólida.
+const GPU_DONE: &str = "virtio-gpu: quadro de cor sólida enviado";
+/// A cor (R, G, B) que o `virtio-gpu` pinta.
+const GPU_RGB: [u8; 3] = [0x20, 0x80, 0xe0];
+
+/// Tira a captura do `virtio-gpu` (uma vez) quando o driver avisa que mandou
+/// o quadro.
+fn shoot_gpu(monitor: &Path, raw: &[u8], shot: &mut Option<Result>) {
+    if shot.is_none() && String::from_utf8_lossy(raw).contains(GPU_DONE) {
+        *shot = Some(check_gpu_frame(monitor));
+    }
+}
+
+/// Captura o scanout do `virtio-gpu-pci` (`id=vgpu`) pelo monitor e confere
+/// que o quadro é da cor sólida que o driver mandou (T-416).
+fn check_gpu_frame(monitor: &Path) -> Result {
+    let shot = root().join("target/vgpu.ppm");
+    let mut last = String::from("sem captura");
+    for _ in 0..10 {
+        let _ = fs::remove_file(&shot);
+        monitor_command(monitor, &format!("screendump {} vgpu", shot.display()));
+        thread::sleep(Duration::from_millis(300));
+        if let Ok(bytes) = fs::read(&shot)
+            && let Some((width, height, pixels)) = parse_ppm(&bytes)
+        {
+            let solid = pixels.chunks(3).filter(|p| **p == GPU_RGB).count();
+            last = format!("{width}x{height}: {solid} pixels da cor");
+            if solid * 10 >= width * height * 9 {
+                println!("xtask: virtio-gpu: quadro {last}");
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "o quadro do virtio-gpu não é de cor sólida ({last})"
+    ))
 }
 
 /// Pede ao monitor do QEMU uma captura da tela e confere a tela de pânico:
@@ -1468,6 +1514,7 @@ fn test(opts: &Options) -> Result {
                 "virtconsole,chardev=vcon",
                 "virtio-keyboard-pci,disable-legacy=on",
                 "virtio-net-pci,netdev=vn0,disable-legacy=on",
+                "virtio-gpu-pci,id=vgpu,disable-legacy=on",
             ],
             ..opts.clone()
         };
@@ -1482,6 +1529,7 @@ fn test(opts: &Options) -> Result {
                 "virtconsole,chardev=vcon",
                 "virtio-keyboard-pci,disable-legacy=on,iommu_platform=on",
                 "virtio-net-pci,netdev=vn0,disable-legacy=on,iommu_platform=on",
+                "virtio-gpu-pci,id=vgpu,disable-legacy=on,iommu_platform=on",
             ],
             ..opts.clone()
         };
@@ -1543,7 +1591,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 8 drivers no conjunto",
+    "devmgr: 9 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
