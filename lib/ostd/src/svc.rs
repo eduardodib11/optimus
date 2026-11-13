@@ -238,4 +238,30 @@ impl Session {
             Err(Error::AccessDenied)
         }
     }
+
+    /// `driver_stop(id)` (1.3): para o driver `id` e apaga os recursos que
+    /// ele tinha (ADR 0051, item 3).
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel e `AccessDenied` se o `svcmgr` recusar (não é o
+    /// `devmgr` ou o driver não está em `Running`).
+    pub fn driver_stop(&mut self, id: u32) -> Result<(), Error> {
+        let mut req = [0u8; osvc::MAX_SHORT_BYTES];
+        let n = osvc::encode_driver_stop(id, &mut req).map_err(|_| Error::InvalidArgument)?;
+        let mut body = [0u8; osvc::MAX_SHORT_BYTES];
+        let (label, _) = ipc::call_corpo(
+            self.control,
+            &mut self.buffer,
+            osvc::label(Method::DriverStop),
+            &req[..n],
+            &mut body,
+            deadline(),
+        )?;
+        if label == osvc::REPLY_OK {
+            Ok(())
+        } else {
+            Err(Error::AccessDenied)
+        }
+    }
 }
