@@ -609,7 +609,13 @@ impl Svcmgr<'_> {
             seed ^= seed << 17;
             let alive: Vec<u32> = (0..self.live.len())
                 .filter_map(|i| u32::try_from(i).ok())
-                .filter(|&id| self.started(id).is_some() && self.plan.broker.badge_of(id).is_some())
+                // Driver fica de fora: os recursos dele são do `devmgr`, e
+                // só um novo `driver_start` o parte de novo.
+                .filter(|&id| {
+                    self.started(id).is_some()
+                        && self.plan.broker.badge_of(id).is_some()
+                        && !self.plan.drivers.contains(&id)
+                })
                 .collect();
             let Some(&id) =
                 alive.get(usize::try_from(seed % alive.len().max(1) as u64).unwrap_or(0))
