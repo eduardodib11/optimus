@@ -173,3 +173,27 @@ fn cota_volta_inteira() {
     assert_eq!(d.map(&o, 0, 0, PAGE_SIZE, false), Err(Error::QuotaExceeded));
     assert_eq!(d.counts(), (0, 0));
 }
+
+#[test]
+fn falta_sinaliza_a_ligacao_do_dominio_do_dispositivo() {
+    let quota = MemoryQuota::root(1 << 20);
+    let d = Arc::new(DmaDomain::with_unit(&quota, None).unwrap());
+    let ntfy = Arc::new(Notification::new(&quota).unwrap());
+    // `bdf` só deste teste: `ATTACHED` é global.
+    d.attach(0xA320).unwrap();
+    // Sem ligação, nada a sinalizar; de outro dispositivo, também não.
+    assert!(fault_binding(0xA320).is_none());
+    assert!(d.bind_fault(Some((Arc::clone(&ntfy), 0b100))).is_none());
+    let (got, mask) = fault_binding(0xA320).unwrap();
+    assert!(Arc::ptr_eq(&got, &ntfy));
+    assert_eq!(mask, 0b100);
+    assert!(fault_binding(0xA328).is_none());
+    // Religar devolve a anterior; `None` desliga.
+    assert!(d.bind_fault(Some((Arc::clone(&ntfy), 1))).is_some());
+    assert!(d.bind_fault(None).is_some());
+    assert!(fault_binding(0xA320).is_none());
+    // Domínio morto: nenhum dispositivo atribuído.
+    d.bind_fault(Some((ntfy, 1)));
+    drop(d);
+    assert!(fault_binding(0xA320).is_none());
+}

@@ -205,7 +205,24 @@ pub fn remap_msi_on() -> bool {
 
 /// Tratador da interrupção de falta: registra as faltas no log.
 pub fn on_fault_irq() {
-    faults(&mut |_| {});
+    // `faults` roda sob a trava da IOMMU (nível 5): os BDFs saem dela e só
+    // depois cada um sinaliza a ligação do domínio dele (ADR 0051, item 1).
+    // Faltas além do teto ficam só no log.
+    let mut seen = [0u16; 16];
+    let mut n = 0;
+    faults(&mut |f| {
+        if n < seen.len() && !seen[..n].contains(&f.bdf) {
+            seen[n] = f.bdf;
+            n += 1;
+        }
+    });
+    for &bdf in &seen[..n] {
+        if let Some((ntfy, bits)) = okernel::dma::fault_binding(bdf)
+            && let Some((thread, word)) = ntfy.signal(bits)
+        {
+            crate::kthread::wake(thread, word);
+        }
+    }
 }
 
 /// Lê e limpa as faltas de DMA; cada uma vira um registro no log (ADR
