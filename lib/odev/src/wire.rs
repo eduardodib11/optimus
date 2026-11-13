@@ -139,6 +139,29 @@ const FLAGS: u8 = HAS_PCI_ID | HAS_CLASS | HAS_MSI | HAS_BDF;
 /// # Errors
 /// [`Error::TooLarge`] acima dos tetos ou sem espaço em `out`.
 pub fn encode_publish(node: &Node, res: &Resources, out: &mut [u8]) -> Result<usize> {
+    let mut names = [""; MAX_COMPATIBLE];
+    let n = node.compatible.len();
+    if n > MAX_COMPATIBLE {
+        return Err(Error::TooLarge);
+    }
+    for (slot, c) in names.iter_mut().zip(&node.compatible) {
+        *slot = c;
+    }
+    encode_publish_names(node, &names[..n], res, out)
+}
+
+/// Como [`encode_publish`], com as strings `compatible` em `compatible`
+/// no lugar das de `node` (que são ignoradas): quem publica sem heap, como
+/// o `acpid`, deixa `node.compatible` vazio.
+///
+/// # Errors
+/// Os de [`encode_publish`].
+pub fn encode_publish_names(
+    node: &Node,
+    compatible: &[&str],
+    res: &Resources,
+    out: &mut [u8],
+) -> Result<usize> {
     let mut w = Writer::new(out, NODE_HEAD)?;
     let (vendor, device) = node.pci_id.unwrap_or((0, 0));
     let class = node.class.unwrap_or(Class {
@@ -167,7 +190,7 @@ pub fn encode_publish(node: &Node, res: &Resources, out: &mut [u8]) -> Result<us
     let bars = w.vec(present, BAR_BYTES, MAX_BARS)?;
     let ports = w.vec(res.ports.iter().flatten().count(), 4, MAX_LEGACY)?;
     let irqs = w.vec(res.irqs.iter().flatten().count(), 1, MAX_LEGACY)?;
-    let names = w.vec(node.compatible.len(), 8, MAX_COMPATIBLE)?;
+    let names = w.vec(compatible.len(), 8, MAX_COMPATIBLE)?;
     let indexed = (0u8..).zip(res.bars).filter_map(|(i, b)| Some((i, b?)));
     for (k, (index, b)) in indexed.enumerate() {
         w.seek(bars + k * BAR_BYTES);
@@ -186,7 +209,7 @@ pub fn encode_publish(node: &Node, res: &Resources, out: &mut [u8]) -> Result<us
         w.seek(irqs + k);
         w.u8(*irq)?;
     }
-    for (i, c) in node.compatible.iter().enumerate() {
+    for (i, c) in compatible.iter().enumerate() {
         w.seek(names + i * 8);
         w.string(c, MAX_NAME)?;
     }

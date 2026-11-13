@@ -7,9 +7,11 @@
 //! conferida e há limites duros ([`Limits`]): estourá-los aborta com
 //! [`Error::Limit`], nunca com pânico.
 //!
-//! Subconjunto desta etapa: `Scope`, `Device`, `Name` com constantes, string
-//! ou buffer, `Method`/`Field`/`OperationRegion` apenas saltados. A execução
-//! de métodos (`_STA`, `_CRS` e `_PRT` dinâmicos) entra na etapa seguinte.
+//! Subconjunto desta etapa: desce em `Scope`, `Device`, `Processor`,
+//! `PowerResource` e `ThermalZone`, lê `Name` com constantes, string ou
+//! buffer e salta todo o resto pela gramática dos opcodes (métodos, campos,
+//! regiões, expressões). A execução de métodos (`_STA`, `_CRS` e `_PRT`
+//! dinâmicos) entra na etapa seguinte.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -247,7 +249,10 @@ impl<'a> Cur<'a> {
         Ok((root, up, segs, n))
     }
 
-    fn value(&mut self, limit: usize) -> Result<Value<'a>, Error> {
+    /// Valor de dados de um `Name`; qualquer outro termo é saltado e vira
+    /// [`Value::Other`].
+    fn value(&mut self, limit: usize, budget: &mut Budget) -> Result<Value<'a>, Error> {
+        let start = self.p;
         Ok(match self.u8()? {
             0x00 => Value::Int(0),
             0x01 => Value::Int(1),
@@ -256,33 +261,137 @@ impl<'a> Cur<'a> {
             0x0B => Value::Int(self.le(2)?),
             0x0C => Value::Int(self.le(4)?),
             0x0E => Value::Int(self.le(8)?),
-            0x0D => {
-                let rest = self.b.get(self.p..limit).ok_or(Error::Truncated)?;
-                let n = rest.iter().position(|c| *c == 0).ok_or(Error::Truncated)?;
-                self.p += n + 1;
-                Value::Str(&rest[..n])
-            }
-            op @ (0x11 | 0x12) => {
+            0x0D => Value::Str(self.string(limit)?),
+            0x11 => {
                 let end = self.pkg_end(limit)?;
-                let v = if op == 0x11 {
-                    // BufferSize é um inteiro; os dados vão até o fim.
-                    let _ = self.value(end)?;
-                    Value::Buf(self.b.get(self.p..end).ok_or(Error::Truncated)?)
-                } else {
-                    Value::Other
-                };
+                // BufferSize é um termo; os dados vão até o fim.
+                self.term(end, budget, 0)?;
+                let data = self.b.get(self.p..end).ok_or(Error::Truncated)?;
                 self.p = end;
-                v
+                Value::Buf(data)
             }
-            _ => return Err(Error::Malformed),
+            _ => {
+                self.p = start;
+                self.term(limit, budget, 0)?;
+                Value::Other
+            }
         })
+    }
+
+    fn string(&mut self, limit: usize) -> Result<&'a [u8], Error> {
+        let rest = self.b.get(self.p..limit).ok_or(Error::Truncated)?;
+        let n = rest.iter().position(|c| *c == 0).ok_or(Error::Truncated)?;
+        self.p += n + 1;
+        Ok(&rest[..n])
+    }
+
+    /// Salta um termo inteiro (objeto, expressão ou comando) pela gramática
+    /// de [`grammar`], sem interpretar. Uma chamada de método aparece como
+    /// um nome solto: os argumentos dela, se houver, são saltados como
+    /// termos seguintes pelo chamador.
+    fn term(&mut self, limit: usize, budget: &mut Budget, depth: usize) -> Result<(), Error> {
+        budget.step(depth)?;
+        if self.p >= limit {
+            return Err(Error::Truncated);
+        }
+        let op = self.u8()?;
+        if matches!(op, b'A'..=b'Z' | b'_' | b'\\' | b'^' | 0x2E | 0x2F) {
+            self.p -= 1;
+            return self.name().map(drop);
+        }
+        let op = if op == 0x5B {
+            0x5B00 | u16::from(self.u8()?)
+        } else {
+            u16::from(op)
+        };
+        for arg in grammar(op).ok_or(Error::Malformed)?.bytes() {
+            match arg {
+                b'N' => drop(self.name()?),
+                b'T' => self.term(limit, budget, depth + 1)?,
+                b'B' => drop(self.take(1)?),
+                b'W' => drop(self.take(2)?),
+                b'D' => drop(self.take(4)?),
+                b'Q' => drop(self.take(8)?),
+                b'S' => drop(self.string(limit)?),
+                _ => self.p = self.pkg_end(limit)?,
+            }
+        }
+        if self.p > limit {
+            Err(Error::Malformed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Argumentos de cada opcode (os de prefixo `5B` somam `0x5B00`): `N` nome,
+/// `T` termo, `B`/`W`/`D`/`Q` inteiros, `S` string e `P` um pacote saltado
+/// inteiro pelo `PkgLength`. `None` para opcode desconhecido.
+fn grammar(op: u16) -> Option<&'static str> {
+    Some(match op {
+        // Constantes, locais, argumentos e comandos sem operando.
+        0x00 | 0x01 | 0xFF | 0x60..=0x6E | 0x9F | 0xA3 | 0xA5 | 0xCC | 0x5B30 | 0x5B31 | 0x5B33 => {
+            ""
+        }
+        0x0A => "B",
+        0x0B => "W",
+        0x0C => "D",
+        0x0E => "Q",
+        0x0D => "S",
+        0x06 => "NN",
+        0x08 | 0x5B20 => "NT",
+        0x15 => "NBB",
+        // Tudo que é delimitado por PkgLength: Scope, Buffer, Package,
+        // Method, If, Else, While, Field, Device, Processor etc.
+        0x10..=0x14 | 0xA0..=0xA2 | 0x5B81..=0x5B87 => "P",
+        0x70
+        | 0x80..=0x82
+        | 0x86
+        | 0x90
+        | 0x91
+        | 0x93..=0x99
+        | 0x9D
+        | 0x5B12
+        | 0x5B25
+        | 0x5B28
+        | 0x5B29 => "TT",
+        0x71 | 0x75 | 0x76 | 0x83 | 0x87 | 0x8E | 0x92 | 0xA4 | 0x5B21 | 0x5B22 | 0x5B24
+        | 0x5B26 | 0x5B27 => "T",
+        0x72..=0x74 | 0x77 | 0x79..=0x7F | 0x84 | 0x85 | 0x88 | 0x9C => "TTT",
+        0x78 | 0x9E => "TTTT",
+        0x89 => "TBTBTT",
+        0x8A..=0x8D | 0x8F => "TTN",
+        0x5B01 => "NB",
+        0x5B02 => "N",
+        0x5B13 => "TTTN",
+        0x5B1F => "TTTTTT",
+        0x5B23 => "TW",
+        0x5B32 => "BDT",
+        0x5B80 => "NBTT",
+        0x5B88 => "NTTT",
+        _ => return None,
+    })
+}
+
+/// Contador dos limites duros.
+struct Budget {
+    limits: Limits,
+    ops: u32,
+}
+
+impl Budget {
+    fn step(&mut self, depth: usize) -> Result<(), Error> {
+        self.ops += 1;
+        if self.ops > self.limits.max_ops || depth > self.limits.max_depth {
+            return Err(Error::Limit);
+        }
+        Ok(())
     }
 }
 
 struct Walker<'a, F> {
     cur: Cur<'a>,
-    limits: Limits,
-    ops: u32,
+    budget: Budget,
     f: F,
 }
 
@@ -309,7 +418,9 @@ impl Scope {
 }
 
 impl<'a, F: FnMut(&Device<'a>)> Walker<'a, F> {
-    /// Lê termos até `end`; devolve a informação do `Device` em curso.
+    /// Lê termos até `end`. Desce em `Scope`, `Device`, `Processor`,
+    /// `PowerResource` e `ThermalZone`; guarda os `Name` do `Device` em
+    /// curso; salta o resto.
     fn body(
         &mut self,
         end: usize,
@@ -317,80 +428,51 @@ impl<'a, F: FnMut(&Device<'a>)> Walker<'a, F> {
         dev: &mut Option<Device<'a>>,
     ) -> Result<(), Error> {
         while self.cur.p < end {
-            self.ops += 1;
-            if self.ops > self.limits.max_ops {
-                return Err(Error::Limit);
-            }
-            match self.cur.u8()? {
-                // Name(seg, valor)
-                0x08 => {
-                    let (_, _, segs, n) = self.cur.name()?;
-                    let v = self.cur.value(end)?;
-                    if let (Some(d), 1) = (dev.as_mut(), n) {
-                        record(d, segs[0], &v);
-                    }
+            self.budget.step(scope.depth)?;
+            let start = self.cur.p;
+            let op = self.cur.u8()?;
+            let ext = if op == 0x5B { self.cur.u8()? } else { 0 };
+            // Bytes fixos entre o nome e o corpo de cada contêiner.
+            let skip = match (op, ext) {
+                (0x10, _) | (0x5B, 0x82 | 0x85) => Some(0),
+                (0x5B, 0x83) => Some(6),
+                (0x5B, 0x84) => Some(3),
+                _ => None,
+            };
+            if let Some(skip) = skip {
+                let pend = self.cur.pkg_end(end)?;
+                let (root, up, segs, n) = self.cur.name()?;
+                self.cur.take(skip)?;
+                if self.cur.p > pend {
+                    return Err(Error::Malformed);
                 }
-                // Scope(...) { ... } e Method(...) { ... } (este só saltado)
-                op @ (0x10 | 0x14) => {
-                    let pend = self.cur.pkg_end(end)?;
-                    let (root, up, segs, n) = self.cur.name()?;
-                    if op == 0x10 {
-                        let sub = scope.child(root, up, &segs[..n])?;
-                        self.nested(pend, sub, &mut None)?;
-                    }
-                    self.cur.p = pend;
+                let sub = scope.child(root, up, &segs[..n])?;
+                let mut me = (ext == 0x82).then_some(Device {
+                    path: sub.path,
+                    depth: sub.depth,
+                    hid: None,
+                    cid: None,
+                    adr: None,
+                    sta: None,
+                    crs: None,
+                });
+                self.body(pend, sub, &mut me)?;
+                if let Some(d) = me {
+                    (self.f)(&d);
                 }
-                0x5B => match self.cur.u8()? {
-                    // Device(...) { ... }
-                    0x82 => {
-                        let pend = self.cur.pkg_end(end)?;
-                        let (root, up, segs, n) = self.cur.name()?;
-                        let sub = scope.child(root, up, &segs[..n])?;
-                        let mut me = Some(Device {
-                            path: sub.path,
-                            depth: sub.depth,
-                            hid: None,
-                            cid: None,
-                            adr: None,
-                            sta: None,
-                            crs: None,
-                        });
-                        self.nested(pend, sub, &mut me)?;
-                        if let Some(d) = me {
-                            (self.f)(&d);
-                        }
-                        self.cur.p = pend;
-                    }
-                    // Field e IndexField: só saltados.
-                    0x81 | 0x86 => {
-                        let pend = self.cur.pkg_end(end)?;
-                        self.cur.p = pend;
-                    }
-                    // OperationRegion(nome, espaço, offset, tamanho)
-                    0x80 => {
-                        self.cur.name()?;
-                        self.cur.u8()?;
-                        self.cur.value(end)?;
-                        self.cur.value(end)?;
-                    }
-                    _ => return Err(Error::Malformed),
-                },
-                _ => return Err(Error::Malformed),
+                self.cur.p = pend;
+            } else if op == 0x08 {
+                let (_, _, segs, n) = self.cur.name()?;
+                let v = self.cur.value(end, &mut self.budget)?;
+                if let (Some(d), 1) = (dev.as_mut(), n) {
+                    record(d, segs[0], &v);
+                }
+            } else {
+                self.cur.p = start;
+                self.cur.term(end, &mut self.budget, 0)?;
             }
         }
         Ok(())
-    }
-
-    fn nested(
-        &mut self,
-        end: usize,
-        scope: Scope,
-        dev: &mut Option<Device<'a>>,
-    ) -> Result<(), Error> {
-        if scope.depth > self.limits.max_depth {
-            return Err(Error::Limit);
-        }
-        self.body(end, scope, dev)
     }
 }
 
@@ -417,10 +499,10 @@ fn record<'a>(d: &mut Device<'a>, seg: NameSeg, v: &Value<'a>) {
 /// Qualquer estrutura inválida ou limite estourado aborta com um [`Error`];
 /// os dispositivos já entregues continuam válidos.
 pub fn scan<'a>(aml: &'a [u8], limits: Limits, f: impl FnMut(&Device<'a>)) -> Result<(), Error> {
+    let budget = Budget { limits, ops: 0 };
     let mut w = Walker {
         cur: Cur { b: aml, p: 0 },
-        limits,
-        ops: 0,
+        budget,
         f,
     };
     let root = Scope {

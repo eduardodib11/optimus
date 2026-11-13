@@ -123,6 +123,9 @@ fn spawn(
     if boot.device.raw() != 0 {
         pool.push(("device", boot.device));
     }
+    if boot.acpi.raw() != 0 {
+        pool.push(("acpi", boot.acpi));
+    }
     let kernel = &mut svcmgr::kernel::Kernel;
     let delivered = match devices {
         Some(d) => {
@@ -747,6 +750,8 @@ struct Boot {
     /// resposta ao anúncio; 0 se não vierem.
     ecam: Handle,
     device: Handle,
+    /// `kernel:acpi`: a cópia da DSDT (T-405); 0 se não vier.
+    acpi: Handle,
 }
 
 fn main(start: Start) -> ! {
@@ -762,6 +767,7 @@ fn main(start: Start) -> ! {
         klog,
         ecam: Handle::from_raw(0),
         device: Handle::from_raw(0),
+        acpi: Handle::from_raw(0),
     };
     let mut boot = boot;
     if boot.log.raw() != 0 {
@@ -793,6 +799,9 @@ fn main(start: Start) -> ! {
             if r.msg.info.caps >= 2 {
                 boot.ecam = Handle::from_raw(caps[0]);
                 boot.device = Handle::from_raw(caps[1]);
+            }
+            if r.msg.info.caps >= 3 {
+                boot.acpi = Handle::from_raw(caps[2]);
             }
             ostd::debug::print("svcmgr: o root aceitou o anúncio");
         }

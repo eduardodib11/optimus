@@ -60,6 +60,10 @@ debug = 0
 [profile.dev.package.pcid]
 debug = 0
 
+# O `acpid` entra no bootfs (T-405).
+[profile.dev.package.acpid]
+debug = 0
+
 [profile.dev.package.opci]
 debug = 0
 

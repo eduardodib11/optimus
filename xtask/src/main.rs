@@ -33,7 +33,6 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("oalloc", "lib/oalloc/src/lib.rs", KERNEL_TARGET),
     ("ocoll", "lib/ocoll/src/lib.rs", KERNEL_TARGET),
     ("olz4", "lib/olz4/src/lib.rs", KERNEL_TARGET),
-    ("acpid", "services/acpid/src/lib.rs", KERNEL_TARGET),
     ("oidl-rt", "lib/oidl-rt/src/lib.rs", KERNEL_TARGET),
     ("osvc", "lib/osvc/src/lib.rs", KERNEL_TARGET),
     ("odev", "lib/odev/src/lib.rs", KERNEL_TARGET),
@@ -48,6 +47,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("timed", "services/timed/src/main.rs", USER_TARGET),
     ("logd", "services/logd/src/main.rs", USER_TARGET),
     ("pcid", "services/pcid/src/main.rs", USER_TARGET),
+    ("acpid", "services/acpid/src/main.rs", USER_TARGET),
     ("devmgr", "services/devmgr/src/main.rs", USER_TARGET),
     ("drvteste", "services/drvteste/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
@@ -105,7 +105,8 @@ const BOOT_MARKERS: &[&str] = &[
     "svcmgr: memd em Running",
     "svcmgr: devmgr em Running",
     "svcmgr: pcid em Running",
-    "svcmgr: 5 serviços em Running",
+    "svcmgr: acpid em Running",
+    "svcmgr: 6 serviços em Running",
     "svcmgr: serviços encerrados",
     "root: o svcmgr terminou",
     "okernel: root terminou",
@@ -380,7 +381,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "okernel" => &["-C", "code-model=kernel", "-C", "relocation-model=pie"],
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
-        "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "devmgr"
+        "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
@@ -424,6 +425,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("logd", "logd"),
     ("memd", "memd"),
     ("pcid", "pcid"),
+    ("acpid", "acpid"),
     ("devmgr", "devmgr"),
     ("drvteste", "drvteste"),
     ("utest", "utest"),
@@ -1350,6 +1352,11 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "devmgr: 1 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
+    // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
+    // (teclado PS/2 e RTC) viram nós com portas e IRQ.
+    "acpid: PNP0303: 2 portas, 1 IRQs",
+    "acpid: PNP0B00: 1 portas, 1 IRQs",
+    "acpid: 9 nós publicados ao devmgr",
 ];
 
 /// CPUs do cenário de integração sem `--smp`.
@@ -1964,7 +1971,8 @@ mod tests {
                   info  [7376636d] svcmgr: memd em Running\r\n\
                   info  [7376636d] svcmgr: devmgr em Running\r\n\
                   info  [7376636d] svcmgr: pcid em Running\r\n\
-                  info  [7376636d] svcmgr: 5 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: acpid em Running\r\n\
+                  info  [7376636d] svcmgr: 6 serviços em Running\r\n\
                   info  [7376636d] svcmgr: serviços encerrados\r\n\
                   info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";

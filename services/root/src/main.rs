@@ -48,9 +48,10 @@ const HELLO_PRIORITY: u8 = 150;
 /// Badge da `DebugLog` do `svcmgr`: "svcm" em ASCII.
 const SVCMGR_LOG_BADGE: u64 = 0x7376_636d;
 /// Cota de partida do `svcmgr` (ADR 0034, item 2): fixa, 8 MiB no M3, 10
-/// MiB com o `pcid` (T-402) e 13 MiB com o `devmgr` (T-401), cujo heap
-/// pede um segmento de 2 MiB.
-const SVCMGR_QUOTA: u64 = 13 << 20;
+/// MiB com o `pcid` (T-402), 13 MiB com o `devmgr` (T-401), cujo heap
+/// pede um segmento de 2 MiB, e 14 MiB com o `acpid` (T-405), que não usa
+/// heap.
+const SVCMGR_QUOTA: u64 = 14 << 20;
 /// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
 const SVCMGR_PRIORITY: u8 = 200;
 /// Badge com que o `root` identifica o `svcmgr` no próprio endpoint.
@@ -82,6 +83,8 @@ struct Boot {
     /// se ausentes.
     device: Handle,
     ecam: Handle,
+    /// Cópia da DSDT (`kernel:acpi`; T-405); 0 se não houver.
+    dsdt: Handle,
 }
 
 /// Sem ninguém no endpoint, receber com prazo vencido dá `TimedOut` e
@@ -378,8 +381,8 @@ fn atende_svcmgr(b: Boot, ep: Handle, reply: Handle) -> Result<(), Error> {
     let mut buffer = None;
     if b.ecam.raw() != 0 && b.device.raw() != 0 {
         let mut buf = Buffer::new(b.quota, b.aspace, b.thread, ipc::DEFAULT_BUFFER_VA)?;
-        buf.get().caps[..2].copy_from_slice(&[b.ecam.raw(), b.device.raw()]);
-        ok.info.caps = 2;
+        buf.get().caps[..3].copy_from_slice(&[b.ecam.raw(), b.device.raw(), b.dsdt.raw()]);
+        ok.info.caps = if b.dsdt.raw() == 0 { 2 } else { 3 };
         buffer = Some(buf);
     }
     ipc::send(reply, &ok, 0)?;
@@ -452,6 +455,8 @@ fn main(start: Start) -> ! {
         )
         .unwrap_or(Handle::from_raw(0)),
         ecam: table_entry(handle(aspace), table, ostd::kabi::startup::KIND_ECAM)
+            .unwrap_or(Handle::from_raw(0)),
+        dsdt: table_entry(handle(aspace), table, ostd::kabi::startup::KIND_ACPI_DSDT)
             .unwrap_or(Handle::from_raw(0)),
     };
     ostd::rt::init(ostd::rt::Env { quota: boot.quota });

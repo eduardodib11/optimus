@@ -1,0 +1,14 @@
+# Manifesto do `acpid` (ADR 0045; T-405): só a cópia da DSDT, o log de
+# depuração e o `DeviceBus` do `devmgr`. Não recebe portas nem MMIO.
+[service]
+name = "acpid"
+binary = "acpid"
+priority = 140
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:1MiB", "kernel:debug", "kernel:acpi", "svc:optimus.dev.DeviceBus@1"]
+provides = []
+
+[limits]
+max_threads = 1
