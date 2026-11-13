@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use acpid::{Device, Id, Limits, Resource};
+use acpid::{Device, Id, Limits, Resource, State};
 use odev::wire::{self, Ports, Resources};
 use odev::{Bus, Node};
 use ostd::ipc::{self, Buffer};
@@ -105,6 +105,48 @@ fn publish(bus: Handle, buffer: &mut Buffer, node: &Node, names: &[&str], res: &
     )
 }
 
+/// Rotas `INTx` do PCI (`_PRT`) no modo APIC. Por ora só confere e registra:
+/// os drivers usam MSI, e a entrega das rotas ao `devmgr` vem com o primeiro
+/// dispositivo que precisar de `INTx`.
+fn routes(aml: &[u8], wide: bool, limits: Limits) {
+    let mut state = State::default();
+    if !matches!(acpid::pic_mode(aml, 1, wide, limits, &mut state), Ok(true)) {
+        return;
+    }
+    let _ = acpid::scan(aml, limits, |d| {
+        // Só as pontes PCI têm `_PRT` (PNP0A03, ou PNP0A08 no PCIe).
+        let bridge =
+            |id: &Option<Id>| id.is_some_and(|i| matches!(i.as_bytes(), b"PNP0A03" | b"PNP0A08"));
+        if !bridge(&d.hid) && !bridge(&d.cid) {
+            return;
+        }
+        let Ok(Some(routes)) = d.routes(aml, wide, limits, &mut state) else {
+            return;
+        };
+        let (mut count, mut resolved) = (0u32, 0u32);
+        // As rotas repetem poucas ligações, e cada busca varre a tabela:
+        // guarda as já resolvidas.
+        let mut known: [Option<(acpid::NameSeg, Option<u32>)>; 8] = [None; 8];
+        for r in routes {
+            count += 1;
+            let cached = r
+                .source
+                .and_then(|s| known.iter().flatten().find(|(k, _)| *k == s))
+                .map(|(_, gsi)| *gsi);
+            let gsi = cached.unwrap_or_else(|| acpid::route_gsi(aml, &r, wide, limits));
+            if let (None, Some(s), Some(free)) =
+                (cached, r.source, known.iter_mut().find(|k| k.is_none()))
+            {
+                *free = Some((s, gsi));
+            }
+            resolved += u32::from(gsi.is_some());
+        }
+        ostd::debug::print_fmt(format_args!(
+            "acpid: _PRT: {count} rotas INTx, {resolved} com GSI"
+        ));
+    });
+}
+
 fn run(s: &mut Session) -> Result<(), &'static str> {
     let cap = |kind: u8, name: u32| {
         s.boot
@@ -163,6 +205,7 @@ fn run(s: &mut Session) -> Result<(), &'static str> {
         "acpid: {ran} métodos executados, {skipped} fora do subconjunto"
     ));
     ostd::debug::print_fmt(format_args!("acpid: {sent} nós publicados ao devmgr"));
+    routes(aml, wide, limits);
     if let Err(e) = result {
         // O que já saiu continua válido (ADR 0045, item 2).
         ostd::debug::print_fmt(format_args!("acpid: varredura parou: {e:?}"));

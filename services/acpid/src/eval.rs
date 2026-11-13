@@ -4,9 +4,10 @@
 //! `Arg0..6`, `Store`, aritmética e lógica, `If`/`Else`, `While` com
 //! `Break` e `Continue`, `Return`, `SizeOf` e referências a `Name` e a
 //! outros métodos, com a busca do espaço de nomes (do escopo para cima).
-//! Não há estado entre chamadas: gravar num objeto com nome, campos de
-//! `OperationRegion` e pacotes dão [`Error::Unsupported`], e o método é
-//! abortado.
+//! Um pacote é devolvido como está, sem avaliar os elementos. Gravar num
+//! `Name` inteiro fica em [`State`] (poucas entradas), que vale entre
+//! execuções; campos de `OperationRegion` dão [`Error::Unsupported`], e o
+//! método é abortado.
 //!
 //! Sem alocação: cada nome é achado varrendo a tabela de novo, e o número
 //! de varreduras ([`MAX_WALKS`]), de operações e de aninhamento é limitado.
@@ -27,6 +28,49 @@ pub struct Method {
 /// Varreduras da tabela (buscas de nome) por execução.
 pub const MAX_WALKS: u32 = 64;
 
+/// Entradas de [`State`].
+pub const MAX_STATE: usize = 8;
+
+/// Inteiros gravados por métodos em objetos `Name` (por exemplo o `PICF`
+/// que o `_PIC` grava). Sem alocação: até [`MAX_STATE`] nomes.
+#[derive(Clone, Copy)]
+pub struct State {
+    names: [(Scope, u64); MAX_STATE],
+    len: usize,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        let empty = Scope {
+            path: [[0; 4]; crate::MAX_DEPTH],
+            depth: 0,
+        };
+        Self {
+            names: [(empty, 0); MAX_STATE],
+            len: 0,
+        }
+    }
+}
+
+impl State {
+    fn slot(&mut self, at: &Scope) -> Option<&mut u64> {
+        self.names[..self.len]
+            .iter_mut()
+            .find(|(s, _)| s.path[..s.depth] == at.path[..at.depth])
+            .map(|(_, v)| v)
+    }
+
+    fn set(&mut self, at: Scope, v: u64) -> Result<(), Error> {
+        if let Some(old) = self.slot(&at) {
+            *old = v;
+            return Ok(());
+        }
+        *self.names.get_mut(self.len).ok_or(Error::Limit)? = (at, v);
+        self.len += 1;
+        Ok(())
+    }
+}
+
 /// Como um bloco terminou.
 enum Flow<'a> {
     Next,
@@ -42,8 +86,9 @@ struct Frame<'a> {
     scope: Scope,
 }
 
-struct Interp<'a> {
+struct Interp<'a, 's> {
     aml: &'a [u8],
+    state: &'s mut State,
     cur: Cur<'a>,
     budget: Budget,
     limits: Limits,
@@ -65,23 +110,74 @@ pub fn eval<'a>(
     width32: bool,
     limits: Limits,
 ) -> Result<Value<'a>, Error> {
+    run(
+        aml,
+        path,
+        method,
+        &[],
+        width32,
+        limits,
+        &mut State::default(),
+    )
+}
+
+/// Chama `\_PIC (mode)` (1 escolhe o modo APIC), para o `_PRT` devolver as
+/// rotas em GSIs. Devolve `false` se a tabela não tem `_PIC`.
+///
+/// # Errors
+/// Os de [`eval`].
+pub fn pic_mode(
+    aml: &[u8],
+    mode: u64,
+    width32: bool,
+    limits: Limits,
+    state: &mut State,
+) -> Result<bool, Error> {
+    let mut found = None;
+    walk(aml, limits, |e| {
+        if let Event::Object(at, Item::Method(m)) = e
+            && at.depth == 1
+            && at.path[0] == *b"_PIC"
+        {
+            found = Some(m);
+        }
+    })?;
+    let Some(m) = found else { return Ok(false) };
+    run(aml, &[], m, &[mode], width32, limits, state).map(|_| true)
+}
+
+/// Como [`eval`], com argumentos inteiros e o estado entre execuções.
+pub(crate) fn run<'a>(
+    aml: &'a [u8],
+    path: &[NameSeg],
+    method: Method,
+    args: &[u64],
+    width32: bool,
+    limits: Limits,
+    state: &mut State,
+) -> Result<Value<'a>, Error> {
     let root = Scope {
         path: [[0; 4]; crate::MAX_DEPTH],
         depth: 0,
     };
     let scope = root.child(true, 0, path)?;
+    let mut values = [Value::Other; 7];
+    for (v, a) in values.iter_mut().zip(args) {
+        *v = Value::Int(*a);
+    }
     let mut i = Interp {
         aml,
+        state,
         cur: Cur { b: aml, p: 0 },
         budget: Budget { limits, ops: 0 },
         limits,
         walks: 0,
         mask: if width32 { 0xFFFF_FFFF } else { u64::MAX },
     };
-    i.call(method, scope, [Value::Other; 7], 0)
+    i.call(method, scope, values, 0)
 }
 
-impl<'a> Interp<'a> {
+impl<'a> Interp<'a, '_> {
     fn call(
         &mut self,
         m: Method,
@@ -195,12 +291,21 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Grava `v` no destino que vem a seguir: nenhum (`Zero`), `Local` ou
-    /// `Arg`. Destino com nome não é aceito (não há estado entre chamadas).
+    /// Grava `v` no destino que vem a seguir: nenhum (`Zero`), `Local`,
+    /// `Arg` ou um `Name` inteiro, que fica em [`State`].
     fn store(&mut self, v: Value<'a>, fr: &mut Frame<'a>) -> Result<(), Error> {
         match self.cur.u8()? {
             0x00 => {}
-            op => *Self::slot(op, fr)? = v,
+            op @ 0x60..=0x6E => *Self::slot(op, fr)? = v,
+            _ => {
+                self.cur.p -= 1;
+                let (root, up, segs, n) = self.cur.name()?;
+                let found = self.lookup(&fr.scope, root, up, &segs[..n])?;
+                let (Some((at, Item::Name(Value::Int(_)))), Value::Int(v)) = (found, v) else {
+                    return Err(Error::Unsupported);
+                };
+                self.state.set(at, v)?;
+            }
         }
         Ok(())
     }
@@ -228,6 +333,10 @@ impl<'a> Interp<'a> {
                 let data = self.aml.get(self.cur.p..end).ok_or(Error::Truncated)?;
                 self.cur.p = end;
                 Value::Buf(data)
+            }
+            0x12 => {
+                let end = self.cur.pkg_end(limit)?;
+                self.cur.package(end)?
             }
             0x60..=0x6E => *Self::slot(op, fr)?,
             0x70 => {
@@ -328,7 +437,10 @@ impl<'a> Interp<'a> {
         depth: usize,
     ) -> Result<Value<'a>, Error> {
         match self.lookup(&fr.scope, root, up, segs)? {
-            Some((_, Item::Name(v))) => Ok(v),
+            Some((at, Item::Name(v))) => Ok(match (v, self.state.slot(&at)) {
+                (Value::Int(_), Some(now)) => Value::Int(*now),
+                _ => v,
+            }),
             Some((at, Item::Method(m))) => {
                 let mut args = [Value::Other; 7];
                 for a in args.iter_mut().take(usize::from(m.args)) {

@@ -12,16 +12,19 @@
 //! buffer e salta todo o resto pela gramática dos opcodes (métodos, campos,
 //! regiões, expressões). Os métodos `_STA` e `_CRS` ficam anotados no
 //! `Device` e [`eval`] os executa (inteiros, locais, argumentos, controle de
-//! fluxo, aritmética e chamadas); campos de `OperationRegion` e `_PRT`
-//! entram na etapa seguinte.
+//! fluxo, aritmética e chamadas). O `_PRT` (rotas de interrupção `INTx` do
+//! PCI) sai por [`Device::routes`], depois de [`pic_mode`] escolher o modo
+//! APIC. Campos de `OperationRegion` ainda dão [`Error::Unsupported`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 mod crs;
 mod eval;
+mod prt;
 pub use crs::{Resource, Resources};
-pub use eval::{Method, eval};
+pub use eval::{Method, State, eval, pic_mode};
+pub use prt::{Route, Routes};
 
 /// Erros de leitura.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +176,44 @@ impl<'a> Device<'a> {
             _ => Ok(self.resources()),
         }
     }
+
+    /// Rotas de `_PRT`; `None` se o dispositivo não tem `_PRT`. O objeto é
+    /// procurado pelo caminho, porque o firmware pode declará-lo num `Scope`
+    /// fora do `Device`. O método enxerga o que [`pic_mode`] gravou em
+    /// `state`.
+    ///
+    /// # Errors
+    /// Os de [`eval`]; [`Error::Unsupported`] também se o resultado não for
+    /// um pacote.
+    pub fn routes(
+        &self,
+        aml: &'a [u8],
+        width32: bool,
+        limits: Limits,
+        state: &mut State,
+    ) -> Result<Option<Routes<'a>>, Error> {
+        let path = &self.path[..self.depth];
+        let mut found = None;
+        walk(aml, limits, |e| {
+            if let Event::Object(at, item) = e
+                && found.is_none()
+                && at.depth == path.len() + 1
+                && at.path[..path.len()] == *path
+                && at.path[path.len()] == *b"_PRT"
+            {
+                found = Some(item);
+            }
+        })?;
+        let v = match found {
+            Some(Item::Name(v)) => v,
+            Some(Item::Method(m)) => eval::run(aml, path, m, &[], width32, limits, state)?,
+            None => return Ok(None),
+        };
+        match v {
+            Value::Pkg { data, .. } => Ok(Some(Routes::new(data))),
+            _ => Err(Error::Unsupported),
+        }
+    }
 }
 
 /// Identificador de hardware em texto (até 8 bytes ASCII).
@@ -224,6 +265,13 @@ pub enum Value<'a> {
     Str(&'a [u8]),
     /// Dados de um buffer.
     Buf(&'a [u8]),
+    /// Pacote: número de elementos e os bytes deles, ainda em AML.
+    Pkg {
+        /// Elementos declarados.
+        count: u8,
+        /// Os elementos codificados.
+        data: &'a [u8],
+    },
     /// Outro tipo de objeto, ou nenhum valor.
     Other,
 }
@@ -352,12 +400,27 @@ impl<'a> Cur<'a> {
                 self.p = end;
                 Value::Buf(data)
             }
+            0x12 => {
+                let end = self.pkg_end(limit)?;
+                self.package(end)?
+            }
             _ => {
                 self.p = start;
                 self.term(limit, budget, 0)?;
                 Value::Other
             }
         })
+    }
+
+    /// Corpo de um `Package` até `end`: o número de elementos e os bytes.
+    fn package(&mut self, end: usize) -> Result<Value<'a>, Error> {
+        if self.p >= end {
+            return Err(Error::Malformed);
+        }
+        let count = self.u8()?;
+        let data = self.b.get(self.p..end).ok_or(Error::Truncated)?;
+        self.p = end;
+        Ok(Value::Pkg { count, data })
     }
 
     fn string(&mut self, limit: usize) -> Result<&'a [u8], Error> {
@@ -616,6 +679,31 @@ pub fn scan<'a>(
             f(&d);
         }
     })
+}
+
+/// GSI de uma rota de `_PRT`: o índice, ou a interrupção estendida do
+/// `_CRS` do dispositivo de ligação. `None` se a ligação não existe ou o
+/// `_CRS` dela sai do subconjunto.
+#[must_use]
+pub fn route_gsi(aml: &[u8], route: &Route, width32: bool, limits: Limits) -> Option<u32> {
+    let Some(link) = route.source else {
+        return Some(route.index);
+    };
+    let mut gsi = None;
+    let _ = scan(aml, limits, |d| {
+        if gsi.is_none() && d.depth > 0 && d.path[d.depth - 1] == link {
+            gsi = d
+                .current_resources(aml, width32, limits)
+                .ok()
+                .and_then(|mut crs| {
+                    crs.find_map(|r| match r {
+                        Resource::Gsi { gsi } => Some(gsi),
+                        _ => None,
+                    })
+                });
+        }
+    });
+    gsi
 }
 
 /// Como [`scan`], com os `Name` e `Method` além dos `Device`.

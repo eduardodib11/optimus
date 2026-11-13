@@ -1424,6 +1424,9 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "acpid: PNP0303: 2 portas, 1 IRQs",
     "acpid: PNP0B00: 1 portas, 1 IRQs",
     "acpid: 9 nós publicados ao devmgr",
+    // T-405: o `_PRT` do q35 (32 dispositivos, 4 pinos) sai no modo APIC e
+    // toda rota resolve num GSI pelo `_CRS` da ligação.
+    "acpid: _PRT: 128 rotas INTx, 128 com GSI",
     // Aceite da T-406 (RTC): o `devmgr` casa o nó `PNP0B00` com o `rtcd`,
     // que lê a hora pelas portas do CMOS ([`check_rtcd`] confere o valor).
     "[\"PNP0B00\"]: rtcd",

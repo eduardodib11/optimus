@@ -22,6 +22,11 @@ pub enum Resource {
         /// Máscara.
         mask: u16,
     },
+    /// Interrupção estendida: o primeiro GSI do descritor.
+    Gsi {
+        /// Número global da interrupção.
+        gsi: u32,
+    },
 }
 
 /// Iterador sobre um buffer `_CRS`. Para no fim, no descritor de fim ou no
@@ -78,6 +83,7 @@ impl Iterator for Resources<'_> {
                         len: u32_at(5),
                     });
                 }
+                (true, 0x9, 6..) if body[1] >= 1 => return Some(Resource::Gsi { gsi: u32_at(2) }),
                 _ => {}
             }
         }

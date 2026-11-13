@@ -296,6 +296,87 @@ fn chamada_com_argumento_e_crs_por_metodo() {
 }
 
 #[test]
+fn prt_muda_com_o_pic_e_resolve_a_ligacao() {
+    // Rota do modo PIC: dispositivo 2, INTA, pela ligação LNKA.
+    let pic = [&[0x12][..], &pkg(b"\x04\x0C\xFF\xFF\x02\x00\x00LNKA\x00")].concat();
+    // Rota do modo APIC: dispositivo 3, INTB, GSI 20.
+    let apic = [
+        &[0x12][..],
+        &pkg(&[4, 0x0C, 0xFF, 0xFF, 3, 0, 0x01, 0x00, 0x0A, 20]),
+    ]
+    .concat();
+    let table = |r: &[u8]| [&[0x12][..], &pkg(&[&[1][..], r].concat())].concat();
+    // Method (_PRT) { If (PICF == 0) { Return (PRTP) } Return (PRTA) }
+    let prt = [&[0xA0][..], &pkg(b"\x93PICF\x00\xA4PRTP"), b"\xA4PRTA"].concat();
+    // _CRS da ligação: interrupção estendida no GSI 17.
+    let crs = [
+        0x11, 0x0E, 0x0A, 0x0B, 0x89, 0x06, 0x00, 0x09, 0x01, 17, 0, 0, 0, 0x79, 0x00,
+    ];
+    let aml = [
+        name(*b"PICF", &[0]),
+        method(*b"_PIC", 1, b"\x70\x68PICF"),
+        dev(
+            *b"PCI0",
+            &[
+                &name(*b"PRTP", &table(&pic)),
+                &name(*b"PRTA", &table(&apic)),
+                &method(*b"_PRT", 0, &prt),
+                &dev(*b"LNKA", &[&name(*b"_CRS", &crs)]),
+            ],
+        ),
+    ]
+    .concat();
+    let (devs, r) = collect(&aml);
+    assert_eq!(r, Ok(()));
+    let (link, pci) = (devs[0], devs[1]);
+    let l = Limits::default();
+    let mut state = State::default();
+    let routes = |state: &mut State| -> Vec<Route> {
+        pci.routes(&aml, false, l, state)
+            .unwrap()
+            .unwrap()
+            .collect()
+    };
+    let lnka = Route {
+        device: 2,
+        pin: 0,
+        source: Some(*b"LNKA"),
+        index: 0,
+    };
+    assert_eq!(routes(&mut state), [lnka]);
+    assert_eq!(route_gsi(&aml, &lnka, false, l), Some(17));
+    assert_eq!(pic_mode(&aml, 1, false, l, &mut state), Ok(true));
+    let gsi20 = Route {
+        device: 3,
+        pin: 1,
+        source: None,
+        index: 20,
+    };
+    assert_eq!(routes(&mut state), [gsi20]);
+    assert_eq!(route_gsi(&aml, &gsi20, false, l), Some(20));
+    // Sem `_PRT`, sem `_PIC`, ligação que não existe e rota malformada.
+    assert!(link.routes(&aml, false, l, &mut state).unwrap().is_none());
+    let so = dev(
+        *b"PCI0",
+        &[&name(*b"_PRT", &table(&[0x12, 0x03, 0x04, 0x00]))],
+    );
+    assert_eq!(pic_mode(&so, 1, false, l, &mut state), Ok(false));
+    let d = collect(&so).0[0];
+    assert_eq!(
+        d.routes(&so, false, l, &mut state)
+            .unwrap()
+            .unwrap()
+            .count(),
+        0
+    );
+    let sem = Route {
+        source: Some(*b"LNKZ"),
+        ..lnka
+    };
+    assert_eq!(route_gsi(&aml, &sem, false, l), None);
+}
+
+#[test]
 fn limites_da_execucao() {
     // While (One) {}: estoura as operações.
     let aml = dev(*b"DEV_", &[&method(*b"_STA", 0, &[0xA2, 0x02, 0x01])]);
@@ -353,6 +434,13 @@ fn mutacao_dos_metodos_sem_panico() {
         for d in devs {
             let _ = d.status(&m, x & 1 == 0, limits);
             let _ = d.current_resources(&m, false, limits).map(Iterator::count);
+            let mut state = State::default();
+            let _ = pic_mode(&m, x & 3, false, limits, &mut state);
+            if let Ok(Some(routes)) = d.routes(&m, false, limits, &mut state) {
+                for r in routes {
+                    let _ = route_gsi(&m, &r, false, limits);
+                }
+            }
         }
     }
 }
@@ -376,6 +464,28 @@ fn dsdt_real_opcional() {
             .current_resources(aml, h.width32(), Limits::default())
             .map(Iterator::collect::<Vec<_>>);
         println!("{hid:?} sta={sta:x?} {crs:?}");
+    }
+    // Rotas INTx no modo APIC: com `_PRT`, toda rota resolve num GSI, direto
+    // ou pelo `_CRS` do dispositivo de ligação.
+    let l = Limits::default();
+    let mut state = State::default();
+    let pic = pic_mode(aml, 1, h.width32(), l, &mut state);
+    println!("_PIC: {pic:?}");
+    for d in &devs {
+        let Some(routes) = d.routes(aml, h.width32(), l, &mut state).unwrap() else {
+            continue;
+        };
+        let routes: Vec<Route> = routes.collect();
+        println!(
+            "_PRT: {} rotas, primeira {:?}",
+            routes.len(),
+            routes.first()
+        );
+        assert!(!routes.is_empty());
+        for r in routes {
+            let gsi = route_gsi(aml, &r, h.width32(), l);
+            assert!(gsi.is_some(), "rota sem GSI: {r:?}");
+        }
     }
     assert_eq!(r, Ok(()));
 }
