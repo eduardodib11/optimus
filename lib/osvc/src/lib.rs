@@ -30,10 +30,12 @@ pub enum Method {
     DriverGive = 5,
     /// `driver_start(id)` (1.2; só para o `devmgr`).
     DriverStart = 6,
+    /// `driver_stop(id)` (1.3; só para o `devmgr`).
+    DriverStop = 7,
 }
 
 /// Versão menor do protocolo.
-pub const MINOR: u16 = 2;
+pub const MINOR: u16 = 3;
 
 /// `SvcError` no fio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,7 @@ pub fn label(m: Method) -> u64 {
     let minor = match m {
         Method::Driver => 1,
         Method::DriverGive | Method::DriverStart => 2,
+        Method::DriverStop => 3,
         _ => 0,
     };
     (u64::from(interface_id()) << 32) | (minor << 16) | m as u64
@@ -97,6 +100,7 @@ pub fn method_of(label: u64) -> Option<Method> {
         4 => Method::Driver,
         5 => Method::DriverGive,
         6 => Method::DriverStart,
+        7 => Method::DriverStop,
         _ => return None,
     })
 }
@@ -472,6 +476,22 @@ pub fn encode_driver_start(id: u32, out: &mut [u8]) -> oidl_rt::Result<usize> {
 /// # Errors
 /// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
 pub fn decode_driver_start(body: &[u8]) -> oidl_rt::Result<u32> {
+    decode_name_of(body)
+}
+
+/// Codifica o pedido de `driver_stop(id)`: o mesmo corpo de `name_of`.
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] sem espaço em `out`.
+pub fn encode_driver_stop(id: u32, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    encode_name_of(id, out)
+}
+
+/// Decodifica o pedido de `driver_stop`.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_driver_stop(body: &[u8]) -> oidl_rt::Result<u32> {
     decode_name_of(body)
 }
 

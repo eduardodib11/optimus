@@ -384,7 +384,34 @@ impl Svcmgr<'_> {
         }
     }
 
-    /// Os métodos do `devmgr` (1.1 e 1.2); devolve a resposta e se os
+    /// `driver_stop(id)` (ADR 0051, item 3): mata o driver em `Running` e
+    /// apaga os recursos dele já, sem reinício (quem o parte de novo é o
+    /// `devmgr`, com recursos novos).
+    fn driver_stop(&mut self, caller: u32, id: u32) -> Result<(), SvcError> {
+        if !self.plan.broker.is_device_manager(caller) || !self.plan.drivers.contains(&id) {
+            return Err(SvcError::NotInManifest);
+        }
+        let thread = self
+            .started(id)
+            .map(|s| s.child.thread)
+            .ok_or(SvcError::NotRunning)?;
+        if ostd::cap::destroy(thread).is_err() {
+            return Err(SvcError::Busy);
+        }
+        // `destroy` já apagou a capability: o `retire` não pode apagar o
+        // mesmo número, que o kernel pode ter dado a outra.
+        if let Some(Some(s)) = usize::try_from(id).ok().and_then(|i| self.live.get_mut(i)) {
+            s.child.thread = Handle::from_raw(0);
+        }
+        self.retire(id);
+        let n = name(&self.plan, id);
+        ostd::debug::print_fmt(format_args!("svcmgr: {n} parado pelo devmgr"));
+        // Morte limpa: a política do driver não o parte sozinho.
+        let _ = self.sup.exited(id, Exit::Clean, ostd::time::now_ns());
+        Ok(())
+    }
+
+    /// Os métodos do `devmgr` (1.1 a 1.3); devolve a resposta e se os
     /// recursos que chegaram ficaram guardados.
     fn serve_driver(
         &mut self,
@@ -406,6 +433,13 @@ impl Svcmgr<'_> {
             },
             Method::DriverStart => match osvc::decode_driver_start(req) {
                 Ok(driver) => match self.driver_start(id, driver) {
+                    Ok(()) => ((osvc::REPLY_OK, 0), false),
+                    Err(e) => (err(e, body), false),
+                },
+                Err(_) => ((osvc::REPLY_BAD_MESSAGE, 0), false),
+            },
+            Method::DriverStop => match osvc::decode_driver_stop(req) {
+                Ok(driver) => match self.driver_stop(id, driver) {
                     Ok(()) => ((osvc::REPLY_OK, 0), false),
                     Err(e) => (err(e, body), false),
                 },
@@ -556,7 +590,15 @@ impl Svcmgr<'_> {
                 },
                 Err(_) => (osvc::REPLY_BAD_MESSAGE, 0),
             },
-            (true, Some(m @ (Method::Driver | Method::DriverGive | Method::DriverStart))) => {
+            (
+                true,
+                Some(
+                    m @ (Method::Driver
+                    | Method::DriverGive
+                    | Method::DriverStart
+                    | Method::DriverStop),
+                ),
+            ) => {
                 let (answer, keep) = self.serve_driver(id, m, &req[..r.corpo], &got, &mut body);
                 kept = keep;
                 answer

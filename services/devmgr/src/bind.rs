@@ -153,6 +153,20 @@ pub struct Bound {
     pub driver: u32,
     /// Originais (revogar tira as cópias do driver).
     pub originals: Vec<Handle>,
+    /// Recursos do nó, para partir o driver de novo (ADR 0051, item 4).
+    pub res: Resources,
+    /// O `DmaDomain` original (com `BIND`), se o nó é PCI: a contenção
+    /// desliga o dispositivo dele (ADR 0051, item 3).
+    pub domain: Option<Handle>,
+    /// Número da partida: 0 na primeira, e a cópia `dma` leva o `badge`
+    /// `partida + 1` (item 5).
+    pub generation: u32,
+}
+
+/// Bit que a falta de DMA do driver `driver` sinaliza (ADR 0051, item 2).
+#[must_use]
+pub const fn fault_bit(driver: u32) -> u64 {
+    1 << (driver % 64)
 }
 
 /// Cria os recursos do nó, liga a função (se for PCI) e parte o driver
@@ -166,13 +180,22 @@ pub fn start(
     s: &mut Session,
     device: Handle,
     ecam: Option<Handle>,
+    faults: Handle,
     driver: u32,
     res: &Resources,
+    generation: u32,
 ) -> Result<Bound, Error> {
     let mut originals = Vec::new();
-    let r = build(s, device, ecam, driver, res, &mut originals);
+    let plan = Plan { faults, generation };
+    let r = build(s, device, ecam, driver, res, &plan, &mut originals);
     match r {
-        Ok(()) => Ok(Bound { driver, originals }),
+        Ok(()) => Ok(Bound {
+            driver,
+            domain: domain_of(&originals, res),
+            originals,
+            res: *res,
+            generation,
+        }),
         Err(e) => {
             for h in originals {
                 let _ = ostd::cap::delete(h);
@@ -180,6 +203,22 @@ pub fn start(
             Err(e)
         }
     }
+}
+
+/// O domínio entre as originais: o primeiro `DmaDomain` (só nós PCI têm).
+fn domain_of(originals: &[Handle], res: &Resources) -> Option<Handle> {
+    res.bdf?;
+    originals
+        .iter()
+        .copied()
+        .find(|&h| ostd::cap::info(h).is_ok_and(|i| i.object_type == ObjectType::DmaDomain))
+}
+
+/// O que muda de uma partida para outra (ADR 0051).
+struct Plan {
+    /// Notificação das faltas de DMA, ligada ao domínio.
+    faults: Handle,
+    generation: u32,
 }
 
 /// O que vai ao driver: capability e hash do nome.
@@ -191,6 +230,7 @@ fn build(
     ecam: Option<Handle>,
     driver: u32,
     res: &Resources,
+    plan: &Plan,
     originals: &mut Vec<Handle>,
 ) -> Result<(), Error> {
     let mut give = Give::new();
@@ -207,7 +247,17 @@ fn build(
     if let Some(bdf) = res.bdf {
         let ecam = ecam.ok_or(Error::NotSupported)?;
         let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
-        irqs = pci(device, quota, ecam, bdf, res, &bars, originals, &mut give)?;
+        irqs = pci(
+            device,
+            quota,
+            ecam,
+            (bdf, driver),
+            res,
+            plan,
+            &bars,
+            originals,
+            &mut give,
+        )?;
     }
     // Nó legado (ADR 0049, item 8): portas de E/S e IRQs ISA.
     for (i, p) in res.ports.iter().flatten().enumerate() {
@@ -251,8 +301,9 @@ fn pci(
     device: Handle,
     quota: Handle,
     ecam: Handle,
-    bdf: u16,
+    (bdf, driver): (u16, u32),
     res: &Resources,
+    plan: &Plan,
     bars: &[Option<Handle>; 6],
     originals: &mut Vec<Handle>,
     give: &mut Give,
@@ -260,7 +311,11 @@ fn pci(
     let domain = ostd::cap::create(device, ObjectType::DmaDomain, 0)?;
     originals.push(domain);
     ostd::dev::dma_bind(domain, bdf, true)?;
-    let map_only = ostd::cap::mint(domain, Rights::MAP, 0, None)?;
+    // Cada falta de DMA do dispositivo sinaliza o bit do driver (ADR 0051,
+    // itens 1 e 2).
+    ostd::cap::bind_notify(domain, plan.faults, fault_bit(driver))?;
+    let badge = u64::from(plan.generation) + 1;
+    let map_only = ostd::cap::mint(domain, Rights::MAP, badge, None)?;
     originals.push(map_only);
     give.push((map_only, name_hash("dma")));
     let mut f = Function::open(ecam, bdf)?;

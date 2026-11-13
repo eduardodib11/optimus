@@ -21,6 +21,7 @@ use kabi::vm::PAGE_SIZE;
 use crate::cap::object::object_bytes;
 use crate::cap::{Charge, MemoryQuota};
 use crate::mm::PhysAddr;
+use crate::notify::Notification;
 use crate::sync::{LockClass, SpinLock};
 use crate::vm::MemoryObject;
 
@@ -102,6 +103,8 @@ struct State {
     hw: Option<(&'static dyn Iommu, u32)>,
     maps: Vec<Map>,
     devices: Vec<u16>,
+    /// Notificação e máscara que cada falta de DMA sinaliza (ADR 0051).
+    on_fault: Option<(Arc<Notification>, u64)>,
 }
 
 /// Domínio de DMA (tipo 11; ADR 0044, item 2).
@@ -150,6 +153,7 @@ impl DmaDomain {
                     hw,
                     maps: Vec::new(),
                     devices: Vec::new(),
+                    on_fault: None,
                 },
             ),
         })
@@ -328,6 +332,17 @@ impl DmaDomain {
         Ok(())
     }
 
+    /// `obj_bind_notify` (ADR 0051, item 1): cada falta de DMA de um
+    /// dispositivo deste domínio passa a sinalizar `mask` em `ntfy`;
+    /// `None` desliga. Devolve a ligação anterior, que quem chama solta
+    /// fora da trava.
+    pub fn bind_fault(
+        &self,
+        event: Option<(Arc<Notification>, u64)>,
+    ) -> Option<(Arc<Notification>, u64)> {
+        core::mem::replace(&mut self.state.lock().on_fault, event)
+    }
+
     /// Mapeamentos e dispositivos (para os testes).
     #[must_use]
     pub fn counts(&self) -> (usize, usize) {
@@ -349,6 +364,20 @@ impl Drop for DmaDomain {
         // As entradas de `ATTACHED` deste domínio ficam com `Weak` morto e
         // saem no próximo `attach`.
     }
+}
+
+/// A ligação de falta do domínio a que `bdf` pertence (ADR 0051, item 1):
+/// o que o tratador da interrupção de falta deve sinalizar. `None` se o
+/// dispositivo não está num domínio vivo ou o domínio não tem ligação.
+#[must_use]
+pub fn fault_binding(bdf: u16) -> Option<(Arc<Notification>, u64)> {
+    // `ATTACHED` e o domínio são da mesma classe: nunca os dois na mão.
+    let domain = ATTACHED
+        .lock()
+        .iter()
+        .find(|(b, _)| *b == bdf)
+        .and_then(|(_, w)| w.upgrade())?;
+    domain.state.lock().on_fault.clone()
 }
 
 #[cfg(test)]

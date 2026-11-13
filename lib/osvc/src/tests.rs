@@ -75,12 +75,14 @@ fn rotulos() {
         Method::Driver,
         Method::DriverGive,
         Method::DriverStart,
+        Method::DriverStop,
     ] {
         assert_eq!(method_of(label(m)), Some(m));
     }
     assert_eq!(label(Method::Driver) >> 16 & 0xFFFF, 1, "driver é da 1.1");
     assert_eq!(label(Method::DriverStart) >> 16 & 0xFFFF, 2);
-    assert_eq!(method_of(label(Method::Ready) | 3 << 16), None);
+    assert_eq!(label(Method::DriverStop) >> 16 & 0xFFFF, 3);
+    assert_eq!(method_of(label(Method::Ready) | 4 << 16), None);
     assert_eq!(method_of(4), None);
     assert_eq!(SvcError::from_u8(3), Some(SvcError::Busy));
     assert_eq!(SvcError::from_u8(4), None);

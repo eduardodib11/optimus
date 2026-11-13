@@ -75,3 +75,33 @@ fn driver_mapeia_e_so_devmgr_liga() {
     );
     dma(&space, [d, ro, 0, 0, PAGE_SIZE, READ]).unwrap();
 }
+
+#[test]
+fn so_o_devmgr_liga_a_falta_de_dma_a_uma_notificacao() {
+    platform::install(fake_platform(1000).1);
+    let (root, space, q) = setup();
+    let n = create(&space, q, ObjectType::Notification);
+    let bind = |obj, bits| call(&space, Syscall::ObjBindNotify, [obj, n, bits, 0, 0, 0]);
+    // Domínio do driver (sem `BIND`): recusado.
+    let d = domain(&space, q);
+    assert_eq!(bind(d, 1), Err(Error::AccessDenied));
+    // Domínio do `devmgr`: liga, religa e desliga (máscara 0).
+    let device = MemoryQuota::device(&root, 1 << 16).unwrap();
+    let dq = space
+        .lock()
+        .insert(Cap {
+            object: Object::MemoryQuota(device),
+            rights: Rights::CREATE,
+            badge: 0,
+        })
+        .unwrap();
+    let b = domain(&space, u64::from(dq.raw()));
+    bind(b, 1 << 3).unwrap();
+    bind(b, 1 << 4).unwrap();
+    bind(b, 0).unwrap();
+    // Lixo nos argumentos extras.
+    assert_eq!(
+        call(&space, Syscall::ObjBindNotify, [b, n, 1, 7, 0, 0]),
+        Err(Error::InvalidArgument)
+    );
+}

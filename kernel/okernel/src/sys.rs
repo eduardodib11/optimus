@@ -475,6 +475,9 @@ fn bind_notify(space: &SharedCapSpace, a: [u64; 6], env: &mut dyn Env) -> Result
             }
         }
         Object::CapSpace(c) => process::bind(c, event, env),
+        // Falta de DMA do domínio (ADR 0051, item 1): a ligação anterior
+        // é solta aqui, sem trava na mão.
+        Object::DmaDomain(d) => drop(d.bind_fault(event)),
         _ => return Err(Error::WrongType),
     }
     env.preempt();

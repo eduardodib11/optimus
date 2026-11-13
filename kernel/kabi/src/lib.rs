@@ -141,7 +141,7 @@ pub enum Syscall: u32, raw(n) => u64::from(n);
     NtfySignal = 22 => "`ntfy_signal`.",
     NtfyWait = 23 => "`ntfy_wait`; `PeerClosed` se a notificação morre durante a espera.",
     NtfyPoll = 24 => "`ntfy_poll`.",
-    ObjBindNotify = 25 => "`obj_bind_notify(obj, ntfy, bits, a3, a4, a5)`: `Interrupt`, a morte de `Thread` e de `CapSpace` e o vencimento de um `Timer` (`a3` prazo, `a4` período, `a5` flags de [`timer`]; ADR 0035).",
+    ObjBindNotify = 25 => "`obj_bind_notify(obj, ntfy, bits, a3, a4, a5)`: `Interrupt`, a morte de `Thread` e de `CapSpace`, o vencimento de um `Timer` (`a3` prazo, `a4` período, `a5` flags de [`timer`]; ADR 0035) e cada falta de DMA de um `DmaDomain` com `BIND` (`bits` é a máscara sinalizada, 0 desliga; ADR 0051).",
     IrqAck = 26 => "`irq_ack`.",
     ClockGet = 27 => "`clock_get`.",
     Yield = 28 => "`yield`.",
