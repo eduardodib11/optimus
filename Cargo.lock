@@ -546,6 +546,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-net"
+version = "0.1.0"
+dependencies = [
+ "optcrypt",
+ "ostd",
+ "vdrv",
+ "virtio-core",
+]
+
+[[package]]
 name = "virtio-rng"
 version = "0.1.0"
 dependencies = [

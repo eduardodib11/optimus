@@ -1,0 +1,20 @@
+[package]
+name = "virtio-net"
+description = "virtio-net: driver de rede virtio em processo de usuário (T-412; ADR 0046)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-net"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+optcrypt = { path = "../../lib/optcrypt" }
+virtio-core = { path = "../../lib/virtio-core" }
+vdrv = { path = "../../lib/vdrv" }
+
+[lints]
+workspace = true
