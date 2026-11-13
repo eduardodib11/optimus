@@ -1,0 +1,18 @@
+# Driver do virtio-rng (T-414; ADR 0042 e 0046): casa com o dispositivo
+# virtio moderno de entropia (`1af4:1044`). Não parte no boot; o `devmgr` o
+# parte com `bar4`, `irq0`, `dma` e `cfg` do nó.
+[service]
+name = "virtio-rng"
+binary = "virtio-rng"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:1MiB", "kernel:debug"]
+provides = []
+
+[match]
+pci = ["1af4:1044"]
+
+[limits]
+max_threads = 1

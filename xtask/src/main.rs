@@ -40,6 +40,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("oinput", "lib/oinput/src/lib.rs", KERNEL_TARGET),
     ("opci", "lib/opci/src/lib.rs", KERNEL_TARGET),
     ("virtio-core", "lib/virtio-core/src/lib.rs", KERNEL_TARGET),
+    ("vdrv", "lib/vdrv/src/lib.rs", USER_TARGET),
     ("ostd", "lib/ostd/src/lib.rs", USER_TARGET),
     ("root", "services/root/src/main.rs", USER_TARGET),
     ("hello", "services/hello/src/main.rs", USER_TARGET),
@@ -52,6 +53,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("devmgr", "services/devmgr/src/main.rs", USER_TARGET),
     ("drvteste", "services/drvteste/src/main.rs", USER_TARGET),
     ("virtio-blk", "services/virtio-blk/src/main.rs", USER_TARGET),
+    ("virtio-rng", "services/virtio-rng/src/main.rs", USER_TARGET),
     ("rtcd", "services/rtcd/src/main.rs", USER_TARGET),
     ("inputd", "services/inputd/src/main.rs", USER_TARGET),
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
@@ -388,9 +390,8 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
-        | "drvteste" | "virtio-blk" | "rtcd" | "inputd" | "i8042d" | "utest" | "okfuzz" => {
-            &["-C", "relocation-model=static"]
-        }
+        | "drvteste" | "virtio-blk" | "virtio-rng" | "rtcd" | "inputd" | "i8042d" | "utest"
+        | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -437,6 +438,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("devmgr", "devmgr"),
     ("drvteste", "drvteste"),
     ("virtio-blk", "virtio-blk"),
+    ("virtio-rng", "virtio-rng"),
     ("rtcd", "rtcd"),
     ("inputd", "inputd"),
     ("i8042d", "i8042d"),
@@ -762,7 +764,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 4 drivers no conjunto",
+        "devmgr: 5 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -783,19 +785,22 @@ const DRIVER_SCENARIO: Scenario = Scenario {
 /// Aceite da T-411: o `devmgr` casa o `virtio-blk-pci` (`1af4:1042`) com o
 /// driver, que negocia o transporte moderno, monta a fila 0 e escreve e lê
 /// um setor com MSI-X.
-const VIRTIO_BLK_SCENARIO: Scenario = Scenario {
-    name: "virtio-blk escreve e lê um setor do disco do QEMU",
+const VIRTIO_SCENARIO: Scenario = Scenario {
+    name: "virtio-blk lê e escreve um setor e virtio-rng entrega bytes",
     markers: &[
         "1af4:1042 ",
+        "1af4:1044 ",
         "svcmgr: virtio-blk em Running",
         "virtio-blk: 2048 setores",
         "virtio-blk: setor escrito e lido com BLAKE3 igual",
+        "virtio-rng: bytes do dispositivo variam",
         "okernel: desligando",
     ],
     forbidden: &[
         "okernel: FALTA",
         "PÂNICO",
         "virtio-blk: falhou",
+        "virtio-rng: falhou",
         "driver não partiu",
     ],
     ..SCENARIOS[0]
@@ -1396,18 +1401,22 @@ fn test(opts: &Options) -> Result {
     }
     if matches!(opts.suite.as_str(), "virtio" | "all") {
         let plain = Options {
-            devices: vec!["virtio-blk-pci,drive=vd0,disable-legacy=on"],
+            devices: vec![
+                "virtio-blk-pci,drive=vd0,disable-legacy=on",
+                "virtio-rng-pci,disable-legacy=on",
+            ],
             ..opts.clone()
         };
-        smoke(&plain, &[VIRTIO_BLK_SCENARIO])?;
+        smoke(&plain, &[VIRTIO_SCENARIO])?;
         let iommu = Options {
             devices: vec![
                 "intel-iommu",
                 "virtio-blk-pci,drive=vd0,disable-legacy=on,iommu_platform=on",
+                "virtio-rng-pci,disable-legacy=on,iommu_platform=on",
             ],
             ..opts.clone()
         };
-        smoke(&iommu, &[VIRTIO_BLK_SCENARIO])?;
+        smoke(&iommu, &[VIRTIO_SCENARIO])?;
     }
     if opts.suite == "smp" {
         smp(opts)?;
@@ -1464,7 +1473,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 4 drivers no conjunto",
+    "devmgr: 5 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
