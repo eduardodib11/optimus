@@ -1,0 +1,19 @@
+# Driver do virtio-input (T-413; ADR 0042 e 0046): casa com o dispositivo
+# virtio moderno de entrada (`1af4:1052`: teclado e mouse). Não parte no
+# boot; o `devmgr` o parte com `bar4`, `irq0`, `dma` e `cfg` do nó. Os
+# eventos vão ao `inputd` por `optimus.input.Sink@1`.
+[service]
+name = "virtio-input"
+binary = "virtio-input"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:768KiB", "kernel:debug", "svc:optimus.input.Sink@1"]
+provides = []
+
+[match]
+pci = ["1af4:1052"]
+
+[limits]
+max_threads = 1
