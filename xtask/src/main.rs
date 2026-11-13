@@ -810,43 +810,93 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     ..SCENARIOS[0]
 };
 
-/// Aceite da T-411: o `devmgr` casa o `virtio-blk-pci` (`1af4:1042`) com o
-/// driver, que negocia o transporte moderno, monta a fila 0 e escreve e lê
-/// um setor com MSI-X.
+/// Marcadores do bloco de drivers do M4 (T-420): os legados (`acpid`,
+/// `rtcd`, `i8042d` e `inputd`) e os seis virtio (T-411 a T-416), todos no
+/// mesmo boot. `$extra` junta o que só vale com IOMMU.
+macro_rules! m4_markers {
+    ($($extra:expr),* $(,)?) => {
+        &[
+            // Legados: o `acpid` publica o teclado PS/2 e o RTC, o `devmgr`
+            // os casa e a tecla injetada chega ao `inputd` (T-405, T-406).
+            "acpid: PNP0303: 2 portas, 1 IRQs",
+            "acpid: PNP0B00: 1 portas, 1 IRQs",
+            "[\"PNP0B00\"]: rtcd",
+            "rtcd: RTC em ",
+            "[\"PNP0303\"]: i8042d",
+            "i8042d: teclado pronto",
+            "inputd: tecla 0x1e apertada",
+            // virtio: o `devmgr` casa cada função com o driver, que
+            // negocia o transporte moderno e faz a operação do seu aceite.
+            "1af4:1042 ",
+            "1af4:1044 ",
+            "1af4:1043 ",
+            "svcmgr: virtio-blk em Running",
+            "virtio-blk: 2048 setores",
+            "virtio-blk: setor escrito e lido com BLAKE3 igual",
+            "virtio-rng: bytes do dispositivo variam",
+            "virtio-console: texto enviado",
+            "1af4:1052 ",
+            "virtio-input: fila de eventos pronta",
+            "virtio-input: tecla 0x1e encaminhada",
+            "1af4:1041 ",
+            "virtio-net: ARP enviado e resposta recebida",
+            "1af4:1050 ",
+            "virtio-gpu: quadro de cor sólida enviado",
+            "okernel: desligando",
+            $($extra),*
+        ]
+    };
+}
+
+/// Aceite da T-420 sem IOMMU: todos os drivers do M4 sobem no q35 e fazem
+/// o que o aceite de cada um pede.
 const VIRTIO_SCENARIO: Scenario = Scenario {
-    name: "drivers virtio: blk, rng, console, input, net e gpu",
-    markers: &[
-        "1af4:1042 ",
-        "1af4:1044 ",
-        "1af4:1043 ",
-        "svcmgr: virtio-blk em Running",
-        "virtio-blk: 2048 setores",
-        "virtio-blk: setor escrito e lido com BLAKE3 igual",
-        "virtio-rng: bytes do dispositivo variam",
-        "virtio-console: texto enviado",
-        "1af4:1052 ",
-        "virtio-input: fila de eventos pronta",
-        "virtio-input: tecla 0x1e encaminhada",
-        "1af4:1041 ",
-        "virtio-net: ARP enviado e resposta recebida",
-        "1af4:1050 ",
-        "virtio-gpu: quadro de cor sólida enviado",
-        "okernel: desligando",
-    ],
-    forbidden: &[
-        "okernel: FALTA",
-        "PÂNICO",
-        "virtio-blk: falhou",
-        "virtio-rng: falhou",
-        "virtio-console: falhou",
-        "virtio-input: falhou",
-        "virtio-net: falhou",
-        "virtio-gpu: falhou",
-        "driver não partiu",
-    ],
+    name: "drivers do M4: legados e virtio, sem IOMMU",
+    markers: m4_markers!(),
+    forbidden: M4_FORBIDDEN,
     key: Some("a"),
     ..SCENARIOS[0]
 };
+
+/// Aceite da T-420 com IOMMU: o mesmo bloco com `intel-iommu` e
+/// `iommu_platform=on`; nenhum driver pode causar falta de DMA.
+const VIRTIO_IOMMU_SCENARIO: Scenario = Scenario {
+    name: "drivers do M4: legados e virtio, com VT-d",
+    markers: m4_markers!(
+        "okernel: VT-d ligado: 1 unidade(s)",
+        "okernel: remapeamento de interrupções ligado",
+    ),
+    forbidden: M4_IOMMU_FORBIDDEN,
+    ..VIRTIO_SCENARIO
+};
+
+/// O que nenhum boot do bloco de drivers pode mostrar.
+const M4_FORBIDDEN: &[&str] = &[
+    "okernel: FALTA",
+    "PÂNICO",
+    "virtio-blk: falhou",
+    "virtio-rng: falhou",
+    "virtio-console: falhou",
+    "virtio-input: falhou",
+    "virtio-net: falhou",
+    "virtio-gpu: falhou",
+    "driver não partiu",
+];
+
+/// Com IOMMU, além disso, nenhuma falta de DMA: os drivers só tocam o que o
+/// domínio deles mapeia.
+const M4_IOMMU_FORBIDDEN: &[&str] = &[
+    "okernel: FALTA",
+    "PÂNICO",
+    "virtio-blk: falhou",
+    "virtio-rng: falhou",
+    "virtio-console: falhou",
+    "virtio-input: falhou",
+    "virtio-net: falhou",
+    "virtio-gpu: falhou",
+    "driver não partiu",
+    "okernel: falta de DMA",
+];
 
 /// Aceite da T-415: o texto que o `virtio-console` escreveu chegou ao
 /// `chardev` do QEMU (`target/vcon.txt`).
@@ -1533,7 +1583,7 @@ fn test(opts: &Options) -> Result {
             ],
             ..opts.clone()
         };
-        smoke(&iommu, &[VIRTIO_SCENARIO])?;
+        smoke(&iommu, &[VIRTIO_IOMMU_SCENARIO])?;
         virtio_console_out()?;
     }
     if opts.suite == "smp" {
