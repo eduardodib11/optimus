@@ -799,6 +799,12 @@ const DRIVER_SCENARIO: Scenario = Scenario {
         "drvteste: DMA e MSI pelo edu ok",
         "drvteste: DMA fora do domínio pedido",
         "iova=0x200000",
+        // T-422 (ADR 0051): o `devmgr` contém o driver que faltou, o
+        // `svcmgr` o para e ele parte de novo, agora sem o DMA ruim.
+        "devmgr: falta de DMA do driver drvteste: contido",
+        "svcmgr: drvteste parado pelo devmgr",
+        "devmgr: driver drvteste reiniciado",
+        "drvteste: reiniciado pelo devmgr, DMA válido ok",
         "okernel: desligando",
     ],
     forbidden: &[
@@ -806,6 +812,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
         "PÂNICO",
         "drvteste: falhou",
         "driver não partiu",
+        "isolado após",
     ],
     ..SCENARIOS[0]
 };

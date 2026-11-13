@@ -6,8 +6,11 @@
 //! 1. lê o registrador de identificação pelo MMIO;
 //! 2. faz DMA de ida e volta por uma página própria mapeada no domínio, com
 //!    a MSI de fim de DMA acordando a notificação;
-//! 3. pede um DMA para uma IOVA fora do domínio, que a IOMMU barra (o
-//!    kernel registra a falta).
+//! 3. na primeira partida, pede um DMA para uma IOVA fora do domínio, que a
+//!    IOMMU barra (o kernel registra a falta), e fica esperando: o `devmgr`
+//!    o contém e o parte de novo (ADR 0051; T-422). A cópia `dma` leva o
+//!    `badge` `partida + 1`; na segunda partida o driver só confirma que o
+//!    DMA válido funciona e termina bem.
 
 #![no_std]
 #![no_main]
@@ -58,9 +61,9 @@ impl Edu {
         self.regs.write32(off, value);
     }
 
-    /// DMA de [`LEN`] bytes entre `iova` e o buffer do `edu`, com MSI no
-    /// fim. `true` se a MSI chegou antes do prazo de 1 s.
-    fn dma(&mut self, iova: u64, to_ram: bool) -> Result<bool, Error> {
+    /// Pede o DMA de [`LEN`] bytes entre `iova` e o buffer do `edu`, com
+    /// MSI no fim, sem esperar.
+    fn start_dma(&mut self, iova: u64, to_ram: bool) -> Result<(), Error> {
         let iova = u32::try_from(iova).map_err(|_| Error::InvalidArgument)?;
         let (src, dst) = if to_ram {
             (EDU_BUF, iova)
@@ -71,6 +74,13 @@ impl Edu {
         self.write(0x88, dst);
         self.write(0x90, LEN32);
         self.write(0x98, 1 | if to_ram { 2 } else { 0 } | 4);
+        Ok(())
+    }
+
+    /// [`start_dma`](Self::start_dma) e espera a MSI. `true` se ela chegou
+    /// antes do prazo de 1 s.
+    fn dma(&mut self, iova: u64, to_ram: bool) -> Result<bool, Error> {
+        self.start_dma(iova, to_ram)?;
         ostd::cap::arm_timer(
             self.timer,
             self.ntfy,
@@ -132,11 +142,27 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
         return Err("os bytes não voltaram iguais");
     }
     ostd::debug::print("drvteste: DMA e MSI pelo edu ok");
+    // Partida depois de uma falta: sem DMA ruim desta vez (ADR 0051, item 5).
+    let generation = ostd::cap::info(domain).map_or(1, |i| i.badge);
+    if generation > 1 {
+        ostd::debug::print("drvteste: reiniciado pelo devmgr, DMA válido ok");
+        return Ok(());
+    }
     // Fora do domínio: a IOMMU barra e o kernel registra a falta. Sem
     // IOMMU o DMA escreveria na memória física de verdade, então não vai.
     if at == IOVA {
-        let _ = edu.dma(OUTSIDE, true);
+        // O texto sai antes: o `devmgr` pode parar o driver durante o DMA.
         ostd::debug::print("drvteste: DMA fora do domínio pedido");
+        edu.start_dma(OUTSIDE, true)
+            .map_err(|_| "pedir o DMA ruim")?;
+        // Quem fez DMA fora do domínio é contido: o `devmgr` o para e o
+        // parte de novo. Passar de 5 s aqui é falha.
+        ostd::cap::arm_timer(timer, ntfy, TIMEOUT_BIT, 5_000_000_000, 0, timer::RELATIVE)
+            .map_err(|_| "armar o prazo de contenção")?;
+        let bits = ostd::cap::ntfy_wait(ntfy).map_err(|_| "esperar a contenção")?;
+        if bits & TIMEOUT_BIT != 0 {
+            return Err("não foi contido em 5 s");
+        }
     }
     Ok(())
 }

@@ -16,7 +16,7 @@ A ADR 0044 (item 4) manda a falta de IOMMU virar registro no log e "um evento ao
 3. **Contenção.** Para cada driver que faltou, o `devmgr`: (a) pede ao `svcmgr` que pare o driver (`driver_stop(id)`, método novo, só do `devmgr`, só para driver em `Running`: destrói a thread do driver como o desligamento ordenado faz, sem a política de reinício do serviço); (b) revoga e destrói as originais dos recursos, o que destrói o domínio e o desliga do BDF (ADR 0042, item 5): sem domínio, a IOMMU barra todo DMA do dispositivo até a nova partida.
 4. **Reinício.** Depois da contenção o `devmgr` repete a partida do item 4 da ADR 0042 (recursos novos, `driver_give` e `driver_start`), com recuo e teto: no máximo 3 faltas do mesmo driver em 60 s; passado disso, o driver fica parado e o `devmgr` registra `devmgr: driver <nome> isolado após N faltas`. O sistema e os outros drivers seguem.
 5. **Geração.** O `devmgr` carimba o `badge` da cópia do `dma` entregue ao driver com o número da partida (0, 1, …), para um driver de teste saber se é a primeira vez.
-6. **`devmgr` com duas linhas de execução.** O laço do `DeviceBus` não pode esperar a notificação ao mesmo tempo: uma segunda thread (`max_threads` = 2) espera os bits e age sob um `Mutex` do estado do `devmgr`.
+6. **Sem segunda thread.** O `devmgr` continua com uma linha de execução (`max_threads` = 1): o laço do `DeviceBus` espera o endpoint com prazo de 50 ms e, a cada volta (por prazo ou por pedido atendido), lê a notificação de faltas sem bloquear. A contenção começa em até 50 ms da falta.
 7. **Sem IOMMU** (ADR 0044, item 5) não há falta nem evento: a marca "isolamento de DMA ausente" continua valendo.
 8. **Aceite (T-422).** `cargo xtask test iommu`: o `drvteste` na primeira partida faz o DMA fora do domínio e fica em laço; o `devmgr` o contém e o reinicia; na segunda partida ele faz o DMA válido e termina bem, o `okernel` registra a falta e o boot segue até o desligamento ordenado. Os testes de unidade cobrem o encaminhamento da falta ao domínio.
 
@@ -28,5 +28,5 @@ A ADR 0044 (item 4) manda a falta de IOMMU virar registro no log e "um evento ao
 
 ## Consequências
 
-- A T-422 sai em PRs pequenos: kernel (ligação e despacho), `svcmgr` (`driver_stop`), `devmgr` (sentinela e reinício) e o cenário de teste.
+- A T-422 sai em PRs pequenos: kernel (ligação e despacho), `svcmgr` (`driver_stop`, versão menor 1.3 do `Supervisor`), `devmgr` (contenção e reinício) e o cenário de teste.
 - Qualquer mudança no que está acima exige ADR nova.
