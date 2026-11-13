@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "tools/oidlc", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oalloc", "lib/obfs", "lib/ocoll", "lib/olz4", "lib/oelf", "lib/oidl-rt", "lib/optcrypt", "lib/ostd", "lib/oman", "lib/ologd", "lib/osvc", "lib/odev", "lib/olegacy", "lib/oinput", "lib/opci", "lib/virtio-core", "lib/vdrv", "services/pcid", "services/devmgr", "services/drvteste", "services/virtio-blk", "services/virtio-rng", "services/hello", "services/memd", "services/root", "services/utest", "services/svcmgr", "services/timed", "services/acpid", "services/rtcd", "services/inputd", "services/i8042d", "services/logd", "fuzz/okfuzz", "tools/mkobfs", "tools/mkmanifest", "tools/mktz"]
+members = ["xtask", "tools/oidlc", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oalloc", "lib/obfs", "lib/ocoll", "lib/olz4", "lib/oelf", "lib/oidl-rt", "lib/optcrypt", "lib/ostd", "lib/oman", "lib/ologd", "lib/osvc", "lib/odev", "lib/olegacy", "lib/oinput", "lib/opci", "lib/virtio-core", "lib/vdrv", "services/pcid", "services/devmgr", "services/drvteste", "services/virtio-blk", "services/virtio-rng", "services/virtio-console", "services/hello", "services/memd", "services/root", "services/utest", "services/svcmgr", "services/timed", "services/acpid", "services/rtcd", "services/inputd", "services/i8042d", "services/logd", "fuzz/okfuzz", "tools/mkobfs", "tools/mkmanifest", "tools/mktz"]
 # Só o xtask roda no host (os testes das bibliotecas também); as demais crates
 # são compiladas por `cargo xtask build`.
 default-members = ["xtask"]
@@ -81,6 +81,9 @@ debug = 0
 debug = 0
 
 [profile.dev.package.virtio-rng]
+debug = 0
+
+[profile.dev.package.virtio-console]
 debug = 0
 
 # O `virtio-blk` leva a biblioteca de transporte, e a cota do `root` paga o

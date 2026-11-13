@@ -1,0 +1,20 @@
+[package]
+name = "virtio-console"
+description = "virtio-console: driver de console virtio em processo de usuário (T-415; ADR 0046)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-console"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+optcrypt = { path = "../../lib/optcrypt" }
+virtio-core = { path = "../../lib/virtio-core" }
+vdrv = { path = "../../lib/vdrv" }
+
+[lints]
+workspace = true

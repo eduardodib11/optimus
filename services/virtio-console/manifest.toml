@@ -1,0 +1,18 @@
+# Driver do virtio-console (T-415; ADR 0042 e 0046): casa com o dispositivo
+# virtio moderno de console (`1af4:1043`). Não parte no boot; o `devmgr` o
+# parte com `bar4`, `irq0`, `dma` e `cfg` do nó.
+[service]
+name = "virtio-console"
+binary = "virtio-console"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:768KiB", "kernel:debug"]
+provides = []
+
+[match]
+pci = ["1af4:1043"]
+
+[limits]
+max_threads = 1
