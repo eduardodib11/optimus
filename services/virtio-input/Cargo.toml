@@ -1,0 +1,21 @@
+[package]
+name = "virtio-input"
+description = "virtio-input: driver de entrada virtio em processo de usuário (T-413; ADR 0046)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-input"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+optcrypt = { path = "../../lib/optcrypt" }
+oinput = { path = "../../lib/oinput" }
+virtio-core = { path = "../../lib/virtio-core" }
+vdrv = { path = "../../lib/vdrv" }
+
+[lints]
+workspace = true

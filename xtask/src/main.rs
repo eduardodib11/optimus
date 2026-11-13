@@ -59,6 +59,11 @@ const CRATES: &[(&str, &str, &str)] = &[
         "services/virtio-console/src/main.rs",
         USER_TARGET,
     ),
+    (
+        "virtio-input",
+        "services/virtio-input/src/main.rs",
+        USER_TARGET,
+    ),
     ("rtcd", "services/rtcd/src/main.rs", USER_TARGET),
     ("inputd", "services/inputd/src/main.rs", USER_TARGET),
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
@@ -395,8 +400,8 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
-        | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "rtcd" | "inputd"
-        | "i8042d" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input" | "rtcd"
+        | "inputd" | "i8042d" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -445,6 +450,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("virtio-blk", "virtio-blk"),
     ("virtio-rng", "virtio-rng"),
     ("virtio-console", "virtio-console"),
+    ("virtio-input", "virtio-input"),
     ("rtcd", "rtcd"),
     ("inputd", "inputd"),
     ("i8042d", "i8042d"),
@@ -776,7 +782,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 6 drivers no conjunto",
+        "devmgr: 7 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -798,7 +804,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
 /// driver, que negocia o transporte moderno, monta a fila 0 e escreve e lê
 /// um setor com MSI-X.
 const VIRTIO_SCENARIO: Scenario = Scenario {
-    name: "drivers virtio: blk, rng e console",
+    name: "drivers virtio: blk, rng, console e input",
     markers: &[
         "1af4:1042 ",
         "1af4:1044 ",
@@ -808,6 +814,9 @@ const VIRTIO_SCENARIO: Scenario = Scenario {
         "virtio-blk: setor escrito e lido com BLAKE3 igual",
         "virtio-rng: bytes do dispositivo variam",
         "virtio-console: texto enviado",
+        "1af4:1052 ",
+        "virtio-input: fila de eventos pronta",
+        "virtio-input: tecla 0x1e encaminhada",
         "okernel: desligando",
     ],
     forbidden: &[
@@ -816,8 +825,10 @@ const VIRTIO_SCENARIO: Scenario = Scenario {
         "virtio-blk: falhou",
         "virtio-rng: falhou",
         "virtio-console: falhou",
+        "virtio-input: falhou",
         "driver não partiu",
     ],
+    key: Some("a"),
     ..SCENARIOS[0]
 };
 
@@ -1245,9 +1256,17 @@ fn check_panic_screen(monitor: &Path) -> Result {
 /// chegar antes de o driver ligar a IRQ).
 fn inject_key(monitor: &Path, key: &str, raw: &[u8], last: &mut Option<Instant>) {
     let text = String::from_utf8_lossy(raw);
-    if text.contains(KEY_READY)
-        && !text.contains(KEY_SEEN)
-        && last.is_none_or(|t| t.elapsed() > KEY_RETRY)
+    // Com um `virtio-keyboard-pci` (1af4:1052) o QEMU entrega a tecla a ele
+    // e não ao PS/2: espera a fila de eventos do driver e a tecla dele.
+    let (ready, seen) = if text.contains("1af4:1052 ") {
+        (
+            "virtio-input: fila de eventos pronta",
+            "virtio-input: tecla ",
+        )
+    } else {
+        (KEY_READY, KEY_SEEN)
+    };
+    if text.contains(ready) && !text.contains(seen) && last.is_none_or(|t| t.elapsed() > KEY_RETRY)
     {
         monitor_command(monitor, &format!("sendkey {key}"));
         *last = Some(Instant::now());
@@ -1436,6 +1455,7 @@ fn test(opts: &Options) -> Result {
                 "virtio-rng-pci,disable-legacy=on",
                 "virtio-serial-pci,disable-legacy=on",
                 "virtconsole,chardev=vcon",
+                "virtio-keyboard-pci,disable-legacy=on",
             ],
             ..opts.clone()
         };
@@ -1448,6 +1468,7 @@ fn test(opts: &Options) -> Result {
                 "virtio-rng-pci,disable-legacy=on,iommu_platform=on",
                 "virtio-serial-pci,disable-legacy=on,iommu_platform=on",
                 "virtconsole,chardev=vcon",
+                "virtio-keyboard-pci,disable-legacy=on,iommu_platform=on",
             ],
             ..opts.clone()
         };
@@ -1509,7 +1530,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 6 drivers no conjunto",
+    "devmgr: 7 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
