@@ -1,0 +1,18 @@
+# Driver do virtio-net (T-412; ADR 0042 e 0046): casa com o dispositivo
+# virtio moderno de rede (`1af4:1041`). Não parte no boot; o `devmgr` o
+# parte com `bar4`, `irq0`, `dma` e `cfg` do nó.
+[service]
+name = "virtio-net"
+binary = "virtio-net"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:768KiB", "kernel:debug"]
+provides = []
+
+[match]
+pci = ["1af4:1041"]
+
+[limits]
+max_threads = 1
