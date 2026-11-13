@@ -1,0 +1,19 @@
+[package]
+name = "virtio-blk"
+description = "virtio-blk: driver de disco virtio em processo de usuário (T-411; ADR 0046)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-blk"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+optcrypt = { path = "../../lib/optcrypt" }
+virtio-core = { path = "../../lib/virtio-core" }
+
+[lints]
+workspace = true

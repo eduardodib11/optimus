@@ -502,6 +502,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-blk"
+version = "0.1.0"
+dependencies = [
+ "optcrypt",
+ "ostd",
+ "virtio-core",
+]
+
+[[package]]
 name = "virtio-core"
 version = "0.1.0"
 

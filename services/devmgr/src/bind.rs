@@ -9,6 +9,9 @@
 //! - `irq0`...: um `Interrupt` por vetor, já programado na função: até
 //!   [`MAX_VECTORS`] entradas de MSI-X, quando existe, senão o vetor MSI;
 //! - `dma`: uma cópia só com `MAP` do `DmaDomain` ligado ao BDF;
+//! - `cfg`: uma cópia só de leitura dos primeiros 256 bytes do espaço de
+//!   configuração da função, tirada na partida (o driver não tem a janela
+//!   ECAM; é daqui que ele lê, por exemplo, as capabilities do virtio);
 //! - `ioN`: a `IoPortRange` de cada faixa de portas de um nó legado, e as
 //!   IRQs ISA dele como `irqN` (ADR 0049, item 8).
 //!
@@ -28,6 +31,10 @@ use ostd::vm::{Mapping, SELF};
 const CONFIG_VA: u64 = 0x20_0000_0000;
 /// Onde a tabela de MSI-X fica mapeada enquanto o `devmgr` a programa.
 const TABLE_VA: u64 = 0x20_0010_0000;
+/// Onde a cópia do espaço de configuração fica mapeada enquanto é escrita.
+const SNAPSHOT_VA: u64 = 0x20_0020_0000;
+/// Bytes copiados do espaço de configuração.
+const SNAPSHOT_BYTES: usize = 256;
 /// Vetores de MSI-X por função.
 const MAX_VECTORS: usize = 8;
 /// Registrador de comando: memória, bus master e `INTx` desligado.
@@ -199,7 +206,8 @@ fn build(
     let mut irqs = 0;
     if let Some(bdf) = res.bdf {
         let ecam = ecam.ok_or(Error::NotSupported)?;
-        irqs = pci(device, ecam, bdf, res, &bars, originals, &mut give)?;
+        let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
+        irqs = pci(device, quota, ecam, bdf, res, &bars, originals, &mut give)?;
     }
     // Nó legado (ADR 0049, item 8): portas de E/S e IRQs ISA.
     for (i, p) in res.ports.iter().flatten().enumerate() {
@@ -218,10 +226,30 @@ fn build(
     s.driver_start(driver)
 }
 
+/// Copia o começo do espaço de configuração para um `MemoryObject` do
+/// `devmgr` e devolve uma cópia dele só de leitura.
+fn snapshot(f: &mut Function, quota: Handle, originals: &mut Vec<Handle>) -> Result<Handle, Error> {
+    use opci::Config;
+    let object = ostd::cap::create(quota, ObjectType::MemoryObject, 4096)?;
+    originals.push(object);
+    let mut map = Mapping::new(SELF, object, SNAPSHOT_VA, 4096, WRITE)?;
+    let bdf = f.bdf;
+    for off in (0..SNAPSHOT_BYTES).step_by(4) {
+        let word = f.read(bdf, u16::try_from(off).map_err(|_| Error::InvalidArgument)?);
+        map.write32(off, word);
+    }
+    drop(map);
+    let read_only = ostd::cap::mint(object, Rights::MAP | Rights::READ, 0, None)?;
+    originals.push(read_only);
+    Ok(read_only)
+}
+
 /// A parte PCI: `DmaDomain` ligado ao BDF, MSI-X ou MSI programados e bus
 /// master. Devolve quantos `irqN` entregou.
+#[allow(clippy::too_many_arguments, reason = "o estado da partida em curso")]
 fn pci(
     device: Handle,
+    quota: Handle,
     ecam: Handle,
     bdf: u16,
     res: &Resources,
@@ -237,6 +265,7 @@ fn pci(
     give.push((map_only, name_hash("dma")));
     let mut f = Function::open(ecam, bdf)?;
     let fbdf = f.bdf;
+    give.push((snapshot(&mut f, quota, originals)?, name_hash("cfg")));
     let caps = opci::probe(&mut f, fbdf)
         .map(|p| p.caps)
         .unwrap_or_default();

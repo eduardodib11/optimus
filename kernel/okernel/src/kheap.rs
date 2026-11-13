@@ -49,7 +49,7 @@ mod tests;
 pub use tests::TESTS;
 
 /// Limite padrão do heap, em MiB.
-pub const DEFAULT_LIMIT_MIB: u64 = 32;
+pub const DEFAULT_LIMIT_MIB: u64 = 40;
 
 /// Faixa de objetos e slabs do kernel (SDD v1.0, seção 6.4), até a de
 /// áreas por CPU e pilhas.

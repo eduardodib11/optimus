@@ -1,0 +1,18 @@
+# Driver do virtio-blk (T-411; ADR 0042 e 0046): casa com o dispositivo
+# virtio moderno de bloco (`1af4:1042`). Não parte no boot; o `devmgr` o
+# parte com `bar4`, `irq0`, `dma` e `cfg` do nó.
+[service]
+name = "virtio-blk"
+binary = "virtio-blk"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:1MiB", "kernel:debug"]
+provides = []
+
+[match]
+pci = ["1af4:1042"]
+
+[limits]
+max_threads = 1
