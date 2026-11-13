@@ -54,6 +54,11 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("drvteste", "services/drvteste/src/main.rs", USER_TARGET),
     ("virtio-blk", "services/virtio-blk/src/main.rs", USER_TARGET),
     ("virtio-rng", "services/virtio-rng/src/main.rs", USER_TARGET),
+    (
+        "virtio-console",
+        "services/virtio-console/src/main.rs",
+        USER_TARGET,
+    ),
     ("rtcd", "services/rtcd/src/main.rs", USER_TARGET),
     ("inputd", "services/inputd/src/main.rs", USER_TARGET),
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
@@ -390,8 +395,8 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
-        | "drvteste" | "virtio-blk" | "virtio-rng" | "rtcd" | "inputd" | "i8042d" | "utest"
-        | "okfuzz" => &["-C", "relocation-model=static"],
+        | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "rtcd" | "inputd"
+        | "i8042d" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -439,6 +444,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("drvteste", "drvteste"),
     ("virtio-blk", "virtio-blk"),
     ("virtio-rng", "virtio-rng"),
+    ("virtio-console", "virtio-console"),
     ("rtcd", "rtcd"),
     ("inputd", "inputd"),
     ("i8042d", "i8042d"),
@@ -567,6 +573,12 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
             "-drive",
             &format!("if=none,id=vd0,format=raw,file={}", disk.display()),
         ]);
+    }
+    // Destino da `virtconsole`: um arquivo que o aceite da T-415 lê depois.
+    if opts.devices.iter().any(|d| d.starts_with("virtconsole")) {
+        let out = root().join("target/vcon.txt");
+        let _ = fs::remove_file(&out);
+        cmd.args(["-chardev", &format!("file,id=vcon,path={}", out.display())]);
     }
     for device in &opts.devices {
         cmd.args(["-device", device]);
@@ -764,7 +776,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 5 drivers no conjunto",
+        "devmgr: 6 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -786,14 +798,16 @@ const DRIVER_SCENARIO: Scenario = Scenario {
 /// driver, que negocia o transporte moderno, monta a fila 0 e escreve e lê
 /// um setor com MSI-X.
 const VIRTIO_SCENARIO: Scenario = Scenario {
-    name: "virtio-blk lê e escreve um setor e virtio-rng entrega bytes",
+    name: "drivers virtio: blk, rng e console",
     markers: &[
         "1af4:1042 ",
         "1af4:1044 ",
+        "1af4:1043 ",
         "svcmgr: virtio-blk em Running",
         "virtio-blk: 2048 setores",
         "virtio-blk: setor escrito e lido com BLAKE3 igual",
         "virtio-rng: bytes do dispositivo variam",
+        "virtio-console: texto enviado",
         "okernel: desligando",
     ],
     forbidden: &[
@@ -801,10 +815,26 @@ const VIRTIO_SCENARIO: Scenario = Scenario {
         "PÂNICO",
         "virtio-blk: falhou",
         "virtio-rng: falhou",
+        "virtio-console: falhou",
         "driver não partiu",
     ],
     ..SCENARIOS[0]
 };
+
+/// Aceite da T-415: o texto que o `virtio-console` escreveu chegou ao
+/// `chardev` do QEMU (`target/vcon.txt`).
+fn virtio_console_out() -> Result<()> {
+    let out = root().join("target/vcon.txt");
+    let text = fs::read_to_string(&out).map_err(|e| format!("lendo {}: {e}", out.display()))?;
+    if text.contains("ola do processo de usuario") {
+        println!("xtask: virtio-console: o texto chegou ao chardev do QEMU");
+        Ok(())
+    } else {
+        Err(format!(
+            "virtio-console: o chardev não recebeu o texto (veio {text:?})"
+        ))
+    }
+}
 
 /// O mesmo aceite com `-device amd-iommu` (T-403), sem conferir o log de
 /// faltas: o `amd-iommu` do QEMU grava eventos fora do formato da AMD.
@@ -1404,19 +1434,25 @@ fn test(opts: &Options) -> Result {
             devices: vec![
                 "virtio-blk-pci,drive=vd0,disable-legacy=on",
                 "virtio-rng-pci,disable-legacy=on",
+                "virtio-serial-pci,disable-legacy=on",
+                "virtconsole,chardev=vcon",
             ],
             ..opts.clone()
         };
         smoke(&plain, &[VIRTIO_SCENARIO])?;
+        virtio_console_out()?;
         let iommu = Options {
             devices: vec![
                 "intel-iommu",
                 "virtio-blk-pci,drive=vd0,disable-legacy=on,iommu_platform=on",
                 "virtio-rng-pci,disable-legacy=on,iommu_platform=on",
+                "virtio-serial-pci,disable-legacy=on,iommu_platform=on",
+                "virtconsole,chardev=vcon",
             ],
             ..opts.clone()
         };
         smoke(&iommu, &[VIRTIO_SCENARIO])?;
+        virtio_console_out()?;
     }
     if opts.suite == "smp" {
         smp(opts)?;
@@ -1473,7 +1509,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 5 drivers no conjunto",
+    "devmgr: 6 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
