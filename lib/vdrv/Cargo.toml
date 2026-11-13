@@ -1,0 +1,19 @@
+[package]
+name = "vdrv"
+description = "Cola comum dos drivers virtio em processo de usuário (T-414): acesso ao BAR e à memória de DMA pelo ostd, sobre o virtio-core. no_std, sem unsafe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../ostd" }
+optcrypt = { path = "../optcrypt" }
+virtio-core = { path = "../virtio-core" }
+
+[lints]
+workspace = true
