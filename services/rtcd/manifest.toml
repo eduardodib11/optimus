@@ -1,0 +1,18 @@
+# Driver do RTC CMOS (T-406; ADR 0042 e 0049): casa com o nó `PNP0B00` que
+# o `acpid` publica. Não parte no boot; o `devmgr` o parte com as portas do
+# nó (`io0`) e nada mais de hardware.
+[service]
+name = "rtcd"
+binary = "rtcd"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:512KiB", "kernel:debug"]
+provides = []
+
+[match]
+compatible = ["PNP0B00"]
+
+[limits]
+max_threads = 1

@@ -50,6 +50,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("acpid", "services/acpid/src/main.rs", USER_TARGET),
     ("devmgr", "services/devmgr/src/main.rs", USER_TARGET),
     ("drvteste", "services/drvteste/src/main.rs", USER_TARGET),
+    ("rtcd", "services/rtcd/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -382,7 +383,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // Binários de usuário: ET_EXEC no endereço de `lib/ostd/user.ld`
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
-        | "drvteste" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        | "drvteste" | "rtcd" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -428,6 +429,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("acpid", "acpid"),
     ("devmgr", "devmgr"),
     ("drvteste", "drvteste"),
+    ("rtcd", "rtcd"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -726,7 +728,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 1 drivers no conjunto",
+        "devmgr: 2 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -1349,7 +1351,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 1 drivers no conjunto",
+    "devmgr: 2 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
@@ -1357,6 +1359,10 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "acpid: PNP0303: 2 portas, 1 IRQs",
     "acpid: PNP0B00: 1 portas, 1 IRQs",
     "acpid: 9 nós publicados ao devmgr",
+    // Aceite da T-406 (RTC): o `devmgr` casa o nó `PNP0B00` com o `rtcd`,
+    // que lê a hora pelas portas do CMOS ([`check_rtcd`] confere o valor).
+    "[\"PNP0B00\"]: rtcd",
+    "rtcd: RTC em ",
 ];
 
 /// CPUs do cenário de integração sem `--smp`.
@@ -1393,11 +1399,36 @@ fn integration(opts: &Options) -> Result {
                 ..SCENARIOS[0]
             },
         )?;
+        check_rtcd(&serial)?;
         if n > 1 {
             check_cpus_online(&serial, n)?;
         }
         println!("xtask: integração em -smp {n}: serviços em Running e encerrados em ordem");
     }
+    Ok(())
+}
+
+/// Maior diferença aceita entre a hora que o `rtcd` leu e a do host, em
+/// segundos (o RTC do QEMU segue o relógio do host, em UTC).
+const RTCD_TOLERANCE_S: i64 = 120;
+
+/// Aceite da T-406: a hora que o `rtcd` leu do CMOS é a do QEMU.
+fn check_rtcd(serial: &str) -> Result {
+    let read = serial
+        .split("rtcd: RTC em ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse::<i64>().ok())
+        .ok_or("o rtcd não informou a hora")?;
+    let host = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("relógio do host: {e}"))?
+        .as_secs();
+    let diff = read - i64::try_from(host).map_err(|e| format!("relógio do host: {e}"))?;
+    if diff.abs() > RTCD_TOLERANCE_S {
+        return Err(format!("o rtcd leu {read}, {diff} s longe da hora do host"));
+    }
+    println!("xtask: hora do rtcd difere {diff} s da do host");
     Ok(())
 }
 

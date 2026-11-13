@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "tools/oidlc", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oalloc", "lib/obfs", "lib/ocoll", "lib/olz4", "lib/oelf", "lib/oidl-rt", "lib/optcrypt", "lib/ostd", "lib/oman", "lib/ologd", "lib/osvc", "lib/odev", "lib/olegacy", "lib/opci", "lib/virtio-core", "services/pcid", "services/devmgr", "services/drvteste", "services/hello", "services/memd", "services/root", "services/utest", "services/svcmgr", "services/timed", "services/acpid", "services/logd", "fuzz/okfuzz", "tools/mkobfs", "tools/mkmanifest", "tools/mktz"]
+members = ["xtask", "tools/oidlc", "boot/optboot", "kernel/kabi", "kernel/okernel", "lib/oalloc", "lib/obfs", "lib/ocoll", "lib/olz4", "lib/oelf", "lib/oidl-rt", "lib/optcrypt", "lib/ostd", "lib/oman", "lib/ologd", "lib/osvc", "lib/odev", "lib/olegacy", "lib/opci", "lib/virtio-core", "services/pcid", "services/devmgr", "services/drvteste", "services/hello", "services/memd", "services/root", "services/utest", "services/svcmgr", "services/timed", "services/acpid", "services/rtcd", "services/logd", "fuzz/okfuzz", "tools/mkobfs", "tools/mkmanifest", "tools/mktz"]
 # Só o xtask roda no host (os testes das bibliotecas também); as demais crates
 # são compiladas por `cargo xtask build`.
 default-members = ["xtask"]
@@ -75,6 +75,13 @@ debug = 0
 debug = 0
 
 [profile.dev.package.drvteste]
+debug = 0
+
+# O `rtcd` entra no bootfs (T-406).
+[profile.dev.package.rtcd]
+debug = 0
+
+[profile.dev.package.olegacy]
 debug = 0
 
 # Com o `pcid` (T-402), a cópia do bootfs na cota do `root` passava do

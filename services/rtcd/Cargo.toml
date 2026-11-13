@@ -1,0 +1,19 @@
+[package]
+name = "rtcd"
+description = "rtcd: driver do RTC CMOS em processo isolado (T-406; ADR 0042 e 0049)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rtcd"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+olegacy = { path = "../../lib/olegacy" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true
