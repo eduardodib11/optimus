@@ -7,7 +7,7 @@ priority = 140
 restart = "never"
 
 [capabilities]
-needs = ["mem:quota:640KiB", "kernel:debug", "kernel:acpi", "svc:optimus.dev.DeviceBus@1"]
+needs = ["mem:quota:768KiB", "kernel:debug", "kernel:acpi", "svc:optimus.dev.DeviceBus@1"]
 provides = []
 
 [limits]

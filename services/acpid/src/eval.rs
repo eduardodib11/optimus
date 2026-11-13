@@ -6,8 +6,10 @@
 //! outros métodos, com a busca do espaço de nomes (do escopo para cima).
 //! Um pacote é devolvido como está, sem avaliar os elementos. Gravar num
 //! `Name` inteiro fica em [`State`] (poucas entradas), que vale entre
-//! execuções; campos de `OperationRegion` dão [`Error::Unsupported`], e o
-//! método é abortado.
+//! execuções. Um campo de `OperationRegion` é lido por
+//! [`crate::Regions`], só em `SystemMemory` e `SystemIO` e dentro da região
+//! declarada; gravar num campo, ou qualquer coisa fora disso, dá
+//! [`Error::Unsupported`], e o método é abortado.
 //!
 //! Sem alocação: cada nome é achado varrendo a tabela de novo, e o número
 //! de varreduras ([`MAX_WALKS`]), de operações e de aninhamento é limitado.
@@ -441,6 +443,7 @@ impl<'a> Interp<'a, '_> {
                 (Value::Int(_), Some(now)) => Value::Int(*now),
                 _ => v,
             }),
+            Some((_, Item::Field(field))) => self.field(&field),
             Some((at, Item::Method(m))) => {
                 let mut args = [Value::Other; 7];
                 for a in args.iter_mut().take(usize::from(m.args)) {
@@ -448,8 +451,55 @@ impl<'a> Interp<'a, '_> {
                 }
                 self.call(m, at, args, depth + 1)
             }
-            None => Err(Error::Unsupported),
+            Some((_, Item::Region(..))) | None => Err(Error::Unsupported),
         }
+    }
+
+    /// Lê um campo: os acessos têm a largura declarada e ficam dentro da
+    /// região; o valor sai dos bits do campo.
+    fn field(&mut self, f: &crate::Field) -> Result<Value<'a>, Error> {
+        let none = Error::Unsupported;
+        let io = self.limits.regions.ok_or(none)?;
+        let root = Scope {
+            path: [[0; 4]; crate::MAX_DEPTH],
+            depth: 0,
+        };
+        let path = &f.region.path[..f.region.depth];
+        let Some((_, Item::Region(space, Some((base, len))))) =
+            self.lookup(&root, true, 0, path)?
+        else {
+            return Err(none);
+        };
+        if !matches!(space, crate::SPACE_MEMORY | crate::SPACE_IO) || f.access == 0 {
+            return Err(none);
+        }
+        let unit = u64::from(f.access) * 8;
+        let end = f.bit.checked_add(f.bits).ok_or(none)?;
+        if f.bits == 0 || f.bits > 64 || end > len.saturating_mul(8) {
+            return Err(none);
+        }
+        let (first, last) = (f.bit / unit, (end - 1) / unit);
+        // Até 128 bits lidos: um campo de 64 bits desalinhado cabe.
+        if (last - first + 1) * unit > 128 {
+            return Err(none);
+        }
+        let mut acc = 0u128;
+        for (i, u) in (first..=last).enumerate() {
+            let addr = u
+                .checked_mul(u64::from(f.access))
+                .and_then(|o| base.checked_add(o))
+                .ok_or(none)?;
+            let v = io.read(space, addr, f.access).ok_or(none)?;
+            let v = if unit == 64 { v } else { v & ((1 << unit) - 1) };
+            acc |= u128::from(v) << (i as u64 * unit);
+        }
+        let v = u64::try_from((acc >> (f.bit % unit)) & u128::from(u64::MAX)).map_err(|_| none)?;
+        let v = if f.bits == 64 {
+            v
+        } else {
+            v & ((1 << f.bits) - 1)
+        };
+        Ok(Value::Int(v & self.mask))
     }
 
     /// Acha o objeto pelo nome: caminho relativo ao escopo; um nome simples
