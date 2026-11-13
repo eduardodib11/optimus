@@ -10,14 +10,18 @@
 //! Subconjunto desta etapa: desce em `Scope`, `Device`, `Processor`,
 //! `PowerResource` e `ThermalZone`, lê `Name` com constantes, string ou
 //! buffer e salta todo o resto pela gramática dos opcodes (métodos, campos,
-//! regiões, expressões). A execução de métodos (`_STA`, `_CRS` e `_PRT`
-//! dinâmicos) entra na etapa seguinte.
+//! regiões, expressões). Os métodos `_STA` e `_CRS` ficam anotados no
+//! `Device` e [`eval`] os executa (inteiros, locais, argumentos, controle de
+//! fluxo, aritmética e chamadas); campos de `OperationRegion` e `_PRT`
+//! entram na etapa seguinte.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 mod crs;
+mod eval;
 pub use crs::{Resource, Resources};
+pub use eval::{Method, eval};
 
 /// Erros de leitura.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +34,8 @@ pub enum Error {
     Malformed,
     /// Limite de profundidade ou de operações estourado.
     Limit,
+    /// Método usa algo fora do subconjunto (ADR 0045, item 3).
+    Unsupported,
 }
 
 /// Limites duros do interpretador (ADR 0045, item 2).
@@ -62,6 +68,16 @@ pub struct Header {
     pub signature: [u8; 4],
     /// Tamanho total, com o cabeçalho.
     pub length: usize,
+    /// Revisão da tabela; abaixo de 2, os inteiros do AML têm 32 bits.
+    pub revision: u8,
+}
+
+impl Header {
+    /// Os inteiros desta tabela têm 32 bits.
+    #[must_use]
+    pub fn width32(&self) -> bool {
+        self.revision < 2
+    }
 }
 
 /// Confere o cabeçalho e a soma de verificação e devolve o corpo AML (tudo
@@ -80,7 +96,12 @@ pub fn table_body(table: &[u8]) -> Result<(Header, &[u8]), Error> {
         return Err(Error::BadChecksum);
     }
     let signature = [raw[0], raw[1], raw[2], raw[3]];
-    Ok((Header { signature, length }, &whole[HEADER_LEN..]))
+    let header = Header {
+        signature,
+        length,
+        revision: raw[8],
+    };
+    Ok((header, &whole[HEADER_LEN..]))
 }
 
 /// Um nome de 4 caracteres do espaço de nomes.
@@ -103,6 +124,10 @@ pub struct Device<'a> {
     pub sta: Option<u64>,
     /// Bytes do buffer `_CRS`; [`Device::resources`] decodifica.
     pub crs: Option<&'a [u8]>,
+    /// `_STA` como método; [`Device::status`] o executa.
+    pub sta_method: Option<Method>,
+    /// `_CRS` como método; [`Device::current_resources`] o executa.
+    pub crs_method: Option<Method>,
 }
 
 impl<'a> Device<'a> {
@@ -110,6 +135,43 @@ impl<'a> Device<'a> {
     #[must_use]
     pub fn resources(&self) -> Resources<'a> {
         Resources::new(self.crs.unwrap_or(&[]))
+    }
+
+    /// `_STA`: a constante, o resultado do método ou, sem nenhum dos dois,
+    /// 0x0F (presente e funcionando, como manda a especificação).
+    ///
+    /// # Errors
+    /// Os de [`eval`]; [`Error::Unsupported`] também se o método não
+    /// devolver um inteiro.
+    pub fn status(&self, aml: &'a [u8], width32: bool, limits: Limits) -> Result<u64, Error> {
+        match (self.sta, self.sta_method) {
+            (Some(v), _) => Ok(v),
+            (None, None) => Ok(0x0F),
+            (None, Some(m)) => match eval(aml, &self.path[..self.depth], m, width32, limits)? {
+                Value::Int(v) => Ok(v),
+                _ => Err(Error::Unsupported),
+            },
+        }
+    }
+
+    /// Recursos de `_CRS`, executando o método quando não é um buffer fixo.
+    ///
+    /// # Errors
+    /// Os de [`eval`]; [`Error::Unsupported`] também se o método não
+    /// devolver um buffer.
+    pub fn current_resources(
+        &self,
+        aml: &'a [u8],
+        width32: bool,
+        limits: Limits,
+    ) -> Result<Resources<'a>, Error> {
+        match (self.crs, self.crs_method) {
+            (None, Some(m)) => match eval(aml, &self.path[..self.depth], m, width32, limits)? {
+                Value::Buf(b) => Ok(Resources::new(b)),
+                _ => Err(Error::Unsupported),
+            },
+            _ => Ok(self.resources()),
+        }
     }
 }
 
@@ -153,12 +215,32 @@ impl Id {
     }
 }
 
-/// Valor de um `Name`.
-enum Value<'a> {
+/// Valor de um `Name` ou resultado de um método.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Value<'a> {
+    /// Inteiro.
     Int(u64),
+    /// String (sem o zero final).
     Str(&'a [u8]),
+    /// Dados de um buffer.
     Buf(&'a [u8]),
+    /// Outro tipo de objeto, ou nenhum valor.
     Other,
+}
+
+/// O que a varredura encontra.
+enum Event<'a> {
+    /// Um `Device` completo, depois dos filhos.
+    Device(Device<'a>),
+    /// Um `Name` ou um `Method`, com o caminho absoluto dele.
+    Object(Scope, Item<'a>),
+}
+
+/// Objeto com nome que [`eval`] sabe usar.
+#[derive(Clone, Copy)]
+enum Item<'a> {
+    Name(Value<'a>),
+    Method(Method),
 }
 
 struct Cur<'a> {
@@ -417,7 +499,7 @@ impl Scope {
     }
 }
 
-impl<'a, F: FnMut(&Device<'a>)> Walker<'a, F> {
+impl<'a, F: FnMut(Event<'a>)> Walker<'a, F> {
     /// Lê termos até `end`. Desce em `Scope`, `Device`, `Processor`,
     /// `PowerResource` e `ThermalZone`; guarda os `Name` do `Device` em
     /// curso; salta o resto.
@@ -455,18 +537,44 @@ impl<'a, F: FnMut(&Device<'a>)> Walker<'a, F> {
                     adr: None,
                     sta: None,
                     crs: None,
+                    sta_method: None,
+                    crs_method: None,
                 });
                 self.body(pend, sub, &mut me)?;
                 if let Some(d) = me {
-                    (self.f)(&d);
+                    (self.f)(Event::Device(d));
                 }
                 self.cur.p = pend;
             } else if op == 0x08 {
-                let (_, _, segs, n) = self.cur.name()?;
+                let (root, up, segs, n) = self.cur.name()?;
                 let v = self.cur.value(end, &mut self.budget)?;
                 if let (Some(d), 1) = (dev.as_mut(), n) {
                     record(d, segs[0], &v);
                 }
+                let at = scope.child(root, up, &segs[..n])?;
+                (self.f)(Event::Object(at, Item::Name(v)));
+            } else if op == 0x14 {
+                let pend = self.cur.pkg_end(end)?;
+                let (root, up, segs, n) = self.cur.name()?;
+                let flags = self.cur.u8()?;
+                if self.cur.p > pend {
+                    return Err(Error::Malformed);
+                }
+                let m = Method {
+                    start: self.cur.p,
+                    end: pend,
+                    args: flags & 7,
+                };
+                if let (Some(d), 1) = (dev.as_mut(), n) {
+                    match &segs[0] {
+                        b"_STA" => d.sta_method = Some(m),
+                        b"_CRS" => d.crs_method = Some(m),
+                        _ => {}
+                    }
+                }
+                let at = scope.child(root, up, &segs[..n])?;
+                (self.f)(Event::Object(at, Item::Method(m)));
+                self.cur.p = pend;
             } else {
                 self.cur.p = start;
                 self.cur.term(end, &mut self.budget, 0)?;
@@ -498,7 +606,20 @@ fn record<'a>(d: &mut Device<'a>, seg: NameSeg, v: &Value<'a>) {
 /// # Errors
 /// Qualquer estrutura inválida ou limite estourado aborta com um [`Error`];
 /// os dispositivos já entregues continuam válidos.
-pub fn scan<'a>(aml: &'a [u8], limits: Limits, f: impl FnMut(&Device<'a>)) -> Result<(), Error> {
+pub fn scan<'a>(
+    aml: &'a [u8],
+    limits: Limits,
+    mut f: impl FnMut(&Device<'a>),
+) -> Result<(), Error> {
+    walk(aml, limits, |e| {
+        if let Event::Device(d) = e {
+            f(&d);
+        }
+    })
+}
+
+/// Como [`scan`], com os `Name` e `Method` além dos `Device`.
+fn walk<'a>(aml: &'a [u8], limits: Limits, f: impl FnMut(Event<'a>)) -> Result<(), Error> {
     let budget = Budget { limits, ops: 0 };
     let mut w = Walker {
         cur: Cur { b: aml, p: 0 },

@@ -1,8 +1,16 @@
 use super::*;
 
-/// `PkgLength` de um pacote de até 63 bytes depois do campo.
+/// Pacote com o `PkgLength` de um ou de dois bytes.
 fn pkg(body: &[u8]) -> Vec<u8> {
-    let mut v = vec![u8::try_from(body.len() + 1).unwrap()];
+    let mut v = if body.len() < 63 {
+        vec![u8::try_from(body.len() + 1).unwrap()]
+    } else {
+        let len = body.len() + 2;
+        vec![
+            0x40 | u8::try_from(len & 15).unwrap(),
+            u8::try_from(len >> 4).unwrap(),
+        ]
+    };
     v.extend_from_slice(body);
     v
 }
@@ -183,6 +191,172 @@ fn mutacao_deterministica_sem_panico() {
     }
 }
 
+fn method(seg: [u8; 4], args: u8, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x14];
+    v.extend(pkg(&[&seg[..], &[args], body].concat()));
+    v
+}
+
+/// Roda o `_STA` e o `_CRS` do primeiro dispositivo de `aml`.
+fn run(aml: &[u8], width32: bool) -> (Result<u64, Error>, Result<usize, Error>) {
+    let (devs, r) = collect(aml);
+    assert_eq!(r, Ok(()));
+    let d = devs[0];
+    let l = Limits::default();
+    (
+        d.status(aml, width32, l),
+        d.current_resources(aml, width32, l).map(Iterator::count),
+    )
+}
+
+#[test]
+fn sta_com_if_e_nome_do_escopo_de_cima() {
+    // Local0 = 0x0B; If (FLAG == 1) { Local0 |= 4 } Else { Return (0) };
+    // Return (Local0)
+    let body = [
+        &[0x70, 0x0A, 0x0B, 0x60, 0xA0][..],
+        &pkg(&[
+            0x93, b'F', b'L', b'A', b'G', 0x01, 0x7D, 0x60, 0x0A, 0x04, 0x60,
+        ]),
+        &[0xA1],
+        &pkg(&[0xA4, 0x00]),
+        &[0xA4, 0x60],
+    ]
+    .concat();
+    for (flag, want) in [(1u8, 0x0F), (0, 0)] {
+        let aml = [
+            name(*b"FLAG", &[flag]),
+            dev(*b"KBD_", &[&method(*b"_STA", 0, &body)]),
+        ]
+        .concat();
+        assert_eq!(run(&aml, false).0, Ok(want));
+    }
+    // Sem o nome (um campo de região, por exemplo): fora do subconjunto.
+    let aml = dev(*b"KBD_", &[&method(*b"_STA", 0, &body)]);
+    assert_eq!(run(&aml, false).0, Err(Error::Unsupported));
+    // Sem `_STA`: presente e funcionando.
+    assert_eq!(run(&dev(*b"KBD_", &[]), false).0, Ok(0x0F));
+}
+
+#[test]
+fn while_aritmetica_e_largura_dos_inteiros() {
+    // Local0 = 0; Local1 = 5; While (Local1) { Local0 += Local1; Local1-- }
+    // Return (Local0)
+    let soma = [
+        &[0x70, 0x00, 0x60, 0x70, 0x0A, 0x05, 0x61, 0xA2][..],
+        &pkg(&[0x61, 0x72, 0x60, 0x61, 0x60, 0x76, 0x61]),
+        &[0xA4, 0x60],
+    ]
+    .concat();
+    let aml = dev(*b"DEV_", &[&method(*b"_STA", 0, &soma)]);
+    assert_eq!(run(&aml, false).0, Ok(15));
+    // Return (Not (Zero)) depende da revisão da tabela.
+    let not = [0xA4, 0x80, 0x00, 0x00];
+    let aml = dev(*b"DEV_", &[&method(*b"_STA", 0, &not)]);
+    assert_eq!(run(&aml, true).0, Ok(0xFFFF_FFFF));
+    assert_eq!(run(&aml, false).0, Ok(u64::MAX));
+    // Divide (7, 2, Local0, Local1); Return (Local0 * 16 + Local1) e a
+    // divisão por zero, que aborta.
+    let div = [
+        0x78, 0x0A, 0x07, 0x0A, 0x02, 0x60, 0x61, 0xA4, 0x72, 0x79, 0x60, 0x0A, 0x04, 0x00, 0x61,
+        0x00,
+    ];
+    let aml = dev(*b"DEV_", &[&method(*b"_STA", 0, &div)]);
+    assert_eq!(run(&aml, false).0, Ok(0x13));
+    let aml = dev(
+        *b"DEV_",
+        &[&method(*b"_STA", 0, &[0x78, 0x01, 0x00, 0x00, 0x00])],
+    );
+    assert_eq!(run(&aml, false).0, Err(Error::Unsupported));
+}
+
+#[test]
+fn chamada_com_argumento_e_crs_por_metodo() {
+    // Method (DBL, 1) { Return (Arg0 << 1) }; _STA: Return (DBL (4) + 1)
+    let dbl = method(*b"DBL_", 1, &[0xA4, 0x79, 0x68, 0x01, 0x00]);
+    let sta = [0xA4, 0x72, b'D', b'B', b'L', b'_', 0x0A, 0x04, 0x01, 0x00];
+    // _CRS: Return (BUF0), com o buffer de uma porta e uma IRQ.
+    let buf = [
+        0x11, 0x10, 0x0A, 0x0D, 0x47, 0x01, 0x60, 0x00, 0x60, 0x00, 0x01, 0x01, 0x22, 0x02, 0x00,
+        0x79, 0x00,
+    ];
+    let aml = [
+        dbl,
+        dev(
+            *b"KBD_",
+            &[
+                &name(*b"BUF0", &buf),
+                &method(*b"_STA", 0, &sta),
+                &method(*b"_CRS", 0, &[0xA4, b'B', b'U', b'F', b'0']),
+            ],
+        ),
+    ]
+    .concat();
+    assert_eq!(run(&aml, false), (Ok(9), Ok(2)));
+}
+
+#[test]
+fn limites_da_execucao() {
+    // While (One) {}: estoura as operações.
+    let aml = dev(*b"DEV_", &[&method(*b"_STA", 0, &[0xA2, 0x02, 0x01])]);
+    assert_eq!(run(&aml, false).0, Err(Error::Limit));
+    // Método que chama a si mesmo: estoura o aninhamento ou as buscas.
+    let aml = dev(
+        *b"DEV_",
+        &[&method(*b"_STA", 0, &[0xA4, b'_', b'S', b'T', b'A'])],
+    );
+    assert_eq!(run(&aml, false).0, Err(Error::Limit));
+    // Corpo fora da tabela.
+    let fora = Method {
+        start: 0,
+        end: 99,
+        args: 0,
+    };
+    let r = eval(&aml, &[*b"DEV_"], fora, false, Limits::default());
+    assert_eq!(r, Err(Error::Malformed));
+}
+
+#[test]
+fn mutacao_dos_metodos_sem_panico() {
+    let sta = [
+        &[0x70, 0x0A, 0x0B, 0x60, 0xA0][..],
+        &pkg(&[
+            0x93, b'F', b'L', b'A', b'G', 0x01, 0x7D, 0x60, 0x0A, 0x04, 0x60,
+        ]),
+        &[0xA2],
+        &pkg(&[0x60, 0x76, 0x60]),
+        &[0xA4, 0x72, b'D', b'B', b'L', b'_', 0x60, 0x01, 0x00],
+    ]
+    .concat();
+    let base = [
+        name(*b"FLAG", &[1]),
+        method(*b"DBL_", 1, &[0xA4, 0x79, 0x68, 0x01, 0x00]),
+        dev(*b"KBD_", &[&method(*b"_STA", 0, &sta)]),
+    ]
+    .concat();
+    let limits = Limits {
+        max_ops: 2_000,
+        ..Limits::default()
+    };
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    for _ in 0..20_000 {
+        let mut m = base.clone();
+        for _ in 0..2 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let i = usize::try_from(x % m.len() as u64).unwrap();
+            m[i] = (x >> 32).to_le_bytes()[0];
+        }
+        let mut devs = Vec::new();
+        let _ = scan(&m, limits, |d| devs.push(*d));
+        for d in devs {
+            let _ = d.status(&m, x & 1 == 0, limits);
+            let _ = d.current_resources(&m, false, limits).map(Iterator::count);
+        }
+    }
+}
+
 /// Com `ACPID_DSDT=<arquivo>` (uma DSDT real, por exemplo a do QEMU), a
 /// tabela inteira precisa ser percorrida sem erro.
 #[test]
@@ -191,13 +365,17 @@ fn dsdt_real_opcional() {
         return;
     };
     let table = std::fs::read(path).unwrap();
-    let (_, aml) = table_body(&table).unwrap();
+    let (h, aml) = table_body(&table).unwrap();
     let (devs, r) = collect(aml);
     for d in &devs {
         let hid = d
             .hid
             .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned());
-        println!("{hid:?} {:?}", d.resources().collect::<Vec<_>>());
+        let sta = d.status(aml, h.width32(), Limits::default());
+        let crs = d
+            .current_resources(aml, h.width32(), Limits::default())
+            .map(Iterator::collect::<Vec<_>>);
+        println!("{hid:?} sta={sta:x?} {crs:?}");
     }
     assert_eq!(r, Ok(()));
 }

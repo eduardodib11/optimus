@@ -53,11 +53,14 @@ fn map_table(object: Handle) -> Option<Mapping> {
 
 /// O nó de um `Device`, se ele tiver `_HID` e portas ou IRQ. O id estável
 /// é o hash do caminho, com o bit 31 ligado para não colidir com os BDFs.
-fn node(d: &Device<'_>) -> Option<(Node, [Option<Id>; 2], Resources)> {
+fn node<'a>(
+    d: &Device<'a>,
+    crs: acpid::Resources<'a>,
+) -> Option<(Node, [Option<Id>; 2], Resources)> {
     let hid = d.hid?;
     let mut res = Resources::default();
     let (mut np, mut ni) = (0, 0);
-    for r in d.resources() {
+    for r in crs {
         match r {
             Resource::Io { base, len } if np < wire::MAX_LEGACY && len > 0 => {
                 res.ports[np] = Some(Ports { base, count: len });
@@ -115,9 +118,25 @@ fn run(s: &mut Session) -> Result<(), &'static str> {
     let table = map_table(dsdt).ok_or("DSDT não mapeia")?;
     let (header, aml) = acpid::table_body(table.bytes()).map_err(|_| "DSDT inválida")?;
     let (mut found, mut sent) = (0u32, 0u32);
-    let result = acpid::scan(aml, Limits::default(), |d| {
+    // Métodos `_STA` e `_CRS` executados e os que saem do subconjunto.
+    let (mut ran, mut skipped) = (0u32, 0u32);
+    let (wide, limits) = (header.width32(), Limits::default());
+    let result = acpid::scan(aml, limits, |d| {
         found += 1;
-        let Some((node, ids, res)) = node(d) else {
+        // Método fora do subconjunto: vale o padrão (presente, `_CRS` fixo).
+        let mut count = |has: bool, ok: bool| match (has, ok) {
+            (true, true) => ran += 1,
+            (true, false) => skipped += 1,
+            _ => {}
+        };
+        let sta = d.status(aml, wide, limits);
+        count(d.sta.is_none() && d.sta_method.is_some(), sta.is_ok());
+        if sta.is_ok_and(|v| v & 1 == 0) {
+            return;
+        }
+        let crs = d.current_resources(aml, wide, limits);
+        count(d.crs.is_none() && d.crs_method.is_some(), crs.is_ok());
+        let Some((node, ids, res)) = node(d, crs.unwrap_or_else(|_| d.resources())) else {
             return;
         };
         let mut names = [""; 2];
@@ -139,6 +158,9 @@ fn run(s: &mut Session) -> Result<(), &'static str> {
     let bytes = header.length;
     ostd::debug::print_fmt(format_args!(
         "acpid: DSDT de {bytes} bytes, {found} dispositivos"
+    ));
+    ostd::debug::print_fmt(format_args!(
+        "acpid: {ran} métodos executados, {skipped} fora do subconjunto"
     ));
     ostd::debug::print_fmt(format_args!("acpid: {sent} nós publicados ao devmgr"));
     if let Err(e) = result {
