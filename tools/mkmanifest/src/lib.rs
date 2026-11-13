@@ -408,13 +408,16 @@ fn parse_need(service: &str, item: &str) -> Result<Need, Error> {
 /// - `ecam`: a janela ECAM, `MemoryObject` de MMIO com `READ`, `WRITE` e
 ///   `MAP` (ADR 0043, item 1; T-402).
 /// - `device`: a cota de dispositivo, `MemoryQuota` só com `CREATE` (T-402).
+/// - `acpi`: a cópia da DSDT, `MemoryObject` com `READ` e `MAP` (ADR 0045,
+///   item 1; T-405).
 #[must_use]
 pub fn kernel_rights(name: &str) -> Option<kabi::Rights> {
     use kabi::Rights;
     match name {
         "debug" => Some(Rights::WRITE.union(Rights::BIND)),
         "mem-pressure" => Some(Rights::BIND.union(Rights::ACK)),
-        "log" => Some(Rights::READ.union(Rights::MAP)),
+        // `acpi` (T-405): a cópia da DSDT, para o `acpid`.
+        "log" | "acpi" => Some(Rights::READ.union(Rights::MAP)),
         // T-402: a janela ECAM (para o `pcid`) e a cota de dispositivo.
         "ecam" => Some(Rights::READ.union(Rights::WRITE).union(Rights::MAP)),
         "device" => Some(Rights::CREATE),

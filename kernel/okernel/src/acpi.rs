@@ -157,6 +157,31 @@ pub fn hpet_base(mem: &mut impl PhysRead, rsdp: u64) -> Result<u64, AcpiError> {
     Ok(u64_at(&buf, 44))
 }
 
+/// Copia a DSDT (achada pela FADT) para `out` e devolve o tamanho (ADR
+/// 0045, item 1; T-405). O kernel não interpreta o AML: só confere o
+/// cabeçalho e a soma, para entregar a cópia ao `acpid`.
+///
+/// # Errors
+///
+/// FADT ou DSDT ausente, inválida ou maior que `out`.
+pub fn dsdt(mem: &mut impl PhysRead, rsdp: u64, out: &mut [u8]) -> Result<usize, AcpiError> {
+    let mut fadt = [0u8; 276];
+    let len = find(mem, rsdp, b"FACP", &mut fadt)?;
+    // X_DSDT (64 bits, deslocamento 140) vence o DSDT de 32 bits (40).
+    let wide = if len >= 148 { u64_at(&fadt, 140) } else { 0 };
+    let addr = if wide != 0 {
+        wide
+    } else if len >= 44 {
+        u64::from(u32_at(&fadt, 40))
+    } else {
+        return Err(AcpiError::BadLength);
+    };
+    if addr == 0 {
+        return Err(AcpiError::NotFound);
+    }
+    table(mem, addr, *b"DSDT", out)
+}
+
 /// Janela ECAM do MCFG (ADR 0043, item 1; T-402).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ecam {
@@ -295,6 +320,32 @@ pub(crate) mod tests {
         assert_eq!(hpet_base(&mut mem, 0x9000), Err(AcpiError::Unreadable));
         mem.0.get_mut(&0xe_0000).unwrap()[30] ^= 1;
         assert_eq!(hpet_base(&mut mem, 0xe_0000), Err(AcpiError::BadChecksum));
+    }
+
+    #[test]
+    fn dsdt_pela_fadt() {
+        let mut mem = machine(sdt(*b"DSDT", &[0x10, 0x05, b'_', b'S', b'B', b'_']));
+        let mut out = [0u8; 128];
+        // A FADT falsa não aponta para nada.
+        assert_eq!(dsdt(&mut mem, 0xe_0000, &mut out), Err(AcpiError::NotFound));
+        let mut body = vec![0u8; 8];
+        body[4..8].copy_from_slice(&0x3000u32.to_le_bytes());
+        mem.0.insert(0x2000, sdt(*b"FACP", &body));
+        assert_eq!(dsdt(&mut mem, 0xe_0000, &mut out), Ok(42));
+        assert_eq!(&out[..4], b"DSDT");
+        assert_eq!(
+            dsdt(&mut mem, 0xe_0000, &mut out[..40]),
+            Err(AcpiError::BadLength)
+        );
+        // X_DSDT vence quando existe; aqui aponta para uma tabela errada.
+        let mut body = vec![0u8; 112];
+        body[4..8].copy_from_slice(&0x3000u32.to_le_bytes());
+        body[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
+        mem.0.insert(0x2000, sdt(*b"FACP", &body));
+        assert_eq!(
+            dsdt(&mut mem, 0xe_0000, &mut out),
+            Err(AcpiError::BadSignature)
+        );
     }
 
     #[test]

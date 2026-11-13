@@ -182,3 +182,22 @@ fn mutacao_deterministica_sem_panico() {
         }
     }
 }
+
+/// Com `ACPID_DSDT=<arquivo>` (uma DSDT real, por exemplo a do QEMU), a
+/// tabela inteira precisa ser percorrida sem erro.
+#[test]
+fn dsdt_real_opcional() {
+    let Some(path) = std::env::var_os("ACPID_DSDT") else {
+        return;
+    };
+    let table = std::fs::read(path).unwrap();
+    let (_, aml) = table_body(&table).unwrap();
+    let (devs, r) = collect(aml);
+    for d in &devs {
+        let hid = d
+            .hid
+            .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned());
+        println!("{hid:?} {:?}", d.resources().collect::<Vec<_>>());
+    }
+    assert_eq!(r, Ok(()));
+}

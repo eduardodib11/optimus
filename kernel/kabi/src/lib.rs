@@ -42,6 +42,10 @@ pub mod startup {
     /// 0043, item 1; T-402). O kernel a lê do MCFG; o tamanho diz quantos
     /// barramentos há (1 MiB cada). Ausente sem MCFG.
     pub const KIND_ECAM: u32 = 6;
+    /// Entrada: cópia só de leitura da DSDT, com o cabeçalho (`MemoryObject`
+    /// com `READ | MAP`; ADR 0045, item 1; T-405). O tamanho da tabela está
+    /// no cabeçalho dela. Ausente sem ACPI.
+    pub const KIND_ACPI_DSDT: u32 = 7;
     /// Bytes do cabeçalho antes da primeira entrada.
     pub const HEADER_BYTES: usize = 8;
     /// Bytes de cada entrada.

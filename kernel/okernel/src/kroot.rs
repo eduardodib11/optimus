@@ -329,6 +329,9 @@ fn start_table(p: &Image, fs: Handle) -> Result<Handle, &'static str> {
     if let Some(ecam) = ecam {
         push(kabi::startup::KIND_ECAM, ecam);
     }
+    if let Some(dsdt) = acpi_dsdt(p) {
+        push(kabi::startup::KIND_ACPI_DSDT, dsdt);
+    }
     let mut bytes = [0u8; 4096];
     bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     let count = u32::try_from(n).map_err(|_| "entradas")?;
@@ -339,6 +342,24 @@ fn start_table(p: &Image, fs: Handle) -> Result<Handle, &'static str> {
         bytes[at + 4..at + 8].copy_from_slice(&handle.to_le_bytes());
     }
     read_only_copy(p, &bytes)
+}
+
+/// Maior DSDT entregue ao `acpid`.
+const MAX_DSDT_BYTES: usize = 64 << 10;
+
+/// Cópia só de leitura da DSDT para o `acpid` (ADR 0045, item 1; T-405),
+/// cobrada da cota de `p`. `None` (com aviso) sem ACPI ou com tabela
+/// inválida: o sistema sobe sem os dispositivos legados.
+fn acpi_dsdt(p: &Image) -> Option<Handle> {
+    let rsdp = bootinfo::get().and_then(kabi::boot::BootInfo::acpi_rsdp)?;
+    let mut buf = alloc::vec![0u8; MAX_DSDT_BYTES];
+    match okernel::acpi::dsdt(&mut ktime::DirectRead, rsdp, &mut buf) {
+        Ok(len) => read_only_copy(p, &buf[..len]).ok(),
+        Err(e) => {
+            warn!("okernel: sem DSDT para o acpid: {e:?}");
+            None
+        }
+    }
 }
 
 /// Orçamento da cota de dispositivo: só metadados (objetos de MMIO e,
