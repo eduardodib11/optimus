@@ -51,7 +51,7 @@ const SVCMGR_LOG_BADGE: u64 = 0x7376_636d;
 /// MiB com o `pcid` (T-402), 13 MiB com o `devmgr` (T-401), cujo heap
 /// pede um segmento de 2 MiB, e 14 MiB com o `acpid` (T-405), que não usa
 /// heap.
-const SVCMGR_QUOTA: u64 = 14 << 20;
+const SVCMGR_QUOTA: u64 = 15 << 20;
 /// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
 const SVCMGR_PRIORITY: u8 = 200;
 /// Badge com que o `root` identifica o `svcmgr` no próprio endpoint.

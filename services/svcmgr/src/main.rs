@@ -693,12 +693,13 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
     let map = map_bootfs(boot.bootfs)?;
     let fs = obfs::Image::parse(map.bytes()).map_err(|_| Error::InvalidArgument)?;
     let plan = plan(&fs)?;
-    let count = plan
-        .levels
-        .iter()
-        .flatten()
-        .max()
-        .map_or(0, |&m| m as usize + 1);
+    // Todos os manifestos, não só os do plano de partida: um driver, que o
+    // `devmgr` parte depois, também precisa de lugar em `live` (T-411).
+    let mut count = 0u32;
+    while plan.broker.manifest(count).is_some() {
+        count += 1;
+    }
+    let count = count as usize;
     let policies: Vec<Policy> = (0..count)
         .map(|i| {
             let id = u32::try_from(i).unwrap_or(u32::MAX);

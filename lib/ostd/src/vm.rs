@@ -150,6 +150,42 @@ impl Mapping {
         ok
     }
 
+    /// Leitura volátil de 8 bits em `off`; `None` fora da faixa.
+    #[must_use]
+    pub fn read8(&self, off: usize) -> Option<u8> {
+        (off < self.size()).then(|| crate::arch::mem::read8(self, off))
+    }
+
+    /// Leitura volátil de 16 bits em `off`; `None` fora da faixa ou
+    /// desalinhada.
+    #[must_use]
+    pub fn read16(&self, off: usize) -> Option<u16> {
+        let ok = off.is_multiple_of(2) && off.checked_add(2).is_some_and(|e| e <= self.size());
+        ok.then(|| crate::arch::mem::read16(self, off))
+    }
+
+    /// Escrita volátil de 8 bits em `off`; `false` fora da faixa ou sem
+    /// escrita.
+    pub fn write8(&mut self, off: usize, value: u8) -> bool {
+        let ok = self.writable && off < self.size();
+        if ok {
+            crate::arch::mem::write8(self, off, value);
+        }
+        ok
+    }
+
+    /// Escrita volátil de 16 bits em `off`; `false` fora da faixa,
+    /// desalinhada ou sem escrita.
+    pub fn write16(&mut self, off: usize, value: u16) -> bool {
+        let ok = self.writable
+            && off.is_multiple_of(2)
+            && off.checked_add(2).is_some_and(|e| e <= self.size());
+        if ok {
+            crate::arch::mem::write16(self, off, value);
+        }
+        ok
+    }
+
     /// Os bytes mapeados, para escrita; `None` se o mapeamento não for
     /// gravável.
     #[must_use]

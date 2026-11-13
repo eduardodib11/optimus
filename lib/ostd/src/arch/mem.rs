@@ -43,6 +43,39 @@ pub fn write32(m: &mut Mapping, off: usize, value: u32) {
     unsafe { ptr.write_volatile(value) }
 }
 
+/// Leitura volátil de 8 bits em `off` de `m` (campos de configuração de
+/// dispositivos virtio; T-411). Quem chama confere que `off` está em `m`.
+pub fn read8(m: &Mapping, off: usize) -> u8 {
+    assert!(off < m.size());
+    let ptr = core::ptr::with_exposed_provenance::<u8>(m.addr() + off);
+    // SAFETY: como em `read32`, com a faixa conferida acima.
+    unsafe { ptr.read_volatile() }
+}
+
+/// Leitura volátil de 16 bits em `off` de `m`, alinhado a 2.
+pub fn read16(m: &Mapping, off: usize) -> u16 {
+    assert!(off.is_multiple_of(2) && off + 2 <= m.size());
+    let ptr = core::ptr::with_exposed_provenance::<u16>(m.addr() + off);
+    // SAFETY: como em `read32`, com o alinhamento a 2 e a faixa conferidos.
+    unsafe { ptr.read_volatile() }
+}
+
+/// Escrita volátil de 8 bits em `off` de `m`, gravável.
+pub fn write8(m: &mut Mapping, off: usize, value: u8) {
+    assert!(m.writable() && off < m.size());
+    let ptr = core::ptr::with_exposed_provenance_mut::<u8>(m.addr() + off);
+    // SAFETY: como em `write32`, com a faixa conferida acima.
+    unsafe { ptr.write_volatile(value) }
+}
+
+/// Escrita volátil de 16 bits em `off` de `m`, gravável e alinhado a 2.
+pub fn write16(m: &mut Mapping, off: usize, value: u16) {
+    assert!(m.writable() && off.is_multiple_of(2) && off + 2 <= m.size());
+    let ptr = core::ptr::with_exposed_provenance_mut::<u16>(m.addr() + off);
+    // SAFETY: como em `write32`, com o alinhamento a 2 e a faixa conferidos.
+    unsafe { ptr.write_volatile(value) }
+}
+
 /// O buffer de IPC no início de `m`, uma página gravável alinhada.
 pub fn ipc_buffer(m: &mut Mapping) -> &mut IpcBuffer {
     assert!(m.writable() && m.size() >= size_of::<IpcBuffer>() && m.addr().is_multiple_of(4096));
