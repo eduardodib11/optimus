@@ -136,19 +136,19 @@ impl Devmgr {
     /// Parte o driver `id` com os recursos do nó (depois de responder a
     /// quem publicou).
     fn start(&mut self, id: u32, res: &Resources) {
-        self.start_gen(id, res, 0);
+        let _ = self.start_gen(id, res, 0);
     }
 
     /// [`start`](Self::start) com o número da partida (ADR 0051, item 5).
-    fn start_gen(&mut self, id: u32, res: &Resources, generation: u32) {
+    fn start_gen(&mut self, id: u32, res: &Resources, generation: u32) -> bool {
         let Some(device) = self.device else {
             ostd::debug::print("devmgr: sem kernel:device, driver não parte");
-            return;
+            return false;
         };
         let ecam = self.ecam;
         if self.bound.iter().any(|b| b.driver == id) {
             ostd::debug::print("devmgr: driver já ligado a outro nó");
-            return;
+            return false;
         }
         match bind::start(&mut self.s, device, ecam, self.faults, id, res, generation) {
             Ok(b) => {
@@ -157,8 +157,12 @@ impl Devmgr {
                     b.originals.len()
                 ));
                 self.bound.push(b);
+                true
             }
-            Err(e) => ostd::debug::print_fmt(format_args!("devmgr: driver não partiu: {e:?}")),
+            Err(e) => {
+                ostd::debug::print_fmt(format_args!("devmgr: driver não partiu: {e:?}"));
+                false
+            }
         }
     }
 
@@ -204,6 +208,11 @@ impl Devmgr {
         if let Err(e) = self.s.driver_stop(id) {
             ostd::debug::print_fmt(format_args!("devmgr: driver {name} não parou: {e:?}"));
         }
+        // O dispositivo sai do domínio já: sem ele a IOMMU barra todo DMA,
+        // mesmo que alguma cópia do domínio ainda não tenha morrido.
+        if let (Some(domain), Some(bdf)) = (b.domain, b.res.bdf) {
+            let _ = ostd::dev::dma_bind(domain, bdf, false);
+        }
         for h in b.originals {
             let _ = ostd::cap::delete(h);
         }
@@ -226,8 +235,9 @@ impl Devmgr {
             ));
             return;
         }
-        self.start_gen(id, &b.res, b.generation + 1);
-        ostd::debug::print_fmt(format_args!("devmgr: driver {name} reiniciado"));
+        if self.start_gen(id, &b.res, b.generation + 1) {
+            ostd::debug::print_fmt(format_args!("devmgr: driver {name} reiniciado"));
+        }
     }
 
     fn serve(&mut self, ep: Handle, quota: Handle) -> Error {

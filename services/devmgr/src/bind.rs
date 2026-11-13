@@ -155,6 +155,9 @@ pub struct Bound {
     pub originals: Vec<Handle>,
     /// Recursos do nó, para partir o driver de novo (ADR 0051, item 4).
     pub res: Resources,
+    /// O `DmaDomain` original (com `BIND`), se o nó é PCI: a contenção
+    /// desliga o dispositivo dele (ADR 0051, item 3).
+    pub domain: Option<Handle>,
     /// Número da partida: 0 na primeira, e a cópia `dma` leva o `badge`
     /// `partida + 1` (item 5).
     pub generation: u32,
@@ -188,6 +191,7 @@ pub fn start(
     match r {
         Ok(()) => Ok(Bound {
             driver,
+            domain: domain_of(&originals, res),
             originals,
             res: *res,
             generation,
@@ -199,6 +203,15 @@ pub fn start(
             Err(e)
         }
     }
+}
+
+/// O domínio entre as originais: o primeiro `DmaDomain` (só nós PCI têm).
+fn domain_of(originals: &[Handle], res: &Resources) -> Option<Handle> {
+    res.bdf?;
+    originals
+        .iter()
+        .copied()
+        .find(|&h| ostd::cap::info(h).is_ok_and(|i| i.object_type == ObjectType::DmaDomain))
 }
 
 /// O que muda de uma partida para outra (ADR 0051).
