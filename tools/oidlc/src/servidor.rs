@@ -153,7 +153,7 @@ impl Gen<'_> {
             "// Gerado pelo oidlc a partir do arquivo .oidl. Não edite à mão.\n\
              //\n\
              // Layout e formato de fio: ADR 0033. Usa só `oidl_rt` e `core`.\n\n\
-             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, clippy::match_single_binding, clippy::manual_range_patterns, non_upper_case_globals, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
+             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, clippy::match_single_binding, clippy::manual_range_patterns, clippy::identity_op, non_upper_case_globals, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
              use oidl_rt::{Error, Reader, Writer};\n\n\
              /// Contexto de uma chamada: o badge do remetente (ADR 0027).\n\
              pub struct Contexto {\n    /// Badge do endpoint que chamou.\n    pub badge: u64,\n}\n\n\
@@ -815,7 +815,7 @@ impl Gen<'_> {
             "// Gerado pelo oidlc a partir do arquivo .oidl. Não edite à mão.\n\
              //\n\
              // Cliente de IPC (T-345): cada chamada usa `ostd::ipc::call_corpo`.\n\n\
-             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, clippy::match_single_binding, clippy::manual_range_patterns, non_upper_case_globals, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
+             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, clippy::match_single_binding, clippy::manual_range_patterns, clippy::identity_op, non_upper_case_globals, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
              use oidl_rt::{Error, Reader, Writer};\n\n\
              /// Erro de codificação ou decodificação vira erro de IPC.\n\
              fn erro_oidl(_: Error) -> ostd::kabi::Error {\n    ostd::kabi::Error::InvalidArgument\n}\n\n",
@@ -938,6 +938,9 @@ impl Gen<'_> {
 
         let ok_rust = match &m.ret {
             Some(r) if matches!(r.ok, Type::Unit) => "()".to_string(),
+            Some(r) if bytes_n(&r.ok).is_some() => {
+                format!("oidl_rt::Bytes<{}>", bytes_n(&r.ok).unwrap_or(0))
+            }
             Some(r) => match self.rs(&r.ok, Modo::Elidido) {
                 Some(t) => t,
                 None => return self.erro(m.name.pos, format!("'{nome}': resposta sem tipo Rust")),
@@ -965,6 +968,8 @@ impl Gen<'_> {
         ] {
             let corpo = if matches!(ty, Type::Unit) {
                 String::from("    let _ = corpo;\n")
+            } else if let Some(n) = bytes_n(ty) {
+                format!("    let v = oidl_rt::Bytes::<{n}>::from_slice(r.bytes({n})?)?;\n")
             } else {
                 match self.dec(ty) {
                     Ok(e) => format!("    let v = {e};\n"),
@@ -991,6 +996,14 @@ impl Gen<'_> {
             metodos,
             "    /// Método `{nome}` (ordinal {ordinal}).\n    pub fn {nome}(&self, buf: &mut ostd::ipc::Buffer{assinatura_pub}) -> Result<Result<{ok_rust}, {err_rust}>, ostd::kabi::Error> {{\n        let mut pedido = [0u8; {tam_pedido}];\n        let n = codifica_{sn}_{ordinal}(&mut pedido{chamada}).map_err(erro_oidl)?;\n        let mut saida = [0u8; {tam_resposta}];\n        let (rotulo, m) = ostd::ipc::call_corpo(self.ep, buf, {rotulo:#018X}, &pedido[..n], &mut saida, 0)?;\n        if rotulo >> 62 == 0 {{\n            Ok(Ok(decodifica_ok_{sn}_{ordinal}(&saida[..m]).map_err(erro_oidl)?))\n        }} else {{\n            Ok(Err(decodifica_err_{sn}_{ordinal}(&saida[..m]).map_err(erro_oidl)?))\n        }}\n    }}\n"
         );
+    }
+}
+
+/// `N` de um `vec<u8, N>`: o cliente o devolve como `oidl_rt::Bytes<N>`.
+fn bytes_n(t: &Type) -> Option<u64> {
+    match t {
+        Type::Vec(elem, n) if matches!(**elem, Type::Prim(Prim::U8, _)) => Some(n.value),
+        _ => None,
     }
 }
 

@@ -14,9 +14,11 @@ use ostd::svc::Session;
 
 mod console_cliente;
 mod display_cliente;
+mod entropy_cliente;
 
 use console_cliente::ConsoleCliente;
 use display_cliente::DisplayDeviceCliente;
+use entropy_cliente::EntropySourceCliente;
 
 ostd::entry!(main);
 
@@ -105,6 +107,24 @@ fn display(s: &mut Session) {
     }
 }
 
+fn entropy(s: &mut Session) {
+    let Some(ep) = connect(s, b"optimus.dev.EntropySource") else {
+        ostd::debug::print("drvcli: entropy: sem driver");
+        return;
+    };
+    let cli = EntropySourceCliente::new(ep);
+    let first = cli.read(&mut s.buffer, 32);
+    let second = cli.read(&mut s.buffer, 32);
+    // Dois blocos de 32 bytes que diferem entre si, pelo contrato gerado.
+    let ok = matches!((&first, &second), (Ok(Ok(one)), Ok(Ok(two)))
+        if one.as_slice().len() == 32 && two.as_slice().len() == 32 && one.as_slice() != two.as_slice());
+    if ok {
+        ostd::debug::print("drvcli: entropy ok");
+    } else {
+        ostd::debug::print("drvcli: entropy: falhou");
+    }
+}
+
 fn main(start: Start) -> ! {
     let mut s = match Session::start(start.args) {
         Ok(s) => s,
@@ -124,5 +144,6 @@ fn main(start: Start) -> ! {
     let _ = s.ready();
     console(&mut s);
     display(&mut s);
+    entropy(&mut s);
     ostd::thread::exit()
 }

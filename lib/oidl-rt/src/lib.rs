@@ -46,6 +46,37 @@ struct Ptr {
     len: u32,
 }
 
+/// `vec<u8, N>` devolvido ao cliente: até `N` bytes, sem alocar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bytes<const N: usize> {
+    len: usize,
+    data: [u8; N],
+}
+
+impl<const N: usize> Bytes<N> {
+    /// Copia `src`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadMessage`] se `src` passar de `N` bytes.
+    pub fn from_slice(src: &[u8]) -> Result<Self> {
+        let mut data = [0u8; N];
+        data.get_mut(..src.len())
+            .ok_or(Error::BadMessage)?
+            .copy_from_slice(src);
+        Ok(Self {
+            len: src.len(),
+            data,
+        })
+    }
+
+    /// Os bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
 /// Região validada na cauda: deslocamento do primeiro elemento e contagem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elems {
@@ -225,6 +256,18 @@ impl<'a> Reader<'a> {
             return Err(Error::BadMessage);
         }
         Ok(e)
+    }
+
+    /// Lê um `vec<u8, max>` como bytes: a região de `p` na cauda.
+    ///
+    /// # Errors
+    ///
+    /// Os de [`Reader::vec`].
+    pub fn bytes(&mut self, max: usize) -> Result<&'a [u8]> {
+        let e = self.vec(max, 1)?;
+        self.body
+            .get(e.off..e.off + e.count)
+            .ok_or(Error::BadMessage)
     }
 
     /// Confere que o corpo acabou exatamente no fim da cauda canônica.
