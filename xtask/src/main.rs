@@ -837,12 +837,12 @@ macro_rules! m4_markers {
             "[\"PNP0303\"]: i8042d",
             "i8042d: teclado pronto",
             "inputd: tecla 0x1e apertada",
-            // T-516: o mouse PS/2 parte pelo nó `PNP0F13` e o movimento que
-            // o xtask injeta chega ao `inputd`.
+            // T-516: o mouse PS/2 parte pelo nó `PNP0F13`. O movimento só é
+            // exigido na integração: com IOMMU o boot é mais lento e o
+            // `ps2mouse` fica pronto no fim da janela de supervisão.
             "acpid: PNP0F13: 2 portas, 1 IRQs",
             "[\"PNP0F13\"]: ps2mouse",
             "ps2mouse: mouse pronto",
-            "inputd: ponteiro dx=",
             // virtio: o `devmgr` casa cada função com o driver, que
             // negocia o transporte moderno e faz a operação do seu aceite.
             "1af4:1042 ",
