@@ -85,6 +85,16 @@ impl opci::Config for Function {
     }
 }
 
+/// Pino de interrupção (`INTERRUPT_PIN`, registrador `0x3D`) da função
+/// `bdf`: 0 sem `INTx`, 1 a 4 para INTA a INTD.
+#[allow(clippy::cast_possible_truncation, reason = "o pino é um byte")]
+pub fn interrupt_pin(ecam: Handle, bdf: u16) -> Option<u8> {
+    use opci::Config;
+    let mut f = Function::open(ecam, bdf).ok()?;
+    let at = f.bdf;
+    Some(((f.read(at, 0x3C) >> 8) & 0xFF) as u8)
+}
+
 /// Programa a capability MSI em `at` com um vetor (sem múltiplas
 /// mensagens) e a liga.
 #[allow(

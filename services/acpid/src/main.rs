@@ -105,10 +105,9 @@ fn publish(bus: Handle, buffer: &mut Buffer, node: &Node, names: &[&str], res: &
     )
 }
 
-/// Rotas `INTx` do PCI (`_PRT`) no modo APIC. Por ora só confere e registra:
-/// os drivers usam MSI, e a entrega das rotas ao `devmgr` vem com o primeiro
-/// dispositivo que precisar de `INTx`.
-fn routes(aml: &[u8], wide: bool, limits: Limits) {
+/// Rotas `INTx` do PCI (`_PRT`) no modo APIC, com o GSI de cada uma
+/// resolvido, publicadas ao `devmgr` (T-513).
+fn routes(aml: &[u8], wide: bool, limits: Limits, bus: Option<Handle>, buffer: &mut Buffer) {
     let mut state = State::default();
     if !matches!(acpid::pic_mode(aml, 1, wide, limits, &mut state), Ok(true)) {
         return;
@@ -124,6 +123,11 @@ fn routes(aml: &[u8], wide: bool, limits: Limits) {
             return;
         };
         let (mut count, mut resolved) = (0u32, 0u32);
+        let mut out = [wire::IrqRoute {
+            device: 0,
+            pin: 0,
+            gsi: 0,
+        }; wire::MAX_ROUTES];
         // As rotas repetem poucas ligações, e cada busca varre a tabela:
         // guarda as já resolvidas.
         let mut known: [Option<(acpid::NameSeg, Option<u32>)>; 8] = [None; 8];
@@ -139,11 +143,33 @@ fn routes(aml: &[u8], wide: bool, limits: Limits) {
             {
                 *free = Some((s, gsi));
             }
-            resolved += u32::from(gsi.is_some());
+            if let (Some(gsi), Some(slot)) = (gsi, out.get_mut(resolved as usize)) {
+                *slot = wire::IrqRoute {
+                    device: r.device,
+                    pin: r.pin,
+                    gsi,
+                };
+                resolved += 1;
+            }
         }
         ostd::debug::print_fmt(format_args!(
             "acpid: _PRT: {count} rotas INTx, {resolved} com GSI"
         ));
+        let mut req = [0u8; wire::MAX_ROUTES_BYTES];
+        let sent = bus.is_some_and(|b| {
+            let Ok(n) = wire::encode_routes(&out[..resolved as usize], &mut req) else {
+                return false;
+            };
+            let deadline = ostd::time::now_ns().saturating_add(PUBLISH_NS);
+            let label = wire::label(wire::Method::PublishRoutes);
+            matches!(
+                ipc::call_corpo(b, buffer, label, &req[..n], &mut [0u8; 8], deadline),
+                Ok((osvc::REPLY_OK, _))
+            )
+        });
+        if sent {
+            ostd::debug::print_fmt(format_args!("acpid: {resolved} rotas _PRT publicadas"));
+        }
     });
 }
 
@@ -207,7 +233,7 @@ fn run(s: &mut Session) -> Result<(), &'static str> {
         "acpid: {ran} métodos executados, {skipped} fora do subconjunto"
     ));
     ostd::debug::print_fmt(format_args!("acpid: {sent} nós publicados ao devmgr"));
-    routes(aml, wide, limits);
+    routes(aml, wide, limits, bus, &mut s.buffer);
     if let Err(e) = result {
         // O que já saiu continua válido (ADR 0045, item 2).
         ostd::debug::print_fmt(format_args!("acpid: varredura parou: {e:?}"));

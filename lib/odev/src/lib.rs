@@ -196,6 +196,7 @@ pub fn best_match<'a>(drivers: &'a [Driver], node: &Node) -> Outcome<'a> {
 #[derive(Debug, Default)]
 pub struct Registry {
     nodes: Vec<(Node, wire::Resources)>,
+    routes: Vec<wire::IrqRoute>,
     max: usize,
 }
 
@@ -205,6 +206,7 @@ impl Registry {
     pub const fn new(max: usize) -> Self {
         Self {
             nodes: Vec::new(),
+            routes: Vec::new(),
             max,
         }
     }
@@ -223,6 +225,36 @@ impl Registry {
         }
         self.nodes.push((node, res));
         Ok(&self.nodes[self.nodes.len() - 1].0)
+    }
+
+    /// Guarda as rotas `INTx` do `_PRT`, no lugar das anteriores.
+    pub fn set_routes(&mut self, routes: Vec<wire::IrqRoute>) {
+        self.routes = routes;
+    }
+
+    /// GSI da rota do dispositivo `device` no pino `pin` (0 é INTA).
+    #[must_use]
+    pub fn gsi(&self, device: u16, pin: u8) -> Option<u32> {
+        self.routes
+            .iter()
+            .find(|r| r.device == device && r.pin == pin)
+            .map(|r| r.gsi)
+    }
+
+    /// Quantas rotas o registro guarda.
+    #[must_use]
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// GSI da `INTx` de uma função PCI: o pino vem do registrador `0x3D`
+    /// (`INTERRUPT_PIN`: 0 sem interrupção, 1 INTA a 4 INTD) e o
+    /// dispositivo do `bdf`. A rota é a da função 0 (o `_PRT` não distingue
+    /// funções).
+    #[must_use]
+    pub fn legacy_gsi(&self, bdf: u16, interrupt_pin: u8) -> Option<u32> {
+        let pin = interrupt_pin.checked_sub(1).filter(|p| *p < 4)?;
+        self.gsi((bdf >> 3) & 0x1F, pin)
     }
 
     /// Os nós, na ordem de publicação.

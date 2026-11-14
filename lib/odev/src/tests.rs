@@ -144,3 +144,23 @@ fn registro_recusa_repetido_e_acima_do_teto() {
     );
     assert_eq!(reg.nodes().count(), 1);
 }
+
+#[test]
+fn irq_legada_pela_rota() {
+    use wire::IrqRoute;
+    let mut reg = Registry::new(4);
+    let route = |device, pin, gsi| IrqRoute { device, pin, gsi };
+    assert_eq!(reg.legacy_gsi(0x18, 1), None, "sem rotas");
+    reg.set_routes(vec![route(3, 0, 18), route(3, 1, 19), route(4, 3, 23)]);
+    assert_eq!(reg.route_count(), 3);
+    // Dispositivo 3 (bdf 0x18), INTA e INTB.
+    assert_eq!(reg.legacy_gsi(0x18, 1), Some(18));
+    assert_eq!(reg.legacy_gsi(0x18, 2), Some(19));
+    // A função 1 usa a rota do dispositivo; INTD do dispositivo 4.
+    assert_eq!(reg.legacy_gsi(0x19, 1), Some(18));
+    assert_eq!(reg.legacy_gsi(0x20, 4), Some(23));
+    // Sem pino (0), pino inválido e rota que não existe.
+    assert_eq!(reg.legacy_gsi(0x18, 0), None);
+    assert_eq!(reg.legacy_gsi(0x18, 5), None);
+    assert_eq!(reg.legacy_gsi(0x28, 1), None);
+}
