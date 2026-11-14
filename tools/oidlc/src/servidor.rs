@@ -153,7 +153,7 @@ impl Gen<'_> {
             "// Gerado pelo oidlc a partir do arquivo .oidl. Não edite à mão.\n\
              //\n\
              // Layout e formato de fio: ADR 0033. Usa só `oidl_rt` e `core`.\n\n\
-             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
+             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, clippy::match_single_binding, non_upper_case_globals, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
              use oidl_rt::{Error, Reader, Writer};\n\n\
              /// Contexto de uma chamada: o badge do remetente (ADR 0027).\n\
              pub struct Contexto {\n    /// Badge do endpoint que chamou.\n    pub badge: u64,\n}\n\n\
@@ -815,7 +815,7 @@ impl Gen<'_> {
             "// Gerado pelo oidlc a partir do arquivo .oidl. Não edite à mão.\n\
              //\n\
              // Cliente de IPC (T-345): cada chamada usa `ostd::ipc::call_corpo`.\n\n\
-             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
+             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, clippy::match_single_binding, non_upper_case_globals, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
              use oidl_rt::{Error, Reader, Writer};\n\n\
              /// Erro de codificação ou decodificação vira erro de IPC.\n\
              fn erro_oidl(_: Error) -> ostd::kabi::Error {\n    ostd::kabi::Error::InvalidArgument\n}\n\n",

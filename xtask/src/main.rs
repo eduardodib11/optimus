@@ -70,6 +70,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("inputd", "services/inputd/src/main.rs", USER_TARGET),
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
     ("ps2mouse", "services/ps2mouse/src/main.rs", USER_TARGET),
+    ("drvcli", "services/drvcli/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -404,8 +405,8 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input"
-        | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "ps2mouse" | "utest"
-        | "okfuzz" => &["-C", "relocation-model=static"],
+        | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "ps2mouse" | "drvcli"
+        | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -461,6 +462,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("inputd", "inputd"),
     ("i8042d", "i8042d"),
     ("ps2mouse", "ps2mouse"),
+    ("drvcli", "drvcli"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -797,7 +799,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 10 drivers no conjunto",
+        "devmgr: 11 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -853,6 +855,8 @@ macro_rules! m4_markers {
             "virtio-blk: setor escrito e lido com BLAKE3 igual",
             "virtio-rng: bytes do dispositivo variam",
             "virtio-console: texto enviado",
+            // T-514: o cliente conversa com o driver pelo contrato gerado.
+            "drvcli: console ok",
             "1af4:1052 ",
             "virtio-input: fila de eventos pronta",
             "virtio-input: tecla 0x1e encaminhada",
@@ -895,6 +899,8 @@ const M4_FORBIDDEN: &[&str] = &[
     "virtio-blk: falhou",
     "virtio-rng: falhou",
     "virtio-console: falhou",
+    "drvcli: console: falhou",
+    "drvcli: console: sem driver",
     "virtio-input: falhou",
     "virtio-net: falhou",
     "virtio-gpu: falhou",
@@ -909,6 +915,8 @@ const M4_IOMMU_FORBIDDEN: &[&str] = &[
     "virtio-blk: falhou",
     "virtio-rng: falhou",
     "virtio-console: falhou",
+    "drvcli: console: falhou",
+    "drvcli: console: sem driver",
     "virtio-input: falhou",
     "virtio-net: falhou",
     "virtio-gpu: falhou",
@@ -1674,8 +1682,8 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 10 drivers no conjunto",
-    "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
+    "devmgr: 11 drivers no conjunto",
+    "devmgr: nó 00:00.0 8086:29c0 0 BARs: drvcli",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
     // (teclado PS/2 e RTC) viram nós com portas e IRQ.

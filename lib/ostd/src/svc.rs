@@ -105,6 +105,22 @@ impl Session {
         interface: u32,
         minor: u16,
     ) -> Result<Result<Handle, SvcError>, Error> {
+        self.connect_svc_until(interface, minor, deadline())
+    }
+
+    /// Como [`Session::connect_svc`], com o prazo da chamada (em ns do
+    /// relógio monotônico). Quem espera um provedor subir repete com prazos
+    /// curtos, para não ficar preso a um `svcmgr` que já desligou.
+    ///
+    /// # Errors
+    ///
+    /// Os de [`Session::connect_svc`]; `TimedOut` se o prazo vencer.
+    pub fn connect_svc_until(
+        &mut self,
+        interface: u32,
+        minor: u16,
+        deadline: u64,
+    ) -> Result<Result<Handle, SvcError>, Error> {
         let mut req = [0u8; osvc::MAX_SHORT_BYTES];
         let n =
             osvc::encode_connect(interface, minor, &mut req).map_err(|_| Error::InvalidArgument)?;
@@ -115,7 +131,7 @@ impl Session {
             osvc::label(Method::Connect),
             &req[..n],
             &mut body,
-            deadline(),
+            deadline,
         )?;
         if label == osvc::REPLY_OK {
             let h = self.buffer.get().caps[0];
