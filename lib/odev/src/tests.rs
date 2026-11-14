@@ -164,3 +164,20 @@ fn irq_legada_pela_rota() {
     assert_eq!(reg.legacy_gsi(0x18, 5), None);
     assert_eq!(reg.legacy_gsi(0x28, 1), None);
 }
+
+#[test]
+fn iommu_nunca_casa() {
+    let mut node = blk_node();
+    node.pci_id = Some((0x1022, 0x0000));
+    node.class = Some(Class {
+        class: 0x08,
+        subclass: 0x06,
+        prog_if: 0,
+    });
+    assert!(node.is_iommu());
+    let drivers = [
+        drv("por-id", vec![Rule::Pci(0x1022, 0x0000)]),
+        drv("por-classe", vec![Rule::Class(0x08, 0x06, None)]),
+    ];
+    assert!(matches!(best_match(&drivers, &node), Outcome::None));
+}
