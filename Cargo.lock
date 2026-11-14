@@ -539,8 +539,10 @@ dependencies = [
 name = "virtio-blk"
 version = "0.1.0"
 dependencies = [
+ "oidl-rt",
  "optcrypt",
  "ostd",
+ "osvc",
  "vdrv",
  "virtio-core",
 ]

@@ -55,9 +55,29 @@ fn metodo_que_cabe_em_registradores_nao_passa_por_bytes() {
 }
 
 #[test]
-fn handle_na_resposta_e_recusado_com_erro() {
+fn handle_na_resposta_le_o_handle_do_buffer() {
     let src = "package optimus.t @1.0;\ninterface I {\n    m() -> result<handle<I>, u8>;\n}\n";
     let file = parse(src).expect("analisa");
-    let erros = gera_cliente(&file).expect_err("handle não tem cliente");
+    let g = formata(&gera_cliente(&file).expect("gera o cliente"));
+    assert!(g.contains("Result<Result<ostd::kabi::Handle, u8>"), "{g}");
+    assert!(g.contains("buf.get().caps[0]"), "{g}");
+    assert!(g.contains("ostd::ipc::call_corpo("), "{g}");
+}
+
+#[test]
+fn handle_no_pedido_vai_nas_capabilities() {
+    let src = "package optimus.t @1.0;\ninterface I {\n    m(a: handle<I>, n: u32) -> result<(), u8>;\n}\n";
+    let file = parse(src).expect("analisa");
+    let g = formata(&gera_cliente(&file).expect("gera o cliente"));
+    assert!(g.contains("a: ostd::kabi::Handle"), "{g}");
+    assert!(g.contains("ostd::ipc::call_corpo_caps("), "{g}");
+    assert!(g.contains("&[a]"), "{g}");
+}
+
+#[test]
+fn handle_no_erro_e_recusado_com_erro() {
+    let src = "package optimus.t @1.0;\ninterface I {\n    m() -> result<u8, handle<I>>;\n}\n";
+    let file = parse(src).expect("analisa");
+    let erros = gera_cliente(&file).expect_err("handle no erro não tem cliente");
     assert!(erros.iter().any(|e| e.msg.contains("handle")), "{erros:?}");
 }

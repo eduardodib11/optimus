@@ -7,14 +7,19 @@
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
+#![allow(clippy::cast_possible_truncation)]
 
-use ostd::kabi::{Error, Handle};
+use ostd::kabi::{Error, Handle, ObjectType, Rights};
+use ostd::ring::{Consumer, Producer};
 use ostd::rt::Start;
 use ostd::svc::Session;
+use ostd::vm::{Mapping, SELF};
 
+mod block_cliente;
 mod console_cliente;
 mod display_cliente;
 
+use block_cliente::BlockDeviceCliente;
 use console_cliente::ConsoleCliente;
 use display_cliente::DisplayDeviceCliente;
 
@@ -105,6 +110,137 @@ fn display(s: &mut Session) {
     }
 }
 
+/// Onde os anéis e a região de dados do `BlockDevice` ficam mapeados.
+const SUBMIT_VA: u64 = 0x30_0000_0000;
+const DONE_VA: u64 = 0x30_0010_0000;
+const DATA_VA: u64 = 0x30_0020_0000;
+/// Mesmos valores que o driver informa em `info()`.
+const RING_BYTES: u32 = 4096;
+const PAGE: usize = 4096;
+const WINDOW_NS: u64 = 2_000_000_000;
+
+/// Espera a conclusão de `id` no anel de conclusões e devolve o status.
+fn completion(done: &mut Consumer, id: u64) -> Option<u8> {
+    let until = ostd::time::now_ns().saturating_add(WINDOW_NS);
+    let mut rec = [0u8; 16];
+    while ostd::time::now_ns() < until {
+        match done.pop(&mut rec) {
+            Ok(Some((_, 16))) if u64::from_le_bytes(rec[..8].try_into().ok()?) == id => {
+                return Some(rec[8]);
+            }
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => ostd::thread::yield_now(),
+        }
+    }
+    None
+}
+
+/// Um pedido de submissão (24 bytes de carga; ADR 0056, item 4).
+fn submit(ring: &mut Producer, id: u64, op: u8, count: u16, sector: u64) -> bool {
+    let mut b = [0u8; 24];
+    b[..8].copy_from_slice(&id.to_le_bytes());
+    b[8] = op;
+    b[10..12].copy_from_slice(&count.to_le_bytes());
+    b[16..24].copy_from_slice(&sector.to_le_bytes());
+    ring.push(1, &b).is_ok()
+}
+
+/// Faz o papel do `storaged`: pega os anéis pelo contrato `BlockDevice`,
+/// escreve, lê, esvazia e recusa pedidos ruins.
+fn block_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
+    let cli = BlockDeviceCliente::new(ep);
+    let buf = &mut s.buffer;
+    let info = cli.info(buf).ok()?.ok()?;
+    if info.sectors != 2048
+        || info.sector_size != 512
+        || info.max_sectors != 8
+        || info.depth != 4
+        || info.data_bytes != 4 * PAGE as u32
+        || info.ring_bytes != RING_BYTES
+        || info.read_only
+    {
+        return None;
+    }
+    let session = BlockDeviceCliente::new(cli.session(buf).ok()?.ok()?);
+    let submit_obj = session.submit_ring(buf).ok()?.ok()?;
+    let submit_sig = session.submit_signal(buf).ok()?.ok()?;
+    let data_obj = session.data_region(buf).ok()?.ok()?;
+    // O anel de conclusões é do `storaged`: ele o cria e o dá ao driver.
+    let done_obj = ostd::cap::create(
+        quota,
+        ObjectType::MemoryObject,
+        ostd::ring::object_bytes(RING_BYTES),
+    )
+    .ok()?;
+    let done_ntfy = ostd::cap::create(quota, ObjectType::Notification, 0).ok()?;
+    let mut done = Consumer::create(done_obj, DONE_VA, RING_BYTES, 0x0B02, done_ntfy).ok()?;
+    let done_sig = ostd::cap::mint(done_ntfy, Rights::SIGNAL, 0, None).ok()?;
+    let done_rw = ostd::cap::mint(
+        done_obj,
+        Rights::MAP | Rights::READ | Rights::WRITE,
+        0,
+        None,
+    )
+    .ok()?;
+    session.attach_done(buf, done_rw, done_sig).ok()?.ok()?;
+    // Uma segunda ligação é recusada.
+    if !matches!(session.attach_done(buf, done_rw, done_sig), Ok(Err(_))) {
+        return None;
+    }
+    let mut ring = Producer::open(submit_obj, SUBMIT_VA, RING_BYTES, submit_sig, 1).ok()?;
+    let mut data = Mapping::new(
+        SELF,
+        data_obj,
+        DATA_VA,
+        4 * PAGE as u64,
+        ostd::kabi::vm::WRITE,
+    )
+    .ok()?;
+    let mut pattern = [0u8; PAGE];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7) ^ 0x5a;
+    }
+    data.bytes_mut()?[..PAGE].copy_from_slice(&pattern);
+    // Escreve o setor 8 (4 KiB), esvazia o buffer e lê de volta.
+    if !submit(&mut ring, 1, 1, 8, 8) || completion(&mut done, 1)? != 0 {
+        return None;
+    }
+    data.bytes_mut()?[..PAGE].fill(0);
+    if !submit(&mut ring, 2, 0, 8, 8) || completion(&mut done, 2)? != 0 {
+        return None;
+    }
+    if data.bytes()[..PAGE] != pattern[..] {
+        return None;
+    }
+    // FLUSH, e os pedidos ruins: fora do disco, operação desconhecida,
+    // mais setores que o máximo e deslocamento desalinhado.
+    if !submit(&mut ring, 3, 2, 0, 0) || completion(&mut done, 3)? != 0 {
+        return None;
+    }
+    if !submit(&mut ring, 4, 0, 8, 2048) || completion(&mut done, 4)? != 1 {
+        return None;
+    }
+    if !submit(&mut ring, 5, 9, 1, 0) || completion(&mut done, 5)? != 5 {
+        return None;
+    }
+    if !submit(&mut ring, 6, 0, 9, 0) || completion(&mut done, 6)? != 5 {
+        return None;
+    }
+    Some(())
+}
+
+fn block(s: &mut Session, quota: Handle) {
+    let Some(ep) = connect(s, b"optimus.block.BlockDevice") else {
+        ostd::debug::print("drvcli: block: sem driver");
+        return;
+    };
+    if block_steps(s, ep, quota).is_some() {
+        ostd::debug::print("drvcli: block ok");
+    } else {
+        ostd::debug::print("drvcli: block: falhou");
+    }
+}
+
 fn main(start: Start) -> ! {
     let mut s = match Session::start(start.args) {
         Ok(s) => s,
@@ -122,7 +258,9 @@ fn main(start: Start) -> ! {
         ostd::debug::set_log(Handle::from_raw(c.handle));
     }
     let _ = s.ready();
+    let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     console(&mut s);
     display(&mut s);
+    block(&mut s, quota);
     ostd::thread::exit()
 }

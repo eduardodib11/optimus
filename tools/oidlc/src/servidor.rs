@@ -153,7 +153,7 @@ impl Gen<'_> {
             "// Gerado pelo oidlc a partir do arquivo .oidl. Não edite à mão.\n\
              //\n\
              // Layout e formato de fio: ADR 0033. Usa só `oidl_rt` e `core`.\n\n\
-             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, clippy::match_single_binding, clippy::manual_range_patterns, non_upper_case_globals, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
+             #![allow(unused_parens, unused_variables, dead_code, clippy::double_parens, clippy::unreadable_literal, clippy::many_single_char_names, clippy::doc_markdown, clippy::unnecessary_wraps, clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref, clippy::manual_let_else, clippy::elidable_lifetime_names, clippy::needless_lifetimes, clippy::explicit_auto_deref, clippy::needless_pass_by_value, clippy::match_single_binding, clippy::manual_range_patterns, non_upper_case_globals, unused_assignments, reason = \"código gerado: estilo e campos que um serviço pode não usar\")]\n\n\
              use oidl_rt::{Error, Reader, Writer};\n\n\
              /// Contexto de uma chamada: o badge do remetente (ADR 0027).\n\
              pub struct Contexto {\n    /// Badge do endpoint que chamou.\n    pub badge: u64,\n}\n\n\
@@ -785,8 +785,9 @@ pub fn formata(src: &str) -> String {
 /// a resposta (ok ou erro, pelo tipo do rótulo).
 ///
 /// Limites desta versão: parâmetros só de tipos por valor (primitivos,
-/// `string`, `enum`, `flags` e tipos com `Timestamp`); `handle`, `vec`,
-/// `struct` como parâmetro e `oneway` ainda não têm cliente.
+/// `string`, `enum`, `flags` e tipos com `Timestamp`) e `handle`; `vec`,
+/// `struct` como parâmetro e `oneway` ainda não têm cliente. `handle` vale
+/// como parâmetro e como sucesso da resposta (um só).
 ///
 /// # Errors
 ///
@@ -900,7 +901,15 @@ impl Gen<'_> {
         let mut assinatura_pub = String::new();
         let mut assinatura_aux = String::new();
         let mut chamada = String::new();
+        let mut caps_pedido: Vec<String> = Vec::new();
         for p in &m.params {
+            if matches!(p.ty, Type::Handle(_)) {
+                // `handle<T>` não ocupa bytes: vai nas capabilities, na ordem
+                // dos parâmetros (o servidor lê na mesma ordem).
+                let _ = write!(assinatura_pub, ", {}: ostd::kabi::Handle", p.name.name);
+                caps_pedido.push(p.name.name.clone());
+                continue;
+            }
             if !self.por_valor(&p.ty) {
                 self.erro(
                     p.name.pos,
@@ -929,7 +938,8 @@ impl Gen<'_> {
                 enc.push_str(&self.enc(&p.ty, &p.name.name, &at));
             }
         }
-        let mutavel = if m.params.is_empty() { "" } else { "mut " };
+        let so_valores = m.params.len() - caps_pedido.len();
+        let mutavel = if so_valores == 0 { "" } else { "mut " };
         let _ = writeln!(
             aux,
             "fn codifica_{sn}_{ordinal}(saida: &mut [u8]{assinatura_aux}) -> Result<usize, Error> {{\n    let {mutavel}w = Writer::new(saida, {})?;\n{enc}    Ok(w.finish())\n}}\n",
@@ -938,6 +948,7 @@ impl Gen<'_> {
 
         let ok_rust = match &m.ret {
             Some(r) if matches!(r.ok, Type::Unit) => "()".to_string(),
+            Some(r) if matches!(r.ok, Type::Handle(_)) => "ostd::kabi::Handle".to_string(),
             Some(r) => match self.rs(&r.ok, Modo::Elidido) {
                 Some(t) => t,
                 None => return self.erro(m.name.pos, format!("'{nome}': resposta sem tipo Rust")),
@@ -952,18 +963,19 @@ impl Gen<'_> {
             },
             None => "()".to_string(),
         };
-        if matches!(ret.ok, Type::Handle(_)) || matches!(ret.err, Type::Handle(_)) {
+        if matches!(ret.err, Type::Handle(_)) {
             self.erro(
                 m.name.pos,
-                format!("'{nome}': resposta com handle ainda não tem cliente"),
+                format!("'{nome}': handle no erro não tem cliente"),
             );
             return;
         }
+        let ok_handle = matches!(ret.ok, Type::Handle(_));
         for (lado, ty, cab, rust) in [
             ("ok", &ret.ok, cab_ok.tamanho, &ok_rust),
             ("err", &ret.err, cab_err.tamanho, &err_rust),
         ] {
-            let corpo = if matches!(ty, Type::Unit) {
+            let corpo = if matches!(ty, Type::Unit | Type::Handle(_)) {
                 String::from("    let _ = corpo;\n")
             } else {
                 match self.dec(ty) {
@@ -971,12 +983,15 @@ impl Gen<'_> {
                     Err(msg) => return self.erro(m.name.pos, format!("'{nome}': {msg}")),
                 }
             };
+            let sem_corpo = matches!(ty, Type::Unit | Type::Handle(_));
             let valor = if matches!(ty, Type::Unit) {
                 "Ok(())"
+            } else if sem_corpo {
+                "Ok(ostd::kabi::Handle::from_raw(0))"
             } else {
                 "Ok(v)"
             };
-            let mutavel_r = if matches!(ty, Type::Unit) { "" } else { "mut " };
+            let mutavel_r = if sem_corpo { "" } else { "mut " };
             let _ = writeln!(
                 aux,
                 "fn decodifica_{lado}_{sn}_{ordinal}(corpo: &[u8]) -> Result<{rust}, Error> {{\n    let {mutavel_r}r = Reader::new(corpo, {cab})?;\n{corpo}    r.finish()?;\n    {valor}\n}}\n"
@@ -987,9 +1002,25 @@ impl Gen<'_> {
         let tam_pedido = tamanho_buffer(pedido.tamanho, pedido.pior_caso);
         let tam_resposta = tamanho_buffer(cab_ok.tamanho, cab_ok.pior_caso)
             .max(tamanho_buffer(cab_err.tamanho, cab_err.pior_caso));
+        let chamada_ipc = if caps_pedido.is_empty() {
+            format!(
+                "ostd::ipc::call_corpo(self.ep, buf, {rotulo:#018X}, &pedido[..n], &mut saida, 0)?"
+            )
+        } else {
+            format!(
+                "ostd::ipc::call_corpo_caps(self.ep, buf, {rotulo:#018X}, &pedido[..n], &[{}], &mut saida, 0)?",
+                caps_pedido.join(", ")
+            )
+        };
+        let braco_ok = if ok_handle {
+            // O handle novo chega no cabeçalho do buffer de IPC.
+            "let h = buf.get().caps[0];\n            if h == 0 {\n                return Err(ostd::kabi::Error::InvalidArgument);\n            }\n            Ok(Ok(ostd::kabi::Handle::from_raw(h)))".to_string()
+        } else {
+            format!("Ok(Ok(decodifica_ok_{sn}_{ordinal}(&saida[..m]).map_err(erro_oidl)?))")
+        };
         let _ = writeln!(
             metodos,
-            "    /// Método `{nome}` (ordinal {ordinal}).\n    pub fn {nome}(&self, buf: &mut ostd::ipc::Buffer{assinatura_pub}) -> Result<Result<{ok_rust}, {err_rust}>, ostd::kabi::Error> {{\n        let mut pedido = [0u8; {tam_pedido}];\n        let n = codifica_{sn}_{ordinal}(&mut pedido{chamada}).map_err(erro_oidl)?;\n        let mut saida = [0u8; {tam_resposta}];\n        let (rotulo, m) = ostd::ipc::call_corpo(self.ep, buf, {rotulo:#018X}, &pedido[..n], &mut saida, 0)?;\n        if rotulo >> 62 == 0 {{\n            Ok(Ok(decodifica_ok_{sn}_{ordinal}(&saida[..m]).map_err(erro_oidl)?))\n        }} else {{\n            Ok(Err(decodifica_err_{sn}_{ordinal}(&saida[..m]).map_err(erro_oidl)?))\n        }}\n    }}\n"
+            "    /// Método `{nome}` (ordinal {ordinal}).\n    pub fn {nome}(&self, buf: &mut ostd::ipc::Buffer{assinatura_pub}) -> Result<Result<{ok_rust}, {err_rust}>, ostd::kabi::Error> {{\n        let mut pedido = [0u8; {tam_pedido}];\n        let n = codifica_{sn}_{ordinal}(&mut pedido{chamada}).map_err(erro_oidl)?;\n        let mut saida = [0u8; {tam_resposta}];\n        let (rotulo, m) = {chamada_ipc};\n        if rotulo >> 62 == 0 {{\n            {braco_ok}\n        }} else {{\n            Ok(Err(decodifica_err_{sn}_{ordinal}(&saida[..m]).map_err(erro_oidl)?))\n        }}\n    }}\n"
         );
     }
 }

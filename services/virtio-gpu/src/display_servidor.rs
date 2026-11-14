@@ -21,6 +21,7 @@
     clippy::match_single_binding,
     clippy::manual_range_patterns,
     non_upper_case_globals,
+    unused_assignments,
     reason = "código gerado: estilo e campos que um serviço pode não usar"
 )]
 
