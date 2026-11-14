@@ -1097,12 +1097,10 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
     // da próxima está mapeada. A próxima segue viva em `current`, que só
     // esta CPU muda.
     unsafe {
-        if let Some(area) = prev_fpu {
-            fpu::save(core::ptr::with_exposed_provenance_mut(area));
-        }
-        if let Some(area) = incoming.fpu {
-            fpu::restore(core::ptr::with_exposed_provenance(area));
-        }
+        fpu::switch(
+            prev_fpu.map(core::ptr::with_exposed_provenance_mut),
+            incoming.fpu.map(core::ptr::with_exposed_provenance),
+        );
         if let Some(top) = incoming.stack_top {
             syscall::set_kernel_stack(top);
         }

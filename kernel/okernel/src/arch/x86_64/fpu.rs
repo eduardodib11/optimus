@@ -28,6 +28,15 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 
 static XSAVE: AtomicBool = AtomicBool::new(false);
 static XSAVEOPT: AtomicBool = AtomicBool::new(false);
+/// `XGETBV` com ECX = 1 (XINUSE) existe (CPUID.(0xD, 1).EAX\[2\]).
+static XINUSE: AtomicBool = AtomicBool::new(false);
+
+/// MXCSR do estado inicial (todas as exceções mascaradas).
+const MXCSR_INIT: u32 = 0x1f80;
+/// Deslocamento do MXCSR na área legada do XSAVE.
+const MXCSR_AT: usize = 24;
+/// Deslocamento do `XSTATE_BV` (cabeçalho do XSAVE).
+const XSTATE_BV_AT: usize = 512;
 static AREA_BYTES: AtomicUsize = AtomicUsize::new(FXSAVE_BYTES);
 
 /// Liga SSE para o anel 3 e, se houver, XSAVE; mede a área.
@@ -57,7 +66,9 @@ pub fn init() {
         FXSAVE_BYTES
     };
     XSAVE.store(xsave, Ordering::Relaxed);
-    XSAVEOPT.store(xsave && cpu::cpuid(0xd, 1).eax & 1 != 0, Ordering::Relaxed);
+    let sub1 = if xsave { cpu::cpuid(0xd, 1).eax } else { 0 };
+    XSAVEOPT.store(sub1 & 1 != 0, Ordering::Relaxed);
+    XINUSE.store(sub1 & (1 << 2) != 0, Ordering::Relaxed);
     AREA_BYTES.store(bytes.max(FXSAVE_BYTES), Ordering::Relaxed);
 }
 
@@ -102,6 +113,101 @@ pub fn uses_xsave() -> bool {
     XSAVE.load(Ordering::Relaxed)
 }
 
+/// Troca o estado de FPU/SIMD da CPU: salva o de quem sai em `prev` e
+/// carrega o de quem entra de `next` (T-519, ADR 0058, item 1).
+///
+/// A política continua ansiosa: ao voltar, os registradores têm o estado
+/// de quem entra. O que muda é pular o trabalho que não muda nada quando os
+/// registradores estão no estado inicial (XINUSE zero e MXCSR padrão), o
+/// caso de todo programa do sistema, que é compilado sem SSE:
+///
+/// - a área de quem sai só ganha o cabeçalho do estado inicial
+///   (`XSTATE_BV` zero e MXCSR padrão), em vez do `XSAVEOPT`;
+/// - a área de quem entra, se também está no estado inicial, não é
+///   carregada: o `XRSTOR` deixaria os registradores como já estão.
+///
+/// # Safety
+///
+/// Cada área aponta [`area_bytes`] bytes alinhados a 64, só da thread
+/// dela, que ninguém mais acessa durante a troca; `next` foi gravada por
+/// esta função, por [`save`] ou iniciada como a de uma thread nova
+/// (cabeçalho zerado, FCW e MXCSR do estado inicial).
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "a área é alinhada a 64 e os campos a 4 e 8 dentro dela"
+)]
+pub unsafe fn switch(prev: Option<*mut u8>, next: Option<*const u8>) {
+    let init = regs_init();
+    if let Some(area) = prev {
+        if init {
+            // SAFETY: contrato acima; MXCSR e `XSTATE_BV` ficam dentro da
+            // área e alinhados. Com `XSTATE_BV` zero, o `XRSTOR` põe cada
+            // componente no estado inicial e só lê o MXCSR da área, que
+            // fica o padrão: é o estado que a CPU tem agora.
+            unsafe {
+                area.add(MXCSR_AT).cast::<u32>().write(MXCSR_INIT);
+                area.add(XSTATE_BV_AT).cast::<u64>().write(0);
+            }
+        } else {
+            // SAFETY: contrato acima.
+            unsafe { save(area) };
+        }
+    }
+    if let Some(area) = next {
+        // SAFETY: contrato acima.
+        if !(init && unsafe { area_init(area) }) {
+            // SAFETY: contrato acima.
+            unsafe { restore(area) };
+        }
+    }
+}
+
+/// A troca pula o trabalho redundante ([`switch`]): a CPU tem XINUSE.
+pub fn skips_redundant() -> bool {
+    XINUSE.load(Ordering::Relaxed)
+}
+
+/// Os registradores de FPU/SIMD desta CPU estão no estado inicial: todo
+/// componente do XCR0 com XINUSE zero (o que garante a configuração
+/// inicial, com FCW e o resto do x87 inclusos) e MXCSR padrão, que o
+/// XINUSE do SSE não cobre em todas as CPUs. Falso sem XINUSE.
+fn regs_init() -> bool {
+    if !XINUSE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let (low, high): (u32, u32);
+    let mut mxcsr: u32 = 0;
+    // SAFETY: XGETBV com ECX = 1 existe (CPUID acima) e só lê; STMXCSR
+    // grava 4 bytes em `mxcsr` (CR4.OSFXSR ligado no `init`).
+    unsafe {
+        asm!("xgetbv", in("ecx") 1, out("eax") low, out("edx") high, options(nomem, nostack));
+        asm!("stmxcsr [{}]", in(reg) &raw mut mxcsr, options(nostack));
+    }
+    low == 0 && high == 0 && mxcsr == MXCSR_INIT
+}
+
+/// A área guarda o estado inicial: o `XRSTOR` dela põe todo componente no
+/// estado inicial e o MXCSR no padrão.
+///
+/// # Safety
+///
+/// `area` aponta uma área de [`area_bytes`] bytes, alinhada a 64, com
+/// cabeçalho XSAVE (só chamada com XINUSE, que implica XSAVE).
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "a área é alinhada a 64 e os campos a 4 e 8 dentro dela"
+)]
+unsafe fn area_init(area: *const u8) -> bool {
+    // SAFETY: contrato acima; os campos ficam dentro da área, alinhados.
+    let (bv, mxcsr) = unsafe {
+        (
+            area.add(XSTATE_BV_AT).cast::<u64>().read(),
+            area.add(MXCSR_AT).cast::<u32>().read(),
+        )
+    };
+    bv == 0 && mxcsr == MXCSR_INIT
+}
+
 /// Salva o estado de FPU/SIMD da CPU em `area`.
 ///
 /// # Safety
@@ -112,9 +218,12 @@ pub unsafe fn save(area: *mut u8) {
     if XSAVEOPT.load(Ordering::Relaxed) {
         // SAFETY: como abaixo. XSAVEOPT deixa de gravar componentes no
         // estado inicial ou não modificados desde o último XRSTOR, se foi
-        // desta mesma área; ela só é salva para a thread que sai da CPU,
-        // cujo XRSTOR foi o último (na troca para ela), e ninguém grava a
-        // área enquanto a thread roda.
+        // desta mesma área; se não foi (a troca para ela pulou o XRSTOR,
+        // ver `switch`), grava tudo. Ninguém grava a área enquanto a
+        // thread roda, e o cabeçalho que `switch` grava só substitui um
+        // estado que os registradores já deixaram por escrita (todo
+        // componente que o XRSTOR deixou fora do inicial foi escrito para
+        // voltar a ele, o que marca a modificação).
         unsafe {
             asm!("xsaveopt64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
         }
