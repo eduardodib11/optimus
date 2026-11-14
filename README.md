@@ -30,6 +30,18 @@ cargo xtask kani     # provas Kani das capabilities (exige o Kani no host)
 Se o OVMF não estiver num caminho conhecido, aponte `OVMF_CODE` e `OVMF_VARS`
 para os arquivos `.fd`.
 
+### QEMU para o AMD-Vi
+
+Os boots com `-device amd-iommu` (`cargo xtask test iommu`) precisam do QEMU
+10.1 ou mais novo: até o 10.0 o `amd-iommu` não atualiza a cauda do log de
+eventos, e o kernel não vê falta de DMA nenhuma (ADR 0055). O script compila
+só o `x86_64-softmmu` em `target/qemu-amd`:
+
+```sh
+export OPTIMUS_QEMU_AMD=$(tools/qemu-amd.sh)
+cargo xtask test iommu
+```
+
 ## Licença
 
 Apache-2.0. Contribuições exigem DCO; veja [CONTRIBUTING.md](CONTRIBUTING.md).

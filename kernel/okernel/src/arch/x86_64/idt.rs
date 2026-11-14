@@ -227,8 +227,10 @@ extern "sysv64" fn exception_handler(frame: &mut TrapFrame) {
             crate::ksmp::ipi::on_ipi();
         } else if frame.vector == u64::from(super::apic::IOMMU_FAULT_VECTOR) {
             // Falta de DMA (ADR 0044, item 4): o log registra cada uma.
+            // O `devmgr` acordado pode ser mais prioritário (ADR 0055).
             super::apic::eoi();
             crate::kiommu::on_fault_irq();
+            crate::kthread::preempt();
         } else if crate::kirq::fire(frame.vector) {
             // Linha de um objeto `Interrupt` (T-209): a notificação ligada
             // pode ter acordado alguém mais prioritário.
