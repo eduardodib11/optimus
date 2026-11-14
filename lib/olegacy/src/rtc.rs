@@ -14,7 +14,7 @@ pub const STATUS_B: u8 = 0x0B;
 /// Registrador de século padrão (o FADT pode indicar outro).
 pub const CENTURY_DEFAULT: u8 = 0x32;
 /// Tentativas de leitura estável antes de desistir.
-pub const MAX_TRIES: u32 = 16;
+pub const MAX_TRIES: u32 = 256;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 struct Raw {
