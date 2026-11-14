@@ -126,3 +126,22 @@ fn aead_tempo_constante() {
     });
     assert!(t_open.abs() < LIMITE, "abrir: |t| = {t_open}");
 }
+
+/// `BLAKE2b` (base do Argon2id): classe 0 = zeros, classe 1 = outros bytes.
+#[test]
+#[ignore = "campanha de tempo constante; rode com --ignored em --release"]
+fn blake2b_tempo_constante() {
+    use optcrypt::blake2b::hash;
+
+    let zeros = [0u8; 200];
+    let mut rnd = [0u8; 200];
+    for (i, b) in rnd.iter_mut().enumerate() {
+        *b = u8::try_from(i * 97 % 256).unwrap();
+    }
+    let t = mede(|c| {
+        let mut out = [0u8; 32];
+        hash(black_box(if c == 0 { &zeros } else { &rnd }), &mut out);
+        black_box(out);
+    });
+    assert!(t.abs() < LIMITE, "|t| = {t}");
+}

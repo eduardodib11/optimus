@@ -18,6 +18,8 @@
 #![forbid(unsafe_code)]
 
 pub mod aead;
+pub mod argon2;
+pub mod blake2b;
 pub mod blake3;
 pub mod block;
 pub mod chacha20;
