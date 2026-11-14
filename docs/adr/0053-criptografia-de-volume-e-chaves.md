@@ -1,6 +1,6 @@
 # ADR 0053: Criptografia de volume e chaves
 
-- Status: proposta (aguarda a revisão do Eduardo; nenhum código de criptografia antes do aceite; T-503)
+- Status: aceita (aprovada por Eduardo em 2026-11-14)
 - Data: 2026-11-14
 - Origem: SDD v1.0, seções 5.3, 5.4, 9.3, 13.2, 13.3 e 13.5; backlog do M5, T-503
 - Relaciona-se com: ADR 0004 (`optcrypt`), 0014 (OptFS), 0038 (`memd`), 0039 (aleatoriedade), 0052 (layout), 0054 (entropia)

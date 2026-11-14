@@ -1,6 +1,6 @@
 # ADR 0056: Contrato do `storaged`, `BlockStore` e `BlockDevice`
 
-- Status: proposta (aguarda a revisão do Eduardo; T-506)
+- Status: aceita (aprovada por Eduardo em 2026-11-14)
 - Data: 2026-11-14
 - Origem: SDD v1.0, seções 8, 9.1, 9.4 e 15; backlog do M5, T-506
 - Relaciona-se com: ADR 0007 (anéis), 0033 (OIDL), 0036 (anel SPSC), 0038 (`memd`), 0046 (virtio), 0051 (reinício de driver), 0052 (OptFS)

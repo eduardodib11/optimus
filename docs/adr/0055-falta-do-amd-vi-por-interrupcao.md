@@ -1,6 +1,6 @@
 # ADR 0055: Falta do AMD-Vi por interrupção e `devmgr` sem espera por prazo
 
-- Status: proposta (aguarda a revisão do Eduardo; T-505 e T-507)
+- Status: aceita (aprovada por Eduardo em 2026-11-14)
 - Data: 2026-11-14
 - Origem: SDD v1.0, seção 8.1 (driver isolado; falha contida e reiniciada); pendência do M4 (`docs/aceite/m4.md`); backlog do M5, T-505 e T-507
 - Relaciona-se com: ADR 0009 (kernel tickless), 0044 (IOMMU), 0051 (falta de DMA contida), 0035 (`obj_bind_notify`)

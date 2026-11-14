@@ -1,6 +1,6 @@
 # ADR 0054: virtio-rng como fonte de entropia
 
-- Status: proposta (aguarda a revisão do Eduardo; T-504)
+- Status: aceita (aprovada por Eduardo em 2026-11-14)
 - Data: 2026-11-14
 - Origem: SDD v1.0, seções 5.1 (passo 5), 13.3 e 13.5; pendência do M4 (`docs/aceite/m4.md`); backlog do M5, T-504
 - Relaciona-se com: ADR 0039 (item 4, aleatoriedade), 0042, 0046 (virtio), 0053 (chaves)

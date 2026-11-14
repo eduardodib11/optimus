@@ -1,6 +1,6 @@
 # ADR 0052: Layout em disco do OptFS
 
-- Status: proposta (aguarda a revisão do Eduardo; nenhum código do OptFS antes do aceite; T-502)
+- Status: aceita (aprovada por Eduardo em 2026-11-14)
 - Data: 2026-11-14
 - Origem: SDD v1.0, seções 9.1 a 9.4 e 13.2; backlog do M5, T-502
 - Relaciona-se com: ADR 0014 (princípios do OptFS), 0015 (imagem Merkle), 0038 (`memd`), 0053 (criptografia), 0056 (`storaged`)
