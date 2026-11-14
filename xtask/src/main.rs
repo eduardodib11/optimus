@@ -1212,8 +1212,8 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let (wall_seen, reader) = spawn_reader(stdout, tx);
     let mut raw = Vec::new();
     let start = Instant::now();
-    let mut last_key: Option<Instant> = None;
-    let mut last_mouse: Option<Instant> = None;
+    // Última injeção da tecla e do mouse.
+    let mut last_key: (Option<Instant>, Option<Instant>) = (None, None);
     let seen_all = |raw: &[u8]| {
         let text = String::from_utf8_lossy(raw);
         sc.markers.iter().all(|m| text.contains(m))
@@ -1234,7 +1234,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
             screen = Some(shot);
         }
         if let Some(key) = sc.key {
-            inject_key(&monitor, key, &raw, &mut last_key, &mut last_mouse);
+            inject_key(&monitor, key, &raw, &mut last_key);
         }
         shoot_gpu(&monitor, &raw, &mut gpu_shot);
         let frozen = sc.exit.is_none() && seen_all(&raw);
@@ -1384,8 +1384,7 @@ fn inject_key(
     monitor: &Path,
     key: &str,
     raw: &[u8],
-    last: &mut Option<Instant>,
-    last_mouse: &mut Option<Instant>,
+    (last, last_mouse): &mut (Option<Instant>, Option<Instant>),
 ) {
     let text = String::from_utf8_lossy(raw);
     // Com um `virtio-keyboard-pci` (1af4:1052) o QEMU entrega a tecla a ele
