@@ -28,7 +28,8 @@ pub fn pcid(on: bool) -> bool {
     }
     true
 }
-const N: usize = 8;
+const N: usize = 16;
+pub static DIR: AtomicU64 = AtomicU64::new(0);
 static LAST: AtomicU64 = AtomicU64::new(0);
 static SUM: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
@@ -40,6 +41,7 @@ pub fn mark(k: usize) {
     if !ON.load(Ordering::Relaxed) {
         return;
     }
+    let k = k + 8 * DIR.load(Ordering::Relaxed) as usize;
     let now = cpu::rdtsc_ordered();
     let d = now.wrapping_sub(LAST.load(Ordering::Relaxed));
     LAST.store(now, Ordering::Relaxed);

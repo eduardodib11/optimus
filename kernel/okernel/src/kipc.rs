@@ -43,6 +43,7 @@ pub fn syscall(frame: &mut TrapFrame, call: Syscall) {
         .and_then(|me| Some((me.cspace()?, me)))
         .ok_or(Error::NotSupported)
         .and_then(|(space, me)| {
+            crate::ketapas::DIR.store(u64::from(call == Syscall::IpcReplyRecv), Ordering::Relaxed);
             crate::ketapas::mark(1);
             invoke(&space, &me, call, &regs)
         });
