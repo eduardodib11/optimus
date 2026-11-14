@@ -1663,6 +1663,9 @@ const INTEGRATION_MARKERS: &[&str] = &[
     // que lê a hora pelas portas do CMOS ([`check_rtcd`] confere o valor).
     "[\"PNP0B00\"]: rtcd",
     "rtcd: RTC em ",
+    // Aceite da T-515: o `timed` acerta o relógio pelo RTC do boot
+    // ([`check_timed`] confere o valor).
+    "timed: hora do RTC em ",
     // Aceite da T-406 (PS/2): o `i8042d` parte pelo nó `PNP0303` e a tecla
     // "a" (código 0x1e) que o xtask injeta pelo monitor chega ao `inputd`.
     "[\"PNP0303\"]: i8042d",
@@ -1708,6 +1711,7 @@ fn integration(opts: &Options) -> Result {
             },
         )?;
         check_rtcd(&serial)?;
+        check_timed(&serial)?;
         if n > 1 {
             check_cpus_online(&serial, n)?;
         }
@@ -1720,24 +1724,36 @@ fn integration(opts: &Options) -> Result {
 /// segundos (o RTC do QEMU segue o relógio do host, em UTC).
 const RTCD_TOLERANCE_S: i64 = 120;
 
-/// Aceite da T-406: a hora que o `rtcd` leu do CMOS é a do QEMU.
-fn check_rtcd(serial: &str) -> Result {
+/// Lê o inteiro depois de `marker` na serial e confere com a hora do host.
+fn check_wall(serial: &str, marker: &str, who: &str) -> Result {
     let read = serial
-        .split("rtcd: RTC em ")
+        .split(marker)
         .nth(1)
         .and_then(|rest| rest.split(' ').next())
         .and_then(|n| n.parse::<i64>().ok())
-        .ok_or("o rtcd não informou a hora")?;
+        .ok_or(format!("o {who} não informou a hora"))?;
     let host = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| format!("relógio do host: {e}"))?
         .as_secs();
     let diff = read - i64::try_from(host).map_err(|e| format!("relógio do host: {e}"))?;
     if diff.abs() > RTCD_TOLERANCE_S {
-        return Err(format!("o rtcd leu {read}, {diff} s longe da hora do host"));
+        return Err(format!(
+            "o {who} leu {read}, {diff} s longe da hora do host"
+        ));
     }
-    println!("xtask: hora do rtcd difere {diff} s da do host");
+    println!("xtask: hora do {who} difere {diff} s da do host");
     Ok(())
+}
+
+/// Aceite da T-406: a hora que o `rtcd` leu do CMOS é a do QEMU.
+fn check_rtcd(serial: &str) -> Result {
+    check_wall(serial, "rtcd: RTC em ", "rtcd")
+}
+
+/// Aceite da T-515: a hora do RTC que o `timed` adotou é a do QEMU.
+fn check_timed(serial: &str) -> Result {
+    check_wall(serial, "timed: hora do RTC em ", "timed")
 }
 
 /// Rodadas do teste de caos (aceite do T-366).
