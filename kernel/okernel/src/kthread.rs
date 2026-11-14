@@ -1097,10 +1097,11 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
     // da próxima está mapeada. A próxima segue viva em `current`, que só
     // esta CPU muda.
     unsafe {
-        if let Some(area) = prev_fpu {
+        let nofpu = crate::ketapas::NOFPU.load(Ordering::Relaxed);
+        if let Some(area) = prev_fpu.filter(|_| !nofpu) {
             fpu::save(core::ptr::with_exposed_provenance_mut(area));
         }
-        if let Some(area) = incoming.fpu {
+        if let Some(area) = incoming.fpu.filter(|_| !nofpu) {
             fpu::restore(core::ptr::with_exposed_provenance(area));
         }
         if let Some(top) = incoming.stack_top {
@@ -1123,7 +1124,7 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
     // Todo caminho até o anel 3 passa por aqui antes de voltar ao usuário
     // (a primeira entrada pelo trampolim, a troca direta do IPC e a thread
     // que mudou de CPU), então o TLS dela vale ao chegar no usuário.
-    if let Some(fs) = incoming.fs_base {
+    if let Some(fs) = incoming.fs_base.filter(|_| !crate::ketapas::NOFS.load(Ordering::Relaxed)) {
         cpu::load_user_fs_base(fs);
     }
     // SAFETY: `prev_slot` é o rsp salvo da anterior, viva (em

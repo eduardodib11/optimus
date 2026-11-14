@@ -214,6 +214,10 @@ fn zero_frame(frame: PhysAddr) {
 /// Como em [`activate`].
 pub unsafe fn load_root(root: u64) {
     tlb::note_root(root);
+    if cpu::read_cr4() & crate::ketapas::CR4_PCIDE != 0 {
+        unsafe { cpu::write_cr3(root | ((root >> 12) % 4095 + 1) | (1 << 63)) };
+        return;
+    }
     // SAFETY: contrato acima: o PML4 mapeia o kernel em execução.
     unsafe { cpu::write_cr3(root) };
 }

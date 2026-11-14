@@ -7,6 +7,27 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::arch::x86_64::{cpu, fpu};
 
 pub static ON: AtomicBool = AtomicBool::new(false);
+pub static NOFPU: AtomicBool = AtomicBool::new(false);
+pub static NOFS: AtomicBool = AtomicBool::new(false);
+pub const CR4_PCIDE: u64 = 1 << 17;
+
+/// Liga ou desliga o PCID nesta CPU (só no experimento).
+pub fn pcid(on: bool) -> bool {
+    if cpu::cpuid(1, 0).ecx & (1 << 17) == 0 {
+        return false;
+    }
+    let cr4 = cpu::read_cr4();
+    unsafe {
+        if on {
+            cpu::write_cr3(cpu::read_cr3() & 0x000f_ffff_ffff_f000);
+            cpu::write_cr4(cr4 | CR4_PCIDE);
+        } else {
+            cpu::write_cr3(cpu::read_cr3() & 0x000f_ffff_ffff_f000);
+            cpu::write_cr4(cr4 & !CR4_PCIDE);
+        }
+    }
+    true
+}
 const N: usize = 8;
 static LAST: AtomicU64 = AtomicU64::new(0);
 static SUM: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];

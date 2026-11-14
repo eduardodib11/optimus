@@ -306,6 +306,37 @@ pub fn run() -> ! {
             }
         }
     }
+    for (name, pcid, nofpu, nofs) in [
+        ("base", false, false, false),
+        ("pcid", true, false, false),
+        ("sem_fpu", false, true, false),
+        ("sem_fs", false, false, true),
+        ("pcid_sem_fpu_sem_fs", true, true, true),
+        ("base2", false, false, false),
+    ] {
+        let ok_pcid = !pcid || crate::ketapas::pcid(true);
+        crate::ketapas::NOFPU.store(nofpu, Ordering::Relaxed);
+        crate::ketapas::NOFS.store(nofs, Ordering::Relaxed);
+        let r = ipc_on(false);
+        crate::ketapas::NOFPU.store(false, Ordering::Relaxed);
+        crate::ketapas::NOFS.store(false, Ordering::Relaxed);
+        if pcid {
+            crate::ketapas::pcid(false);
+        }
+        match r {
+            Ok(mut s) => {
+                s.sort_unstable();
+                let n = s.len();
+                info!(
+                    "bench: variante {name} pcid_ok={ok_pcid} mediana_ns={} p99_ns={} min_ns={}",
+                    ns(s[n / 2]),
+                    ns(s[n * 99 / 100]),
+                    ns(s[0])
+                );
+            }
+            Err(why) => info!("bench: variante {name} erro {why}"),
+        }
+    }
     info!("bench: fim");
     qemu_exit(if ok {
         QemuExit::Success

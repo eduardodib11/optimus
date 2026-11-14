@@ -104,7 +104,7 @@ pub fn bench(opts: &Options) -> Result {
     let user = boot_scenario(&ci, &USER_SCENARIO)?;
     let services = services(&boot, &user)?;
     let meta = meta();
-    for l in serial.lines().filter(|l| l.contains("bench: etapa") || l.contains("bench: custos")) {
+    for l in serial.lines().filter(|l| l.contains("bench: etapa") || l.contains("bench: custos") || l.contains("bench: variante")) {
         println!("EXPERIMENTO {l}");
     }
     let mut report = report(&serial, &meta, opts.smp)?;
