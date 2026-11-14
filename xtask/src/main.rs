@@ -569,11 +569,47 @@ fn ovmf() -> Result<(PathBuf, PathBuf)> {
         })
 }
 
+/// Variável com o QEMU dos boots com `amd-iommu`.
+const QEMU_AMD_VAR: &str = "OPTIMUS_QEMU_AMD";
+/// Versão mínima do QEMU com `amd-iommu` (ADR 0055; T-510): até o 10.0 ele
+/// nunca atualiza a cauda do log de eventos, e o kernel não lê falta nenhuma.
+const QEMU_AMD_MIN: (u32, u32) = (10, 1);
+
+/// O QEMU do boot: com `amd-iommu`, o de `OPTIMUS_QEMU_AMD` (ou o do
+/// `PATH`), conferida a versão mínima.
+fn qemu_bin(opts: &Options) -> Result<String> {
+    let path = String::from("qemu-system-x86_64");
+    if !opts.devices.contains(&"amd-iommu") {
+        return Ok(path);
+    }
+    let bin = env::var(QEMU_AMD_VAR).unwrap_or(path);
+    let out = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("rodando {bin} --version: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text
+        .split_whitespace()
+        .skip_while(|w| *w != "version")
+        .nth(1)
+        .unwrap_or("?");
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let found = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    if found < QEMU_AMD_MIN {
+        return Err(format!(
+            "o amd-iommu precisa do QEMU {}.{} ou mais novo, e {bin} é o {version}: \
+             aponte {QEMU_AMD_VAR} para um (README, \"QEMU para o AMD-Vi\")",
+            QEMU_AMD_MIN.0, QEMU_AMD_MIN.1
+        ));
+    }
+    Ok(bin)
+}
+
 fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     let (code, vars) = ovmf()?;
     let vars_copy = root().join("target/OVMF_VARS.fd");
     fs::copy(&vars, &vars_copy).map_err(|e| format!("copiando {}: {e}", vars.display()))?;
-    let mut cmd = Command::new("qemu-system-x86_64");
+    let mut cmd = Command::new(qemu_bin(opts)?);
     cmd.args([
         "-machine",
         "q35",
@@ -953,14 +989,18 @@ fn virtio_console_out() -> Result<()> {
     }
 }
 
-/// O mesmo aceite com `-device amd-iommu` (T-403), sem conferir o log de
-/// faltas: o `amd-iommu` do QEMU grava eventos fora do formato da AMD.
+/// O mesmo aceite com `-device amd-iommu` (T-403). A falta chega pela MSI
+/// do log de eventos em até 1 ms do DMA (ADR 0055; T-510), mas o
+/// `amd-iommu` do QEMU grava o endereço e o sentido fora do formato da AMD:
+/// só o dispositivo se confere.
 const AMD_IOMMU_SCENARIO: Scenario = Scenario {
-    name: "AMD-Vi isola o DMA do edu e a MSI dele acorda a notificação",
+    name: "AMD-Vi isola o DMA do edu e a falta chega pela interrupção",
     cmdline: "test=kernel ktest=dev.",
     markers: &[
         KTEST_START,
         "okernel: AMD-Vi ligado: 1 unidade(s)",
+        "okernel: falta de DMA: dev=00:",
+        "ktest: AMD-Vi: ",
         KTEST_END,
     ],
     forbidden: &[
@@ -969,6 +1009,7 @@ const AMD_IOMMU_SCENARIO: Scenario = Scenario {
         "PÂNICO",
         "sem edu ou sem IOMMU",
         "sem edu;",
+        "AMD-Vi sem interrupção de falta",
     ],
     ..KERNEL_SCENARIO
 };
@@ -1200,6 +1241,21 @@ fn spawn_reader(
     (wall_seen, reader)
 }
 
+/// A serial do cenário; com `OPTIMUS_SERIAL_DIR`, gravada também em
+/// `<dir>/<nome>.log`, para ler os carimbos do log depois.
+fn serial_of(sc: &Scenario, raw: &[u8]) -> String {
+    let serial = String::from_utf8_lossy(raw).into_owned();
+    if let Ok(dir) = env::var("OPTIMUS_SERIAL_DIR") {
+        let slug: String = sc
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        let _ = fs::write(Path::new(&dir).join(format!("{slug}.log")), &serial);
+    }
+    serial
+}
+
 /// Dá boot num cenário e devolve a serial, se ela conferir.
 fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let esp = image(opts, sc.cmdline, sc.rounds)?;
@@ -1273,7 +1329,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     };
     let _ = reader.join();
     raw.extend(rx.try_iter().flatten());
-    let serial = String::from_utf8_lossy(&raw);
+    let serial = serial_of(sc, &raw);
     let result = check_serial(&serial, sc.markers, sc.forbidden)
         .and_then(|()| check_hello(&serial, sc))
         .and_then(|()| {
@@ -1304,7 +1360,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
         Ok(()) => {
             show_report(&serial, sc.harness);
             println!("xtask: smoke test de boot ok ({})", sc.name);
-            Ok(serial.into_owned())
+            Ok(serial)
         }
         Err(e) => Err(format!(
             "smoke test de boot falhou ({}): {e}; serial:\n{serial}",
@@ -1573,6 +1629,21 @@ fn check_serial(serial: &str, markers: &[&str], forbidden: &[&str]) -> Result {
     Ok(())
 }
 
+/// `cargo xtask test iommu`: os aceites com VT-d e com AMD-Vi (T-403,
+/// T-404, T-422, T-510).
+fn iommu(opts: &Options) -> Result {
+    let vtd = Options {
+        devices: vec!["intel-iommu", "edu"],
+        ..opts.clone()
+    };
+    smoke(&vtd, &[IOMMU_SCENARIO, DRIVER_SCENARIO])?;
+    let amd = Options {
+        devices: vec!["amd-iommu", "edu"],
+        ..opts.clone()
+    };
+    smoke(&amd, &[AMD_IOMMU_SCENARIO])
+}
+
 fn test(opts: &Options) -> Result {
     if matches!(opts.suite.as_str(), "unit" | "all") {
         status(cargo().args([
@@ -1599,16 +1670,7 @@ fn test(opts: &Options) -> Result {
         smoke(opts, &[KERNEL_SCENARIO])?;
     }
     if matches!(opts.suite.as_str(), "iommu" | "all") {
-        let iommu = Options {
-            devices: vec!["intel-iommu", "edu"],
-            ..opts.clone()
-        };
-        smoke(&iommu, &[IOMMU_SCENARIO, DRIVER_SCENARIO])?;
-        let amd = Options {
-            devices: vec!["amd-iommu", "edu"],
-            ..opts.clone()
-        };
-        smoke(&amd, &[AMD_IOMMU_SCENARIO])?;
+        iommu(opts)?;
     }
     if matches!(opts.suite.as_str(), "virtio" | "all") {
         let plain = Options {

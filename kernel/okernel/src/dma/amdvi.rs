@@ -10,6 +10,17 @@
 //!
 //! O acesso aos registradores fica atrás do mesmo [`Hw`] do VT-d. A trava
 //! é de nível 5, como a do VT-d.
+//!
+//! Faltas por interrupção (ADR 0055): o kernel programa a MSI da função
+//! PCI da IOMMU e liga [`AmdVi::enable_fault_irq`]; o tratador lê o log com
+//! [`AmdVi::faults`], que limpa `EventLogInt` e, no transbordo, religa o
+//! log vazio.
+//!
+//! Entradas não presentes não são zeradas: levam [`ABSENT`], com `PR` = 0,
+//! que o hardware trata como ausente do mesmo jeito. O `amd-iommu` do QEMU
+//! (8.2 a 10.1) para a tradução sem registrar evento quando lê uma entrada
+//! zerada, e só registra a falta numa entrada não nula sem `PR`; sem isso
+//! nenhuma falta do QEMU chegaria ao log.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -35,9 +46,11 @@ pub(crate) const CMD_HEAD: usize = 0x2000;
 pub(crate) const CMD_TAIL: usize = 0x2008;
 pub(crate) const EVT_HEAD: usize = 0x2010;
 pub(crate) const EVT_TAIL: usize = 0x2018;
+pub(crate) const STATUS: usize = 0x2020;
 
 const IOMMU_EN: u64 = 1;
 const EVENT_LOG_EN: u64 = 1 << 2;
+const EVENT_INT_EN: u64 = 1 << 3;
 const COHERENT: u64 = 1 << 10;
 const CMD_BUF_EN: u64 = 1 << 12;
 /// 2 MiB de tabela de dispositivos: 512 páginas (o campo leva páginas − 1).
@@ -58,6 +71,15 @@ const LEVELS: u32 = 3;
 const SPIN: u32 = 10_000_000;
 /// Domínios aceitos (o id 0 fica reservado).
 const MAX_DOMAINS: usize = 1024;
+
+/// Bits do registrador de status; os três primeiros se limpam escrevendo 1.
+const EVENT_OVERFLOW: u64 = 1;
+const EVENT_LOG_INT: u64 = 1 << 1;
+const EVENT_LOG_RUN: u64 = 1 << 3;
+
+/// Entrada não presente: `PR` = 0 e próximo nível 1 (ver a documentação do
+/// módulo).
+pub(crate) const ABSENT: u64 = 1 << 9;
 
 const COMPLETION_WAIT: u32 = 1 << 28;
 const INVALIDATE_DTE: u32 = 2 << 28;
@@ -110,6 +132,31 @@ fn blocked(unit: &Unit) -> u64 {
 fn dte(unit: &Unit, bdf: u16) -> (PhysAddr, usize) {
     let page = unit.dev_table.0 + u64::from(bdf >> 7) * 4096;
     (PhysAddr(page), usize::from(bdf & 127) * 4)
+}
+
+/// Tabela nova, com todas as entradas [`ABSENT`].
+fn fresh_table(hw: &mut dyn Hw) -> Option<PhysAddr> {
+    let t = hw.alloc_table()?;
+    hw.table(t).fill(ABSENT);
+    Some(t)
+}
+
+/// Religa vazio o log de eventos da unidade `u` depois de um transbordo
+/// (ADR 0055, item 2): desliga, espera `EventLogRun` cair, zera cabeça e
+/// cauda, limpa `EventOverflow` e liga de novo.
+fn restart_log(hw: &mut dyn Hw, u: usize) {
+    let control = hw.read64(u, CONTROL);
+    hw.write64(u, CONTROL, control & !EVENT_LOG_EN);
+    for _ in 0..SPIN {
+        if hw.read64(u, STATUS) & EVENT_LOG_RUN == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    hw.write64(u, EVT_HEAD, 0);
+    hw.write64(u, EVT_TAIL, 0);
+    hw.write64(u, STATUS, EVENT_OVERFLOW);
+    hw.write64(u, CONTROL, control);
 }
 
 impl Inner {
@@ -197,7 +244,7 @@ impl AmdVi {
         for index in 0..n {
             let dev_table = hw.alloc_contiguous(DEV_TAB_ORDER)?;
             let (cmd, events) = (hw.alloc_table()?, hw.alloc_table()?);
-            let (sem, empty) = (hw.alloc_table()?, hw.alloc_table()?);
+            let (sem, empty) = (hw.alloc_table()?, fresh_table(&mut *hw)?);
             units.push(Unit {
                 index,
                 dev_table,
@@ -250,13 +297,41 @@ impl AmdVi {
         self.inner.lock().units.len()
     }
 
+    /// BDF da função PCI de cada unidade, para o kernel programar a MSI
+    /// dela (ADR 0055, item 1).
+    pub fn functions(&self) -> Vec<u16> {
+        let i = self.inner.lock();
+        i.ivrs.units().iter().map(|u| u.bdf).collect()
+    }
+
+    /// `bdf` é a função de uma das IOMMUs, que é do kernel (ADR 0055, item
+    /// 3).
+    #[must_use]
+    pub fn owns(&self, bdf: u16) -> bool {
+        self.inner.lock().ivrs.units().iter().any(|u| u.bdf == bdf)
+    }
+
+    /// Liga `EventIntEn` na unidade `unit`, depois que o kernel programou a
+    /// MSI da função dela: cada evento gravado no log a dispara.
+    pub fn enable_fault_irq(&self, unit: usize) {
+        let mut i = self.inner.lock();
+        let control = i.hw.read64(unit, CONTROL);
+        i.hw.write64(unit, CONTROL, control | EVENT_INT_EN);
+    }
+
     /// Lê os eventos de falta de página de todas as unidades e avança o
-    /// log; os outros eventos são descartados.
-    pub fn faults(&self, out: &mut dyn FnMut(Fault)) {
+    /// log; os outros eventos são descartados. `EventLogInt` sai antes da
+    /// leitura: um evento gravado depois dela dispara outra interrupção.
+    /// Uma unidade que transbordou tem o log religado vazio (ADR 0055, item
+    /// 2); devolve quantas transbordaram.
+    pub fn faults(&self, out: &mut dyn FnMut(Fault)) -> u32 {
         let mut i = self.inner.lock();
         let Inner { hw, units, .. } = &mut *i;
+        let mut overflows = 0;
         for unit in units.iter() {
             let u = unit.index;
+            let status = hw.read64(u, STATUS);
+            hw.write64(u, STATUS, EVENT_LOG_INT);
             let (mut head, tail) = (hw.read64(u, EVT_HEAD), hw.read64(u, EVT_TAIL));
             while head != tail {
                 let at = (head / 8) as usize;
@@ -276,7 +351,12 @@ impl AmdVi {
                 head = (head + 16) % RING_BYTES;
             }
             hw.write64(u, EVT_HEAD, head);
+            if status & EVENT_OVERFLOW != 0 {
+                overflows += 1;
+                restart_log(&mut **hw, u);
+            }
         }
+        overflows
     }
 }
 
@@ -286,7 +366,7 @@ impl Iommu for AmdVi {
         let id = (1..i.domains.len())
             .find(|&d| i.domains[d].is_none())
             .ok_or(Error::Busy)?;
-        let root = i.hw.alloc_table().ok_or(Error::QuotaExceeded)?;
+        let root = fresh_table(&mut *i.hw).ok_or(Error::QuotaExceeded)?;
         if let Err(e) = table() {
             i.hw.free_table(root);
             return Err(e);
@@ -329,7 +409,7 @@ impl Iommu for AmdVi {
             t = if entry & PRESENT != 0 {
                 PhysAddr(entry & ADDR)
             } else {
-                let next = i.hw.alloc_table().ok_or(Error::QuotaExceeded)?;
+                let next = fresh_table(&mut *i.hw).ok_or(Error::QuotaExceeded)?;
                 if let Err(err) = table() {
                     i.hw.free_table(next);
                     return Err(err);
@@ -355,7 +435,7 @@ impl Iommu for AmdVi {
                 assert!(entry & PRESENT != 0, "amd-vi: unmap fora do mapeado");
                 t = PhysAddr(entry & ADDR);
             }
-            i.hw.table(t)[((at >> 12) & 511) as usize] = 0;
+            i.hw.table(t)[((at >> 12) & 511) as usize] = ABSENT;
         }
         // Antes de voltar: o objeto pode ser solto logo depois.
         i.flush_domain(id);
@@ -363,6 +443,10 @@ impl Iommu for AmdVi {
 
     fn attach(&self, id: u32, bdf: u16) -> Result<(), Error> {
         let mut i = self.inner.lock();
+        // A função da IOMMU é do kernel (ADR 0055, item 3).
+        if i.ivrs.units().iter().any(|u| u.bdf == bdf) {
+            return Err(Error::AccessDenied);
+        }
         let u = i.ivrs.unit_for(bdf).ok_or(Error::InvalidArgument)?;
         let root = i.domain(id).root;
         i.domain(id)

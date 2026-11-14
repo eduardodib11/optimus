@@ -174,7 +174,85 @@ pub fn init() {
         *UNIT.lock() = Some(Unit::Amd(amd));
         okernel::dma::install(amd);
         info!("okernel: AMD-Vi ligado: {} unidade(s)", amd.units());
+        // Faltas por interrupção (ADR 0055, item 1): a MSI de cada função
+        // da IOMMU, pela ECAM, vai ao BSP. Sem ela o kernel continua
+        // tickless e não lê o log por prazo (item 4).
+        let ecam = okernel::acpi::mcfg(&mut ktime::DirectRead, rsdp).ok();
+        let dest = crate::ksmp::apic_id(0).and_then(|d| u8::try_from(d).ok());
+        for (unit, bdf) in amd.functions().into_iter().enumerate() {
+            let programmed = ecam
+                .zip(dest)
+                .is_some_and(|(e, dest)| amd_msi(e.base, bdf, dest));
+            if programmed {
+                amd.enable_fault_irq(unit);
+            } else {
+                warn!("okernel: AMD-Vi sem interrupção de falta: contenção de DMA ausente");
+            }
+        }
     }
+}
+
+/// Programa a MSI da função `bdf` da IOMMU AMD (ADR 0055, item 1), pelo
+/// espaço de configuração dela na ECAM em `ecam`: destino `dest`, vetor
+/// [`IOMMU_FAULT_VECTOR`](crate::arch::x86_64::apic::IOMMU_FAULT_VECTOR),
+/// fixo e por borda. Sem remapeamento no AMD-Vi, a mensagem vai direta (item
+/// 5). `false` se a função não tem MSI ou a página não mapeou.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "deslocamentos de capability têm 8 bits"
+)]
+fn amd_msi(ecam: u64, bdf: u16, dest: u8) -> bool {
+    let Ok(cfg) = kmem::mmio_shared(ecam + (u64::from(bdf) << 12)) else {
+        return false;
+    };
+    let reg = |off: u8| (cfg + u64::from(off & 0xfc)) as *mut u32;
+    // SAFETY: `cfg` é a página de configuração da função, mapeada sem cache
+    // por `mmio_shared`; os deslocamentos ficam nela, alinhados a 4 bytes.
+    let read = |off: u8| unsafe { ptr::read_volatile(reg(off)) };
+    // SAFETY: como acima; só se escrevem o comando e a capability de MSI.
+    let write = |off: u8, v: u32| unsafe { ptr::write_volatile(reg(off), v) };
+    // Lista de capabilities (status, bit 4), com teto contra laço.
+    let mut at = if read(0x04) & 1 << 20 != 0 {
+        read(0x34) as u8 & 0xfc
+    } else {
+        0
+    };
+    let mut msi = None;
+    for _ in 0..48 {
+        if at == 0 {
+            break;
+        }
+        let head = read(at);
+        if head as u8 == 5 {
+            msi = Some((at, head));
+            break;
+        }
+        at = (head >> 8) as u8 & 0xfc;
+    }
+    let Some((at, head)) = msi else {
+        return false;
+    };
+    let address = 0xfee0_0000 | u32::from(dest) << 12;
+    let vector = u32::from(crate::arch::x86_64::apic::IOMMU_FAULT_VECTOR);
+    write(at + 4, address);
+    // Bit 23: endereço de 64 bits; o dado vem depois da parte alta.
+    if head & 1 << 23 != 0 {
+        write(at + 8, 0);
+        write(at + 12, vector);
+    } else {
+        write(at + 8, vector);
+    }
+    // Um vetor só (MME = 0) e MSI ligada; bus master para a escrita dela.
+    write(at, (head & !(7 << 20)) | 1 << 16);
+    write(0x04, read(0x04) & 0xffff | 1 << 2);
+    true
+}
+
+/// `bdf` é a função PCI de uma IOMMU, que é do kernel: nada de MSI,
+/// `DmaDomain` ou driver para ela (ADR 0055, item 3).
+pub fn owns(bdf: u16) -> bool {
+    let unit = *UNIT.lock();
+    matches!(unit, Some(Unit::Amd(a)) if a.owns(bdf))
 }
 
 /// A IOMMU ligada: `"VT-d"`, `"AMD-Vi"` ou nenhuma.
@@ -203,14 +281,22 @@ pub fn remap_msi_on() -> bool {
     matches!(unit, Some(Unit::Vtd(v)) if v.remapping())
 }
 
+/// Faltas lidas pelo tratador da interrupção, para o aceite (ADR 0055,
+/// item 7).
+pub static FAULT_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Instante (`ktime`) em que o tratador entrou pela última vez.
+pub static FAULT_IRQ_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Tratador da interrupção de falta: registra as faltas no log.
 pub fn on_fault_irq() {
+    FAULT_IRQ_AT.store(ktime::now_ns(), core::sync::atomic::Ordering::Relaxed);
     // `faults` roda sob a trava da IOMMU (nível 5): os BDFs saem dela e só
     // depois cada um sinaliza a ligação do domínio dele (ADR 0051, item 1).
     // Faltas além do teto ficam só no log.
     let mut seen = [0u16; 16];
     let mut n = 0;
     faults(&mut |f| {
+        FAULT_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if n < seen.len() && !seen[..n].contains(&f.bdf) {
             seen[n] = f.bdf;
             n += 1;
@@ -245,6 +331,15 @@ pub fn faults(out: &mut dyn FnMut(Fault)) {
     };
     match unit {
         Unit::Vtd(u) => u.faults(&mut log),
-        Unit::Amd(u) => u.faults(&mut log),
+        Unit::Amd(u) => {
+            if u.faults(&mut log) > 0 {
+                // ADR 0055, item 2: as faltas perdidas só ficam contadas.
+                let n = OVERFLOWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                warn!("okernel: log de eventos do AMD-Vi transbordou ({n}ª vez)");
+            }
+        }
     }
 }
+
+/// Transbordos do log de eventos do AMD-Vi.
+pub static OVERFLOWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
