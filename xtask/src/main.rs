@@ -1660,11 +1660,11 @@ const INTEGRATION_MARKERS: &[&str] = &[
     // toda rota resolve num GSI pelo `_CRS` da ligação.
     "acpid: _PRT: 128 rotas INTx, 128 com GSI",
     // Aceite da T-513: as rotas chegam ao `devmgr`, que resolve a IRQ legada
-    // de cada função PCI pelo pino do registrador `0x3D` (q35: a placa de
-    // vídeo, no 00:01.0, usa INTA).
+    // de cada função PCI pelo pino do registrador `0x3D` (q35: a placa de rede,
+    // no 00:02.0, usa INTA e cai no GSI 22).
     "acpid: 128 rotas _PRT publicadas",
     "devmgr: 128 rotas _PRT",
-    "devmgr: 00:01.0 INTA -> GSI ",
+    "devmgr: 00:02.0 INTA -> GSI 22",
     // Aceite da T-406 (RTC): o `devmgr` casa o nó `PNP0B00` com o `rtcd`,
     // que lê a hora pelas portas do CMOS ([`check_rtcd`] confere o valor).
     "[\"PNP0B00\"]: rtcd",
