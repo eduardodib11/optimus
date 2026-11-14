@@ -341,6 +341,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ps2mouse"
+version = "0.1.0"
+dependencies = [
+ "oinput",
+ "olegacy",
+ "optcrypt",
+ "ostd",
+ "osvc",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"

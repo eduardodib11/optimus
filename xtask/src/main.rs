@@ -69,6 +69,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("rtcd", "services/rtcd/src/main.rs", USER_TARGET),
     ("inputd", "services/inputd/src/main.rs", USER_TARGET),
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
+    ("ps2mouse", "services/ps2mouse/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -403,9 +404,8 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input"
-        | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "utest" | "okfuzz" => {
-            &["-C", "relocation-model=static"]
-        }
+        | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "ps2mouse" | "utest"
+        | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -460,6 +460,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("rtcd", "rtcd"),
     ("inputd", "inputd"),
     ("i8042d", "i8042d"),
+    ("ps2mouse", "ps2mouse"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -694,6 +695,10 @@ struct Scenario {
 const KEY_READY: &str = "i8042d: teclado pronto";
 /// Linha do `inputd` que encerra a injeção.
 const KEY_SEEN: &str = "inputd: tecla ";
+/// Linha do `ps2mouse` que libera o movimento injetado (T-516).
+const MOUSE_READY: &str = "ps2mouse: mouse pronto";
+/// Linha do `inputd` que encerra a injeção do movimento.
+const MOUSE_SEEN: &str = "inputd: ponteiro ";
 /// Intervalo entre injeções enquanto o `inputd` não mostra a tecla.
 const KEY_RETRY: Duration = Duration::from_millis(300);
 
@@ -792,7 +797,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 9 drivers no conjunto",
+        "devmgr: 10 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -832,6 +837,12 @@ macro_rules! m4_markers {
             "[\"PNP0303\"]: i8042d",
             "i8042d: teclado pronto",
             "inputd: tecla 0x1e apertada",
+            // T-516: o mouse PS/2 parte pelo nó `PNP0F13` e o movimento que
+            // o xtask injeta chega ao `inputd`.
+            "acpid: PNP0F13: 2 portas, 1 IRQs",
+            "[\"PNP0F13\"]: ps2mouse",
+            "ps2mouse: mouse pronto",
+            "inputd: ponteiro dx=",
             // virtio: o `devmgr` casa cada função com o driver, que
             // negocia o transporte moderno e faz a operação do seu aceite.
             "1af4:1042 ",
@@ -1202,6 +1213,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let mut raw = Vec::new();
     let start = Instant::now();
     let mut last_key: Option<Instant> = None;
+    let mut last_mouse: Option<Instant> = None;
     let seen_all = |raw: &[u8]| {
         let text = String::from_utf8_lossy(raw);
         sc.markers.iter().all(|m| text.contains(m))
@@ -1222,7 +1234,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
             screen = Some(shot);
         }
         if let Some(key) = sc.key {
-            inject_key(&monitor, key, &raw, &mut last_key);
+            inject_key(&monitor, key, &raw, &mut last_key, &mut last_mouse);
         }
         shoot_gpu(&monitor, &raw, &mut gpu_shot);
         let frozen = sc.exit.is_none() && seen_all(&raw);
@@ -1368,7 +1380,13 @@ fn check_panic_screen(monitor: &Path) -> Result {
 /// Injeta `key` pelo monitor quando o `i8042d` está pronto, e de novo a
 /// cada [`KEY_RETRY`] enquanto o `inputd` não mostrar a tecla (ela pode
 /// chegar antes de o driver ligar a IRQ).
-fn inject_key(monitor: &Path, key: &str, raw: &[u8], last: &mut Option<Instant>) {
+fn inject_key(
+    monitor: &Path,
+    key: &str,
+    raw: &[u8],
+    last: &mut Option<Instant>,
+    last_mouse: &mut Option<Instant>,
+) {
     let text = String::from_utf8_lossy(raw);
     // Com um `virtio-keyboard-pci` (1af4:1052) o QEMU entrega a tecla a ele
     // e não ao PS/2: espera a fila de eventos do driver e a tecla dele.
@@ -1384,6 +1402,15 @@ fn inject_key(monitor: &Path, key: &str, raw: &[u8], last: &mut Option<Instant>)
     {
         monitor_command(monitor, &format!("sendkey {key}"));
         *last = Some(Instant::now());
+    }
+    // Movimento do mouse PS/2 (T-516), com o mesmo reenvio, depois da tecla
+    // para não atrasá-la.
+    if text.contains(MOUSE_READY)
+        && !text.contains(MOUSE_SEEN)
+        && last_mouse.is_none_or(|t| t.elapsed() > KEY_RETRY)
+    {
+        monitor_command(monitor, "mouse_move 10 -5");
+        *last_mouse = Some(Instant::now());
     }
 }
 
@@ -1648,7 +1675,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 9 drivers no conjunto",
+    "devmgr: 10 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
@@ -1672,6 +1699,12 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "i8042d: teclado pronto",
     "inputd: tecla 0x1e apertada",
     "inputd: tecla 0x1e solta",
+    // Aceite da T-516: o `ps2mouse` parte pelo nó `PNP0F13` (portas do 8042
+    // herdadas pelo `acpid`) e o movimento injetado chega ao `inputd`.
+    "acpid: PNP0F13: 2 portas, 1 IRQs",
+    "[\"PNP0F13\"]: ps2mouse",
+    "ps2mouse: mouse pronto",
+    "inputd: ponteiro dx=",
     "inputd: encerrado",
 ];
 

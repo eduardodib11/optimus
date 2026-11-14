@@ -1,0 +1,21 @@
+[package]
+name = "ps2mouse"
+description = "ps2mouse: driver do mouse PS/2 em processo isolado (T-516)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ps2mouse"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+olegacy = { path = "../../lib/olegacy" }
+oinput = { path = "../../lib/oinput" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true
