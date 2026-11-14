@@ -13,8 +13,10 @@ use ostd::rt::Start;
 use ostd::svc::Session;
 
 mod console_cliente;
+mod display_cliente;
 
 use console_cliente::ConsoleCliente;
+use display_cliente::DisplayDeviceCliente;
 
 ostd::entry!(main);
 
@@ -83,6 +85,26 @@ fn console(s: &mut Session) {
     }
 }
 
+fn display(s: &mut Session) {
+    let Some(ep) = connect(s, b"optimus.display.DisplayDevice") else {
+        ostd::debug::print("drvcli: display: sem driver");
+        return;
+    };
+    let cli = DisplayDeviceCliente::new(ep);
+    let buf = &mut s.buffer;
+    let ok = matches!(cli.mode_count(buf), Ok(Ok(1)))
+        && matches!(cli.mode(buf, 0), Ok(Ok(m)) if m.width == 64 && m.height == 64)
+        && matches!(cli.mode(buf, 1), Ok(Err(e)) if e == display_cliente::DisplayError::BadMode)
+        && matches!(cli.set_mode(buf, 0), Ok(Ok(())))
+        && matches!(cli.present(buf, 0, 0, 64, 64), Ok(Ok(())))
+        && matches!(cli.present(buf, 60, 0, 8, 8), Ok(Err(e)) if e == display_cliente::DisplayError::BadRect);
+    if ok {
+        ostd::debug::print("drvcli: display ok");
+    } else {
+        ostd::debug::print("drvcli: display: falhou");
+    }
+}
+
 fn main(start: Start) -> ! {
     let mut s = match Session::start(start.args) {
         Ok(s) => s,
@@ -101,5 +123,6 @@ fn main(start: Start) -> ! {
     }
     let _ = s.ready();
     console(&mut s);
+    display(&mut s);
     ostd::thread::exit()
 }

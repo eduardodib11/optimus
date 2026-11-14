@@ -2,8 +2,10 @@
 //! processo de usuário. Cria um recurso 2D `XRGB8888` de 64x64, liga a
 //! memória de apoio (uma página por entrada, que serve com e sem IOMMU),
 //! pinta de cor sólida, e o põe no scanout 0 com `SET_SCANOUT`,
-//! `TRANSFER_TO_HOST_2D` e `RESOURCE_FLUSH`. O `DisplayDevice` por OIDL (modos,
-//! buffers compartilhados com o `displayd`) vem na parte 2.
+//! `TRANSFER_TO_HOST_2D` e `RESOURCE_FLUSH`. Depois serve o `DisplayDevice` gerado do
+//! `idl/optimus/display.oidl` (T-514): modos, troca de modo e apresentação de
+//! um retângulo. Os buffers compartilhados com o `displayd` e os eventos vêm
+//! na parte seguinte.
 
 #![no_std]
 #![no_main]
@@ -12,12 +14,17 @@
 
 use core::cell::RefCell;
 
-use ostd::kabi::{Handle, ObjectType};
+use ostd::ipc::{self, Message};
+use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::Start;
 use ostd::svc::Session;
 use ostd::vm::{Mapping, SELF};
 use vdrv::{Dma, Irq, Regs};
 use virtio_core::{F_ACCESS_PLATFORM, Mmio, Queue, Seg, Transport};
+
+mod display_servidor;
+
+use display_servidor::{Contexto, DisplayDevice, DisplayError, ID_DISPLAYDEVICE, Mode};
 
 ostd::entry!(main);
 
@@ -101,6 +108,123 @@ impl Gpu<'_> {
     }
 }
 
+impl DisplayDevice for Gpu<'_> {
+    fn mode_count(&mut self, _ctx: &Contexto) -> Result<u16, DisplayError> {
+        Ok(1)
+    }
+
+    fn mode(&mut self, _ctx: &Contexto, index: u16) -> Result<Mode, DisplayError> {
+        if index != 0 {
+            return Err(DisplayError::BadMode);
+        }
+        Ok(Mode {
+            id: 0,
+            width: WIDTH as u16,
+            height: HEIGHT as u16,
+        })
+    }
+
+    fn set_mode(&mut self, _ctx: &Contexto, id: u16) -> Result<(), DisplayError> {
+        if id != 0 {
+            return Err(DisplayError::BadMode);
+        }
+        self.command(
+            CMD_SET_SCANOUT,
+            &le(&[0, 0, WIDTH, HEIGHT, 0, RESOURCE_ID])[..24],
+        )
+        .map_err(|_| DisplayError::Io)
+    }
+
+    fn present(
+        &mut self,
+        _ctx: &Contexto,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> Result<(), DisplayError> {
+        let (x, y, w, h) = (
+            u32::from(x),
+            u32::from(y),
+            u32::from(width),
+            u32::from(height),
+        );
+        if w == 0 || h == 0 || x + w > WIDTH || y + h > HEIGHT {
+            return Err(DisplayError::BadRect);
+        }
+        let offset = u64::from(y * WIDTH + x) * 4;
+        let io = |_| DisplayError::Io;
+        self.command(
+            CMD_TRANSFER,
+            &le(&[
+                x,
+                y,
+                w,
+                h,
+                offset as u32,
+                (offset >> 32) as u32,
+                RESOURCE_ID,
+            ])[..32],
+        )
+        .map_err(io)?;
+        self.command(CMD_FLUSH, &le(&[x, y, w, h, RESOURCE_ID])[..24])
+            .map_err(io)
+    }
+}
+
+/// Atende o contrato `DisplayDevice` em `ep` até o endpoint ser revogado.
+fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, gpu: &mut Gpu<'_>) -> Error {
+    let reply = match ostd::cap::create(quota, ObjectType::Reply, 0) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let (mut corpo, mut saida) = ([0u8; 64], [0u8; 32]);
+    let mut rec = match ipc::recv(ep, reply, 0) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    loop {
+        let ctx = Contexto { badge: rec.badge };
+        let resp = if let Some((rotulo, w)) = display_servidor::despacha_display_device_palavras(
+            gpu,
+            rec.msg.label,
+            &rec.msg.words,
+            &ctx,
+        ) {
+            Ok(Message::new(rotulo, &w))
+        } else {
+            match ipc::copia(buf, &rec.msg, &mut corpo) {
+                Ok(n) => {
+                    let entrada = display_servidor::Entrada {
+                        rotulo: rec.msg.label,
+                        badge: rec.badge,
+                        corpo: &corpo[..n],
+                        caps: &[],
+                    };
+                    match display_servidor::despacha_display_device(
+                        gpu,
+                        0,
+                        &entrada,
+                        &mut saida,
+                        &mut [],
+                    ) {
+                        Some(d) => ipc::monta(buf, d.rotulo, &saida[..d.corpo]),
+                        None => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
+                    }
+                }
+                Err(_) => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
+            }
+        };
+        let Ok(resp) = resp else {
+            return Error::InvalidArgument;
+        };
+        rec = match ipc::reply_recv(ep, reply, &resp, 0) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+    }
+}
+
 fn le(fields: &[u32]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, f) in fields.iter().enumerate() {
@@ -109,7 +233,7 @@ fn le(fields: &[u32]) -> [u8; 32] {
     out
 }
 
-fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
+fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let (Some(irq), Some(domain)) = (vdrv::resource(s, b"irq0"), vdrv::resource(s, b"dma")) else {
         return Err("faltou irq0 ou dma");
     };
@@ -195,6 +319,13 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
     )?;
     gpu.command(CMD_FLUSH, &le(&[0, 0, WIDTH, HEIGHT, RESOURCE_ID])[..24])?;
     ostd::debug::print("virtio-gpu: quadro de cor sólida enviado");
+    let ep = s
+        .boot
+        .provided(ID_DISPLAYDEVICE)
+        .map(Handle::from_raw)
+        .ok_or("descritor sem o endpoint do DisplayDevice")?;
+    let e = serve(ep, quota, &mut s.buffer, &mut gpu);
+    ostd::debug::print_fmt(format_args!("virtio-gpu: encerrado ({e:?})"));
     Ok(())
 }
 
@@ -212,7 +343,7 @@ fn main(start: Start) -> ! {
     }
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     let _ = s.ready();
-    if let Err(e) = run(&s, quota) {
+    if let Err(e) = run(&mut s, quota) {
         ostd::debug::print_fmt(format_args!("virtio-gpu: falhou: {e}"));
     }
     ostd::thread::exit()

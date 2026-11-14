@@ -16,6 +16,7 @@ needs = [
   "mem:quota:576KiB",
   "kernel:debug",
   "svc:optimus.console.Console@1?",
+  "svc:optimus.display.DisplayDevice@1?",
 ]
 provides = []
 
