@@ -100,24 +100,28 @@ neste host fica perto de 950 ns.
 
 `cargo xtask bench` no workflow "Bench em KVM", mediana da ida e volta de
 IPC; cada par é uma rodada (1 CPU / 4 CPUs). A linha de base é a `main` em
-`86565f6`, medida no mesmo dia. A mudança foi medida com o código deste PR
-sobre `26353a0` (commit de experimento `60f59a5`; a diferença para a `main`
-é só a T-515, fora do caminho do IPC). O host é sorteado a cada rodada.
+`86565f6` e `2331fa4`, medida no mesmo dia. A mudança foi medida com o
+código deste PR, sobre `26353a0` (commit de experimento `60f59a5`) e sobre
+`86565f6` (o próprio ramo do PR, `1c17cf4`); as diferenças entre essas bases
+ficam fora do caminho do IPC. O host é sorteado a cada rodada.
 
 | Host do runner | Linha de base | Com o item 1 | Variação |
 |---|---:|---:|---:|
-| AMD EPYC 9V74 | 891 / 901 ns; 881 / 891 ns | **640 / 640 ns** | −28% |
+| AMD EPYC 9V74 | 891 / 901 ns; 881 / 891 ns; 911 / 901 ns | **640 / 640 ns** | −28% |
 | AMD EPYC 9V45 | 1050 / 1010 ns | não sorteado | — |
-| Intel Xeon 6975P-C | ≈ 950 ns (estimado das rodadas com marcas) | **848 / 845 ns**; 846 / 954 ns | ≈ −11% |
-| Intel Xeon Platinum 8370C | não sorteado | 1180 / 1080 ns | — |
+| Intel Xeon 6975P-C | ≈ 950 ns (estimado das rodadas com marcas) | **848 / 845 ns**; 846 / 954 ns; 848 / 846 ns; 959 / 955 ns | até −11%, dentro do ruído do host |
+| Intel Xeon Platinum 8370C | 1050 / 1170 ns | 1180 / 1080 ns | nenhuma visível |
 
 A troca entre processos caiu junto: de 395–400 ns para 270 ns no AMD 9V74.
 
-Leitura: a meta passa com folga nos dois hosts mais comuns do runner (AMD
-9V74 e Intel 6975P-C). O Intel 8370C (Ice Lake, o mais lento do sorteio)
-fica acima de 1 µs mesmo com o item 1; o próximo passo para ele é o item 2
-da ADR 0058. No AMD 9V45, o host da ressalva da T-430, o ganho esperado
-pelo custo isolado da FPU é da ordem do medido no 9V74.
+Leitura: no AMD a troca de FPU era o item mais caro, e o ganho é grande e
+estável. No Intel ela custa ≈ 145 ciclos por troca (≈ 100 ns por ida e
+volta no máximo), menos que a variação entre rodadas no mesmo host
+(846 a 959 ns no 6975P-C). A meta passa no AMD 9V74 e no Intel 6975P-C. O
+Intel 8370C (Ice Lake, o mais lento do sorteio) fica acima de 1 µs antes e
+depois; o próximo passo para ele é o item 2 da ADR 0058. No AMD 9V45, o
+host da ressalva da T-430, o ganho esperado pelo custo isolado da FPU é da
+ordem do medido no 9V74.
 
 O `cargo xtask test kernel` em KVM passou com a mudança (95 testes,
 `thread.fpu_inicial_nao_vaza` incluso, com XINUSE presente) no AMD 9V74 e
