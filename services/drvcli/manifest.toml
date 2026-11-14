@@ -1,0 +1,26 @@
+# Cliente de teste dos contratos dos drivers (T-514; ADR 0046, item 5): é um
+# driver como os outros (o `devmgr` o parte e o `svcmgr` o encerra no
+# desligamento) casado com a ponte do host do q35 (`8086:29c0`), que existe
+# em toda VM do teste e não tem outro driver. Quando o `devmgr` parte cada driver virtio, conecta ao endpoint
+# dele pelo `svcmgr` e conversa pelo cliente gerado do `.oidl`. As
+# necessidades são opcionais porque os drivers só existem depois do casamento
+# com o dispositivo.
+[service]
+name = "drvcli"
+binary = "drvcli"
+priority = 110
+restart = "never"
+
+[capabilities]
+needs = [
+  "mem:quota:576KiB",
+  "kernel:debug",
+  "svc:optimus.console.Console@1?",
+]
+provides = []
+
+[match]
+pci = ["8086:29c0"]
+
+[limits]
+max_threads = 1

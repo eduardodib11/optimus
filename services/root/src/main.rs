@@ -51,7 +51,7 @@ const SVCMGR_LOG_BADGE: u64 = 0x7376_636d;
 /// MiB com o `pcid` (T-402), 13 MiB com o `devmgr` (T-401), cujo heap
 /// pede um segmento de 2 MiB, e 14 MiB com o `acpid` (T-405), que não usa
 /// heap, 17 MiB com os drivers virtio (T-410 a T-415) e 18 MiB com o
-/// `ps2mouse` (T-516).
+/// `ps2mouse` (T-516) com o `drvcli` (T-514; a cota dele é de 576 KiB para caber).
 const SVCMGR_QUOTA: u64 = 18 << 20;
 /// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
 const SVCMGR_PRIORITY: u8 = 200;

@@ -1,0 +1,20 @@
+[package]
+name = "drvcli"
+description = "drvcli: cliente de teste dos contratos OIDL dos drivers virtio (T-514)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "drvcli"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+oidl-rt = { path = "../../lib/oidl-rt" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true

@@ -75,6 +75,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "drvcli"
+version = "0.1.0"
+dependencies = [
+ "oidl-rt",
+ "optcrypt",
+ "ostd",
+ "osvc",
+]
+
+[[package]]
 name = "drvteste"
 version = "0.1.0"
 dependencies = [
@@ -535,8 +545,10 @@ dependencies = [
 name = "virtio-console"
 version = "0.1.0"
 dependencies = [
+ "oidl-rt",
  "optcrypt",
  "ostd",
+ "osvc",
  "vdrv",
  "virtio-core",
 ]

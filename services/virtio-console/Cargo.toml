@@ -12,6 +12,8 @@ bench = false
 
 [dependencies]
 ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+oidl-rt = { path = "../../lib/oidl-rt" }
 optcrypt = { path = "../../lib/optcrypt" }
 virtio-core = { path = "../../lib/virtio-core" }
 vdrv = { path = "../../lib/vdrv" }
