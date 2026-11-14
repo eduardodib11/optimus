@@ -1,0 +1,21 @@
+// DisplayDevice (T-514; ADR 0047, item 1): o `virtio-gpu` serve este contrato
+// ao `displayd`. Esta parte cobre modos, troca de modo e apresentação de um
+// retângulo do buffer do driver; `create_buffer` (buffers compartilhados) e
+// `events` vêm na parte seguinte.
+package optimus.display @1.0;
+
+enum DisplayError : u8 { BadMode, BadRect, Io }
+
+// `XRGB8888` (ADR 0047, item 2): 32 bits por pixel.
+struct Mode { id: u16, width: u16, height: u16 }
+
+interface DisplayDevice {
+    // Quantos modos o dispositivo tem e o modo de `index` (a lista inteira
+    // não cabe num retorno; o `displayd` itera).
+    mode_count() -> result<u16, DisplayError>;
+    mode(index: u16) -> result<Mode, DisplayError>;
+    set_mode(id: u16) -> result<(), DisplayError>;
+    // Copia o retângulo do buffer do driver ao dispositivo e o mostra
+    // (`TRANSFER_TO_HOST_2D` e `RESOURCE_FLUSH`).
+    present(x: u16, y: u16, width: u16, height: u16) -> result<(), DisplayError>;
+}
