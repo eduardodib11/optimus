@@ -1097,13 +1097,10 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
     // da próxima está mapeada. A próxima segue viva em `current`, que só
     // esta CPU muda.
     unsafe {
-        let nofpu = crate::ketapas::NOFPU.load(Ordering::Relaxed);
-        if let Some(area) = prev_fpu.filter(|_| !nofpu) {
-            fpu::save(core::ptr::with_exposed_provenance_mut(area));
-        }
-        if let Some(area) = incoming.fpu.filter(|_| !nofpu) {
-            fpu::restore(core::ptr::with_exposed_provenance(area));
-        }
+        fpu::switch(
+            prev_fpu.map(core::ptr::with_exposed_provenance_mut),
+            incoming.fpu.map(core::ptr::with_exposed_provenance),
+        );
         if let Some(top) = incoming.stack_top {
             syscall::set_kernel_stack(top);
         }
@@ -1124,7 +1121,7 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
     // Todo caminho até o anel 3 passa por aqui antes de voltar ao usuário
     // (a primeira entrada pelo trampolim, a troca direta do IPC e a thread
     // que mudou de CPU), então o TLS dela vale ao chegar no usuário.
-    if let Some(fs) = incoming.fs_base.filter(|_| !crate::ketapas::NOFS.load(Ordering::Relaxed)) {
+    if let Some(fs) = incoming.fs_base {
         cpu::load_user_fs_base(fs);
     }
     // SAFETY: `prev_slot` é o rsp salvo da anterior, viva (em
@@ -1132,10 +1129,8 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
     // função ou montado por `start`.
     crate::ksync::assert_none_held("switch_context");
     percpu::assert_no_borrows();
-    crate::ketapas::mark(3);
     unsafe { switch_context(prev_slot, incoming.rsp) };
     finish_switch();
-    crate::ketapas::mark(4);
 }
 
 /// rsp salvo do ocioso desta CPU.
@@ -1623,7 +1618,6 @@ pub fn exit_if_killed() {
 /// volta pode usar SYSRET.
 #[unsafe(no_mangle)]
 extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
-    crate::ketapas::mark(0);
     if let Ok(
         call @ (Syscall::IpcSend | Syscall::IpcRecv | Syscall::IpcCall | Syscall::IpcReplyRecv),
     ) = Syscall::try_from(frame.rax)
@@ -1633,7 +1627,6 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
         crate::kpressure::poll();
         exit_if_killed();
         crate::ksync::assert_none_held("volta ao usuário");
-        crate::ketapas::mark(6);
         return u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss));
     }
     let args = [

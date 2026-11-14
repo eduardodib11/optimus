@@ -20,6 +20,7 @@ use crate::kvm::activate;
 use crate::{kmem, ktime};
 
 mod affinity;
+mod fpu;
 mod sched;
 mod smp;
 mod smp_ipc;
@@ -34,6 +35,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "thread.duas_threads_de_usuario_alternam",
         run: alternam,
+    },
+    Test {
+        name: "thread.fpu_inicial_nao_vaza",
+        run: fpu::estado_inicial_nao_vaza,
     },
     Test {
         name: "thread.start_recusa_rip_de_kernel",

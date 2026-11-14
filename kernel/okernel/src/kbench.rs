@@ -170,15 +170,7 @@ fn ipc_on(cross: bool) -> Result<Vec<u64>, &'static str> {
     let client_sym = &raw const user_bench_ipc_client;
     let args = [u64::from(c_ep.raw()), rounds, SAMPLES_VA];
     let (hc, tc) = spawn(&client, client_sym, args, STACK_PAGE)?;
-    if !cross {
-        crate::ketapas::start();
-    }
     run_until_exit(&[Arc::clone(&ts), Arc::clone(&tc)])?;
-    if !cross {
-        crate::ketapas::report();
-        let root = client.aspace.object.as_address_space().map_err(|_| "tipo")?.lock().root().0;
-        crate::ketapas::costs([crate::kmem::kernel_root().map_or(0, |r| r.0), root]);
-    }
     let fast = fast_switches() - fast0;
     let paths = crate::kipc::fast_paths() - paths0;
     // Só a primeira chamada e a última resposta podem não ser diretas, nem
@@ -304,37 +296,6 @@ pub fn run() -> ! {
                 ok = false;
                 error!("bench: {} FALHOU: {why}", b.name);
             }
-        }
-    }
-    for (name, pcid, nofpu, nofs) in [
-        ("base", false, false, false),
-        ("pcid", true, false, false),
-        ("sem_fpu", false, true, false),
-        ("sem_fs", false, false, true),
-        ("pcid_sem_fpu_sem_fs", true, true, true),
-        ("base2", false, false, false),
-    ] {
-        let ok_pcid = !pcid || crate::ketapas::pcid(true);
-        crate::ketapas::NOFPU.store(nofpu, Ordering::Relaxed);
-        crate::ketapas::NOFS.store(nofs, Ordering::Relaxed);
-        let r = ipc_on(false);
-        crate::ketapas::NOFPU.store(false, Ordering::Relaxed);
-        crate::ketapas::NOFS.store(false, Ordering::Relaxed);
-        if pcid {
-            crate::ketapas::pcid(false);
-        }
-        match r {
-            Ok(mut s) => {
-                s.sort_unstable();
-                let n = s.len();
-                info!(
-                    "bench: variante {name} pcid_ok={ok_pcid} mediana_ns={} p99_ns={} min_ns={}",
-                    ns(s[n / 2]),
-                    ns(s[n * 99 / 100]),
-                    ns(s[0])
-                );
-            }
-            Err(why) => info!("bench: variante {name} erro {why}"),
         }
     }
     info!("bench: fim");
