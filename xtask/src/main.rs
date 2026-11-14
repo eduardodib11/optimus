@@ -30,6 +30,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("oelf", "lib/oelf/src/lib.rs", KERNEL_TARGET),
     ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
     ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
+    ("optfs-format", "lib/optfs-format/src/lib.rs", KERNEL_TARGET),
     ("oalloc", "lib/oalloc/src/lib.rs", KERNEL_TARGET),
     ("ocoll", "lib/ocoll/src/lib.rs", KERNEL_TARGET),
     ("olz4", "lib/olz4/src/lib.rs", KERNEL_TARGET),
@@ -79,6 +80,7 @@ const CRATES: &[(&str, &str, &str)] = &[
 const HOST_TESTED: &[&str] = &[
     "oalloc",
     "obfs",
+    "optfs-format",
     "ocoll",
     "olz4",
     "oelf",
