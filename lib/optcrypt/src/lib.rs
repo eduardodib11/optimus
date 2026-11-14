@@ -17,9 +17,13 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod aead;
 pub mod blake3;
+pub mod block;
+pub mod chacha20;
 pub mod hkdf;
 pub mod hmac;
+pub mod poly1305;
 pub mod secret;
 pub mod sha256;
 

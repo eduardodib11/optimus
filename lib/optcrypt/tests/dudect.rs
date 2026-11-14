@@ -41,6 +41,10 @@ impl Welch {
 fn mede(mut op: impl FnMut(usize)) -> f64 {
     let mut w = Welch::default();
     let mut estado = 0x9e37_79b9_7f4a_7c15u64;
+    // Aquecimento: caches, predição de desvios e frequência da CPU.
+    for i in 0..20_000 {
+        op(i % 2);
+    }
     let mut tempos = Vec::with_capacity(AMOSTRAS);
     for _ in 0..AMOSTRAS {
         estado = estado
@@ -91,4 +95,34 @@ fn hmac_verify_tempo_constante() {
         ));
     });
     assert!(t.abs() < LIMITE, "|t| = {t}");
+}
+
+/// Selar e abrir: classe 0 = texto zerado, classe 1 = texto "aleatório".
+#[test]
+#[ignore = "campanha de tempo constante; rode com --ignored em --release"]
+fn aead_tempo_constante() {
+    use optcrypt::aead::{open, seal};
+    use optcrypt::secret::Secret;
+
+    let key = Secret::take(&mut [0x42u8; 32]);
+    let nonce = [1u8; 12];
+    let zeros = [0u8; 256];
+    let mut rnd = [0u8; 256];
+    for (i, b) in rnd.iter_mut().enumerate() {
+        *b = u8::try_from(i * 167 % 256).unwrap();
+    }
+    let t_seal = mede(|c| {
+        let mut buf = if c == 0 { zeros } else { rnd };
+        black_box(seal(&key, &nonce, b"aad", black_box(&mut buf)));
+    });
+    assert!(t_seal.abs() < LIMITE, "selar: |t| = {t_seal}");
+    let mut s0 = zeros;
+    let mut s1 = rnd;
+    let tag0 = seal(&key, &nonce, b"aad", &mut s0);
+    let tag1 = seal(&key, &nonce, b"aad", &mut s1);
+    let t_open = mede(|c| {
+        let (mut buf, tag) = if c == 0 { (s0, tag0) } else { (s1, tag1) };
+        black_box(open(&key, &nonce, b"aad", black_box(&mut buf), &tag).is_ok());
+    });
+    assert!(t_open.abs() < LIMITE, "abrir: |t| = {t_open}");
 }
