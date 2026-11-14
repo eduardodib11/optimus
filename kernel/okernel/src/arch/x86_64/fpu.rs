@@ -132,6 +132,10 @@ pub fn uses_xsave() -> bool {
 /// dela, que ninguém mais acessa durante a troca; `next` foi gravada por
 /// esta função, por [`save`] ou iniciada como a de uma thread nova
 /// (cabeçalho zerado, FCW e MXCSR do estado inicial).
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "a área é alinhada a 64 e os campos a 4 e 8 dentro dela"
+)]
 pub unsafe fn switch(prev: Option<*mut u8>, next: Option<*const u8>) {
     let init = regs_init();
     if let Some(area) = prev {
@@ -189,6 +193,10 @@ fn regs_init() -> bool {
 ///
 /// `area` aponta uma área de [`area_bytes`] bytes, alinhada a 64, com
 /// cabeçalho XSAVE (só chamada com XINUSE, que implica XSAVE).
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "a área é alinhada a 64 e os campos a 4 e 8 dentro dela"
+)]
 unsafe fn area_init(area: *const u8) -> bool {
     // SAFETY: contrato acima; os campos ficam dentro da área, alinhados.
     let (bv, mxcsr) = unsafe {
