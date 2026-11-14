@@ -2,6 +2,9 @@
 //! endpoint de `optimus.time.Clock@1` no descritor, avisa `ready` e atende
 //! `now()` com a hora do boot ([`timed::Clock::from_boot`]).
 //!
+//! Ao subir, registra a hora do RTC que o `optboot` leu (T-515), para o
+//! cenário de integração conferir com a hora do QEMU.
+//!
 //! `now()` (método 0) responde as palavras `[unix_ns, mono_ns,
 //! uncertainty_ns, synced]`. O `set()` e o `Admin@1` vêm com o `connect`
 //! dos clientes.
@@ -16,6 +19,14 @@ use ostd::rt::Start;
 use ostd::svc::Session;
 
 ostd::entry!(main);
+
+/// `kind` das capabilities de origem do kernel no descritor (ADR 0034).
+const KIND_KERNEL: u8 = 5;
+
+fn hash(text: &[u8]) -> u32 {
+    let h = optcrypt::blake3::hash(text);
+    u32::from_le_bytes([h[0], h[1], h[2], h[3]])
+}
 
 /// `interface_id("optimus.time.Clock", 1)`.
 fn clock_id() -> u32 {
@@ -52,6 +63,14 @@ fn main(start: Start) -> ! {
     let Ok(mut s) = Session::start(start.args) else {
         ostd::thread::exit()
     };
+    if let Some(c) = s
+        .boot
+        .caps()
+        .iter()
+        .find(|c| c.kind == KIND_KERNEL && c.name_hash == hash(b"debug"))
+    {
+        ostd::debug::set_log(Handle::from_raw(c.handle));
+    }
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     let Some(ep) = s.boot.provided(clock_id()).map(Handle::from_raw) else {
         ostd::thread::exit()
@@ -60,6 +79,13 @@ fn main(start: Start) -> ! {
         Ok(Some((wall, at))) => timed::Clock::from_boot(wall, at, true),
         _ => timed::Clock::from_boot(0, 0, false),
     };
+    match clock.now(ostd::time::now_ns()) {
+        Ok(t) => ostd::debug::print_fmt(format_args!(
+            "timed: hora do RTC em {} s (Unix)",
+            t.unix_ns / 1_000_000_000
+        )),
+        Err(_) => ostd::debug::print("timed: sem hora do RTC"),
+    }
     if s.ready().is_ok() {
         let _ = serve(ep, quota, &clock);
     }
