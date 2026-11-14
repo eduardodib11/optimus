@@ -151,7 +151,7 @@ pub unsafe fn switch(prev: Option<*mut u8>, next: Option<*const u8>) {
     }
     if let Some(area) = next {
         // SAFETY: contrato acima.
-        if !init {
+        if !(init && unsafe { area_init(area) }) {
             // SAFETY: contrato acima.
             unsafe { restore(area) };
         }
