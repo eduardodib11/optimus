@@ -1,0 +1,13 @@
+[package]
+name = "optfs-format"
+description = "Formato em disco do OptFS (ADR 0052): ponteiro de bloco, superbloco, cabeçalho de nó e chave."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true
