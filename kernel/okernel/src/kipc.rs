@@ -42,7 +42,10 @@ pub fn syscall(frame: &mut TrapFrame, call: Syscall) {
     let result = current()
         .and_then(|me| Some((me.cspace()?, me)))
         .ok_or(Error::NotSupported)
-        .and_then(|(space, me)| invoke(&space, &me, call, &regs));
+        .and_then(|(space, me)| {
+            crate::ketapas::mark(1);
+            invoke(&space, &me, call, &regs)
+        });
     match result {
         Ok(out) => {
             frame.rax = kabi::STATUS_OK;
@@ -80,6 +83,7 @@ fn invoke(
         Syscall::IpcReplyRecv => fast::reply_recv(space, me, regs, cpu, &mut KernelEnv),
         _ => Fast::Slow,
     };
+    crate::ketapas::mark(2);
     match fast {
         Fast::Slow => ops::invoke_as(space, me, call, regs, &mut KernelEnv),
         Fast::Switch(to) => {
@@ -87,7 +91,9 @@ fn invoke(
                 c.store(c.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
             }
             kthread::switch_direct(to);
-            ops::finish(me)
+            let r = ops::finish(me);
+            crate::ketapas::mark(5);
+            r
         }
         Fast::Done(result) => result,
     }

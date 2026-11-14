@@ -170,7 +170,15 @@ fn ipc_on(cross: bool) -> Result<Vec<u64>, &'static str> {
     let client_sym = &raw const user_bench_ipc_client;
     let args = [u64::from(c_ep.raw()), rounds, SAMPLES_VA];
     let (hc, tc) = spawn(&client, client_sym, args, STACK_PAGE)?;
+    if !cross {
+        crate::ketapas::start();
+    }
     run_until_exit(&[Arc::clone(&ts), Arc::clone(&tc)])?;
+    if !cross {
+        crate::ketapas::report();
+        let root = client.aspace.object.as_address_space().map_err(|_| "tipo")?.lock().root().0;
+        crate::ketapas::costs([crate::kmem::kernel_root().map_or(0, |r| r.0), root]);
+    }
     let fast = fast_switches() - fast0;
     let paths = crate::kipc::fast_paths() - paths0;
     // Só a primeira chamada e a última resposta podem não ser diretas, nem

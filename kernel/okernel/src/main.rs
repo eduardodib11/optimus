@@ -20,6 +20,7 @@ mod ktest;
 mod arch;
 mod bootinfo;
 mod kbench;
+mod ketapas;
 mod kcap;
 mod kfault;
 mod kfuzz;

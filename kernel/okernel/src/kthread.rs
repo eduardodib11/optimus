@@ -1131,8 +1131,10 @@ fn switch_away(mut s: SpinGuard<'_, Sched>, prev: Option<Arc<Thread>>, next: Opt
     // função ou montado por `start`.
     crate::ksync::assert_none_held("switch_context");
     percpu::assert_no_borrows();
+    crate::ketapas::mark(3);
     unsafe { switch_context(prev_slot, incoming.rsp) };
     finish_switch();
+    crate::ketapas::mark(4);
 }
 
 /// rsp salvo do ocioso desta CPU.
@@ -1620,6 +1622,7 @@ pub fn exit_if_killed() {
 /// volta pode usar SYSRET.
 #[unsafe(no_mangle)]
 extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
+    crate::ketapas::mark(0);
     if let Ok(
         call @ (Syscall::IpcSend | Syscall::IpcRecv | Syscall::IpcCall | Syscall::IpcReplyRecv),
     ) = Syscall::try_from(frame.rax)
@@ -1629,6 +1632,7 @@ extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> u64 {
         crate::kpressure::poll();
         exit_if_killed();
         crate::ksync::assert_none_held("volta ao usuário");
+        crate::ketapas::mark(6);
         return u64::from(syscall::sysret_ok(frame.rip, frame.cs, frame.ss));
     }
     let args = [
