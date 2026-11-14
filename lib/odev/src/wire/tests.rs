@@ -105,7 +105,7 @@ fn recusa_o_que_esta_fora_do_formato() {
 #[test]
 fn rotulos_e_erros() {
     assert_eq!(method_of(label(Method::Publish)), Some(Method::Publish));
-    assert_eq!(method_of(label(Method::Publish) | 1), None);
+    assert_eq!(method_of(label(Method::Publish) | 2), None);
     assert_eq!(method_of(1 << 16 | label(Method::Publish)), None);
     assert_eq!(method_of(osvc_like()), None);
     let mut buf = [0u8; 8];
@@ -118,4 +118,33 @@ fn rotulos_e_erros() {
 /// Rótulo de outra interface.
 fn osvc_like() -> u64 {
     u64::from(interface_id().wrapping_add(1)) << 32
+}
+
+#[test]
+fn rotas_ida_e_volta() {
+    let routes = vec![
+        IrqRoute {
+            device: 1,
+            pin: 0,
+            gsi: 16,
+        },
+        IrqRoute {
+            device: 31,
+            pin: 3,
+            gsi: 23,
+        },
+    ];
+    let mut buf = [0u8; MAX_ROUTES_BYTES];
+    let n = encode_routes(&routes, &mut buf).unwrap();
+    assert_eq!(n, 8 + 2 * 8);
+    assert_eq!(decode_routes(&buf[..n]).unwrap(), routes);
+    // Pino fora de 0..=3 é rejeitado; o teto de rotas também.
+    buf[8 + 2] = 4;
+    assert!(decode_routes(&buf[..n]).is_err());
+    let many = vec![routes[0]; MAX_ROUTES + 1];
+    assert!(encode_routes(&many, &mut buf).is_err());
+    assert_eq!(
+        method_of(label(Method::PublishRoutes)),
+        Some(Method::PublishRoutes)
+    );
 }
