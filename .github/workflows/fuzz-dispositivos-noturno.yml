@@ -4,6 +4,8 @@ name: Fuzzing dos parsers de dispositivo (noturno)
 # pânico (AML do acpid, varredura PCIe do opci, capabilities e fila do virtio-core). A campanha de 4 h
 # fica para o Gate 2 (`minutes` = 240). Alvos novos entram na matriz.
 # Uma falha grava o artefato em `crash-*` e sai com código diferente de zero.
+# Cada diretório em fuzz/ já é a crate do cargo-fuzz, daí `--fuzz-dir .`
+# (sem ele o cargo-fuzz procura ./fuzz/Cargo.toml e sai em segundos).
 
 on:
   schedule:
@@ -44,7 +46,7 @@ jobs:
         run: |
           set -o pipefail
           secs=$(( ${MINUTES_IN:-30} * 60 ))
-          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time="$secs" 2>&1 | tee fuzz.log
+          cargo +nightly fuzz run --fuzz-dir . ${{ matrix.target }} -- -max_total_time="$secs" 2>&1 | tee fuzz.log
       - name: Resumo da rodada
         if: always()
         working-directory: ${{ matrix.dir }}
@@ -60,5 +62,5 @@ jobs:
         if: failure()
         with:
           name: crash-${{ matrix.target }}
-          path: ${{ matrix.dir }}/fuzz/artifacts/
+          path: ${{ matrix.dir }}/artifacts/
           if-no-files-found: ignore
