@@ -22,6 +22,9 @@ ostd::entry!(main);
 /// `kind` das capabilities de origem do kernel no descritor (ADR 0034).
 const KIND_KERNEL: u8 = 5;
 
+/// Quantos movimentos do ponteiro vão ao log (os primeiros).
+const POINTER_LOG: u64 = 8;
+
 fn hash(text: &[u8]) -> u32 {
     let h = optcrypt::blake3::hash(text);
     u32::from_le_bytes([h[0], h[1], h[2], h[3]])
@@ -53,8 +56,13 @@ fn serve(ep: Handle, quota: Handle) -> Error {
                     ostd::debug::print_fmt(format_args!("inputd: tecla {code:#x} {what}"));
                     osvc::REPLY_OK
                 }
-                Some(Event::Pointer { .. }) => {
+                Some(Event::Pointer { dx, dy, buttons }) => {
                     moves += 1;
+                    if moves <= POINTER_LOG {
+                        ostd::debug::print_fmt(format_args!(
+                            "inputd: ponteiro dx={dx} dy={dy} botões={buttons:#x}"
+                        ));
+                    }
                     osvc::REPLY_OK
                 }
                 None => osvc::REPLY_BAD_MESSAGE,

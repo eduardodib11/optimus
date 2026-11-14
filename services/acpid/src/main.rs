@@ -77,6 +77,14 @@ fn node<'a>(
             _ => {}
         }
     }
+    // O mouse PS/2 (`PNP0F13`) só traz a IRQ 12 no `_CRS`, mas fala pelas
+    // portas do 8042 do teclado (ADR 0059): ele herda 0x60 e 0x64.
+    if np == 0 && hid.as_bytes() == b"PNP0F13" {
+        for base in [0x60, 0x64] {
+            res.ports[np] = Some(Ports { base, count: 1 });
+            np += 1;
+        }
+    }
     if np == 0 && ni == 0 {
         return None;
     }
