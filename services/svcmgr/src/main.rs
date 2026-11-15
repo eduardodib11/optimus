@@ -200,6 +200,18 @@ const fn wire(e: svcmgr::broker::SvcError) -> SvcError {
     }
 }
 
+/// Encerra o processo inteiro de `cspace` (`cap_delete` com `DESTROY` numa
+/// cópia do `CapSpace`; ADR 0035, item 4): todas as threads morrem como
+/// `Killed`, inclusive as que esperam sem prazo (a segunda thread do
+/// `devmgr`, ADR 0055, item 6), e a capability original fica para ler o
+/// registro de morte.
+fn kill(cspace: Handle) -> Result<(), Error> {
+    let copy = ostd::cap::mint(cspace, ostd::kabi::Rights::DESTROY, 0, None)?;
+    ostd::cap::destroy(copy).inspect_err(|_| {
+        let _ = ostd::cap::delete(copy);
+    })
+}
+
 fn name(plan: &Plan, id: u32) -> &str {
     plan.broker.manifest(id).map_or("?", |m| m.name.as_str())
 }
@@ -393,17 +405,12 @@ impl Svcmgr<'_> {
         if !self.plan.broker.is_device_manager(caller) || !self.plan.drivers.contains(&id) {
             return Err(SvcError::NotInManifest);
         }
-        let thread = self
+        let cspace = self
             .started(id)
-            .map(|s| s.child.thread)
+            .map(|s| s.child.cspace)
             .ok_or(SvcError::NotRunning)?;
-        if ostd::cap::destroy(thread).is_err() {
+        if kill(cspace).is_err() {
             return Err(SvcError::Busy);
-        }
-        // `destroy` já apagou a capability: o `retire` não pode apagar o
-        // mesmo número, que o kernel pode ter dado a outra.
-        if let Some(Some(s)) = usize::try_from(id).ok().and_then(|i| self.live.get_mut(i)) {
-            s.child.thread = Handle::from_raw(0);
         }
         self.retire(id);
         let n = name(&self.plan, id);
@@ -640,9 +647,8 @@ impl Svcmgr<'_> {
     }
 
     /// Teste de caos (T-366; §18, "volta em ≤ 1 s"): `rounds` vezes, mata
-    /// um serviço em `Running` escolhido ao acaso (`cap_delete` com
-    /// `DESTROY` da thread dele) e espera que volte a `Running`. Registra o
-    /// tempo de cada volta; quem não volta em [`READY_NS`] conta como falha.
+    /// um serviço em `Running` escolhido ao acaso ([`kill`], o processo
+    /// inteiro) e espera que volte a `Running`. Registra o tempo de cada volta; quem não volta em [`READY_NS`] conta como falha.
     fn chaos(&mut self, rounds: u64) {
         let mut seed = ostd::time::now_ns() | 1;
         let mut worst = 0;
@@ -667,19 +673,14 @@ impl Svcmgr<'_> {
                 ostd::debug::print("svcmgr: caos: nenhum serviço vivo");
                 return;
             };
-            let Some(thread) = self.started(id).map(|s| s.child.thread) else {
+            let Some(cspace) = self.started(id).map(|s| s.child.cspace) else {
                 continue;
             };
             let t0 = ostd::time::now_ns();
             self.induced.push(id);
-            if ostd::cap::destroy(thread).is_err() {
+            if kill(cspace).is_err() {
                 self.induced.retain(|&x| x != id);
                 continue;
-            }
-            // `destroy` já apagou a capability: o `retire` não pode apagar o
-            // mesmo número, que o kernel pode ter dado a outra.
-            if let Some(Some(s)) = usize::try_from(id).ok().and_then(|i| self.live.get_mut(i)) {
-                s.child.thread = Handle::from_raw(0);
             }
             let deadline = t0.saturating_add(READY_NS);
             let back = loop {

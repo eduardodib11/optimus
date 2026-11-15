@@ -340,6 +340,13 @@ fn register_kernel_mmio(page: u64) {
 /// A página fica fora do alcance dos objetos de dispositivo (T-402).
 pub fn mmio(phys: u64) -> Result<u64, MapError> {
     register_kernel_mmio(phys & !0xfff);
+    mmio_shared(phys)
+}
+
+/// Como [`mmio`], sem tirar a página do alcance dos objetos de dispositivo:
+/// para o espaço de configuração da função PCI da IOMMU AMD, que fica
+/// dentro da janela ECAM do `pcid` (ADR 0055, item 1).
+pub fn mmio_shared(phys: u64) -> Result<u64, MapError> {
     let virt = direct(PhysAddr(phys & !0xfff));
     let flags = Flags {
         uncached: true,

@@ -31,6 +31,8 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
     ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
     ("optfs-format", "lib/optfs-format/src/lib.rs", KERNEL_TARGET),
+    ("ogpt", "lib/ogpt/src/lib.rs", KERNEL_TARGET),
+    ("optfs", "lib/optfs/src/lib.rs", KERNEL_TARGET),
     ("oalloc", "lib/oalloc/src/lib.rs", KERNEL_TARGET),
     ("ocoll", "lib/ocoll/src/lib.rs", KERNEL_TARGET),
     ("olz4", "lib/olz4/src/lib.rs", KERNEL_TARGET),
@@ -72,6 +74,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
     ("ps2mouse", "services/ps2mouse/src/main.rs", USER_TARGET),
     ("drvcli", "services/drvcli/src/main.rs", USER_TARGET),
+    ("keyd", "services/keyd/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -81,6 +84,8 @@ const HOST_TESTED: &[&str] = &[
     "oalloc",
     "obfs",
     "optfs-format",
+    "ogpt",
+    "optfs",
     "ocoll",
     "olz4",
     "oelf",
@@ -130,7 +135,7 @@ const BOOT_MARKERS: &[&str] = &[
     "svcmgr: devmgr em Running",
     "svcmgr: pcid em Running",
     "svcmgr: acpid em Running",
-    "svcmgr: 7 serviços em Running",
+    "svcmgr: 8 serviços em Running",
     "svcmgr: serviços encerrados",
     "root: o svcmgr terminou",
     "okernel: root terminou",
@@ -212,6 +217,8 @@ struct Options {
     /// Dispositivos extras do QEMU, antes dos de sempre (a `intel-iommu`
     /// precisa vir antes dos dispositivos PCI).
     devices: Vec<&'static str>,
+    /// Objetos do QEMU (`-object`), como o `rng-random` do virtio-rng.
+    objects: Vec<String>,
 }
 
 impl Default for Options {
@@ -232,6 +239,7 @@ impl Default for Options {
             fail_on_purpose: false,
             chaos: None,
             devices: Vec::new(),
+            objects: Vec::new(),
         }
     }
 }
@@ -284,7 +292,7 @@ fn parse(args: &[String]) -> Result<Options> {
                 );
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
-            | "integration" | "chaos" | "iommu" | "virtio" | "all" => {
+            | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "storage" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -408,7 +416,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input"
         | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "ps2mouse" | "drvcli"
-        | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        | "keyd" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -465,6 +473,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("i8042d", "i8042d"),
     ("ps2mouse", "ps2mouse"),
     ("drvcli", "drvcli"),
+    ("keyd", "keyd"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -567,11 +576,47 @@ fn ovmf() -> Result<(PathBuf, PathBuf)> {
         })
 }
 
+/// Variável com o QEMU dos boots com `amd-iommu`.
+const QEMU_AMD_VAR: &str = "OPTIMUS_QEMU_AMD";
+/// Versão mínima do QEMU com `amd-iommu` (ADR 0055; T-510): até o 10.0 ele
+/// nunca atualiza a cauda do log de eventos, e o kernel não lê falta nenhuma.
+const QEMU_AMD_MIN: (u32, u32) = (10, 1);
+
+/// O QEMU do boot: com `amd-iommu`, o de `OPTIMUS_QEMU_AMD` (ou o do
+/// `PATH`), conferida a versão mínima.
+fn qemu_bin(opts: &Options) -> Result<String> {
+    let path = String::from("qemu-system-x86_64");
+    if !opts.devices.contains(&"amd-iommu") {
+        return Ok(path);
+    }
+    let bin = env::var(QEMU_AMD_VAR).unwrap_or(path);
+    let out = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("rodando {bin} --version: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text
+        .split_whitespace()
+        .skip_while(|w| *w != "version")
+        .nth(1)
+        .unwrap_or("?");
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let found = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    if found < QEMU_AMD_MIN {
+        return Err(format!(
+            "o amd-iommu precisa do QEMU {}.{} ou mais novo, e {bin} é o {version}: \
+             aponte {QEMU_AMD_VAR} para um (README, \"QEMU para o AMD-Vi\")",
+            QEMU_AMD_MIN.0, QEMU_AMD_MIN.1
+        ));
+    }
+    Ok(bin)
+}
+
 fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     let (code, vars) = ovmf()?;
     let vars_copy = root().join("target/OVMF_VARS.fd");
     fs::copy(&vars, &vars_copy).map_err(|e| format!("copiando {}: {e}", vars.display()))?;
-    let mut cmd = Command::new("qemu-system-x86_64");
+    let mut cmd = Command::new(qemu_bin(opts)?);
     cmd.args([
         "-machine",
         "q35",
@@ -600,6 +645,9 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     // Rede de usuário (slirp) para o `virtio-net-pci`: responde ao ARP.
     if opts.devices.iter().any(|d| d.starts_with("virtio-net-pci")) {
         cmd.args(["-netdev", "user,id=vn0"]);
+    }
+    for object in &opts.objects {
+        cmd.args(["-object", object]);
     }
     for device in &opts.devices {
         cmd.args(["-device", device]);
@@ -811,6 +859,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
         // T-422 (ADR 0051): o `devmgr` contém o driver que faltou, o
         // `svcmgr` o para e ele parte de novo, agora sem o DMA ruim.
         "devmgr: falta de DMA do driver drvteste: contido",
+        CONTAINED,
         "svcmgr: drvteste parado pelo devmgr",
         "devmgr: driver drvteste reiniciado",
         "drvteste: reiniciado pelo devmgr, DMA válido ok",
@@ -822,6 +871,39 @@ const DRIVER_SCENARIO: Scenario = Scenario {
         "drvteste: falhou",
         "driver não partiu",
         "isolado após",
+    ],
+    ..SCENARIOS[0]
+};
+
+/// Linha do `devmgr` com o tempo da falta à contenção (T-511).
+const CONTAINED: &str = "µs depois da falta";
+
+/// Aceite da T-511 (ADR 0055): o mesmo roteiro da T-422 com `amd-iommu`.
+/// A falta do `drvteste` chega ao `devmgr` pela MSI do log de eventos, e
+/// ele contém e reinicia o driver como no VT-d.
+const AMD_DRIVER_SCENARIO: Scenario = Scenario {
+    name: "devmgr contém e reinicia o drvteste com AMD-Vi",
+    markers: &[
+        "okernel: AMD-Vi ligado: 1 unidade(s)",
+        "1234:11e8 1 BARs: drvteste",
+        "svcmgr: drvteste em Running",
+        "drvteste: DMA e MSI pelo edu ok",
+        "drvteste: DMA fora do domínio pedido",
+        "okernel: falta de DMA: dev=00:",
+        "devmgr: falta de DMA do driver drvteste: contido",
+        CONTAINED,
+        "svcmgr: drvteste parado pelo devmgr",
+        "devmgr: driver drvteste reiniciado",
+        "drvteste: reiniciado pelo devmgr, DMA válido ok",
+        "okernel: desligando",
+    ],
+    forbidden: &[
+        "okernel: FALTA",
+        "PÂNICO",
+        "drvteste: falhou",
+        "driver não partiu",
+        "isolado após",
+        "AMD-Vi sem interrupção de falta",
     ],
     ..SCENARIOS[0]
 };
@@ -861,6 +943,11 @@ macro_rules! m4_markers {
             "drvcli: console ok",
             "drvcli: display ok",
             "drvcli: block ok",
+            "drvcli: entropy ok",
+            // T-518: o `keyd` soma a contribuição do virtio-rng à semente.
+            "keyd: contribuição virtio=",
+            "keyd: semente=",
+            "keyd: gerador semeado",
             "1af4:1052 ",
             "virtio-input: fila de eventos pronta",
             "virtio-input: tecla 0x1e encaminhada",
@@ -909,6 +996,8 @@ const M4_FORBIDDEN: &[&str] = &[
     "drvcli: display: sem driver",
     "drvcli: block: falhou",
     "drvcli: block: sem driver",
+    "drvcli: entropy: falhou",
+    "drvcli: entropy: sem driver",
     "virtio-input: falhou",
     "virtio-net: falhou",
     "virtio-gpu: falhou",
@@ -929,6 +1018,8 @@ const M4_IOMMU_FORBIDDEN: &[&str] = &[
     "drvcli: display: sem driver",
     "drvcli: block: falhou",
     "drvcli: block: sem driver",
+    "drvcli: entropy: falhou",
+    "drvcli: entropy: sem driver",
     "virtio-input: falhou",
     "virtio-net: falhou",
     "virtio-gpu: falhou",
@@ -951,14 +1042,126 @@ fn virtio_console_out() -> Result<()> {
     }
 }
 
-/// O mesmo aceite com `-device amd-iommu` (T-403), sem conferir o log de
-/// faltas: o `amd-iommu` do QEMU grava eventos fora do formato da AMD.
+/// Linhas do `keyd` na imagem de teste (ADR 0054, item 6).
+const KEYD_VIRTIO: &str = "keyd: contribuição virtio=";
+const KEYD_SEED: &str = "keyd: semente=";
+/// O `keyd` sem o dispositivo, ou com ele em `Failed` (ADR 0054, item 5).
+const KEYD_SEM_VIRTIO: &str = "keyd: sem virtio-rng; semente só do kernel";
+
+/// Boot só com o que o `keyd` precisa, para os cenários de entropia.
+const KEYD_SCENARIO: Scenario = Scenario {
+    name: "keyd: semente do sistema",
+    markers: &["keyd: gerador semeado", "okernel: desligando"],
+    forbidden: &[
+        "okernel: FALTA",
+        "PÂNICO",
+        "keyd: falha",
+        "keyd: sem entropia",
+    ],
+    ..SCENARIOS[0]
+};
+
+/// Valor de `prefixo` na serial (até o fim da linha).
+fn keyd_field(serial: &str, prefix: &str) -> Result<String> {
+    serial
+        .lines()
+        .find_map(|l| l.split_once(prefix))
+        .map(|(_, v)| v.trim().to_string())
+        .ok_or_else(|| format!("a serial não tem {prefix:?}"))
+}
+
+/// Arquivo de bytes sem blocos repetidos para o `rng-random`; com `constante`,
+/// tudo a partir do byte 160 é igual: o OVMF gasta uns 80 bytes do arquivo no
+/// `EFI_RNG` e o autoteste do driver lê dois blocos, então a leitura do `keyd`
+/// cai nessa parte e derruba o teste de saúde.
+fn rng_file(name: &str, constante: bool) -> Result<PathBuf> {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut bytes = Vec::with_capacity(1 << 14);
+    for _ in 0..1 << 14 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        bytes.push(u8::try_from((state >> 33) & 0xff).unwrap_or(0));
+    }
+    if constante {
+        bytes[160..].fill(0xaa);
+    }
+    let path = root().join("target").join(name);
+    fs::write(&path, bytes).map_err(|e| format!("gravando {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Aceite da T-518 (ADR 0054, item 7): com o `rng-random` de arquivo fixo, dois
+/// boots mostram a mesma contribuição virtio e sementes diferentes (o
+/// dispositivo soma e não substitui); sem o dispositivo o `keyd` parte só com
+/// o kernel; com bytes repetidos o driver marca `Failed` e o `keyd` segue
+/// só com o kernel.
+fn keyd_entropy(opts: &Options) -> Result {
+    build_test(opts)?;
+    let with_file = |file: &Path| Options {
+        devices: vec!["virtio-rng-pci,disable-legacy=on,rng=rngfix"],
+        objects: vec![format!("rng-random,id=rngfix,filename={}", file.display())],
+        ..opts.clone()
+    };
+    let fixed = rng_file("rng-fixo.bin", false)?;
+    let first = boot_scenario(&with_file(&fixed), &KEYD_SCENARIO)?;
+    let second = boot_scenario(&with_file(&fixed), &KEYD_SCENARIO)?;
+    let (v1, v2) = (
+        keyd_field(&first, KEYD_VIRTIO)?,
+        keyd_field(&second, KEYD_VIRTIO)?,
+    );
+    let (s1, s2) = (
+        keyd_field(&first, KEYD_SEED)?,
+        keyd_field(&second, KEYD_SEED)?,
+    );
+    if v1 != v2 {
+        return Err(format!(
+            "keyd: a contribuição virtio mudou entre boots ({v1} e {v2})"
+        ));
+    }
+    if s1 == s2 {
+        return Err(format!(
+            "keyd: a semente repetiu entre boots ({s1}): o virtio substituiu o kernel"
+        ));
+    }
+    println!("xtask: keyd: contribuição virtio {v1} igual e sementes {s1} e {s2} diferentes");
+    let sem = Scenario {
+        name: "keyd: sem virtio-rng",
+        markers: &[
+            KEYD_SEM_VIRTIO,
+            "keyd: gerador semeado",
+            "okernel: desligando",
+        ],
+        ..KEYD_SCENARIO
+    };
+    boot_scenario(opts, &sem)?;
+    let ruim = rng_file("rng-repetido.bin", true)?;
+    let falha = Scenario {
+        name: "keyd: virtio-rng com bytes repetidos",
+        markers: &[
+            "virtio-rng: teste de saúde falhou",
+            KEYD_SEM_VIRTIO,
+            "keyd: gerador semeado",
+            "okernel: desligando",
+        ],
+        ..KEYD_SCENARIO
+    };
+    boot_scenario(&with_file(&ruim), &falha)?;
+    Ok(())
+}
+
+/// O mesmo aceite com `-device amd-iommu` (T-403). A falta chega pela MSI
+/// do log de eventos em até 1 ms do DMA (ADR 0055; T-510), mas o
+/// `amd-iommu` do QEMU grava o endereço e o sentido fora do formato da AMD:
+/// só o dispositivo se confere.
 const AMD_IOMMU_SCENARIO: Scenario = Scenario {
-    name: "AMD-Vi isola o DMA do edu e a MSI dele acorda a notificação",
+    name: "AMD-Vi isola o DMA do edu e a falta chega pela interrupção",
     cmdline: "test=kernel ktest=dev.",
     markers: &[
         KTEST_START,
         "okernel: AMD-Vi ligado: 1 unidade(s)",
+        "okernel: falta de DMA: dev=00:",
+        "ktest: AMD-Vi: ",
         KTEST_END,
     ],
     forbidden: &[
@@ -967,6 +1170,7 @@ const AMD_IOMMU_SCENARIO: Scenario = Scenario {
         "PÂNICO",
         "sem edu ou sem IOMMU",
         "sem edu;",
+        "AMD-Vi sem interrupção de falta",
     ],
     ..KERNEL_SCENARIO
 };
@@ -1070,6 +1274,11 @@ fn smoke(opts: &Options, scenarios: &[Scenario]) -> Result {
     for scenario in scenarios {
         let serial = boot_scenario(opts, scenario)?;
         bases.extend(direct_map_base(&serial));
+        // T-511 (ADR 0055, item 7): da falta à contenção, pelo `devmgr`.
+        if let Some(line) = serial.lines().find(|l| l.contains(CONTAINED)) {
+            let text = line.split_once("devmgr: ").map_or(line, |(_, t)| t);
+            println!("xtask: {}: {}", scenario.name, text.trim());
+        }
     }
     check_direct_map_bases(&bases)
 }
@@ -1198,6 +1407,21 @@ fn spawn_reader(
     (wall_seen, reader)
 }
 
+/// A serial do cenário; com `OPTIMUS_SERIAL_DIR`, gravada também em
+/// `<dir>/<nome>.log`, para ler os carimbos do log depois.
+fn serial_of(sc: &Scenario, raw: &[u8]) -> String {
+    let serial = String::from_utf8_lossy(raw).into_owned();
+    if let Ok(dir) = env::var("OPTIMUS_SERIAL_DIR") {
+        let slug: String = sc
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        let _ = fs::write(Path::new(&dir).join(format!("{slug}.log")), &serial);
+    }
+    serial
+}
+
 /// Dá boot num cenário e devolve a serial, se ela conferir.
 fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let esp = image(opts, sc.cmdline, sc.rounds)?;
@@ -1271,7 +1495,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     };
     let _ = reader.join();
     raw.extend(rx.try_iter().flatten());
-    let serial = String::from_utf8_lossy(&raw);
+    let serial = serial_of(sc, &raw);
     let result = check_serial(&serial, sc.markers, sc.forbidden)
         .and_then(|()| check_hello(&serial, sc))
         .and_then(|()| {
@@ -1302,7 +1526,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
         Ok(()) => {
             show_report(&serial, sc.harness);
             println!("xtask: smoke test de boot ok ({})", sc.name);
-            Ok(serial.into_owned())
+            Ok(serial)
         }
         Err(e) => Err(format!(
             "smoke test de boot falhou ({}): {e}; serial:\n{serial}",
@@ -1571,6 +1795,37 @@ fn check_serial(serial: &str, markers: &[&str], forbidden: &[&str]) -> Result {
     Ok(())
 }
 
+/// `cargo xtask test iommu`: os aceites do kernel e do `devmgr` com VT-d e
+/// com AMD-Vi (T-403, T-404, T-422, T-510, T-511).
+fn iommu(opts: &Options) -> Result {
+    let vtd = Options {
+        devices: vec!["intel-iommu", "edu"],
+        ..opts.clone()
+    };
+    smoke(&vtd, &[IOMMU_SCENARIO, DRIVER_SCENARIO])?;
+    let amd = Options {
+        devices: vec!["amd-iommu", "edu"],
+        ..opts.clone()
+    };
+    smoke(&amd, &[AMD_IOMMU_SCENARIO, AMD_DRIVER_SCENARIO])
+}
+
+/// Conjunto do armazenamento (T-531): formato, GPT e `OptFS` (commit, árvore,
+/// arquivos, snapshots, 200 quedas de energia). Os cenários em QEMU do
+/// `storaged` entram aqui quando ele existir. O `unit`/`all` já roda os
+/// mesmos testes; este atalho é para o ciclo de desenvolvimento e o CI.
+fn storage() -> Result {
+    status(cargo().args([
+        "test",
+        "--package",
+        "optfs-format",
+        "--package",
+        "ogpt",
+        "--package",
+        "optfs",
+    ]))
+}
+
 fn test(opts: &Options) -> Result {
     if matches!(opts.suite.as_str(), "unit" | "all") {
         status(cargo().args([
@@ -1597,16 +1852,7 @@ fn test(opts: &Options) -> Result {
         smoke(opts, &[KERNEL_SCENARIO])?;
     }
     if matches!(opts.suite.as_str(), "iommu" | "all") {
-        let iommu = Options {
-            devices: vec!["intel-iommu", "edu"],
-            ..opts.clone()
-        };
-        smoke(&iommu, &[IOMMU_SCENARIO, DRIVER_SCENARIO])?;
-        let amd = Options {
-            devices: vec!["amd-iommu", "edu"],
-            ..opts.clone()
-        };
-        smoke(&amd, &[AMD_IOMMU_SCENARIO])?;
+        iommu(opts)?;
     }
     if matches!(opts.suite.as_str(), "virtio" | "all") {
         let plain = Options {
@@ -1623,6 +1869,7 @@ fn test(opts: &Options) -> Result {
         };
         smoke(&plain, &[VIRTIO_SCENARIO])?;
         virtio_console_out()?;
+        keyd_entropy(opts)?;
         let iommu = Options {
             devices: vec![
                 "intel-iommu",
@@ -1638,6 +1885,12 @@ fn test(opts: &Options) -> Result {
         };
         smoke(&iommu, &[VIRTIO_IOMMU_SCENARIO])?;
         virtio_console_out()?;
+    }
+    if opts.suite == "keyd" {
+        keyd_entropy(opts)?;
+    }
+    if opts.suite == "storage" {
+        storage()?;
     }
     if opts.suite == "smp" {
         smp(opts)?;
@@ -2387,7 +2640,7 @@ mod tests {
                   info  [7376636d] svcmgr: devmgr em Running\r\n\
                   info  [7376636d] svcmgr: pcid em Running\r\n\
                   info  [7376636d] svcmgr: acpid em Running\r\n\
-                  info  [7376636d] svcmgr: 7 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: 8 serviços em Running\r\n\
                   info  [7376636d] svcmgr: serviços encerrados\r\n\
                   info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";

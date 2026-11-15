@@ -21,6 +21,21 @@ jobs:
       - uses: actions/checkout@v5
       - name: QEMU e OVMF
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+      # O amd-iommu do QEMU 8.2 do Ubuntu não atualiza a cauda do log de
+      # eventos (ADR 0055; T-510): os boots com AMD-Vi usam o 10.1.
+      - name: QEMU 10.1 para o AMD-Vi (cache)
+        id: qemu-amd
+        uses: actions/cache@v4
+        with:
+          path: ~/qemu-amd
+          key: qemu-amd-${{ hashFiles('tools/qemu-amd.sh') }}-ubuntu-24.04
+      - name: QEMU 10.1 para o AMD-Vi (compilação)
+        if: steps.qemu-amd.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y ninja-build libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison
+          tools/qemu-amd.sh ~/qemu-amd
+      - name: QEMU 10.1 para o AMD-Vi (variável)
+        run: echo "OPTIMUS_QEMU_AMD=$HOME/qemu-amd/bin/qemu-system-x86_64" >> "$GITHUB_ENV"
       - name: Toolchain fixada em rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - name: Testes unitários, smoke test de boot, testes de kernel e de usuário no QEMU
@@ -60,6 +75,8 @@ jobs:
         run: cargo xtask test integration
       - name: Teste de caos, 100 mortes aleatórias em -smp 4 (T-366)
         run: cargo xtask test chaos
+      - name: Armazenamento, formato, GPT e OptFS (T-531)
+        run: cargo xtask test storage
 
   # Miri sobre os testes do alocador (ADR 0039, item 1): só nos PRs que mudam
   # a lib/oalloc. O GitHub Actions não filtra `paths` por job, então o job

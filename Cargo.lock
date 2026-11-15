@@ -154,6 +154,16 @@ name = "kabi"
 version = "0.1.0"
 
 [[package]]
+name = "keyd"
+version = "0.1.0"
+dependencies = [
+ "oidl-rt",
+ "optcrypt",
+ "ostd",
+ "osvc",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -239,6 +249,10 @@ name = "oelf"
 version = "0.1.0"
 
 [[package]]
+name = "ogpt"
+version = "0.1.0"
+
+[[package]]
 name = "oidl-rt"
 version = "0.1.0"
 
@@ -310,6 +324,14 @@ dependencies = [
 [[package]]
 name = "optcrypt"
 version = "0.1.0"
+
+[[package]]
+name = "optfs"
+version = "0.1.0"
+dependencies = [
+ "optcrypt",
+ "optfs-format",
+]
 
 [[package]]
 name = "optfs-format"
@@ -600,8 +622,10 @@ dependencies = [
 name = "virtio-rng"
 version = "0.1.0"
 dependencies = [
+ "oidl-rt",
  "optcrypt",
  "ostd",
+ "osvc",
  "vdrv",
  "virtio-core",
 ]

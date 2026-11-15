@@ -9,6 +9,13 @@
 //! quem publicou, parte o driver casado com os recursos do nó
 //! ([`bind`]). Quando o `svcmgr` revoga o endpoint no desligamento, o
 //! `devmgr` sai.
+//!
+//! As faltas de DMA (ADR 0055, item 6) chegam por uma segunda thread, que só
+//! espera a notificação de faltas, sem prazo, e passa os bits ao laço
+//! principal por `ipc_call` ao próprio endpoint, com o badge
+//! [`FAULT_BADGE`]. O laço trata a falta em série com os pedidos do
+//! `DeviceBus`: nenhum estado é dividido entre as threads, e com a máquina
+//! parada nada acorda.
 
 #![no_std]
 #![no_main]
@@ -21,7 +28,7 @@ use alloc::vec::Vec;
 use odev::wire::{self, Method, Resources};
 use odev::{Bus, Driver, Node, Outcome, Registry, Rule};
 use ostd::ipc;
-use ostd::kabi::{Error, Handle, ObjectType};
+use ostd::kabi::{Error, Handle, ObjectType, Rights};
 use ostd::rt::Start;
 use ostd::svc::Session;
 
@@ -36,9 +43,12 @@ const REQ_BYTES: usize = wire::MAX_ROUTES_BYTES;
 const _: () = assert!(wire::MAX_PUBLISH_BYTES <= REQ_BYTES);
 /// Teto de nós guardados.
 const MAX_NODES: usize = 256;
-/// Quanto o laço espera um pedido antes de olhar as faltas de DMA (ADR
-/// 0051, item 6: sem segunda thread, só o endpoint e a notificação).
-const POLL_NS: u64 = 50_000_000;
+/// Badge da capability com que a thread de faltas chama o próprio endpoint
+/// (ADR 0055, item 6). O badge de cliente do `svcmgr` tem os 16 bits altos
+/// zerados (geração de 16 bits acima do id), então este nunca colide.
+const FAULT_BADGE: u64 = u64::MAX;
+/// Pilha da thread de faltas.
+const FAULT_STACK: usize = 16 * 1024;
 /// Faltas de DMA de um mesmo driver aceitas na janela [`FAULT_WINDOW_NS`];
 /// a seguinte o deixa parado (ADR 0051, item 4).
 const MAX_FAULTS: usize = 3;
@@ -212,12 +222,9 @@ impl Devmgr {
             .map_or("?", |d| d.name.as_str())
     }
 
-    /// Olha as faltas de DMA sinaladas e trata cada driver que faltou.
-    fn faulted(&mut self) {
-        let bits = ostd::cap::ntfy_poll(self.faults).unwrap_or(0);
-        if bits == 0 {
-            return;
-        }
+    /// Trata cada driver cujo bit de falta de DMA veio em `bits`; `woke` é
+    /// quando a thread de faltas acordou com eles.
+    fn faulted(&mut self, bits: u64, woke: u64) {
         let hit: Vec<u32> = self
             .bound
             .iter()
@@ -225,15 +232,16 @@ impl Devmgr {
             .map(|b| b.driver)
             .collect();
         for id in hit {
-            self.contain(id);
+            self.contain(id, woke);
         }
     }
 
     /// Contém o driver `id` que fez DMA fora do domínio (ADR 0051, itens 3
     /// e 4): o `svcmgr` o para, os recursos dele saem (o domínio morre e a
     /// IOMMU passa a barrar o dispositivo) e, dentro do teto de faltas, o
-    /// driver parte de novo com recursos novos.
-    fn contain(&mut self, id: u32) {
+    /// driver parte de novo com recursos novos. O log registra o tempo
+    /// desde `woke` até os recursos saírem (ADR 0055, item 7).
+    fn contain(&mut self, id: u32, woke: u64) {
         let Some(i) = self.bound.iter().position(|b| b.driver == id) else {
             return;
         };
@@ -254,6 +262,10 @@ impl Devmgr {
             let _ = ostd::cap::delete(h);
         }
         let now = ostd::time::now_ns();
+        ostd::debug::print_fmt(format_args!(
+            "devmgr: {name} contido {} µs depois da falta",
+            now.saturating_sub(woke) / 1000
+        ));
         let k = self
             .history
             .iter()
@@ -285,19 +297,26 @@ impl Devmgr {
         let mut req = [0u8; REQ_BYTES];
         let mut out = [0u8; 8];
         loop {
-            let deadline = ostd::time::now_ns().saturating_add(POLL_NS);
-            let r = match ipc::recv_corpo(ep, reply, &mut self.s.buffer, &mut req, deadline) {
+            let r = match ipc::recv_corpo(ep, reply, &mut self.s.buffer, &mut req, 0) {
                 Ok(r) => r,
-                Err(Error::TimedOut) => {
-                    self.faulted();
-                    continue;
-                }
                 Err(Error::InvalidArgument) => {
                     let _ = ipc::send(reply, &ipc::Message::new(osvc::REPLY_BAD_MESSAGE, &[]), 0);
                     continue;
                 }
                 Err(e) => return e,
             };
+            if r.badge == FAULT_BADGE {
+                // A thread de faltas volta a esperar já; as faltas que
+                // chegarem enquanto esta é tratada ficam como bits.
+                let _ = ipc::send(reply, &ipc::Message::new(osvc::REPLY_OK, &[]), 0);
+                let word = |i: usize| {
+                    let mut w = [0u8; 8];
+                    w.copy_from_slice(&req[i * 8..i * 8 + 8]);
+                    u64::from_le_bytes(w)
+                };
+                self.faulted(word(0), word(1));
+                continue;
+            }
             let ((label, n), start) = match wire::method_of(r.rotulo) {
                 Some(Method::Publish) => self.publish(&req[..r.corpo], &mut out),
                 Some(Method::PublishRoutes) => (self.routes(&req[..r.corpo]), None),
@@ -307,14 +326,29 @@ impl Devmgr {
             if let Some((id, res)) = start {
                 self.start(id, &res);
             }
-            self.faulted();
+        }
+    }
+}
+
+/// A thread de faltas (ADR 0055, item 6): espera, sem prazo, a notificação
+/// e manda os bits e o instante em que acordou ao laço por `send`, a
+/// capability de envio com [`FAULT_BADGE`]. Termina quando o endpoint some.
+fn wait_faults(faults: Handle, send: Handle) {
+    while let Ok(bits) = ostd::cap::ntfy_wait(faults) {
+        let woke = ostd::time::now_ns();
+        if ipc::call(send, &ipc::Message::new(0, &[bits, woke]), 0).is_err() {
+            return;
         }
     }
 }
 
 fn main(start: Start) -> ! {
-    let Ok(mut s) = Session::start(start.args) else {
-        ostd::thread::exit()
+    let mut s = match Session::start(start.args) {
+        Ok(s) => s,
+        Err(e) => {
+            ostd::debug::print_fmt(format_args!("devmgr: sem a sessão do svcmgr ({e:?})"));
+            ostd::thread::exit()
+        }
     };
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     if let Some(log) = s
@@ -346,6 +380,15 @@ fn main(start: Start) -> ! {
         ostd::debug::print("devmgr: sem notificação de faltas de DMA");
         ostd::thread::exit()
     };
+    let waiter = ostd::cap::mint(ep, Rights::SEND, FAULT_BADGE, None).and_then(|send| {
+        ostd::thread::Builder::new()
+            .stack_size(FAULT_STACK)
+            .spawn(move || wait_faults(faults, send))
+    });
+    if waiter.is_err() {
+        ostd::debug::print("devmgr: sem a thread de faltas de DMA");
+        ostd::thread::exit()
+    }
     if s.ready().is_ok() {
         let mut d = Devmgr {
             s,
@@ -361,5 +404,7 @@ fn main(start: Start) -> ! {
         let end = d.serve(ep, quota);
         ostd::debug::print_fmt(format_args!("devmgr: encerrado ({end:?})"));
     }
+    // A thread de faltas sai junto.
+    let _ = ostd::thread::exit_group(0);
     ostd::thread::exit()
 }

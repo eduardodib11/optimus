@@ -98,6 +98,12 @@ impl Hw for Fake {
 
     fn write64(&mut self, unit: usize, off: usize, value: u64) {
         let mut seen = self.0.lock().unwrap();
+        // Os três bits baixos do status se limpam escrevendo 1.
+        let value = if off == STATUS {
+            seen.regs[unit].get(&off).copied().unwrap_or(0) & !(value & 7)
+        } else {
+            value
+        };
         seen.regs[unit].insert(off, value);
         let on = seen.regs[unit]
             .get(&CONTROL)
@@ -148,7 +154,7 @@ fn blocked_entry(fake: &Fake) -> (u64, u64) {
     let (lo, hi) = entry(fake, 0);
     assert_eq!(lo & !ADDR, VALID | TRANSLATE | 3 << 9 | IR | IW);
     let empty = lo & ADDR;
-    assert!((0..512).all(|e| fake.word(empty + e * 8) == 0));
+    assert!((0..512).all(|e| fake.word(empty + e * 8) == ABSENT));
     (lo, hi)
 }
 
@@ -204,10 +210,13 @@ fn attach_e_map_montam_as_tabelas() {
     let leaf = |i: u64| fake.word((l1 & ADDR) + i * 8);
     assert_eq!(leaf(2), 0x1234_5000 | IR | IW | PRESENT);
     assert_eq!(leaf(3), 0x1234_6000 | IR | PRESENT);
-    // Desmapear zera a folha e invalida as páginas do domínio.
+    // As entradas vagas são `ABSENT`, nunca zero (o QEMU só registra falta
+    // numa entrada não nula).
+    assert_eq!((leaf(4), fake.word(l3 + 8)), (ABSENT, ABSENT));
+    // Desmapear tira a folha e invalida as páginas do domínio.
     let flushes = |f: &Fake| f.0.lock().unwrap().done.iter().filter(|d| d.1 == 3).count();
     amd.unmap(id, 0x40_2000, 1);
-    assert_eq!(leaf(2), 0);
+    assert_eq!(leaf(2), ABSENT);
     assert_eq!(flushes(&fake), 1);
     // Destruir bloqueia de novo e devolve as três tabelas.
     assert_eq!(amd.destroy(id), 3);
@@ -241,7 +250,10 @@ fn faltas_do_log_de_eventos() {
         seen.regs[0].insert(EVT_TAIL, 32);
     }
     let mut got = Vec::new();
-    amd.faults(&mut |f| got.push(f));
+    fake.0.lock().unwrap().regs[0].insert(STATUS, EVENT_LOG_INT | EVENT_LOG_RUN);
+    assert_eq!(amd.faults(&mut |f| got.push(f)), 0);
+    // `EventLogInt` limpo, o log continua ligado.
+    assert_eq!(fake.reg(0, STATUS), EVENT_LOG_RUN);
     let fault = Fault {
         bdf: 0x0018,
         iova: 0x40_2000,
@@ -266,4 +278,45 @@ fn recusas() {
     let id = amd.create(&mut no_quota()).unwrap();
     amd.attach(id, 0x0018).unwrap();
     assert!(fake.0.lock().unwrap().done.iter().all(|d| d.0 == 0));
+}
+
+#[test]
+fn interrupcao_e_transbordo_do_log() {
+    let (fake, amd) = one_unit();
+    assert_eq!(fake.reg(0, CONTROL) & EVENT_INT_EN, 0);
+    amd.enable_fault_irq(0);
+    let control = fake.reg(0, CONTROL);
+    assert_eq!(
+        control & (EVENT_INT_EN | EVENT_LOG_EN),
+        EVENT_INT_EN | EVENT_LOG_EN
+    );
+    // Transbordo com uma falta ainda no log: ela sai, e o log volta vazio
+    // e ligado, sem o bit de transbordo.
+    {
+        let mut seen = fake.0.lock().unwrap();
+        let log = seen.regs[0][&EVT_LOG] & ADDR;
+        let t = seen.tables.get_mut(&log).unwrap();
+        t[2] = 0x0020 | (2u64 << 28) << 32;
+        t[3] = 0x9000;
+        let regs = &mut seen.regs[0];
+        regs.insert(EVT_HEAD, 16);
+        regs.insert(EVT_TAIL, 32);
+        regs.insert(STATUS, EVENT_OVERFLOW | EVENT_LOG_INT);
+    }
+    let mut got = Vec::new();
+    assert_eq!(amd.faults(&mut |f| got.push(f.bdf)), 1);
+    assert_eq!(got, [0x0020]);
+    assert_eq!((fake.reg(0, EVT_HEAD), fake.reg(0, EVT_TAIL)), (0, 0));
+    assert_eq!(fake.reg(0, STATUS), 0);
+    assert_eq!(fake.reg(0, CONTROL), control);
+}
+
+#[test]
+fn funcao_da_iommu_e_do_kernel() {
+    let (_, amd) = one_unit();
+    // O IVHD de `ivrs_all` dá à IOMMU o BDF 00:00.0.
+    assert_eq!(amd.functions(), [0]);
+    assert!(amd.owns(0) && !amd.owns(0x18));
+    let id = amd.create(&mut no_quota()).unwrap();
+    assert_eq!(amd.attach(id, 0), Err(Error::AccessDenied));
 }

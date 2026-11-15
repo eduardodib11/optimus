@@ -1,0 +1,17 @@
+[package]
+name = "optfs"
+description = "OptFS: commit atômico, montagem pelo superbloco válido e alocador com liberação adiada (ADR 0052)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[dependencies]
+optfs-format = { path = "../optfs-format" }
+optcrypt = { path = "../optcrypt" }
+
+[lints]
+workspace = true

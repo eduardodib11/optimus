@@ -81,3 +81,13 @@ fn handle_no_erro_e_recusado_com_erro() {
     let erros = gera_cliente(&file).expect_err("handle no erro não tem cliente");
     assert!(erros.iter().any(|e| e.msg.contains("handle")), "{erros:?}");
 }
+
+#[test]
+fn vec_de_bytes_na_resposta_vira_oidl_rt_bytes() {
+    let src = "package optimus.t @1.0;\nenum E : u8 { A }\ninterface S { ler(n: u8) -> result<vec<u8, 64>, E>; }\n";
+    let file = parse(src).expect("analisa");
+    assert!(oidlc::analyze(&file).is_empty());
+    let g = formata(&gera_cliente(&file).expect("gera o cliente"));
+    assert!(g.contains("Result<oidl_rt::Bytes<64>, E>"), "{g}");
+    assert!(g.contains("r.bytes(64)?"));
+}

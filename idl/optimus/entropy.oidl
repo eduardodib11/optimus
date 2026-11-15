@@ -1,0 +1,11 @@
+// Fonte de entropia (T-514; ADR 0054, item 2): o `virtio-rng` serve este
+// contrato só ao `keyd`. É fonte secundária; o kernel segue a primária.
+package optimus.dev @1.0;
+
+enum RngError : u8 { Failed, Busy }
+
+interface EntropySource {
+    // Até 64 bytes do dispositivo. `Failed` depois que o teste de saúde do
+    // driver reprova um bloco, até o driver reiniciar.
+    read(len: u8) -> result<vec<u8, 64>, RngError>;
+}
