@@ -136,7 +136,7 @@ const BOOT_MARKERS: &[&str] = &[
     "svcmgr: devmgr em Running",
     "svcmgr: pcid em Running",
     "svcmgr: acpid em Running",
-    "svcmgr: 9 serviços em Running",
+    "svcmgr: 8 serviços em Running",
     "svcmgr: serviços encerrados",
     "root: o svcmgr terminou",
     "okernel: root terminou",
@@ -924,7 +924,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 11 drivers no conjunto",
+        "devmgr: 12 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -2035,8 +2035,9 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 11 drivers no conjunto",
+    "devmgr: 12 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: drvcli",
+    "devmgr: nó 00:1f.0 8086:2918 0 BARs: storaged",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
     // (teclado PS/2 e RTC) viram nós com portas e IRQ.
@@ -2728,7 +2729,7 @@ mod tests {
                   info  [7376636d] svcmgr: devmgr em Running\r\n\
                   info  [7376636d] svcmgr: pcid em Running\r\n\
                   info  [7376636d] svcmgr: acpid em Running\r\n\
-                  info  [7376636d] svcmgr: 9 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: 8 serviços em Running\r\n\
                   info  [7376636d] svcmgr: serviços encerrados\r\n\
                   info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";

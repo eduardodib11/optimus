@@ -1,7 +1,12 @@
 # Manifesto do `storaged` (T-520; ADR 0056 e 0066): lê a GPT do disco que o
 # driver serve pelo `BlockDevice` e serve as partições como `BlockStore`.
 # O driver só existe depois que o `devmgr` casa o dispositivo, então a
-# necessidade é opcional e o serviço espera por ele.
+# necessidade é opcional e o serviço espera por ele. Por isso o `storaged`
+# parte pelo `devmgr`, como o `drvcli` (ADR 0046, item 5), casado com a ponte
+# LPC do q35 (`8086:2918`), que existe em toda VM do teste: um serviço de boot
+# que espera um disco que talvez não exista prenderia a cota no desligamento
+# (a chamada ao `svcmgr` morto não falha, só expira). Casar por classe de
+# armazenamento fica para quando o `devmgr` souber.
 [service]
 name = "storaged"
 binary = "storaged"
@@ -11,6 +16,9 @@ restart = "never"
 [capabilities]
 needs = ["mem:quota:768KiB", "kernel:debug", "svc:optimus.block.BlockDevice@1?"]
 provides = ["optimus.storage.Storage@1.0"]
+
+[match]
+pci = ["8086:2918"]
 
 [limits]
 max_threads = 1
