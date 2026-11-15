@@ -829,7 +829,13 @@ struct Scenario {
 }
 
 /// O que o xtask digita no console virtio (`drvcli::CONSOLE_INPUT`).
-const CONSOLE_INPUT: &str = "optimus-entrada\n";
+/// A primeira linha é do `drvcli` (leitura do contrato); o resto é a senha de
+/// teste que o `keyd` pede (T-527): criar com `SENHA` duas vezes, desbloquear
+/// errando uma vez e, depois, errar três vezes para o volume ficar trancado.
+const CONSOLE_INPUT: &str =
+    "optimus-entrada\nsenha-de-teste\nsenha-de-teste\nerrada\nsenha-de-teste\nx1\nx2\nx3\n";
+/// Senha de teste: não pode aparecer na serial nem ser repetida no console.
+const TEST_PASSWORD: &str = "senha-de-teste";
 
 /// Digita [`CONSOLE_INPUT`] no console virtio pelo socket do `chardev`.
 struct ConsoleFeed {
@@ -863,7 +869,7 @@ impl ConsoleFeed {
             self.sent = true;
             self.conn = Some(c);
         }
-        if self.conn.is_some() && serial.contains("drvcli: console: entrada ok") {
+        if self.conn.is_some() && serial.contains("drvcli: keyd: volume trancado sem a senha") {
             self.conn = None;
         }
     }
@@ -1072,6 +1078,11 @@ macro_rules! m4_markers {
             // T-514: o cliente conversa com o driver pelo contrato gerado.
             "drvcli: console ok",
             "drvcli: console: entrada ok",
+            // T-527: o `keyd` cria e desbloqueia um volume pedindo a senha no
+            // console; o cliente (no papel do `optfs`) nunca a vê.
+            "drvcli: keyd: volume criado",
+            "drvcli: keyd: volume desbloqueado",
+            "drvcli: keyd: volume trancado sem a senha",
             "drvcli: display ok",
             "drvcli: storage ok",
             "drvcli: net ok",
@@ -1126,6 +1137,11 @@ const M4_FORBIDDEN: &[&str] = &[
     "virtio-console: falhou",
     "drvcli: console: falhou",
     "drvcli: console: entrada falhou",
+    "drvcli: keyd: sem serviço",
+    "drvcli: keyd: criar falhou",
+    "drvcli: keyd: desbloqueio falhou",
+    "drvcli: keyd: trancado falhou",
+    TEST_PASSWORD,
     "drvcli: console: sem driver",
     "drvcli: display: falhou",
     "drvcli: display: sem driver",
@@ -1155,6 +1171,11 @@ const M4_IOMMU_FORBIDDEN: &[&str] = &[
     "virtio-console: falhou",
     "drvcli: console: falhou",
     "drvcli: console: entrada falhou",
+    "drvcli: keyd: sem serviço",
+    "drvcli: keyd: criar falhou",
+    "drvcli: keyd: desbloqueio falhou",
+    "drvcli: keyd: trancado falhou",
+    TEST_PASSWORD,
     "drvcli: console: sem driver",
     "drvcli: display: falhou",
     "drvcli: display: sem driver",
@@ -1182,6 +1203,20 @@ fn virtio_console_out() -> Result<()> {
     let text = fs::read_to_string(&out).map_err(|e| format!("lendo {}: {e}", out.display()))?;
     if text.contains("ola do processo de usuario") {
         println!("xtask: virtio-console: o texto chegou ao chardev do QEMU");
+        // T-527: o `keyd` pediu as senhas, mostrou a chave de recuperação
+        // só no console e não repetiu a senha de teste.
+        for want in [
+            "keyd: senha nova: ",
+            "keyd: senha: ",
+            "keyd: chave de recuperação",
+        ] {
+            if !text.contains(want) {
+                return Err(format!("virtio-console: o chardev não tem {want:?}"));
+            }
+        }
+        if text.contains(TEST_PASSWORD) {
+            return Err("virtio-console: a senha de teste apareceu no console".into());
+        }
         Ok(())
     } else {
         Err(format!(

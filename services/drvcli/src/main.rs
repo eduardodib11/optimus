@@ -19,6 +19,7 @@ mod console_cliente;
 mod display_cliente;
 mod entropy_cliente;
 mod input_cliente;
+mod keyd_cliente;
 mod net_cliente;
 mod storage_cliente;
 
@@ -26,6 +27,7 @@ use console_cliente::ConsoleCliente;
 use display_cliente::DisplayDeviceCliente;
 use entropy_cliente::EntropySourceCliente;
 use input_cliente::InputDeviceCliente;
+use keyd_cliente::{KeydError, KeyringCliente};
 use net_cliente::NetDeviceCliente;
 use storage_cliente::{BlockStoreCliente, StorageCliente};
 
@@ -99,7 +101,7 @@ fn console(s: &mut Session) {
     }
     // A entrada da porta 0 (T-527): o xtask digita `CONSOLE_INPUT` no
     // `chardev` do QEMU.
-    match ConsoleCliente::new(ep).read(&mut s.buffer, 32, 2000) {
+    match ConsoleCliente::new(ep).read(&mut s.buffer, CONSOLE_INPUT.len() as u8, 2000) {
         Ok(Ok(b)) if b.as_slice() == CONSOLE_INPUT.as_bytes() => {
             ostd::debug::print("drvcli: console: entrada ok");
         }
@@ -482,6 +484,50 @@ fn entropy(s: &mut Session) {
     }
 }
 
+/// O papel do `optfs` (T-527): cria um volume pelo `keyd`, desbloqueia com a
+/// senha certa (o xtask digita uma errada antes) e confere que o volume não
+/// destranca com três senhas erradas. As senhas vão pelo console; este
+/// cliente nunca as vê.
+fn keyd(s: &mut Session) {
+    let Some(ep) = connect(s, b"optimus.keyd.Keyring") else {
+        ostd::debug::print("drvcli: keyd: sem serviço");
+        return;
+    };
+    let keyring = KeyringCliente::new(ep);
+    let uuid = "0102030405060708090a0b0c0d0e0f10";
+    let slots = match keyring.create_volume(&mut s.buffer, uuid) {
+        Ok(Ok(b)) => b,
+        r => {
+            ostd::debug::print_fmt(format_args!("drvcli: keyd: criar falhou ({r:?})"));
+            return;
+        }
+    };
+    ostd::debug::print("drvcli: keyd: volume criado");
+    let mut hex = [0u8; 404];
+    let n = optcrypt::keyring::to_hex(slots.as_slice(), &mut hex);
+    let Ok(hex) = core::str::from_utf8(&hex[..n]) else {
+        return;
+    };
+    match keyring.unlock(&mut s.buffer, uuid, hex) {
+        Ok(Ok(k)) if k.as_slice().len() == 96 && k.as_slice().iter().any(|&b| b != 0) => {
+            ostd::debug::print("drvcli: keyd: volume desbloqueado");
+        }
+        r => {
+            ostd::debug::print_fmt(format_args!("drvcli: keyd: desbloqueio falhou ({r:?})"));
+            return;
+        }
+    }
+    match keyring.unlock(&mut s.buffer, uuid, hex) {
+        Ok(Err(KeydError::WrongPassword)) => {
+            ostd::debug::print("drvcli: keyd: volume trancado sem a senha");
+        }
+        r => ostd::debug::print_fmt(format_args!(
+            "drvcli: keyd: trancado falhou ({:?})",
+            r.map(|x| x.map(|b| b.as_slice().len()))
+        )),
+    }
+}
+
 fn main(start: Start) -> ! {
     let mut s = match Session::start(start.args) {
         Ok(s) => s,
@@ -506,5 +552,7 @@ fn main(start: Start) -> ! {
     net(&mut s, quota);
     entropy(&mut s);
     input(&mut s, quota);
+    // Por último: pede senhas no console e é o passo mais demorado do cliente.
+    keyd(&mut s);
     ostd::thread::exit()
 }

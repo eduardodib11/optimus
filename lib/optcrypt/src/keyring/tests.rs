@@ -283,3 +283,17 @@ fn kek_por_senha_e_deterministica_e_depende_do_sal() {
     let k3 = kek_password(b"s", &b, &mut w).unwrap();
     assert!(!k1.ct_eq(&k3));
 }
+
+#[test]
+fn hexadecimal_de_ida_e_volta_e_recusas() {
+    let mut h = [0u8; 8];
+    assert_eq!(to_hex(&[0x00, 0xab, 0x7f, 0xff], &mut h), 8);
+    assert_eq!(&h, b"00ab7fff");
+    assert_eq!(to_hex(&[1, 2, 3], &mut [0u8; 5]), 0);
+    let mut b = [0u8; 4];
+    assert_eq!(from_hex(b"00AB7fff", &mut b), Ok(4));
+    assert_eq!(b, [0x00, 0xab, 0x7f, 0xff]);
+    assert_eq!(from_hex(b"0", &mut b), Err(Error::BadEncoding));
+    assert_eq!(from_hex(b"0g", &mut b), Err(Error::BadEncoding));
+    assert_eq!(from_hex(b"0000000000", &mut b), Err(Error::BadEncoding));
+}

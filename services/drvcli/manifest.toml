@@ -21,6 +21,7 @@ needs = [
   "svc:optimus.net.NetDevice@1?",
   "svc:optimus.input.InputDevice@1?",
   "svc:optimus.dev.EntropySource@1?",
+  "svc:optimus.keyd.Keyring@1?",
 ]
 provides = []
 
