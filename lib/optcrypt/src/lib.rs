@@ -15,9 +15,12 @@
 //! código verificado (P9 da ADR 0053) continua pendente, como a do BLAKE3.
 
 #![cfg_attr(not(test), no_std)]
-#![forbid(unsafe_code)]
+// `unsafe` só em `arch` (AES-NI), pelo orçamento de `unsafe-allowlist.toml`.
+#![deny(unsafe_code)]
 
 pub mod aead;
+pub mod aes_gcm;
+pub mod arch;
 pub mod argon2;
 pub mod blake2b;
 pub mod blake3;

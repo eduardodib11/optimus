@@ -11,6 +11,8 @@ crates = [
     "lib/ostd",
     # Núcleo do alocador (T-334): testável no host, sem syscalls.
     "lib/oalloc",
+    # AES-NI e PCLMULQDQ do AES-256-GCM (T-534, ADR 0053): só `arch`.
+    "lib/optcrypt",
 ]
 
 # Tetos de usos de `unsafe` (blocos, `impl`, `fn`, `trait`, `extern`) por
@@ -25,6 +27,7 @@ crates = [
 "lib/ostd/src/tls" = 23     # bloco da thread, thread_local!, Handoff (T-335)
 "lib/ostd/src/ring" = 4    # anéis SPSC compartilhados: cabeçalho atômico e cópia da carga útil (T-339)
 "lib/ostd/src/sync" = 28   # guardas (UnsafeCell), Send/Sync das travas e OnceLock (T-336)
+"lib/optcrypt/src/arch" = 5   # AES-NI: transmute de/para __m128i e as chamadas das funções com target_feature (T-534)
 "lib/oalloc" = 74         # alocador (núcleo e testes; T-337: +4 no teste do ponteiro interior, +6 no rastro de coleções)
 
 # Previstos pela ADR 0039 para quando os módulos existirem (o primeiro PR de

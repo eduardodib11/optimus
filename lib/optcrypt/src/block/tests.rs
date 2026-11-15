@@ -59,3 +59,26 @@ fn contador_esgotado() {
     s.next = u64::MAX;
     assert_eq!(s.seal(b"", &mut [0u8; 1]), Err(Error::EpochExhausted));
 }
+
+#[test]
+fn aes_gcm_pelo_bloco() {
+    let sal = [4u8; SALT_LEN];
+    let Ok(mut sealer) = EpochSealer::with_algo(Algo::Aes256Gcm, &base(), 2, &sal) else {
+        // Sem AES-NI: o pedido é recusado, nunca cai em software.
+        assert_eq!(
+            EpochSealer::with_algo(Algo::Aes256Gcm, &base(), 2, &sal).err(),
+            Some(Error::Unsupported)
+        );
+        return;
+    };
+    let opener = EpochOpener::with_algo(Algo::Aes256Gcm, &base(), 2, &sal).unwrap();
+    let mut bloco = *b"bloco cifrado com AES";
+    let r1 = sealer.seal(b"aad", &mut bloco).unwrap();
+    opener.open(&r1, b"aad", &mut bloco).unwrap();
+    assert_eq!(&bloco, b"bloco cifrado com AES");
+    // O mesmo bloco não abre com o algoritmo errado.
+    let mut outro = *b"outro bloco";
+    let r2 = sealer.seal(b"aad", &mut outro).unwrap();
+    let errado = EpochOpener::new(&base(), 2, &sal);
+    assert_eq!(errado.open(&r2, b"aad", &mut outro), Err(Error::Auth));
+}
