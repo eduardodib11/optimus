@@ -1,0 +1,25 @@
+// InputDevice (T-514; ADR 0046, item 5; ADR 0062): o driver de entrada
+// (hoje o `virtio-input`) serve este contrato ao `inputd`/`displayd`. Mesmo
+// modelo do `BlockDevice` (ADR 0061): `session()` dá um endpoint com
+// `SEND|GRANT`, e o cliente cria o anel de eventos e o entrega por
+// `attach_events(ring, signal)`, com o `SIGNAL` da sua `Notification`.
+//
+// Cada registro do anel (tipo 1, carga de 8 bytes) é um evento `evdev` como o
+// dispositivo o mandou: `type: u16`, `code: u16`, `value: u32`. O driver
+// guarda até 16 eventos que chegam antes do `attach_events` e os entrega ao
+// ligar. Anel cheio descarta o evento mais novo (`dropped` do anel).
+package optimus.input @1.0;
+
+enum InputError : u8 { Io, BadRequest }
+
+// `ring_bytes` de dados no anel de eventos que o cliente cria.
+struct InputInfo {
+    ring_bytes: u32
+}
+
+interface InputDevice {
+    info() -> result<InputInfo, InputError>;
+    session() -> result<handle<Endpoint>, InputError>;
+    // Só pela sessão (com `GRANT`).
+    attach_events(ring: handle<MemoryObject>, signal: handle<Notification>) -> result<(), InputError>;
+}

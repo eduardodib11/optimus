@@ -10,7 +10,7 @@ restart = "never"
 
 [capabilities]
 needs = ["mem:quota:768KiB", "kernel:debug", "svc:optimus.input.Sink@1"]
-provides = []
+provides = ["optimus.input.InputDevice@1.0"]
 
 [match]
 pci = ["1af4:1052"]
