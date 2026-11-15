@@ -74,6 +74,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
     ("ps2mouse", "services/ps2mouse/src/main.rs", USER_TARGET),
     ("drvcli", "services/drvcli/src/main.rs", USER_TARGET),
+    ("keyd", "services/keyd/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -216,6 +217,8 @@ struct Options {
     /// Dispositivos extras do QEMU, antes dos de sempre (a `intel-iommu`
     /// precisa vir antes dos dispositivos PCI).
     devices: Vec<&'static str>,
+    /// Objetos do QEMU (`-object`), como o `rng-random` do virtio-rng.
+    objects: Vec<String>,
 }
 
 impl Default for Options {
@@ -236,6 +239,7 @@ impl Default for Options {
             fail_on_purpose: false,
             chaos: None,
             devices: Vec::new(),
+            objects: Vec::new(),
         }
     }
 }
@@ -288,7 +292,7 @@ fn parse(args: &[String]) -> Result<Options> {
                 );
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
-            | "integration" | "chaos" | "iommu" | "virtio" | "all" => {
+            | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -412,7 +416,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input"
         | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "ps2mouse" | "drvcli"
-        | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        | "keyd" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -469,6 +473,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("i8042d", "i8042d"),
     ("ps2mouse", "ps2mouse"),
     ("drvcli", "drvcli"),
+    ("keyd", "keyd"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -640,6 +645,9 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     // Rede de usuário (slirp) para o `virtio-net-pci`: responde ao ARP.
     if opts.devices.iter().any(|d| d.starts_with("virtio-net-pci")) {
         cmd.args(["-netdev", "user,id=vn0"]);
+    }
+    for object in &opts.objects {
+        cmd.args(["-object", object]);
     }
     for device in &opts.devices {
         cmd.args(["-device", device]);
@@ -901,6 +909,10 @@ macro_rules! m4_markers {
             "drvcli: console ok",
             "drvcli: display ok",
             "drvcli: entropy ok",
+            // T-518: o `keyd` soma a contribuição do virtio-rng à semente.
+            "keyd: contribuição virtio=",
+            "keyd: semente=",
+            "keyd: gerador semeado",
             "1af4:1052 ",
             "virtio-input: fila de eventos pronta",
             "virtio-input: tecla 0x1e encaminhada",
@@ -989,6 +1001,114 @@ fn virtio_console_out() -> Result<()> {
             "virtio-console: o chardev não recebeu o texto (veio {text:?})"
         ))
     }
+}
+
+/// Linhas do `keyd` na imagem de teste (ADR 0054, item 6).
+const KEYD_VIRTIO: &str = "keyd: contribuição virtio=";
+const KEYD_SEED: &str = "keyd: semente=";
+/// O `keyd` sem o dispositivo, ou com ele em `Failed` (ADR 0054, item 5).
+const KEYD_SEM_VIRTIO: &str = "keyd: sem virtio-rng; semente só do kernel";
+
+/// Boot só com o que o `keyd` precisa, para os cenários de entropia.
+const KEYD_SCENARIO: Scenario = Scenario {
+    name: "keyd: semente do sistema",
+    markers: &["keyd: gerador semeado", "okernel: desligando"],
+    forbidden: &[
+        "okernel: FALTA",
+        "PÂNICO",
+        "keyd: falha",
+        "keyd: sem entropia",
+    ],
+    ..SCENARIOS[0]
+};
+
+/// Valor de `prefixo` na serial (até o fim da linha).
+fn keyd_field(serial: &str, prefix: &str) -> Result<String> {
+    serial
+        .lines()
+        .find_map(|l| l.split_once(prefix))
+        .map(|(_, v)| v.trim().to_string())
+        .ok_or_else(|| format!("a serial não tem {prefix:?}"))
+}
+
+/// Arquivo de bytes sem blocos repetidos para o `rng-random`; com `constante`,
+/// tudo a partir do byte 160 é igual: o OVMF gasta uns 80 bytes do arquivo no
+/// `EFI_RNG` e o autoteste do driver lê dois blocos, então a leitura do `keyd`
+/// cai nessa parte e derruba o teste de saúde.
+fn rng_file(name: &str, constante: bool) -> Result<PathBuf> {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut bytes = Vec::with_capacity(1 << 14);
+    for _ in 0..1 << 14 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        bytes.push(u8::try_from((state >> 33) & 0xff).unwrap_or(0));
+    }
+    if constante {
+        bytes[160..].fill(0xaa);
+    }
+    let path = root().join("target").join(name);
+    fs::write(&path, bytes).map_err(|e| format!("gravando {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Aceite da T-518 (ADR 0054, item 7): com o `rng-random` de arquivo fixo, dois
+/// boots mostram a mesma contribuição virtio e sementes diferentes (o
+/// dispositivo soma e não substitui); sem o dispositivo o `keyd` parte só com
+/// o kernel; com bytes repetidos o driver marca `Failed` e o `keyd` segue
+/// só com o kernel.
+fn keyd_entropy(opts: &Options) -> Result {
+    build_test(opts)?;
+    let with_file = |file: &Path| Options {
+        devices: vec!["virtio-rng-pci,disable-legacy=on,rng=rngfix"],
+        objects: vec![format!("rng-random,id=rngfix,filename={}", file.display())],
+        ..opts.clone()
+    };
+    let fixed = rng_file("rng-fixo.bin", false)?;
+    let first = boot_scenario(&with_file(&fixed), &KEYD_SCENARIO)?;
+    let second = boot_scenario(&with_file(&fixed), &KEYD_SCENARIO)?;
+    let (v1, v2) = (
+        keyd_field(&first, KEYD_VIRTIO)?,
+        keyd_field(&second, KEYD_VIRTIO)?,
+    );
+    let (s1, s2) = (
+        keyd_field(&first, KEYD_SEED)?,
+        keyd_field(&second, KEYD_SEED)?,
+    );
+    if v1 != v2 {
+        return Err(format!(
+            "keyd: a contribuição virtio mudou entre boots ({v1} e {v2})"
+        ));
+    }
+    if s1 == s2 {
+        return Err(format!(
+            "keyd: a semente repetiu entre boots ({s1}): o virtio substituiu o kernel"
+        ));
+    }
+    println!("xtask: keyd: contribuição virtio {v1} igual e sementes {s1} e {s2} diferentes");
+    let sem = Scenario {
+        name: "keyd: sem virtio-rng",
+        markers: &[
+            KEYD_SEM_VIRTIO,
+            "keyd: gerador semeado",
+            "okernel: desligando",
+        ],
+        ..KEYD_SCENARIO
+    };
+    boot_scenario(opts, &sem)?;
+    let ruim = rng_file("rng-repetido.bin", true)?;
+    let falha = Scenario {
+        name: "keyd: virtio-rng com bytes repetidos",
+        markers: &[
+            "virtio-rng: teste de saúde falhou",
+            KEYD_SEM_VIRTIO,
+            "keyd: gerador semeado",
+            "okernel: desligando",
+        ],
+        ..KEYD_SCENARIO
+    };
+    boot_scenario(&with_file(&ruim), &falha)?;
+    Ok(())
 }
 
 /// O mesmo aceite com `-device amd-iommu` (T-403). A falta chega pela MSI
@@ -1689,6 +1809,7 @@ fn test(opts: &Options) -> Result {
         };
         smoke(&plain, &[VIRTIO_SCENARIO])?;
         virtio_console_out()?;
+        keyd_entropy(opts)?;
         let iommu = Options {
             devices: vec![
                 "intel-iommu",
@@ -1704,6 +1825,9 @@ fn test(opts: &Options) -> Result {
         };
         smoke(&iommu, &[VIRTIO_IOMMU_SCENARIO])?;
         virtio_console_out()?;
+    }
+    if opts.suite == "keyd" {
+        keyd_entropy(opts)?;
     }
     if opts.suite == "smp" {
         smp(opts)?;
