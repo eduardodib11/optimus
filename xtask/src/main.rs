@@ -135,7 +135,7 @@ const BOOT_MARKERS: &[&str] = &[
     "svcmgr: devmgr em Running",
     "svcmgr: pcid em Running",
     "svcmgr: acpid em Running",
-    "svcmgr: 7 serviços em Running",
+    "svcmgr: 8 serviços em Running",
     "svcmgr: serviços encerrados",
     "root: o svcmgr terminou",
     "okernel: root terminou",
@@ -2577,7 +2577,7 @@ mod tests {
                   info  [7376636d] svcmgr: devmgr em Running\r\n\
                   info  [7376636d] svcmgr: pcid em Running\r\n\
                   info  [7376636d] svcmgr: acpid em Running\r\n\
-                  info  [7376636d] svcmgr: 7 serviços em Running\r\n\
+                  info  [7376636d] svcmgr: 8 serviços em Running\r\n\
                   info  [7376636d] svcmgr: serviços encerrados\r\n\
                   info  [0] root: o svcmgr terminou\r\n\
                   info  okernel: root terminou\r\n";
