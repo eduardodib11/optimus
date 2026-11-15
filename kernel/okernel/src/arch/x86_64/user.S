@@ -1065,5 +1065,50 @@ user_tls:
     syscall
     ud2
 
+/* user_fpu(rdi = modo, rsi = voltas, rdx = página RW) (T-519)
+ *
+ * Confere, a cada volta, o estado de FPU/SIMD que a thread deve ver, e
+ * cede a CPU. Modo 0: nunca toca na FPU e espera o estado inicial (xmm0
+ * zero, MXCSR 0x1f80), o que pega estado de outra thread vazando pela troca
+ * que pula o XSAVE/XRSTOR. Modo 1: xmm0 = 0x5ec2e7 e MXCSR 0x9f80
+ * (flush-to-zero). Modo 2: só o MXCSR muda (0x9f80), que o XINUSE do SSE
+ * não cobre em todas as CPUs. Grava na página: [0] voltas com estado
+ * errado, [8] voltas feitas; [16] é rascunho do MXCSR. */
+.global user_fpu
+user_fpu:
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
+    xor r15d, r15d            /* xmm0 esperado */
+    mov ebx, 0x1f80           /* MXCSR esperado */
+    test r12, r12
+    jz 1f
+    mov ebx, 0x9f80
+    mov dword ptr [r14 + 16], ebx
+    ldmxcsr [r14 + 16]
+    cmp r12, 1
+    jne 1f
+    mov r15d, 0x5ec2e7
+    movq xmm0, r15
+1:
+    movq rax, xmm0
+    cmp rax, r15
+    jne 2f
+    stmxcsr [r14 + 16]
+    cmp dword ptr [r14 + 16], ebx
+    je 3f
+2:
+    inc qword ptr [r14]
+3:
+    inc qword ptr [r14 + 8]
+    mov eax, 28
+    syscall
+    dec r13
+    jnz 1b
+    xor esi, esi              /* thread_exit sem flags */
+    mov eax, 33
+    syscall
+    ud2
+
 .global user_test_end
 user_test_end:
