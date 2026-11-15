@@ -339,8 +339,9 @@ fn send_out(
         return Err(Error::Cancelled);
     };
     // O receptor só entra na fila com o `Reply` vazio.
-    let _ = reply.bind(Arc::clone(me), grant);
-    reply.donate(&r);
+    if reply.bind(Arc::clone(me), grant).is_ok() {
+        reply.donate(me, &r);
+    }
     block(me, Blocked::Reply(Arc::downgrade(&reply)), None);
     let handoff = if fast {
         Some(r)
@@ -410,8 +411,9 @@ pub(super) fn take_from(
     let call = out.call;
     deliver(&s, out, me, env);
     if call {
-        let _ = reply.bind(Arc::clone(&s), grant);
-        reply.donate(me);
+        if reply.bind(Arc::clone(&s), grant).is_ok() {
+            reply.donate(&s, me);
+        }
         s.ipc().lock().blocked = Blocked::Reply(Arc::downgrade(reply));
     } else {
         let mut slot = s.ipc().lock();
