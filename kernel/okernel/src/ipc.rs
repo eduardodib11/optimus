@@ -411,16 +411,6 @@ impl Reply {
         self.caller.lock().as_ref().map(|c| c.1)
     }
 
-    /// Quem espera está na CPU `cpu`, fora dela (a pilha livre), para a
-    /// troca direta do caminho rápido.
-    #[must_use]
-    pub fn caller_on(&self, cpu: u32) -> bool {
-        self.caller
-            .lock()
-            .as_ref()
-            .is_some_and(|c| c.0.cpu() == cpu && !c.0.on_cpu())
-    }
-
     /// Verdadeiro se `t` é quem espera.
     #[must_use]
     pub fn holds(&self, t: &Thread) -> bool {
@@ -447,33 +437,55 @@ impl Reply {
     /// Consome a resposta: devolve quem espera (uma vez só).
     pub fn take(&self) -> Option<Caller> {
         let caller = self.caller.lock().take();
-        self.end_donation();
+        self.end_donation(None);
         caller
     }
 
-    /// Doação (seção 6.6): `server` atende a chamada pendente com o
-    /// `SchedContext` de quem chamou, até a resposta (ou até a espera
-    /// acabar de outro jeito).
-    pub fn donate(&self, server: &Arc<Thread>) {
-        let Some(sc) = self
-            .caller
-            .lock()
+    /// Caminho rápido de `ipc_reply_recv` (ADR 0058, item 2): consome a
+    /// resposta numa trava só, se quem espera está na CPU `cpu`, fora dela
+    /// (a pilha livre), para a troca direta; senão nada muda. `me` é quem
+    /// responde, que costuma ser quem recebeu a doação.
+    pub fn take_on(&self, cpu: u32, me: &Thread) -> Option<Caller> {
+        let mut c = self.caller.lock();
+        if !c
             .as_ref()
-            .and_then(|c| c.0.sched_context())
-        else {
+            .is_some_and(|c| c.0.cpu() == cpu && !c.0.on_cpu())
+        {
+            return None;
+        }
+        let caller = c.take();
+        drop(c);
+        self.end_donation(Some(me));
+        caller
+    }
+
+    /// Doação (seção 6.6): `server` atende a chamada pendente de `caller`
+    /// (já guardado por [`bind`](Self::bind)) com o `SchedContext` dele,
+    /// até a resposta (ou até a espera acabar de outro jeito).
+    pub fn donate(&self, caller: &Thread, server: &Arc<Thread>) {
+        debug_assert!(self.holds(caller), "doação de quem não espera a resposta");
+        let Some(sc) = caller.sched_context() else {
             return;
         };
         server.donate(Arc::clone(&sc));
         *self.donation.lock() = Some((Arc::downgrade(server), sc));
     }
 
-    /// Devolve a doação, se houver.
-    fn end_donation(&self) {
+    /// Devolve a doação, se houver. Se quem a recebeu é `me`, que está vivo
+    /// (é quem chama), devolve direto, sem promover o `Weak`.
+    fn end_donation(&self, me: Option<&Thread>) {
+        // A trava sai antes de devolver (a última referência pode ir lá).
         let donation = self.donation.lock().take();
-        if let Some((server, sc)) = donation
-            && let Some(server) = server.upgrade()
-        {
-            server.undonate(&sc);
+        let Some((server, sc)) = donation else {
+            return;
+        };
+        match me {
+            Some(me) if core::ptr::eq(server.as_ptr(), me) => me.undonate(&sc),
+            _ => {
+                if let Some(server) = server.upgrade() {
+                    server.undonate(&sc);
+                }
+            }
         }
     }
 
@@ -488,7 +500,7 @@ impl Reply {
         }
         drop(c);
         if ours {
-            self.end_donation();
+            self.end_donation(None);
         }
         ours
     }
@@ -534,7 +546,7 @@ impl Drop for Reply {
     /// A resposta nunca virá: quem espera acorda com `PeerClosed`.
     fn drop(&mut self) {
         let caller = self.caller.lock().take();
-        self.end_donation();
+        self.end_donation(None);
         if let Some((t, _)) = caller {
             close(t, core::ptr::from_ref(self).cast());
         }

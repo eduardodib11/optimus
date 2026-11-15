@@ -114,8 +114,9 @@ pub fn call(space: &SharedCapSpace, me: &Arc<Thread>, regs: &Regs, cpu: u32) -> 
         return Fast::Slow;
     };
     // Como no `send_out`: o receptor só entra na fila com o `Reply` vazio.
-    let _ = reply.bind(Arc::clone(me), grant);
-    reply.donate(&server);
+    if reply.bind(Arc::clone(me), grant).is_ok() {
+        reply.donate(me, &server);
+    }
     ops::block(me, Blocked::Reply(Arc::downgrade(&reply)), None);
     drop(reply);
     Fast::Switch(server)
@@ -146,13 +147,14 @@ pub fn reply_recv(
         return Fast::Slow;
     }
     let grant = ec.rights.contains(Rights::GRANT);
-    if !reply.caller_on(cpu) || ep.has_senders() {
+    if ep.has_senders() {
         return Fast::Slow;
     }
     // Daqui em diante, o que o caminho comum faz (`reply_to` e
-    // `receive`). Quem chamou pode ter saído do `Reply` (prazo) desde a
-    // conferência: então nada mudou e o caminho comum decide.
-    let Some((caller, _)) = reply.take() else {
+    // `receive`). A resposta só é consumida se quem chamou espera nesta
+    // CPU (numa trava só, ADR 0058, item 2); senão, ou se ele saiu do
+    // `Reply` (prazo), nada mudou e o caminho comum decide.
+    let Some((caller, _)) = reply.take_on(cpu, me) else {
         return Fast::Slow;
     };
     deliver(&mut caller.ipc().lock(), msg, 0);
