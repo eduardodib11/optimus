@@ -75,6 +75,8 @@ jobs:
         run: cargo xtask test integration
       - name: Teste de caos, 100 mortes aleatórias em -smp 4 (T-366)
         run: cargo xtask test chaos
+      - name: Armazenamento, formato, GPT e OptFS (T-531)
+        run: cargo xtask test storage
 
   # Miri sobre os testes do alocador (ADR 0039, item 1): só nos PRs que mudam
   # a lib/oalloc. O GitHub Actions não filtra `paths` por job, então o job
