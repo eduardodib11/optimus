@@ -11,7 +11,7 @@
 name = "storaged"
 binary = "storaged"
 priority = 115
-restart = "never"
+restart = "on-failure"
 
 [capabilities]
 needs = ["mem:quota:768KiB", "kernel:debug", "svc:optimus.block.BlockDevice@1?"]

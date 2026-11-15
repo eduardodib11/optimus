@@ -170,6 +170,10 @@ struct Voo {
     slot: usize,
 }
 
+/// `id` de um pedido em voo cujo cliente morreu: nunca vai para o anel de
+/// conclusões do cliente novo (ADR 0067).
+const ORFAO: u64 = u64::MAX;
+
 /// Um pedido lido do anel de submissões (ADR 0056, item 4).
 #[derive(Clone, Copy)]
 struct Pedido {
@@ -232,6 +236,9 @@ struct Servico<'a> {
 impl Servico<'_> {
     /// Conclui `id` no anel de conclusões (16 bytes: `id` e `status`).
     fn complete(&mut self, id: u64, status: u8) {
+        if id == ORFAO {
+            return;
+        }
         if let Some(done) = self.done.as_mut() {
             let mut b = [0u8; 16];
             b[..8].copy_from_slice(&id.to_le_bytes());
@@ -399,6 +406,26 @@ impl Servico<'_> {
         }
     }
 
+    /// O cliente anterior morreu e o `svcmgr` partiu outro (ADR 0067): larga
+    /// o anel de conclusões dele, descarta o que ele deixou na fila de
+    /// submissão e espera o dispositivo terminar o que estava em voo, para
+    /// que nenhum DMA caia numa página que o cliente novo vai usar.
+    fn reset_session(&mut self) {
+        self.done = None;
+        self.held = None;
+        let mut raw = [0u8; 32];
+        while matches!(self.submit.pop(&mut raw), Ok(Some(_))) {}
+        let until = ostd::time::now_ns().saturating_add(ORFAO_NS);
+        while self.voo.iter().any(Option::is_some) && ostd::time::now_ns() < until {
+            self.reap();
+            ostd::thread::yield_now();
+        }
+        // O que o dispositivo não devolveu a tempo fica sem dono.
+        for v in self.voo.iter_mut().flatten() {
+            v.id = ORFAO;
+        }
+    }
+
     /// Um passo do laço: conclusões primeiro, depois pedidos novos.
     fn pump(&mut self) {
         self.reap();
@@ -412,6 +439,9 @@ fn grant(h: Handle, rights: Rights, badge: u64) -> Result<u64, BlockError> {
         .map(|c| u64::from(c.raw()))
         .map_err(|_| BlockError::Io)
 }
+
+/// Quanto o driver espera o dispositivo terminar os pedidos do cliente morto.
+const ORFAO_NS: u64 = 500_000_000;
 
 /// Badge da sessão (o `storaged`): distingue a capability com `GRANT`.
 const SESSION_BADGE: u64 = 1;
@@ -451,8 +481,13 @@ impl BlockDevice for Servico<'_> {
     }
 
     fn attach_done(&mut self, ctx: &Contexto, ring: u64, signal: u64) -> Result<(), BlockError> {
-        if ctx.badge & 0xFFFF_FFFF != SESSION_BADGE || self.done.is_some() {
+        if ctx.badge & 0xFFFF_FFFF != SESSION_BADGE {
             return Err(BlockError::BadRequest);
+        }
+        if self.done.is_some() {
+            // Só o `storaged` tem a sessão (ADR 0067): outro pedido de
+            // anexo é o `storaged` novo, depois da morte do antigo.
+            self.reset_session();
         }
         let (Ok(ring), Ok(signal)) = (u32::try_from(ring), u32::try_from(signal)) else {
             return Err(BlockError::BadRequest);

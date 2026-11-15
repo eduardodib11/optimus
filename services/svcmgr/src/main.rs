@@ -83,7 +83,7 @@ struct Started {
     child: process::Child,
     /// Recursos de dispositivo que o `devmgr` deu (só num driver): as
     /// cópias do `svcmgr` ficam até o fim da instância.
-    devices: Vec<Handle>,
+    devices: Vec<(Handle, u32)>,
 }
 
 /// Parte o serviço `id`: carrega, entrega as capabilities e inicia.
@@ -184,6 +184,9 @@ struct Svcmgr<'a> {
     live: Vec<Option<Started>>,
     /// Mortes que o próprio `svcmgr` causou (teste de caos).
     induced: Vec<u32>,
+    /// Recursos dos drivers que morreram sozinhos, guardados para o reinício
+    /// (ADR 0067, item 3); `driver_stop` e o desligamento os apagam.
+    kept: Vec<(u32, Vec<(Handle, u32)>)>,
     /// Recursos que o `devmgr` deu a cada driver, até o `driver_start`.
     pending: Vec<(u32, Vec<(Handle, u32)>)>,
 }
@@ -221,6 +224,11 @@ fn name(plan: &Plan, id: u32) -> &str {
 impl Svcmgr<'_> {
     /// Parte `id` e liga a morte do processo ao bit dele em `deaths`.
     fn launch(&mut self, id: u32) -> bool {
+        // Driver que morreu sozinho: parte de novo com os mesmos recursos.
+        if let Some(i) = self.kept.iter().position(|(d, _)| *d == id) {
+            let (_, res) = self.kept.swap_remove(i);
+            return self.launch_with(id, Some(&res));
+        }
         self.launch_with(id, None)
     }
 
@@ -235,7 +243,7 @@ impl Svcmgr<'_> {
             self.control,
             devices,
         );
-        let handles: Vec<Handle> = devices.unwrap_or(&[]).iter().map(|d| d.0).collect();
+        let handles: Vec<(Handle, u32)> = devices.unwrap_or(&[]).to_vec();
         match r {
             Ok(mut s) => {
                 s.devices = handles;
@@ -252,7 +260,7 @@ impl Svcmgr<'_> {
             Err(e) => {
                 let n = name(&self.plan, id);
                 ostd::debug::print_fmt(format_args!("svcmgr: {n} não partiu: {e:?}"));
-                for h in handles {
+                for (h, _) in handles {
                     let _ = ostd::cap::delete(h);
                 }
                 false
@@ -280,7 +288,7 @@ impl Svcmgr<'_> {
             id,
             &mut svcmgr::kernel::Kernel,
         );
-        for &h in &s.devices {
+        for &(h, _) in &s.devices {
             let _ = ostd::cap::delete(h);
         }
         let c = s.child;
@@ -309,7 +317,15 @@ impl Svcmgr<'_> {
             } else {
                 Exit::Failed
             };
+            // Um driver que morreu sozinho guarda os recursos para o reinício.
+            let kept = self.live[id as usize]
+                .as_mut()
+                .map(|s| core::mem::take(&mut s.devices));
             self.retire(id);
+            if let Some(k) = kept.filter(|k| !k.is_empty()) {
+                self.kept.retain(|(d, _)| *d != id);
+                self.kept.push((id, k));
+            }
             let now = ostd::time::now_ns();
             let n = name(&self.plan, id);
             if let Some(i) = self.induced.iter().position(|&x| x == id) {
@@ -648,6 +664,47 @@ impl Svcmgr<'_> {
         }
     }
 
+    /// Mata o processo de `id` ([`kill`]) e espera que volte a `Running`
+    /// em [`READY_NS`]. Devolve o tempo da volta, em ns.
+    fn kill_and_wait(&mut self, id: u32) -> Option<u64> {
+        let cspace = self.started(id).map(|s| s.child.cspace)?;
+        let t0 = ostd::time::now_ns();
+        self.induced.push(id);
+        if kill(cspace).is_err() {
+            self.induced.retain(|&x| x != id);
+            return None;
+        }
+        let deadline = t0.saturating_add(READY_NS);
+        loop {
+            if ostd::time::now_ns() >= deadline {
+                return None;
+            }
+            if self.serve_one(deadline) == Some(id) {
+                return Some(ostd::time::now_ns().saturating_sub(t0));
+            }
+        }
+    }
+
+    /// Teste de queda de serviço (T-541): depois de `delay_ns` mata o
+    /// serviço `nome` e registra a volta. Os clientes recebem `PeerClosed`.
+    fn kill_named(&mut self, nome: &str, delay_ns: u64) {
+        self.supervise(ostd::time::now_ns().saturating_add(delay_ns));
+        let id = (0..self.live.len())
+            .filter_map(|i| u32::try_from(i).ok())
+            .find(|&id| name(&self.plan, id) == nome && self.started(id).is_some());
+        let Some(id) = id else {
+            ostd::debug::print_fmt(format_args!("svcmgr: mata: {nome} não está vivo"));
+            return;
+        };
+        match self.kill_and_wait(id) {
+            Some(ns) => ostd::debug::print_fmt(format_args!(
+                "svcmgr: mata: {nome} voltou em {} ms",
+                ns / 1_000_000
+            )),
+            None => ostd::debug::print_fmt(format_args!("svcmgr: mata: {nome} não voltou")),
+        }
+    }
+
     /// Teste de caos (T-366; §18, "volta em ≤ 1 s"): `rounds` vezes, mata
     /// um serviço em `Running` escolhido ao acaso ([`kill`], o processo
     /// inteiro) e espera que volte a `Running`. Registra o tempo de cada volta; quem não volta em [`READY_NS`] conta como falha.
@@ -675,24 +732,7 @@ impl Svcmgr<'_> {
                 ostd::debug::print("svcmgr: caos: nenhum serviço vivo");
                 return;
             };
-            let Some(cspace) = self.started(id).map(|s| s.child.cspace) else {
-                continue;
-            };
-            let t0 = ostd::time::now_ns();
-            self.induced.push(id);
-            if kill(cspace).is_err() {
-                self.induced.retain(|&x| x != id);
-                continue;
-            }
-            let deadline = t0.saturating_add(READY_NS);
-            let back = loop {
-                if ostd::time::now_ns() >= deadline {
-                    break None;
-                }
-                if self.serve_one(deadline) == Some(id) {
-                    break Some(ostd::time::now_ns().saturating_sub(t0));
-                }
-            };
+            let back = self.kill_and_wait(id);
             let n = name(&self.plan, id);
             if let Some(ns) = back {
                 worst = worst.max(ns);
@@ -724,6 +764,11 @@ impl Svcmgr<'_> {
                 let _ = ostd::cap::destroy(cspace);
             }
             self.retire(id);
+        }
+        for (_, res) in core::mem::take(&mut self.kept) {
+            for (h, _) in res {
+                let _ = ostd::cap::delete(h);
+            }
         }
         let levels = self.plan.levels.clone();
         for level in levels.iter().rev() {
@@ -771,6 +816,7 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
         sup: Supervisor::new(&policies),
         live,
         induced: Vec::new(),
+        kept: Vec::new(),
         pending: Vec::new(),
     };
     let levels = s.plan.levels.clone();
@@ -794,6 +840,15 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
             .and_then(|t| t.trim().parse::<u64>().ok())
     {
         s.chaos(rounds);
+    }
+    // T-541: `svcmgr.mata` = `<serviço> <atraso em ms>`.
+    if let Some((nome, ms)) =
+        s.fs.find("svcmgr.mata")
+            .and_then(|e| core::str::from_utf8(e.data).ok())
+            .and_then(|t| t.trim().split_once(' '))
+            .and_then(|(n, ms)| Some((n, ms.trim().parse::<u64>().ok()?)))
+    {
+        s.kill_named(nome, ms.saturating_mul(1_000_000));
     }
     s.supervise(ostd::time::now_ns().saturating_add(SUPERVISE_NS));
     s.shutdown();

@@ -216,6 +216,8 @@ struct Options {
     /// Rodadas do teste de caos do `svcmgr` (entrada `svcmgr.caos` do
     /// bootfs, T-366); `None` não liga o caos.
     chaos: Option<u64>,
+    /// Entrada `svcmgr.mata` do bootfs (T-541): `<serviço> <atraso em ms>`.
+    kill: Option<String>,
     /// Dispositivos extras do QEMU, antes dos de sempre (a `intel-iommu`
     /// precisa vir antes dos dispositivos PCI).
     devices: Vec<&'static str>,
@@ -240,6 +242,7 @@ impl Default for Options {
             minutes: STRESS_MINUTES,
             fail_on_purpose: false,
             chaos: None,
+            kill: None,
             devices: Vec::new(),
             objects: Vec::new(),
         }
@@ -295,7 +298,7 @@ fn parse(args: &[String]) -> Result<Options> {
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
             | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "storage" | "crash"
-            | "persist" | "all" => {
+            | "persist" | "caos-storaged" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -539,6 +542,12 @@ fn bootfs(opts: &Options, output: &Path, rounds: Option<u64>) -> Result {
             .map_err(|e| format!("gravando {}: {e}", file.display()))?;
         cmd.arg(format!("svcmgr.caos={}", file.display()));
     }
+    if let Some(k) = &opts.kill {
+        let file = root().join("target/svcmgr.mata");
+        fs::write(&file, format!("{k}\n"))
+            .map_err(|e| format!("gravando {}: {e}", file.display()))?;
+        cmd.arg(format!("svcmgr.mata={}", file.display()));
+    }
     if let Some(n) = rounds {
         let file = root().join("target/hello.rounds");
         fs::write(&file, format!("{n}\n"))
@@ -635,6 +644,8 @@ const DISK_CRASH: u8 = 1;
 const DISK_KEEP: u8 = 2;
 /// Disco zerado com a partição `cifra` (T-540).
 const DISK_PERSIST: u8 = 3;
+/// Disco zerado com a partição `caos` (T-541).
+const DISK_CAOS: u8 = 4;
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -725,6 +736,7 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
             let renamed = match DISK_MODE.load(Ordering::SeqCst) {
                 DISK_CRASH => Some("crash"),
                 DISK_PERSIST => Some("cifra"),
+                DISK_CAOS => Some("caos"),
                 _ => None,
             };
             fs::write(&disk, gpt_disk(renamed))
@@ -2216,6 +2228,92 @@ fn crash(opts: &Options) -> Result {
     Ok(())
 }
 
+/// Aceite da T-541: o `svcmgr` mata o `storaged` no meio da escrita do
+/// `drvcli` (`OPTIMUS_CAOS_ROUNDS` rodadas, 3 por padrão, cada uma com um
+/// atraso diferente). O cliente tem de ver `PeerClosed`, reconectar ao
+/// `storaged` reiniciado e remontar sem perder commit confirmado; no fim o
+/// xtask confere o disco como no teste de queda de energia.
+fn caos_storaged(opts: &Options) -> Result {
+    let rounds: u64 = env::var("OPTIMUS_CAOS_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| d.as_secs() ^ u64::from(d.subsec_nanos()))
+        | 1;
+    println!("xtask: queda do storaged: {rounds} rodadas, semente {seed}");
+    let mut last = 0;
+    for round in 1..=rounds {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        // 3 a 6 s depois de o `svcmgr` pôr os serviços em `Running`.
+        let delay = 3000 + seed % 3000;
+        let plain = Options {
+            devices: vec![
+                "virtio-blk-pci,drive=vd0,disable-legacy=on",
+                "virtio-rng-pci,disable-legacy=on",
+                "virtio-serial-pci,disable-legacy=on",
+                "virtconsole,chardev=vcon",
+                "virtio-keyboard-pci,disable-legacy=on",
+                "virtio-net-pci,netdev=vn0,disable-legacy=on",
+                "virtio-gpu-pci,id=vgpu,disable-legacy=on",
+            ],
+            kill: Some(format!("storaged {delay}")),
+            ..opts.clone()
+        };
+        build_test(&plain)?;
+        DISK_MODE.store(
+            if round == 1 { DISK_CAOS } else { DISK_KEEP },
+            Ordering::SeqCst,
+        );
+        let sc = Scenario {
+            name: "queda do storaged",
+            markers: &[
+                "svcmgr: mata: storaged voltou",
+                "fsstress: queda vista (Some(",
+                "fsstress: recuperado: montou txg",
+                "fsstress: caos do storaged ok",
+            ],
+            forbidden: &[
+                "fsstress: erro",
+                "fsstress: perdeu commit",
+                "svcmgr: mata: storaged não voltou",
+                "svcmgr: mata: storaged não está vivo",
+                "okernel: FALTA",
+                "PÂNICO",
+            ],
+            key: None,
+            ..VIRTIO_SCENARIO
+        };
+        let serial = boot_scenario(&plain, &sc);
+        DISK_MODE.store(DISK_KEEP, Ordering::SeqCst);
+        let serial = serial?;
+        let confirmed = serial
+            .lines()
+            .filter_map(|l| {
+                l.split_once("fsstress: commit ")?
+                    .1
+                    .split_once(" txg ")?
+                    .1
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0);
+        let mounted = crash_verify(confirmed)?;
+        println!(
+            "xtask: queda do storaged {round}/{rounds} (atraso {delay} ms): confirmado txg {confirmed}, montado txg {mounted}"
+        );
+        last = confirmed;
+    }
+    DISK_MODE.store(0, Ordering::SeqCst);
+    println!("xtask: queda do storaged: último commit confirmado txg {last}");
+    Ok(())
+}
+
 /// Texto que o cenário cifrado grava (`persist_step::SEGREDO`): não pode
 /// aparecer em claro no disco.
 const PERSIST_SECRET: &[u8] = b"segredo-do-usuario-optfs-cifrado-T540";
@@ -2388,6 +2486,9 @@ fn test(opts: &Options) -> Result {
     }
     if matches!(opts.suite.as_str(), "persist" | "all") {
         persist(opts)?;
+    }
+    if matches!(opts.suite.as_str(), "caos-storaged" | "all") {
+        caos_storaged(opts)?;
     }
     if opts.suite == "smp" {
         smp(opts)?;
