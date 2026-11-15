@@ -213,7 +213,7 @@ fn kernel_metrics(serial: &str) -> Vec<(String, u64)> {
 }
 
 /// O comentário com as métricas, para a próxima comparação.
-fn metrics_comment(m: &[(String, u64)]) -> String {
+pub fn metrics_comment(m: &[(String, u64)]) -> String {
     let body: Vec<String> = m.iter().map(|(k, v)| format!("{k}={v}")).collect();
     format!("\n<!-- metricas: {} -->\n", body.join(" "))
 }
@@ -262,7 +262,7 @@ fn comparison_section(name: &str, rows: &[(String, u64, u64, i64)]) -> String {
 }
 
 /// O relatório mais recente de `dir` com o sufixo dado (nome e texto).
-fn latest(dir: &std::path::Path, suffix: &str) -> Option<(String, String)> {
+pub fn latest(dir: &std::path::Path, suffix: &str) -> Option<(String, String)> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())

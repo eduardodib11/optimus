@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, sync::mpsc, thread};
 
 mod bench;
+mod bench_io;
 mod perfil;
 mod unsafe_budget;
 
@@ -338,6 +339,7 @@ fn main() -> ExitCode {
         "check" => check(),
         "kani" => kani(),
         "bench" => bench::bench(&opts),
+        "bench-io" => bench_io::bench_io(),
         "perfil" => perfil::perfil(&opts),
         other => Err(format!("subcomando desconhecido: {other}")),
     });
