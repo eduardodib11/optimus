@@ -265,3 +265,157 @@ mod arvore {
         (d, s)
     }
 }
+
+mod arquivos {
+    use super::*;
+    use crate::{Fs, FsError, ObjKind, Tx};
+
+    fn big() -> (Sim, Superblock) {
+        let mut d = Sim::new(4096);
+        let mut s = sb(1, 1);
+        s.volume_blocks = 4096;
+        d.write(SUPERBLOCKS[1], &s.encode(&Fake)).unwrap();
+        d.flush().unwrap();
+        (d, s)
+    }
+
+    fn pat(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn diretorios_arquivos_e_conteudo_sobrevivem_a_queda() {
+        let (mut d, s1) = big();
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, 2, 1);
+        let mut fs = Fs::create(&mut tx, [5; 32]).unwrap();
+        let docs = fs.mkdir(&mut tx, 1, "docs").unwrap();
+        let small = fs.create_file(&mut tx, docs, "nota.txt").unwrap();
+        let large = fs.create_file(&mut tx, docs, "grande.bin").unwrap();
+        fs.write(&mut tx, small, 0, b"ola, optfs").unwrap();
+        let big_data = pat(70_000, 3);
+        fs.write(&mut tx, large, 0, &big_data).unwrap();
+        // Sobrescreve o meio, atravessando blocos, e escreve com buraco.
+        let mid = pat(9_000, 99);
+        fs.write(&mut tx, large, 5_000, &mid).unwrap();
+        let mut want = big_data.clone();
+        want[5_000..14_000].copy_from_slice(&mid);
+        fs.write(&mut tx, large, 100_000, b"fim").unwrap();
+        want.resize(100_000, 0);
+        want.extend_from_slice(b"fim");
+        assert_eq!(fs.read(&mut tx, large, 0, 200_000).unwrap(), want);
+        assert_eq!(
+            fs.read(&mut tx, large, 69_990, 20).unwrap(),
+            want[69_990..70_010]
+        );
+        assert_eq!(fs.read(&mut tx, small, 0, 100).unwrap(), b"ola, optfs");
+        // Pequeno que cresce além de 1 KiB vira bloco de dados.
+        fs.write(&mut tx, small, 10, &pat(3000, 1)).unwrap();
+        let mut sw = b"ola, optfs".to_vec();
+        sw.extend(pat(3000, 1));
+        assert_eq!(fs.read(&mut tx, small, 0, 5000).unwrap(), sw);
+        let mut new = sb(0, 0);
+        new.root = fs.root;
+        tx.commit(&s1, new).unwrap();
+        let (root, name_key) = (fs.root, fs.name_key);
+        d.crash();
+        let m = mount(&mut d, &Fake).unwrap();
+        assert_eq!(m.sb.root, root);
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, 3, 1);
+        let fs = Fs {
+            root: m.sb.root,
+            name_key,
+        };
+        // O alocador remontado reconhece os blocos em uso: 19 de dados do
+        // arquivo grande, 1 do pequeno e os nós.
+        let before = tx.free_blocks();
+        tx.mark_reachable(&fs.root).unwrap();
+        assert!(before - tx.free_blocks() >= 20);
+        assert_eq!(
+            fs.lookup(&mut tx, 1, "docs").unwrap(),
+            Some((docs, ObjKind::Dir))
+        );
+        assert_eq!(
+            fs.lookup(&mut tx, docs, "grande.bin").unwrap(),
+            Some((large, ObjKind::File))
+        );
+        assert_eq!(fs.read(&mut tx, large, 0, 200_000).unwrap(), want);
+        let mut names: Vec<String> = fs
+            .readdir(&mut tx, docs)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.0)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["grande.bin", "nota.txt"]);
+        assert_eq!(fs.stat(&mut tx, large).unwrap().size, 100_003);
+    }
+
+    #[test]
+    fn erros_de_nome_e_tipo() {
+        let (mut d, _) = big();
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, 2, 1);
+        let mut fs = Fs::create(&mut tx, [5; 32]).unwrap();
+        let dir = fs.mkdir(&mut tx, 1, "d").unwrap();
+        let f = fs.create_file(&mut tx, dir, "f").unwrap();
+        assert_eq!(fs.create_file(&mut tx, dir, "f"), Err(FsError::Exists));
+        for bad in ["", "a/b", "a\0b", &"x".repeat(256)] {
+            assert_eq!(fs.create_file(&mut tx, dir, bad), Err(FsError::BadName));
+        }
+        assert_eq!(fs.create_file(&mut tx, f, "x"), Err(FsError::NotDir));
+        assert_eq!(fs.read(&mut tx, dir, 0, 1), Err(FsError::IsDir));
+        assert_eq!(fs.write(&mut tx, dir, 0, b"x"), Err(FsError::IsDir));
+        assert_eq!(fs.unlink(&mut tx, 1, "d"), Err(FsError::NotEmpty));
+        assert_eq!(fs.unlink(&mut tx, 1, "nada"), Err(FsError::NotFound));
+        fs.unlink(&mut tx, dir, "f").unwrap();
+        fs.unlink(&mut tx, 1, "d").unwrap();
+        assert!(fs.readdir(&mut tx, 1).unwrap().is_empty());
+        assert_eq!(fs.stat(&mut tx, f), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn apagar_devolve_o_espaco_depois_de_dois_commits() {
+        let (mut d, mut prev) = big();
+        let mut al = Allocator::new(4096);
+        let mut root;
+        {
+            let mut tx = Tx::new(&mut d, &Fake, &mut al, 2, 1);
+            let mut fs = Fs::create(&mut tx, [5; 32]).unwrap();
+            let f = fs.create_file(&mut tx, 1, "f").unwrap();
+            fs.write(&mut tx, f, 0, &pat(200_000, 1)).unwrap();
+            let mut new = sb(0, 0);
+            new.root = fs.root;
+            prev = tx.commit(&prev, new).unwrap();
+            root = fs.root;
+        }
+        let free0 = al.free_blocks();
+        for txg in [3, 4, 5] {
+            let mut tx = Tx::new(&mut d, &Fake, &mut al, txg, 1);
+            let mut fs = Fs {
+                root,
+                name_key: [5; 32],
+            };
+            if txg == 3 {
+                fs.unlink(&mut tx, 1, "f").unwrap();
+            }
+            let mut new = sb(0, 0);
+            new.root = fs.root;
+            prev = tx.commit(&prev, new).unwrap();
+            root = fs.root;
+            if txg == 3 {
+                assert!(al.free_blocks() < free0 + 5, "volta antes da hora");
+            }
+        }
+        // 200 000 bytes são 49 blocos de dados mais nós; tudo volta.
+        assert!(
+            al.free_blocks() >= free0 + 49,
+            "{} {}",
+            al.free_blocks(),
+            free0
+        );
+    }
+}

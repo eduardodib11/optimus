@@ -11,6 +11,7 @@ bench = false
 
 [dependencies]
 optfs-format = { path = "../optfs-format" }
+optcrypt = { path = "../optcrypt" }
 
 [lints]
 workspace = true
