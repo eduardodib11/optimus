@@ -333,8 +333,12 @@ fn wait_faults(faults: Handle, send: Handle) {
 }
 
 fn main(start: Start) -> ! {
-    let Ok(mut s) = Session::start(start.args) else {
-        ostd::thread::exit()
+    let mut s = match Session::start(start.args) {
+        Ok(s) => s,
+        Err(e) => {
+            ostd::debug::print_fmt(format_args!("devmgr: sem a sessão do svcmgr ({e:?})"));
+            ostd::thread::exit()
+        }
     };
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     if let Some(log) = s
