@@ -1,7 +1,8 @@
 # Manifesto do `keyd` (T-518; ADR 0053 e 0054): guarda as chaves do sistema e
 # o gerador de bytes que as cria. Parte no boot. A capability de entropia do
 # virtio-rng é opcional: o driver só existe se o dispositivo existir, e sem
-# ele o `keyd` segue só com a entropia do kernel (ADR 0054, item 5).
+# ele o `keyd` segue só com a entropia do kernel (ADR 0054, item 5). Serve o
+# contrato `Keyring` (T-527) e pede a senha no console, também opcional.
 [service]
 name = "keyd"
 binary = "keyd"
@@ -10,11 +11,12 @@ restart = "on-failure"
 
 [capabilities]
 needs = [
-  "mem:quota:512KiB",
+  "mem:quota:1280KiB",
   "kernel:debug",
   "svc:optimus.dev.EntropySource@1?",
+  "svc:optimus.console.Console@1?",
 ]
-provides = []
+provides = ["optimus.keyd.Keyring@1.0"]
 
 [limits]
 max_threads = 1

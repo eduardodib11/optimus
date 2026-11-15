@@ -84,6 +84,17 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// Slot vazio (tipo zero, inválido), para preencher arranjos.
+    pub const EMPTY: Self = Self {
+        kind: 0,
+        m_kib: 0,
+        t: 0,
+        salt: [0; SALT_LEN],
+        nonce: [0; NONCE_LEN],
+        wrapped: [0; KEY_LEN],
+        tag: [0; TAG_LEN],
+    };
+
     /// Serializa o slot (little-endian).
     #[must_use]
     pub fn to_bytes(&self) -> [u8; SLOT_LEN] {
@@ -413,6 +424,42 @@ pub fn recovery_decode(text: &[u8]) -> Result<Secret<KEY_LEN>, Error> {
         return Err(Error::BadEncoding);
     }
     Ok(key)
+}
+
+/// Hexadecimal minúsculo de `src` em `out`; devolve os bytes escritos
+/// (`2 * src.len()`), ou zero se `out` for pequeno.
+#[must_use]
+pub fn to_hex(src: &[u8], out: &mut [u8]) -> usize {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    if out.len() < src.len() * 2 {
+        return 0;
+    }
+    for (b, o) in src.iter().zip(out.chunks_mut(2)) {
+        o[0] = D[usize::from(b >> 4)];
+        o[1] = D[usize::from(b & 15)];
+    }
+    src.len() * 2
+}
+
+/// Lê hexadecimal (maiúsculo ou minúsculo) em `out`; devolve os bytes lidos.
+///
+/// # Errors
+/// [`Error::BadEncoding`] se o texto tem tamanho ímpar, símbolo inválido ou
+/// não cabe em `out`.
+pub fn from_hex(src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    if !src.len().is_multiple_of(2) || out.len() < src.len() / 2 {
+        return Err(Error::BadEncoding);
+    }
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(Error::BadEncoding),
+    };
+    for (o, p) in out.iter_mut().zip(src.chunks(2)) {
+        *o = (nib(p[0])? << 4) | nib(p[1])?;
+    }
+    Ok(src.len() / 2)
 }
 
 /// Compara duas chaves de recuperação em tempo constante (conferência da

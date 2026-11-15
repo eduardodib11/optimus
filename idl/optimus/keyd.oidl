@@ -1,0 +1,35 @@
+// Chaveiro (T-527; ADR 0053, itens 3 e 4): o `keyd` cria o cabeçalho de chaves
+// de um volume e o desbloqueia no boot. A senha NUNCA passa por este contrato:
+// o `keyd` a pede e a lê no console (porta 0 do `virtio-console`), então quem
+// chama (o `optfs`, no M5; o `drvcli`, no teste) não a vê. Os slots seguem a
+// serialização de `optcrypt::keyring::Slot` (101 bytes cada). O `oidlc` ainda
+// não aceita `vec` em parâmetro (ADR 0033), então o UUID e os slots vão em
+// hexadecimal minúsculo nos pedidos; as respostas são bytes.
+package optimus.keyd @1.0;
+
+enum KeydError : u8 {
+    // Sem driver de console para pedir a senha.
+    NoConsole,
+    // Slots malformados, acima dos limites ou de tipo desconhecido.
+    BadSlot,
+    // Senha ou chave de recuperação erradas, ou slot adulterado.
+    WrongPassword,
+    // O usuário não respondeu a tempo ou digitou uma linha inválida.
+    Cancelled,
+    // O gerador não foi semeado (sem entropia do kernel).
+    NoEntropy,
+    // Sem memória para o Argon2id.
+    Memory,
+    // Espera após senha errada ainda não passou; tente depois.
+    Locked
+}
+
+interface Keyring {
+    // Cria um volume de UUID `uuid`: pede a senha nova duas vezes, gera a
+    // K_mestra e devolve os dois slots (senha e recuperação) serializados. A
+    // chave de recuperação aparece no console, uma vez, nunca no log.
+    create_volume(uuid: string<32>) -> result<vec<u8, 202>, KeydError>;
+    // Pede a senha (ou a chave de recuperação) e, se algum dos `slots`
+    // (até 8) abre, devolve K_cab ‖ K_meta ‖ K_nome (3 × 32 bytes).
+    unlock(uuid: string<32>, slots: string<1616>) -> result<vec<u8, 96>, KeydError>;
+}
