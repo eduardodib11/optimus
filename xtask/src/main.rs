@@ -1021,6 +1021,7 @@ macro_rules! m4_markers {
             // T-514: o cliente conversa com o driver pelo contrato gerado.
             "drvcli: console ok",
             "drvcli: display ok",
+            "drvcli: optfs ok",
             "drvcli: storage ok",
             "drvcli: net ok",
             "drvcli: input ok",

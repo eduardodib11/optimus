@@ -166,8 +166,10 @@ const TICK_NS: u64 = 20_000_000;
 /// partida antes do desligamento ordenado. Até existir quem peça o
 /// desligamento (M4), é ela que devolve a cota ao `root` nos testes. Os
 /// drivers partem pelo `devmgr` já dentro dela; 3 s dão folga ao boot lento
-/// do TCG com IOMMU (o `ps2mouse` ficava pronto no fim de 1 s).
-const SUPERVISE_NS: u64 = 3_000_000_000;
+/// do TCG com IOMMU (o `ps2mouse` ficava pronto no fim de 1 s). Passou a 6 s
+/// com o `OptFS` no `drvcli` (T-522), cujos 35 pedidos de bloco rodam dentro
+/// dela.
+const SUPERVISE_NS: u64 = 6_000_000_000;
 
 /// O `svcmgr` em execução: plano, canal de controle e instâncias vivas.
 struct Svcmgr<'a> {

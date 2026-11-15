@@ -20,6 +20,7 @@ mod display_cliente;
 mod entropy_cliente;
 mod input_cliente;
 mod net_cliente;
+mod optfs_step;
 mod storage_cliente;
 
 use console_cliente::ConsoleCliente;
@@ -209,21 +210,10 @@ fn open_fila(buf: &mut ostd::ipc::Buffer, quota: Handle, ep: Handle) -> Option<F
     })
 }
 
-/// Faz o papel de um cliente do `storaged` (T-520): lê e escreve blocos da
-/// partição `data` com checksum igual, recusa pedidos ruins e confere que a
-/// `sys-a` é só de leitura.
-fn storage_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
-    let storage = StorageCliente::new(ep);
-    let buf = &mut s.buffer;
-    // Partição que não existe.
-    if !matches!(storage.open(buf, "nada"), Ok(Err(_))) {
-        return None;
-    }
-    let data = storage.open(buf, "data").ok()?.ok()?;
-    let info = BlockStoreCliente::new(data).info(buf).ok()?.ok()?;
-    if info.blocks != DATA_PART_BLOCKS || info.read_only || info.max_blocks != 32 {
-        return None;
-    }
+/// Pedidos de bloco na partição `data`, num quadro de pilha próprio (o
+/// padrão de 8 KiB não fica vivo durante o `OptFS`).
+#[inline(never)]
+fn block_steps(buf: &mut ostd::ipc::Buffer, quota: Handle, data: Handle) -> Option<()> {
     let mut f = open_fila(buf, quota, data)?;
     let mut pattern = [0u8; 2 * PAGE];
     for (i, b) in pattern.iter_mut().enumerate() {
@@ -280,6 +270,33 @@ fn storage_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
     }
     // Solta os mapeamentos: a próxima fila usa os mesmos endereços.
     drop(f);
+    Some(())
+}
+
+/// Faz o papel de um cliente do `storaged` (T-520): lê e escreve blocos da
+/// partição `data` com checksum igual, recusa pedidos ruins e confere que a
+/// `sys-a` é só de leitura.
+fn storage_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
+    let storage = StorageCliente::new(ep);
+    let buf = &mut s.buffer;
+    // Partição que não existe.
+    if !matches!(storage.open(buf, "nada"), Ok(Err(_))) {
+        return None;
+    }
+    let data = storage.open(buf, "data").ok()?.ok()?;
+    let info = BlockStoreCliente::new(data).info(buf).ok()?.ok()?;
+    if info.blocks != DATA_PART_BLOCKS || info.read_only || info.max_blocks != 32 {
+        return None;
+    }
+    block_steps(buf, quota, data)?;
+    // O `OptFS` sobre a mesma partição (T-522).
+    let mut o = open_fila(buf, quota, data)?;
+    optfs_step::run(&mut o, info.blocks)?;
+    ostd::debug::print("drvcli: optfs ok");
+    if !matches!(o.store.close_queue(buf, o.id), Ok(Ok(()))) {
+        return None;
+    }
+    drop(o);
     // A `sys-a` é só de leitura no M5: a escrita volta `ReadOnly` e a
     // leitura funciona.
     let sys = storage.open(buf, "sys-a").ok()?.ok()?;

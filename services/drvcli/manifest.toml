@@ -13,7 +13,7 @@ restart = "never"
 
 [capabilities]
 needs = [
-  "mem:quota:832KiB",
+  "mem:quota:3072KiB",
   "kernel:debug",
   "svc:optimus.console.Console@1?",
   "svc:optimus.display.DisplayDevice@1?",

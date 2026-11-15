@@ -120,10 +120,20 @@ debug = 0
 [profile.dev.package.ps2mouse]
 debug = 0
 
+# Pilha de 64 KiB: o `OptFS` roda no `drvcli` do QEMU, e os genéricos dele
+# são compilados na crate que os usa; em `opt-level = 0` os quadros da árvore
+# (blocos de 4 KiB por valor) estouram a pilha.
 [profile.dev.package.drvcli]
 debug = 0
+opt-level = 2
 
 [profile.dev.package.keyd]
+debug = 0
+
+[profile.dev.package.optfs]
+debug = 0
+
+[profile.dev.package.optfs-format]
 debug = 0
 
 [profile.dev.package.storaged]
