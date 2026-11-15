@@ -15,15 +15,15 @@ use ostd::rt::Start;
 use ostd::svc::Session;
 use ostd::vm::{Mapping, SELF};
 
-mod block_cliente;
 mod console_cliente;
 mod display_cliente;
 mod entropy_cliente;
+mod storage_cliente;
 
-use block_cliente::BlockDeviceCliente;
 use console_cliente::ConsoleCliente;
 use display_cliente::DisplayDeviceCliente;
 use entropy_cliente::EntropySourceCliente;
+use storage_cliente::{BlockStoreCliente, StorageCliente};
 
 ostd::entry!(main);
 
@@ -112,14 +112,17 @@ fn display(s: &mut Session) {
     }
 }
 
-/// Onde os anéis e a região de dados do `BlockDevice` ficam mapeados.
+/// Onde os anéis e a área do `BlockStore` ficam mapeados.
 const SUBMIT_VA: u64 = 0x30_0000_0000;
 const DONE_VA: u64 = 0x30_0010_0000;
 const DATA_VA: u64 = 0x30_0020_0000;
-/// Mesmos valores que o driver informa em `info()`.
 const RING_BYTES: u32 = 4096;
 const PAGE: usize = 4096;
+/// Blocos da região de dados da fila de teste.
+const DATA_BLOCKS: u16 = 8;
 const WINDOW_NS: u64 = 2_000_000_000;
+/// Blocos da partição `data` do disco de teste (`xtask`: 14303 setores).
+const DATA_PART_BLOCKS: u64 = 1787;
 
 /// Espera a conclusão de `id` no anel de conclusões e devolve o status.
 fn completion(done: &mut Consumer, id: u64) -> Option<u8> {
@@ -138,108 +141,169 @@ fn completion(done: &mut Consumer, id: u64) -> Option<u8> {
 }
 
 /// Um pedido de submissão (24 bytes de carga; ADR 0056, item 4).
-fn submit(ring: &mut Producer, id: u64, op: u8, count: u16, sector: u64) -> bool {
+fn submit(
+    ring: &mut Producer,
+    id: u64,
+    op: u8,
+    flags: u8,
+    count: u16,
+    offset: u32,
+    block: u64,
+) -> bool {
     let mut b = [0u8; 24];
     b[..8].copy_from_slice(&id.to_le_bytes());
     b[8] = op;
+    b[9] = flags;
     b[10..12].copy_from_slice(&count.to_le_bytes());
-    b[16..24].copy_from_slice(&sector.to_le_bytes());
+    b[12..16].copy_from_slice(&offset.to_le_bytes());
+    b[16..24].copy_from_slice(&block.to_le_bytes());
     ring.push(1, &b).is_ok()
 }
 
-/// Faz o papel do `storaged`: pega os anéis pelo contrato `BlockDevice`,
-/// escreve, lê, esvazia e recusa pedidos ruins.
-fn block_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
-    let cli = BlockDeviceCliente::new(ep);
-    let buf = &mut s.buffer;
-    let info = cli.info(buf).ok()?.ok()?;
-    if info.sectors != 2048
-        || info.sector_size != 512
-        || info.max_sectors != 8
-        || info.depth != 4
-        || info.data_bytes != 4 * PAGE as u32
-        || info.ring_bytes != RING_BYTES
-        || info.read_only
-    {
-        return None;
-    }
-    let session = BlockDeviceCliente::new(cli.session(buf).ok()?.ok()?);
-    let submit_obj = session.submit_ring(buf).ok()?.ok()?;
-    let submit_sig = session.submit_signal(buf).ok()?.ok()?;
-    let data_obj = session.data_region(buf).ok()?.ok()?;
-    // O anel de conclusões é do `storaged`: ele o cria e o dá ao driver.
-    let done_obj = ostd::cap::create(
-        quota,
-        ObjectType::MemoryObject,
-        ostd::ring::object_bytes(RING_BYTES),
-    )
-    .ok()?;
-    let done_ntfy = ostd::cap::create(quota, ObjectType::Notification, 0).ok()?;
-    let mut done = Consumer::create(done_obj, DONE_VA, RING_BYTES, 0x0B02, done_ntfy).ok()?;
-    let done_sig = ostd::cap::mint(done_ntfy, Rights::SIGNAL, 0, None).ok()?;
-    let done_rw = ostd::cap::mint(
-        done_obj,
-        Rights::MAP | Rights::READ | Rights::WRITE,
-        0,
-        None,
-    )
-    .ok()?;
-    session.attach_done(buf, done_rw, done_sig).ok()?.ok()?;
-    // Uma segunda ligação é recusada.
-    if !matches!(session.attach_done(buf, done_rw, done_sig), Ok(Err(_))) {
-        return None;
-    }
-    let mut ring = Producer::open(submit_obj, SUBMIT_VA, RING_BYTES, submit_sig, 1).ok()?;
-    let mut data = Mapping::new(
+/// Uma fila aberta num `BlockStore`: o cliente do contrato.
+struct Fila {
+    store: BlockStoreCliente,
+    id: u32,
+    ring: Producer,
+    done: Consumer,
+    data: Mapping,
+}
+
+/// Abre uma fila no `BlockStore` `ep` (a área é do cliente: anel de
+/// conclusões e região de dados).
+fn open_fila(buf: &mut ostd::ipc::Buffer, quota: Handle, ep: Handle) -> Option<Fila> {
+    let store = BlockStoreCliente::new(ep);
+    let bytes = ostd::ring::object_bytes(RING_BYTES) + u64::from(DATA_BLOCKS) * PAGE as u64;
+    let area = ostd::cap::create(quota, ObjectType::MemoryObject, bytes).ok()?;
+    let ntfy = ostd::cap::create(quota, ObjectType::Notification, 0).ok()?;
+    let done = Consumer::create(area, DONE_VA, RING_BYTES, 0x0B02, ntfy).ok()?;
+    let area_rw =
+        ostd::cap::mint(area, Rights::MAP | Rights::READ | Rights::WRITE, 0, None).ok()?;
+    let sig = ostd::cap::mint(ntfy, Rights::SIGNAL, 0, None).ok()?;
+    let id = store
+        .open_queue(buf, area_rw, sig, 4, 1, DATA_BLOCKS)
+        .ok()?
+        .ok()?;
+    let submit_obj = store.submit_ring(buf, id).ok()?.ok()?;
+    let kick = store.kick(buf, id).ok()?.ok()?;
+    let ring = Producer::open(submit_obj, SUBMIT_VA, RING_BYTES, kick, 1).ok()?;
+    let data = Mapping::new_at(
         SELF,
-        data_obj,
+        area,
         DATA_VA,
-        4 * PAGE as u64,
+        ostd::ring::object_bytes(RING_BYTES),
+        u64::from(DATA_BLOCKS) * PAGE as u64,
         ostd::kabi::vm::WRITE,
     )
     .ok()?;
-    let mut pattern = [0u8; PAGE];
+    Some(Fila {
+        store,
+        id,
+        ring,
+        done,
+        data,
+    })
+}
+
+/// Faz o papel de um cliente do `storaged` (T-520): lê e escreve blocos da
+/// partição `data` com checksum igual, recusa pedidos ruins e confere que a
+/// `sys-a` é só de leitura.
+fn storage_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
+    let storage = StorageCliente::new(ep);
+    let buf = &mut s.buffer;
+    // Partição que não existe.
+    if !matches!(storage.open(buf, "nada"), Ok(Err(_))) {
+        return None;
+    }
+    let data = storage.open(buf, "data").ok()?.ok()?;
+    let info = BlockStoreCliente::new(data).info(buf).ok()?.ok()?;
+    if info.blocks != DATA_PART_BLOCKS || info.read_only || info.max_blocks != 32 {
+        return None;
+    }
+    let mut f = open_fila(buf, quota, data)?;
+    let mut pattern = [0u8; 2 * PAGE];
     for (i, b) in pattern.iter_mut().enumerate() {
-        *b = (i as u8).wrapping_mul(7) ^ 0x5a;
+        *b = (i as u8).wrapping_mul(13) ^ 0x3c;
     }
-    data.bytes_mut()?[..PAGE].copy_from_slice(&pattern);
-    // Escreve o setor 8 (4 KiB), esvazia o buffer e lê de volta.
-    if !submit(&mut ring, 1, 1, 8, 8) || completion(&mut done, 1)? != 0 {
+    f.data.bytes_mut()?[..2 * PAGE].copy_from_slice(&pattern);
+    // Escreve 2 blocos com FUA no bloco 3, zera o buffer e lê de volta.
+    if !submit(&mut f.ring, 1, 1, 1, 2, 0, 3) || completion(&mut f.done, 1)? != 0 {
         return None;
     }
-    data.bytes_mut()?[..PAGE].fill(0);
-    if !submit(&mut ring, 2, 0, 8, 8) || completion(&mut done, 2)? != 0 {
+    f.data.bytes_mut()?[..2 * PAGE].fill(0);
+    if !submit(&mut f.ring, 2, 0, 0, 2, 0, 3) || completion(&mut f.done, 2)? != 0 {
         return None;
     }
-    if data.bytes()[..PAGE] != pattern[..] {
+    if optcrypt::blake3::hash(&f.data.bytes()[..2 * PAGE]) != optcrypt::blake3::hash(&pattern) {
         return None;
     }
-    // FLUSH, e os pedidos ruins: fora do disco, operação desconhecida,
-    // mais setores que o máximo e deslocamento desalinhado.
-    if !submit(&mut ring, 3, 2, 0, 0) || completion(&mut done, 3)? != 0 {
+    // O último bloco da partição lê, e um além dele não.
+    if !submit(&mut f.ring, 3, 0, 0, 1, 0, DATA_PART_BLOCKS - 1) || completion(&mut f.done, 3)? != 0
+    {
         return None;
     }
-    if !submit(&mut ring, 4, 0, 8, 2048) || completion(&mut done, 4)? != 1 {
+    if !submit(&mut f.ring, 4, 0, 0, 1, 0, DATA_PART_BLOCKS) || completion(&mut f.done, 4)? != 1 {
         return None;
     }
-    if !submit(&mut ring, 5, 9, 1, 0) || completion(&mut done, 5)? != 5 {
+    // FLUSH; operação desconhecida; mais blocos que o máximo; deslocamento
+    // desalinhado; região de dados estourada.
+    if !submit(&mut f.ring, 5, 2, 0, 0, 0, 0) || completion(&mut f.done, 5)? != 0 {
         return None;
     }
-    if !submit(&mut ring, 6, 0, 9, 0) || completion(&mut done, 6)? != 5 {
+    if !submit(&mut f.ring, 6, 9, 0, 1, 0, 0) || completion(&mut f.done, 6)? != 5 {
+        return None;
+    }
+    if !submit(&mut f.ring, 7, 0, 0, 33, 0, 0) || completion(&mut f.done, 7)? != 5 {
+        return None;
+    }
+    if !submit(&mut f.ring, 8, 0, 0, 1, 1, 0) || completion(&mut f.done, 8)? != 5 {
+        return None;
+    }
+    if !submit(
+        &mut f.ring,
+        9,
+        0,
+        0,
+        2,
+        (u32::from(DATA_BLOCKS) - 1) * PAGE as u32,
+        0,
+    ) || completion(&mut f.done, 9)? != 5
+    {
+        return None;
+    }
+    if !matches!(f.store.close_queue(buf, f.id), Ok(Ok(()))) {
+        return None;
+    }
+    // Solta os mapeamentos: a próxima fila usa os mesmos endereços.
+    drop(f);
+    // A `sys-a` é só de leitura no M5: a escrita volta `ReadOnly` e a
+    // leitura funciona.
+    let sys = storage.open(buf, "sys-a").ok()?.ok()?;
+    if !BlockStoreCliente::new(sys).info(buf).ok()?.ok()?.read_only {
+        return None;
+    }
+    let mut g = open_fila(buf, quota, sys)?;
+    if !submit(&mut g.ring, 1, 1, 0, 1, 0, 0) || completion(&mut g.done, 1)? != 2 {
+        return None;
+    }
+    if !submit(&mut g.ring, 2, 0, 0, 1, 0, 0) || completion(&mut g.done, 2)? != 0 {
+        return None;
+    }
+    if !matches!(g.store.release(buf), Ok(Ok(()))) {
         return None;
     }
     Some(())
 }
 
-fn block(s: &mut Session, quota: Handle) {
-    let Some(ep) = connect(s, b"optimus.block.BlockDevice") else {
-        ostd::debug::print("drvcli: block: sem driver");
+fn storage(s: &mut Session, quota: Handle) {
+    let Some(ep) = connect(s, b"optimus.storage.Storage") else {
+        ostd::debug::print("drvcli: storage: sem serviço");
         return;
     };
-    if block_steps(s, ep, quota).is_some() {
-        ostd::debug::print("drvcli: block ok");
+    if storage_steps(s, ep, quota).is_some() {
+        ostd::debug::print("drvcli: storage ok");
     } else {
-        ostd::debug::print("drvcli: block: falhou");
+        ostd::debug::print("drvcli: storage: falhou");
     }
 }
 
@@ -281,7 +345,7 @@ fn main(start: Start) -> ! {
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     console(&mut s);
     display(&mut s);
-    block(&mut s, quota);
+    storage(&mut s, quota);
     entropy(&mut s);
     ostd::thread::exit()
 }

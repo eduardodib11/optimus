@@ -1,0 +1,16 @@
+# Manifesto do `storaged` (T-520; ADR 0056 e 0064): lê a GPT do disco que o
+# driver serve pelo `BlockDevice` e serve as partições como `BlockStore`.
+# O driver só existe depois que o `devmgr` casa o dispositivo, então a
+# necessidade é opcional e o serviço espera por ele.
+[service]
+name = "storaged"
+binary = "storaged"
+priority = 115
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:768KiB", "kernel:debug", "svc:optimus.block.BlockDevice@1?"]
+provides = ["optimus.storage.Storage@1.0"]
+
+[limits]
+max_threads = 1

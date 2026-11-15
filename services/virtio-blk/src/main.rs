@@ -51,6 +51,9 @@ const DATA_AT: usize = 512;
 const STATUS_AT: usize = 1024;
 /// Tamanho do setor.
 const SECTOR: usize = 512;
+/// Setor do autoteste: depois da tabela GPT (LBA 0 a 33) e antes da primeira
+/// partição alinhada a 1 MiB, para não pisar na tabela (T-520).
+const SELF_TEST_SECTOR: u64 = 64;
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 /// Prazo de uma requisição.
@@ -140,7 +143,7 @@ impl Disk<'_> {
     }
 }
 
-/// Escreve o setor 1, lê de volta e confere o BLAKE3 (aceite da T-411).
+/// Escreve o setor `SELF_TEST_SECTOR`, lê de volta e confere o BLAKE3 (aceite da T-411).
 fn self_test(disk: &mut Disk<'_>) -> Result<(), &'static str> {
     let mut sent = [0u8; SECTOR];
     for (i, b) in sent.iter_mut().enumerate() {
@@ -150,9 +153,9 @@ fn self_test(disk: &mut Disk<'_>) -> Result<(), &'static str> {
         return Err("página de requisições só de leitura");
     };
     bytes[DATA_AT..DATA_AT + SECTOR].copy_from_slice(&sent);
-    disk.request(T_OUT, 1)?;
+    disk.request(T_OUT, SELF_TEST_SECTOR)?;
     disk.req.bytes_mut().ok_or("página só de leitura")?[DATA_AT..DATA_AT + SECTOR].fill(0);
-    disk.request(T_IN, 1)?;
+    disk.request(T_IN, SELF_TEST_SECTOR)?;
     let got = &disk.req.bytes()[DATA_AT..DATA_AT + SECTOR];
     if optcrypt::blake3::hash(got) != optcrypt::blake3::hash(&sent) {
         return Err("o setor lido difere do escrito");

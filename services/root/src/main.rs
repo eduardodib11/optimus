@@ -52,8 +52,9 @@ const SVCMGR_LOG_BADGE: u64 = 0x7376_636d;
 /// pede um segmento de 2 MiB, e 14 MiB com o `acpid` (T-405), que não usa
 /// heap, 17 MiB com os drivers virtio (T-410 a T-415) e 18 MiB com o
 /// `ps2mouse` (T-516) com o `drvcli` (T-514; a cota dele é de 576 KiB para caber) e
-/// 19 MiB com o `keyd` (T-518, 512 KiB, com o heap do kernel em 48 MiB).
-const SVCMGR_QUOTA: u64 = 19 << 20;
+/// 19 MiB com o `keyd` (T-518, 512 KiB, com o heap do kernel em 48 MiB) e
+/// 21 MiB com o `storaged` (T-520, 768 KiB) e a cota do `drvcli` em 768 KiB.
+const SVCMGR_QUOTA: u64 = 21 << 20;
 /// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
 const SVCMGR_PRIORITY: u8 = 200;
 /// Badge com que o `root` identifica o `svcmgr` no próprio endpoint.
