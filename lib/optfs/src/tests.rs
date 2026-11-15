@@ -140,3 +140,128 @@ fn aloca_ate_encher() {
     got.dedup();
     assert_eq!(got.len(), 15);
 }
+
+mod arvore {
+    use super::*;
+    use crate::Tx;
+    use optfs_format::{Key, KeyKind};
+
+    fn k(n: u64) -> Key {
+        Key {
+            object: n,
+            kind: KeyKind::Extent,
+            offset: 0,
+        }
+    }
+    fn val(n: u64, len: usize) -> Vec<u8> {
+        (0..len).map(|i| (n as usize + i) as u8).collect()
+    }
+    fn perm(n: u64) -> Vec<u64> {
+        // Permutação determinística (multiplicador coprimo com n primo).
+        (0..n).map(|i| (i * 7919) % n).collect()
+    }
+
+    #[test]
+    fn insere_busca_remove_e_remonta_depois_de_queda() {
+        let (mut d, s1) = formatted_big();
+        let mut al = Allocator::new(d.blocks());
+        let mut root = BlockPtr::null();
+        let n = 3001; // primo
+        {
+            let mut tx = Tx::new(&mut d, &Fake, &mut al, 2, 1);
+            for i in perm(n) {
+                root = tx
+                    .insert(&root, k(i), &val(i, 100 + (i % 200) as usize))
+                    .unwrap();
+            }
+            for i in 0..n {
+                assert_eq!(
+                    tx.get(&root, &k(i)).unwrap(),
+                    Some(val(i, 100 + (i % 200) as usize))
+                );
+            }
+            assert_eq!(tx.get(&root, &k(n + 5)).unwrap(), None);
+            // Remove os pares e troca um valor.
+            for i in (0..n).step_by(2) {
+                root = tx.remove(&root, &k(i)).unwrap();
+            }
+            root = tx.insert(&root, k(1), b"novo").unwrap();
+            for i in 0..n {
+                let want = if i % 2 == 0 {
+                    None
+                } else if i == 1 {
+                    Some(b"novo".to_vec())
+                } else {
+                    Some(val(i, 100 + (i % 200) as usize))
+                };
+                assert_eq!(tx.get(&root, &k(i)).unwrap(), want, "chave {i}");
+            }
+            // Varredura em ordem.
+            let mut at = k(0);
+            let mut seen = 0u64;
+            while let Some((key, _)) = tx.first_ge(&root, &at).unwrap() {
+                assert_eq!(key.object % 2, 1);
+                seen += 1;
+                at = Key { offset: 1, ..key };
+            }
+            assert_eq!(seen, n / 2);
+            let mut new = sb(0, 0);
+            new.root = root;
+            tx.commit(&s1, new).unwrap();
+        }
+        d.crash();
+        let m = mount(&mut d, &Fake).unwrap();
+        assert_eq!(m.sb.txg, 2);
+        let mut al2 = Allocator::new(d.blocks());
+        let mut tx = Tx::new(&mut d, &Fake, &mut al2, 3, 1);
+        assert_eq!(tx.get(&m.sb.root, &k(1)).unwrap(), Some(b"novo".to_vec()));
+        assert_eq!(tx.get(&m.sb.root, &k(2)).unwrap(), None);
+        assert_eq!(
+            tx.get(&m.sb.root, &k(2999)).unwrap(),
+            Some(val(2999, 100 + (2999 % 200) as usize))
+        );
+    }
+
+    #[test]
+    fn adulteracao_de_no_e_detectada_na_leitura() {
+        let (mut d, s1) = formatted_big();
+        let mut al = Allocator::new(d.blocks());
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, 2, 1);
+        let mut root = BlockPtr::null();
+        for i in 0..200 {
+            root = tx.insert(&root, k(i), &val(i, 300)).unwrap();
+        }
+        let mut new = sb(0, 0);
+        new.root = root;
+        tx.commit(&s1, new).unwrap();
+        let addr = root.addr as usize;
+        let mut al2 = Allocator::new(d.blocks());
+        d.durable[addr][500] ^= 1;
+        let mut tx = Tx::new(&mut d, &Fake, &mut al2, 3, 1);
+        assert_eq!(tx.get(&root, &k(1)).unwrap_err(), IoError::Integrity);
+        // Árvore de outro dono: o cabeçalho não confere.
+        d.durable[addr][500] ^= 1;
+        let mut tx = Tx::new(&mut d, &Fake, &mut al2, 3, 99);
+        assert_eq!(tx.get(&root, &k(1)).unwrap_err(), IoError::Integrity);
+    }
+
+    #[test]
+    fn valor_grande_demais_e_recusado() {
+        let mut d = Sim::new(N);
+        let mut al = Allocator::new(N as u64);
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, 2, 1);
+        assert_eq!(
+            tx.insert(&BlockPtr::null(), k(1), &[0; 1025]).unwrap_err(),
+            IoError::BadRequest
+        );
+    }
+
+    fn formatted_big() -> (Sim, Superblock) {
+        let mut d = Sim::new(4096);
+        let mut s = sb(1, 1);
+        s.volume_blocks = 4096;
+        d.write(SUPERBLOCKS[1], &s.encode(&Fake)).unwrap();
+        d.flush().unwrap();
+        (d, s)
+    }
+}
