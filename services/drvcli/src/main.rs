@@ -18,11 +18,13 @@ use ostd::vm::{Mapping, SELF};
 mod console_cliente;
 mod display_cliente;
 mod entropy_cliente;
+mod net_cliente;
 mod storage_cliente;
 
 use console_cliente::ConsoleCliente;
 use display_cliente::DisplayDeviceCliente;
 use entropy_cliente::EntropySourceCliente;
+use net_cliente::NetDeviceCliente;
 use storage_cliente::{BlockStoreCliente, StorageCliente};
 
 ostd::entry!(main);
@@ -307,6 +309,87 @@ fn storage(s: &mut Session, quota: Handle) {
     }
 }
 
+/// Anéis do `NetDevice`: 16 KiB de dados cada (o que `info()` informa).
+const NET_TX_VA: u64 = 0x30_0100_0000;
+const NET_RX_VA: u64 = 0x30_0200_0000;
+const NET_RING_BYTES: u32 = 16384;
+
+/// Faz o papel do futuro `netd`: liga os anéis pelo contrato `NetDevice`,
+/// manda um ARP para o gateway e espera a resposta pelo anel de recepção.
+fn net_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
+    let cli = NetDeviceCliente::new(ep);
+    let buf = &mut s.buffer;
+    let info = cli.info(buf).ok()?.ok()?;
+    if info.mac == 0
+        || info.ring_bytes != NET_RING_BYTES
+        || info.max_frame != 1514
+        || info.mtu != 1500
+    {
+        return None;
+    }
+    let mac = &info.mac.to_le_bytes()[..6];
+    let session = NetDeviceCliente::new(cli.session(buf).ok()?.ok()?);
+    let tx_obj = session.tx_ring(buf).ok()?.ok()?;
+    let tx_sig = session.tx_signal(buf).ok()?.ok()?;
+    let rx_obj = ostd::cap::create(
+        quota,
+        ObjectType::MemoryObject,
+        ostd::ring::object_bytes(NET_RING_BYTES),
+    )
+    .ok()?;
+    let rx_ntfy = ostd::cap::create(quota, ObjectType::Notification, 0).ok()?;
+    let mut rx = Consumer::create(rx_obj, NET_RX_VA, NET_RING_BYTES, 0x0E02, rx_ntfy).ok()?;
+    let rx_sig = ostd::cap::mint(rx_ntfy, Rights::SIGNAL, 0, None).ok()?;
+    let rx_rw =
+        ostd::cap::mint(rx_obj, Rights::MAP | Rights::READ | Rights::WRITE, 0, None).ok()?;
+    session.attach_rx(buf, rx_rw, rx_sig).ok()?.ok()?;
+    if !matches!(session.attach_rx(buf, rx_rw, rx_sig), Ok(Err(_))) {
+        return None;
+    }
+    let mut tx = Producer::open(tx_obj, NET_TX_VA, NET_RING_BYTES, tx_sig, 1).ok()?;
+    // ARP "quem tem 10.0.2.2", de 10.0.2.15.
+    let mut f = [0u8; 42];
+    f[0..6].fill(0xff);
+    f[6..12].copy_from_slice(mac);
+    f[12..14].copy_from_slice(&[0x08, 0x06]);
+    f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    f[22..28].copy_from_slice(mac);
+    f[28..32].copy_from_slice(&[10, 0, 2, 15]);
+    f[38..42].copy_from_slice(&[10, 0, 2, 2]);
+    tx.push(1, &f).ok()?;
+    let until = ostd::time::now_ns().saturating_add(WINDOW_NS);
+    let mut rec = [0u8; 2048];
+    while ostd::time::now_ns() < until {
+        match rx.pop(&mut rec) {
+            Ok(Some((1, n)))
+                if n >= 42
+                    && rec[12..14] == [0x08, 0x06]
+                    && rec[20..22] == [0, 2]
+                    && rec[28..32] == [10, 0, 2, 2]
+                    && rec[32..38] == *mac =>
+            {
+                return Some(());
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => ostd::thread::yield_now(),
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn net(s: &mut Session, quota: Handle) {
+    let Some(ep) = connect(s, b"optimus.net.NetDevice") else {
+        ostd::debug::print("drvcli: net: sem driver");
+        return;
+    };
+    if net_steps(s, ep, quota).is_some() {
+        ostd::debug::print("drvcli: net ok");
+    } else {
+        ostd::debug::print("drvcli: net: falhou");
+    }
+}
+
 fn entropy(s: &mut Session) {
     let Some(ep) = connect(s, b"optimus.dev.EntropySource") else {
         ostd::debug::print("drvcli: entropy: sem driver");
@@ -346,6 +429,7 @@ fn main(start: Start) -> ! {
     console(&mut s);
     display(&mut s);
     storage(&mut s, quota);
+    net(&mut s, quota);
     entropy(&mut s);
     ostd::thread::exit()
 }
