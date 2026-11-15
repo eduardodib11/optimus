@@ -95,6 +95,8 @@ pub const ID_CONSOLE: u32 = 0x9A709035;
 pub trait Console {
     /// Método `write` (ordinal 0).
     fn write(&mut self, ctx: &Contexto, texto: &str) -> Result<u32, ConsoleError>;
+    /// Método `read` (ordinal 1).
+    fn read(&mut self, ctx: &Contexto, max: u8, prazo_ms: u32) -> Result<&[u8], ConsoleError>;
 }
 
 fn pedido_console_0<'a>(r: &mut Reader<'a>, caps: &[u64]) -> Result<(&'a str,), Error> {
@@ -113,6 +115,38 @@ fn resp_ok_console_0(saida: &mut [u8], v: &u32) -> Result<usize, Error> {
 }
 
 fn resp_err_console_0(saida: &mut [u8], v: &ConsoleError) -> Result<usize, Error> {
+    let mut escritor = Writer::new(saida, 1)?;
+    {
+        let w = &mut escritor;
+        w.seek(0);
+        w.u8((v).0)?;
+    }
+    Ok(escritor.finish())
+}
+
+fn pedido_console_1<'a>(r: &mut Reader<'a>, caps: &[u64]) -> Result<(u8, u32), Error> {
+    let _ = caps;
+    Ok((r.u8()?, r.u32()?))
+}
+
+fn resp_ok_console_1(saida: &mut [u8], v: &&[u8]) -> Result<usize, Error> {
+    let mut escritor = Writer::new(saida, 8)?;
+    {
+        let w = &mut escritor;
+        let off1 = {
+            w.seek(0);
+            w.vec((*v).len(), 1, 64)?
+        };
+        for (i1, el) in (*v).iter().enumerate() {
+            let at2 = off1 + i1 * 1;
+            w.seek(at2);
+            w.u8((*el))?;
+        }
+    }
+    Ok(escritor.finish())
+}
+
+fn resp_err_console_1(saida: &mut [u8], v: &ConsoleError) -> Result<usize, Error> {
     let mut escritor = Writer::new(saida, 1)?;
     {
         let w = &mut escritor;
@@ -162,6 +196,41 @@ pub fn despacha_console<S: Console>(
                     Err(_) => protocolo(5),
                 },
                 Err(x) => match resp_err_console_0(saida, &x) {
+                    Ok(n) => Some(Despacho {
+                        rotulo: rotulo_resposta(1, 0),
+                        corpo: n,
+                        caps: 0,
+                    }),
+                    Err(_) => protocolo(5),
+                },
+            }
+        }
+        1 => {
+            if e.corpo.len() as u64 > 8 {
+                return protocolo(5);
+            }
+            let mut r = match Reader::new(e.corpo, 8) {
+                Ok(r) => r,
+                Err(_) => return protocolo(4),
+            };
+            let (p_max, p_prazo_ms) = match pedido_console_1(&mut r, e.caps) {
+                Ok(x) => x,
+                Err(_) => return protocolo(4),
+            };
+            if r.finish().is_err() {
+                return protocolo(4);
+            }
+            let ctx = Contexto { badge: e.badge };
+            match s.read(&ctx, p_max, p_prazo_ms) {
+                Ok(x) => match resp_ok_console_1(saida, &x) {
+                    Ok(n) => Some(Despacho {
+                        rotulo: rotulo_resposta(0, 0),
+                        corpo: n,
+                        caps: 0,
+                    }),
+                    Err(_) => protocolo(5),
+                },
+                Err(x) => match resp_err_console_1(saida, &x) {
                     Ok(n) => Some(Despacho {
                         rotulo: rotulo_resposta(1, 0),
                         corpo: n,

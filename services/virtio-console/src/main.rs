@@ -3,9 +3,9 @@
 //! das capabilities, `irq0` e `dma`) e com isso negocia o transporte, monta a
 //! fila de transmissão da porta 0 (fila 1) e escreve um texto nela, que o
 //! QEMU entrega ao seu `chardev`. Depois serve o contrato `Console` gerado do
-//! `idl/optimus/console.oidl` (T-514): quem tem o endpoint escreve na porta.
-//! A porta é só de saída por ora; a entrada (fila 0) e as portas extras
-//! vêm depois.
+//! `idl/optimus/console.oidl` (T-514): quem tem o endpoint escreve na porta e
+//! lê o que foi digitado nela (fila de recepção 0, para o pedido de senha do
+//! `keyd`, T-527). As portas extras vêm depois.
 
 #![no_std]
 #![no_main]
@@ -38,8 +38,17 @@ const BUF_VA: u64 = 0x20_0030_0000;
 /// IOVAs das páginas da fila e do buffer.
 const QUEUE_IOVA: u64 = 0x10_0000;
 const BUF_IOVA: u64 = 0x10_1000;
-/// Descritores da fila de transmissão.
+/// Fila e buffers de recepção.
+const RXQ_VA: u64 = 0x20_0040_0000;
+const RXBUF_VA: u64 = 0x20_0050_0000;
+const RXQ_IOVA: u64 = 0x10_2000;
+const RXBUF_IOVA: u64 = 0x10_3000;
+/// Bytes de cada buffer de recepção; cabem `QUEUE_SIZE` numa página.
+const RX_BUF: usize = 64;
+/// Descritores de cada fila.
 const QUEUE_SIZE: usize = 8;
+/// Índice da fila de recepção da porta 0.
+const RECEIVE_QUEUE: u16 = 0;
 /// Índice da fila de transmissão da porta 0.
 const TRANSMIT_QUEUE: u16 = 1;
 /// Prazo de uma transmissão.
@@ -50,11 +59,21 @@ const HELLO: &str = "virtio-console: ola do processo de usuario\n";
 /// A porta 0 em uso.
 struct Port<'a> {
     queue: Queue<Dma<'a>, QUEUE_SIZE>,
+    rx: Queue<Dma<'a>, QUEUE_SIZE>,
     notify: Regs<'a>,
     notify_at: usize,
+    rx_notify: usize,
     buf: Mapping,
     buf_iova: u64,
+    rxbuf: Mapping,
+    rxbuf_iova: u64,
     irq: Irq,
+    /// Bytes recebidos que a leitura ainda não entregou.
+    pending: [u8; RX_BUF],
+    pending_pos: usize,
+    pending_len: usize,
+    /// Saída da leitura atual.
+    out: [u8; RX_BUF],
 }
 
 impl Port<'_> {
@@ -72,13 +91,59 @@ impl Port<'_> {
         };
         self.queue.push(&[seg]).map_err(|_| ConsoleError::Io)?;
         self.notify.write16(self.notify_at, TRANSMIT_QUEUE);
-        self.irq
-            .wait(TIMEOUT_NS)
-            .map_err(|_| ConsoleError::Timeout)?;
-        match self.queue.pop() {
-            Ok(Some(_)) => Ok(()),
-            // Sem cadeia usada ou cadeia inválida: o dispositivo não é confiável.
-            Ok(None) | Err(_) => Err(ConsoleError::Io),
+        // A interrupção também sai da recepção: sem cadeia usada na
+        // transmissão, espera de novo (cada espera tem prazo).
+        for _ in 0..4 {
+            self.irq
+                .wait(TIMEOUT_NS)
+                .map_err(|_| ConsoleError::Timeout)?;
+            match self.queue.pop() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                // Cadeia inválida: o dispositivo não é confiável.
+                Err(_) => return Err(ConsoleError::Io),
+            }
+        }
+        Err(ConsoleError::Io)
+    }
+
+    /// Entrega o buffer `slot` de recepção ao dispositivo.
+    fn give_rx(&mut self, slot: u16) -> Result<(), ConsoleError> {
+        let seg = Seg {
+            addr: self.rxbuf_iova + u64::from(slot) * RX_BUF as u64,
+            len: RX_BUF as u32,
+            write: true,
+        };
+        self.rx.push(&[seg]).map_err(|_| ConsoleError::Io)?;
+        Ok(())
+    }
+
+    /// Espera até `prazo_ns` por uma cadeia de recepção e a guarda em
+    /// `pending`, devolvendo o buffer ao dispositivo.
+    fn fill_pending(&mut self, prazo_ns: u64) -> Result<(), ConsoleError> {
+        loop {
+            match self.rx.pop() {
+                Ok(Some(chain)) => {
+                    let slot = chain.head;
+                    let len = (chain.len as usize).min(RX_BUF);
+                    let at = usize::from(slot) * RX_BUF;
+                    let src = self
+                        .rxbuf
+                        .bytes()
+                        .get(at..at + len)
+                        .ok_or(ConsoleError::Io)?;
+                    self.pending[..len].copy_from_slice(src);
+                    self.pending_pos = 0;
+                    self.pending_len = len;
+                    self.give_rx(slot)?;
+                    self.notify.write16(self.rx_notify, RECEIVE_QUEUE);
+                    if len > 0 {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => self.irq.wait(prazo_ns).map_err(|_| ConsoleError::Timeout)?,
+                Err(_) => return Err(ConsoleError::Io),
+            }
         }
     }
 }
@@ -89,6 +154,18 @@ impl Console for Port<'_> {
         // `texto` tem no máximo 128 bytes (`string<128>`).
         Ok(texto.len() as u32)
     }
+
+    fn read(&mut self, _ctx: &Contexto, max: u8, prazo_ms: u32) -> Result<&[u8], ConsoleError> {
+        if self.pending_len == 0 {
+            self.fill_pending(u64::from(prazo_ms).saturating_mul(1_000_000))?;
+        }
+        let n = usize::from(max).min(RX_BUF).min(self.pending_len);
+        let from = self.pending_pos;
+        self.out[..n].copy_from_slice(&self.pending[from..from + n]);
+        self.pending_pos += n;
+        self.pending_len -= n;
+        Ok(&self.out[..n])
+    }
 }
 
 /// Atende o contrato `Console` em `ep` até o endpoint ser revogado.
@@ -97,7 +174,7 @@ fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, port: &mut Port<'_>) 
         Ok(r) => r,
         Err(e) => return e,
     };
-    let (mut corpo, mut saida) = ([0u8; 136], [0u8; 16]);
+    let (mut corpo, mut saida) = ([0u8; 136], [0u8; 96]);
     let mut rec = match ipc::recv(ep, reply, 0) {
         Ok(r) => r,
         Err(e) => return e,
@@ -138,6 +215,16 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
         ostd::cap::create(quota, ObjectType::MemoryObject, 4096).map_err(|_| "página da fila")?;
     let buf_obj =
         ostd::cap::create(quota, ObjectType::MemoryObject, 4096).map_err(|_| "página do buffer")?;
+    let rxq_obj = ostd::cap::create(quota, ObjectType::MemoryObject, 4096)
+        .map_err(|_| "página da fila rx")?;
+    let rxbuf_obj =
+        ostd::cap::create(quota, ObjectType::MemoryObject, 4096).map_err(|_| "buffers rx")?;
+    let rxq_map = RefCell::new(
+        Mapping::new(SELF, rxq_obj, RXQ_VA, 4096, ostd::kabi::vm::WRITE)
+            .map_err(|_| "mapear a fila rx")?,
+    );
+    let rxbuf = Mapping::new(SELF, rxbuf_obj, RXBUF_VA, 4096, ostd::kabi::vm::WRITE)
+        .map_err(|_| "mapear os buffers rx")?;
     let queue_map = RefCell::new(
         Mapping::new(SELF, queue_obj, QUEUE_VA, 4096, ostd::kabi::vm::WRITE)
             .map_err(|_| "mapear a fila")?,
@@ -148,6 +235,10 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
         .map_err(|_| "dma_map da fila")?;
     let buf_at = ostd::dev::dma_map(domain, buf_obj, BUF_IOVA, 0, 4096, false)
         .map_err(|_| "dma_map do buffer")?;
+    let rxq_at = ostd::dev::dma_map(domain, rxq_obj, RXQ_IOVA, 0, 4096, true)
+        .map_err(|_| "dma_map da fila rx")?;
+    let rxbuf_at = ostd::dev::dma_map(domain, rxbuf_obj, RXBUF_IOVA, 0, 4096, true)
+        .map_err(|_| "dma_map dos buffers rx")?;
     // Com IOMMU o `dma_map` devolve a IOVA; o dispositivo precisa de
     // `ACCESS_PLATFORM` para endereçar por ela.
     let required = if queue_at == QUEUE_IOVA {
@@ -159,21 +250,37 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     transport
         .negotiate(F_ACCESS_PLATFORM, required)
         .map_err(|_| "negociar as features")?;
+    let (rx, rx_off) = transport
+        .setup_queue::<_, QUEUE_SIZE>(RECEIVE_QUEUE, Dma::new(&rxq_map, rxq_at), 0)
+        .map_err(|_| "montar a fila de recepção")?;
     let (queue, notify_off) = transport
         .setup_queue::<_, QUEUE_SIZE>(TRANSMIT_QUEUE, Dma::new(&queue_map, queue_at), 0)
         .map_err(|_| "montar a fila de transmissão")?;
     let irq = Irq::new(quota, irq)?;
     transport.driver_ok();
     let notify_at =
-        caps.notify.offset as usize + usize::from(notify_off) * caps.notify_multiplier as usize;
+        |off: u16| caps.notify.offset as usize + usize::from(off) * caps.notify_multiplier as usize;
     let mut port = Port {
         queue,
+        rx,
         notify: Regs::new(&bar_map, 0),
-        notify_at,
+        notify_at: notify_at(notify_off),
+        rx_notify: notify_at(rx_off),
         buf,
         buf_iova: buf_at,
+        rxbuf,
+        rxbuf_iova: rxbuf_at,
         irq,
+        pending: [0; RX_BUF],
+        pending_pos: 0,
+        pending_len: 0,
+        out: [0; RX_BUF],
     };
+    for slot in 0..QUEUE_SIZE as u16 {
+        port.give_rx(slot)
+            .map_err(|_| "entregar buffer de recepção")?;
+    }
+    port.notify.write16(port.rx_notify, RECEIVE_QUEUE);
     port.transmit(HELLO).map_err(|_| "escrever na porta 0")?;
     ostd::debug::print("virtio-console: texto enviado à porta 0");
     let ep = s
@@ -182,6 +289,8 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
         .map(Handle::from_raw)
         .ok_or("descritor sem o endpoint do Console")?;
     let e = serve(ep, quota, &mut s.buffer, &mut port);
+    // Antes de largar o DMA: o dispositivo ainda consulta a fila de recepção.
+    transport.reset();
     ostd::debug::print_fmt(format_args!("virtio-console: encerrado ({e:?})"));
     Ok(())
 }

@@ -715,7 +715,17 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     if opts.devices.iter().any(|d| d.starts_with("virtconsole")) {
         let out = root().join("target/vcon.txt");
         let _ = fs::remove_file(&out);
-        cmd.args(["-chardev", &format!("file,id=vcon,path={}", out.display())]);
+        // Socket com `logfile`: o texto que o guest escreve vai para o arquivo
+        // e o xtask digita a entrada (T-527) pelo socket.
+        let _ = fs::remove_file(root().join("target/vcon.sock"));
+        cmd.args([
+            "-chardev",
+            &format!(
+                "socket,id=vcon,path={},server=on,wait=off,logfile={}",
+                root().join("target/vcon.sock").display(),
+                out.display()
+            ),
+        ]);
     }
     // Rede de usuário (slirp) para o `virtio-net-pci`: responde ao ARP.
     if opts.devices.iter().any(|d| d.starts_with("virtio-net-pci")) {
@@ -816,6 +826,47 @@ struct Scenario {
     /// Tecla que o xtask injeta pelo monitor do QEMU (`sendkey`) quando o
     /// `i8042d` avisa que está pronto (T-406).
     key: Option<&'static str>,
+}
+
+/// O que o xtask digita no console virtio (`drvcli::CONSOLE_INPUT`).
+const CONSOLE_INPUT: &str = "optimus-entrada\n";
+
+/// Digita [`CONSOLE_INPUT`] no console virtio pelo socket do `chardev`.
+struct ConsoleFeed {
+    enabled: bool,
+    sent: bool,
+    conn: Option<std::os::unix::net::UnixStream>,
+}
+
+impl ConsoleFeed {
+    fn new(opts: &Options) -> Self {
+        Self {
+            enabled: opts.devices.iter().any(|d| d.starts_with("virtconsole")),
+            sent: false,
+            conn: None,
+        }
+    }
+
+    /// Conecta e digita quando o driver já pôs buffers na fila de recepção
+    /// (a linha do driver). Depois da leitura o xtask larga o cliente: com
+    /// ele conectado o QEMU continua consultando a fila de recepção, e o
+    /// driver é morto pelo `svcmgr` sem resetar o dispositivo, o que dá falta
+    /// de DMA com IOMMU.
+    fn step(&mut self, serial: &str) {
+        if self.enabled
+            && !self.sent
+            && serial.contains("virtio-console: texto enviado")
+            && let Ok(mut c) =
+                std::os::unix::net::UnixStream::connect(root().join("target/vcon.sock"))
+            && c.write_all(CONSOLE_INPUT.as_bytes()).is_ok()
+        {
+            self.sent = true;
+            self.conn = Some(c);
+        }
+        if self.conn.is_some() && serial.contains("drvcli: console: entrada ok") {
+            self.conn = None;
+        }
+    }
 }
 
 /// Linha do `i8042d` que libera a tecla injetada.
@@ -1020,6 +1071,7 @@ macro_rules! m4_markers {
             "virtio-console: texto enviado",
             // T-514: o cliente conversa com o driver pelo contrato gerado.
             "drvcli: console ok",
+            "drvcli: console: entrada ok",
             "drvcli: display ok",
             "drvcli: storage ok",
             "drvcli: net ok",
@@ -1073,6 +1125,7 @@ const M4_FORBIDDEN: &[&str] = &[
     "virtio-rng: falhou",
     "virtio-console: falhou",
     "drvcli: console: falhou",
+    "drvcli: console: entrada falhou",
     "drvcli: console: sem driver",
     "drvcli: display: falhou",
     "drvcli: display: sem driver",
@@ -1101,6 +1154,7 @@ const M4_IOMMU_FORBIDDEN: &[&str] = &[
     "virtio-rng: falhou",
     "virtio-console: falhou",
     "drvcli: console: falhou",
+    "drvcli: console: entrada falhou",
     "drvcli: console: sem driver",
     "drvcli: display: falhou",
     "drvcli: display: sem driver",
@@ -1517,6 +1571,10 @@ fn serial_of(sc: &Scenario, raw: &[u8]) -> String {
 }
 
 /// Dá boot num cenário e devolve a serial, se ela conferir.
+#[allow(
+    clippy::too_many_lines,
+    reason = "laço único do QEMU: injeções, captura e conferências"
+)]
 fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let esp = image(opts, sc.cmdline, sc.rounds)?;
     let monitor = root().join("target/qemu-monitor.sock");
@@ -1552,6 +1610,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let start = Instant::now();
     // Última injeção da tecla e do mouse.
     let mut last_key: (Option<Instant>, Option<Instant>) = (None, None);
+    let mut console = ConsoleFeed::new(opts);
     let seen_all = |raw: &[u8]| {
         let text = String::from_utf8_lossy(raw);
         sc.markers.iter().all(|m| text.contains(m))
@@ -1571,6 +1630,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
             }
             screen = Some(shot);
         }
+        console.step(&String::from_utf8_lossy(&raw));
         if let Some(key) = sc.key {
             inject_key(&monitor, key, &raw, &mut last_key);
         }

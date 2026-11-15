@@ -29,6 +29,9 @@ use input_cliente::InputDeviceCliente;
 use net_cliente::NetDeviceCliente;
 use storage_cliente::{BlockStoreCliente, StorageCliente};
 
+/// O que o xtask digita no console (`CONSOLE_INPUT` do xtask).
+const CONSOLE_INPUT: &str = "optimus-entrada\n";
+
 ostd::entry!(main);
 
 /// `kind` das capabilities de origem do kernel no descritor (ADR 0034).
@@ -93,6 +96,17 @@ fn console(s: &mut Session) {
     match ConsoleCliente::new(ep).write(&mut s.buffer, text) {
         Ok(Ok(n)) if n as usize == text.len() => ostd::debug::print("drvcli: console ok"),
         r => ostd::debug::print_fmt(format_args!("drvcli: console: falhou ({r:?})")),
+    }
+    // A entrada da porta 0 (T-527): o xtask digita `CONSOLE_INPUT` no
+    // `chardev` do QEMU.
+    match ConsoleCliente::new(ep).read(&mut s.buffer, 32, 2000) {
+        Ok(Ok(b)) if b.as_slice() == CONSOLE_INPUT.as_bytes() => {
+            ostd::debug::print("drvcli: console: entrada ok");
+        }
+        r => ostd::debug::print_fmt(format_args!(
+            "drvcli: console: entrada falhou ({:?})",
+            r.map(|x| x.map(|b| b.as_slice().len()))
+        )),
     }
 }
 
