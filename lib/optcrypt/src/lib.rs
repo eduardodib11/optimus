@@ -26,6 +26,7 @@ pub mod blake2b;
 pub mod blake3;
 pub mod block;
 pub mod chacha20;
+pub mod drbg;
 pub mod hkdf;
 pub mod hmac;
 pub mod poly1305;
