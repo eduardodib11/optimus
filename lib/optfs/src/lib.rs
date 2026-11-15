@@ -16,12 +16,14 @@
 extern crate alloc;
 
 mod alloc_map;
+mod crypt;
 mod fs;
 mod io;
 mod tree;
 mod txg;
 
 pub use alloc_map::Allocator;
+pub use crypt::{BlockCipher, VolumeCipher};
 pub use fs::{Fs, FsError, Inode, ObjKind, Snap};
 pub use io::{BlockIo, IoError};
 pub use tree::{MAX_VALUE, Tx};
