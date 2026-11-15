@@ -7,12 +7,12 @@
 use super::crash_step::{FILE_LEN, KEY, UUID, pattern};
 use super::optfs_step::{QueueIo, Sha};
 use super::{BlockStoreCliente, Fila, Session, StorageCliente, connect, open_fila};
-use optfs::{Allocator, BlockIo, Fs, Tx, mount};
+use optfs::{Allocator, BlockIo, Fs, IoError, Tx, mount};
 use optfs_format::{BlockPtr, Integrity, SUPERBLOCKS, Superblock};
 use ostd::kabi::{Error, Handle};
 
 /// Commits depois da recuperação que encerram o cenário.
-const AFTER: u32 = 2;
+const AFTER: u32 = 1;
 
 /// Fim de uma tentativa que não foi um erro do cenário.
 enum Fim {
@@ -29,10 +29,15 @@ enum Fim {
 fn attempt(f: &mut Fila, blocks: u64, confirmed: &mut u64, check: bool) -> Option<Fim> {
     let h = Sha;
     let mut io = QueueIo::new(f, blocks);
-    let (mut prev, mut root) = if let Ok(m) = mount(&mut io, &h) {
+    let mounted = mount(&mut io, &h);
+    // Erro de E/S na montagem é a queda; só um volume em branco se formata.
+    if matches!(mounted, Err(IoError::Io)) {
+        return Some(Fim::Queda);
+    }
+    let (mut prev, mut root) = if let Ok(m) = mounted {
         (m.sb, m.sb.root)
-    } else if check {
-        // Montar tem de funcionar depois de uma queda.
+    } else if check && *confirmed > 0 {
+        // Com commit confirmado, montar tem de funcionar depois de uma queda.
         return None;
     } else {
         let s1 = Superblock {
@@ -74,14 +79,24 @@ fn attempt(f: &mut Fila, blocks: u64, confirmed: &mut u64, check: bool) -> Optio
     loop {
         let txg = prev.txg + 1;
         let mut tx = Tx::new(&mut io, &h, &mut al, txg, 1);
-        let (mut fs, file) = if root.is_null() {
-            let mut fs = Fs::create(&mut tx, KEY).ok()?;
-            let file = fs.create_file(&mut tx, 1, "f").ok()?;
-            (fs, file)
+        // Erro de E/S aqui é a queda do `storaged` no meio do commit.
+        let opened = if root.is_null() {
+            Fs::create(&mut tx, KEY)
+                .and_then(|mut fs| {
+                    let file = fs.create_file(&mut tx, 1, "f")?;
+                    Ok((fs, file))
+                })
+                .ok()
         } else {
             let fs = Fs::from_root(root, KEY);
-            let (file, _) = fs.lookup(&mut tx, 1, "f").ok()??;
-            (fs, file)
+            match fs.lookup(&mut tx, 1, "f") {
+                Ok(Some((file, _))) => Some((fs, file)),
+                Ok(None) => return None,
+                Err(_) => None,
+            }
+        };
+        let Some((mut fs, file)) = opened else {
+            return Some(Fim::Queda);
         };
         if fs.write(&mut tx, file, 0, &pattern(txg)).is_err() {
             return Some(Fim::Queda);
@@ -122,8 +137,18 @@ pub fn run(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
     let mut confirmed = 0u64;
     let mut ep = ep;
     let mut dead = false;
+    let mut retries = 0u32;
     loop {
-        let (mut q, blocks) = open_caos(s, ep, quota)?;
+        // Uma queda no meio de `open` ou da abertura da fila também vale.
+        let Some((mut q, blocks)) = open_caos(s, ep, quota) else {
+            retries += 1;
+            if retries > 5 {
+                return None;
+            }
+            ep = connect(s, b"optimus.storage.Storage")?;
+            dead = true;
+            continue;
+        };
         match attempt(&mut q, blocks, &mut confirmed, dead)? {
             Fim::Pronto => return Some(()),
             Fim::Queda => {

@@ -196,6 +196,9 @@ fn deliver_and_start(
     Ok(desc)
 }
 
+/// Supervisão a mais depois de `svcmgr.mata` (T-541), em ns.
+const MATA_EXTRA_NS: u64 = 6_000_000_000;
+
 /// Espera entre duas tentativas de reiniciar um serviço que não partiu.
 const RETRY_NS: u64 = 250_000_000;
 
@@ -925,6 +928,9 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
             .and_then(|(n, ms)| Some((n, ms.trim().parse::<u64>().ok()?)))
     {
         s.kill_named(nome, ms.saturating_mul(1_000_000));
+        // A recuperação dos clientes (prazo de conclusão de 2 s, remontagem e
+        // novos commits) cabe depois da queda.
+        s.supervise(ostd::time::now_ns().saturating_add(MATA_EXTRA_NS));
     }
     s.supervise(ostd::time::now_ns().saturating_add(SUPERVISE_NS));
     s.shutdown();

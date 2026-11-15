@@ -2248,8 +2248,8 @@ fn caos_storaged(opts: &Options) -> Result {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
-        // 3 a 7 s depois de o `svcmgr` pôr os serviços em `Running`.
-        let delay = 3000 + seed % 4000;
+        // 5 a 9 s depois de o `svcmgr` pôr os serviços em `Running`.
+        let delay = 5000 + seed % 4000;
         let plain = Options {
             devices: vec![
                 "virtio-blk-pci,drive=vd0,disable-legacy=on",
