@@ -164,8 +164,10 @@ fn spawn(
 const TICK_NS: u64 = 20_000_000;
 /// Janela de supervisão do M3: quanto o `svcmgr` supervisiona depois da
 /// partida antes do desligamento ordenado. Até existir quem peça o
-/// desligamento (M4), é ela que devolve a cota ao `root` nos testes.
-const SUPERVISE_NS: u64 = 1_000_000_000;
+/// desligamento (M4), é ela que devolve a cota ao `root` nos testes. Os
+/// drivers partem pelo `devmgr` já dentro dela; 3 s dão folga ao boot lento
+/// do TCG com IOMMU (o `ps2mouse` ficava pronto no fim de 1 s).
+const SUPERVISE_NS: u64 = 3_000_000_000;
 
 /// O `svcmgr` em execução: plano, canal de controle e instâncias vivas.
 struct Svcmgr<'a> {

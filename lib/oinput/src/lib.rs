@@ -86,6 +86,93 @@ pub fn decode(words: &[u64]) -> Option<Event> {
     }
 }
 
+/// Rótulo do pedido `poll` (método 1, `minor_min` 1): o cliente do
+/// `inputd` pede o próximo evento da fila (T-517). A resposta traz as
+/// palavras de [`encode`] e, no fim, os eventos perdidos desde o último
+/// `poll` (5 palavras); sem evento na fila traz só a contagem de perdas.
+#[must_use]
+pub fn poll_label() -> u64 {
+    (u64::from(interface_id()) << 32) | (1 << 16) | 1
+}
+
+/// O rótulo é um pedido `poll` desta interface.
+#[must_use]
+pub fn is_poll(label: u64) -> bool {
+    label == poll_label()
+}
+
+/// Fila de eventos com limite (T-517): o produtor (o driver, por meio do
+/// `inputd`) nunca espera o cliente. Cheia, descarta o evento novo e conta a
+/// perda, que o cliente lê no próximo `poll`.
+#[derive(Clone, Debug)]
+pub struct EventQueue<const N: usize> {
+    slots: [Event; N],
+    head: usize,
+    len: usize,
+    lost: u64,
+}
+
+impl<const N: usize> Default for EventQueue<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> EventQueue<N> {
+    /// Fila vazia.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            slots: [Event::Key {
+                code: 0,
+                pressed: false,
+            }; N],
+            head: 0,
+            len: 0,
+            lost: 0,
+        }
+    }
+
+    /// Enfileira `e`; `false` (e uma perda contada) se a fila está cheia.
+    pub fn push(&mut self, e: Event) -> bool {
+        if self.len == N {
+            self.lost = self.lost.saturating_add(1);
+            return false;
+        }
+        self.slots[(self.head + self.len) % N] = e;
+        self.len += 1;
+        true
+    }
+
+    /// Tira o evento mais antigo.
+    pub fn pop(&mut self) -> Option<Event> {
+        if self.len == 0 {
+            return None;
+        }
+        let e = self.slots[self.head];
+        self.head = (self.head + 1) % N;
+        self.len -= 1;
+        Some(e)
+    }
+
+    /// Eventos na fila.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// A fila está vazia.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Perdas desde a última chamada (zera a contagem).
+    pub fn take_lost(&mut self) -> u64 {
+        core::mem::take(&mut self.lost)
+    }
+}
+
 /// Tradução dos eventos `evdev` que o `virtio-input` entrega (`type`,
 /// `code`, `value`) para [`Event`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -176,6 +263,54 @@ impl Evdev {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev(i: u64) -> Event {
+        Event::Pointer {
+            dx: i16::try_from(i).unwrap_or(0),
+            dy: 0,
+            buttons: 0,
+        }
+    }
+
+    #[test]
+    fn fila_sem_perda_abaixo_do_limite() {
+        let mut q = EventQueue::<64>::new();
+        // Estresse: enche e esvazia várias vezes, dando a volta no anel.
+        for round in 0..50u64 {
+            for i in 0..64 {
+                assert!(q.push(ev(round * 64 + i)));
+            }
+            for i in 0..64 {
+                assert_eq!(q.pop(), Some(ev(round * 64 + i)));
+            }
+        }
+        assert!(q.is_empty());
+        assert_eq!(q.take_lost(), 0);
+    }
+
+    #[test]
+    fn fila_conta_perda_acima_do_limite() {
+        let mut q = EventQueue::<64>::new();
+        for i in 0..1000 {
+            q.push(ev(i));
+        }
+        assert_eq!(q.len(), 64);
+        assert_eq!(q.take_lost(), 1000 - 64);
+        assert_eq!(q.take_lost(), 0);
+        // Os 64 primeiros ficaram, em ordem; depois de esvaziar, volta a aceitar.
+        for i in 0..64 {
+            assert_eq!(q.pop(), Some(ev(i)));
+        }
+        assert_eq!(q.pop(), None);
+        assert!(q.push(ev(7)));
+    }
+
+    #[test]
+    fn rotulo_do_poll() {
+        assert!(is_poll(poll_label()));
+        assert!(!is_poll(label()));
+        assert!(!is_event(poll_label()));
+    }
 
     #[test]
     fn ida_e_volta() {

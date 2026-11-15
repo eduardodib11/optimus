@@ -6,8 +6,10 @@
 //!
 //! A IRQ é de borda: o driver esvazia o controlador, confirma a IRQ e
 //! esvazia de novo, para não perder o byte que chegar entre as duas coisas.
-//! Bytes do mouse (o nó `PNP0F13` só traz a IRQ 12) são descartados; o
-//! ponteiro vem pelo `virtio-input` (T-413).
+//! O controlador também é do mouse (T-516; ADR 0059): o `init` liga a IRQ 12
+//! e o relógio do mouse, mas os bytes do mouse ficam para o `ps2mouse`, que
+//! o `devmgr` parte pelo nó `PNP0F13`. O status diz de quem é cada byte (bit
+//! 5), e cada driver só lê os seus.
 
 #![no_std]
 #![no_main]
@@ -32,8 +34,13 @@ const KIND_KERNEL: u8 = 5;
 /// Comandos do controlador: ler e gravar o byte de configuração.
 const CMD_READ_CONFIG: u8 = 0x20;
 const CMD_WRITE_CONFIG: u8 = 0x60;
-/// Byte de configuração: IRQ 1 ligada e tradução para o conjunto 1.
+/// Comando: liga a porta do mouse.
+const CMD_ENABLE_AUX: u8 = 0xA8;
+/// Byte de configuração: IRQ 1 e IRQ 12 ligadas, relógio do mouse ligado e
+/// tradução para o conjunto 1.
 const CONFIG_KBD_IRQ: u8 = 1 << 0;
+const CONFIG_AUX_IRQ: u8 = 1 << 1;
+const CONFIG_AUX_CLOCK_OFF: u8 = 1 << 5;
 const CONFIG_TRANSLATE: u8 = 1 << 6;
 /// Status: há byte para ler; o controlador ainda não leu o último escrito.
 const STATUS_OUTPUT_FULL: u8 = 1 << 0;
@@ -70,10 +77,11 @@ impl Chip {
         Err("o controlador não aceita comando")
     }
 
-    /// Espera a resposta de um comando.
+    /// Espera a resposta de um comando (um byte que não é do mouse: o
+    /// `ps2mouse` pode estar ligando o mouse na mesma hora).
     fn wait_read(&self) -> Result<u8, &'static str> {
         for _ in 0..SPIN {
-            if self.status() & STATUS_OUTPUT_FULL != 0 {
+            if ps2::source(self.status()) == Source::Keyboard {
                 return Ok(self.data.read8(0));
             }
             core::hint::spin_loop();
@@ -88,11 +96,14 @@ impl Chip {
         }
         self.wait_write()?;
         self.ctl.write8(0, CMD_READ_CONFIG);
-        let config = self.wait_read()? | CONFIG_KBD_IRQ | CONFIG_TRANSLATE;
+        let config = (self.wait_read()? | CONFIG_KBD_IRQ | CONFIG_AUX_IRQ | CONFIG_TRANSLATE)
+            & !CONFIG_AUX_CLOCK_OFF;
         self.wait_write()?;
         self.ctl.write8(0, CMD_WRITE_CONFIG);
         self.wait_write()?;
         self.data.write8(0, config);
+        self.wait_write()?;
+        self.ctl.write8(0, CMD_ENABLE_AUX);
         Ok(())
     }
 }
@@ -107,14 +118,11 @@ impl Driver {
     /// Lê todos os bytes à espera; `false` quando o `inputd` se foi.
     fn drain(&mut self) -> bool {
         loop {
-            let from = ps2::source(self.chip.status());
-            if from == Source::None {
+            // Byte do mouse fica no controlador para o `ps2mouse`.
+            if ps2::source(self.chip.status()) != Source::Keyboard {
                 return true;
             }
             let byte = self.chip.data.read8(0);
-            if from != Source::Keyboard {
-                continue;
-            }
             let Some(key) = self.keyboard.feed(byte) else {
                 continue;
             };

@@ -6,8 +6,10 @@
 //! Os bytes do dispositivo são uma fonte a mais, nunca a única: não
 //! substituem a entropia do kernel (`optboot` e `krand`), só se somam a ela.
 //! Por isso o driver confere que o dispositivo responde com bytes que variam
-//! antes de entregá-los; a entrega ao gerador de semente do sistema vem a
-//! seguir.
+//! antes de entregá-los. Depois serve o contrato `EntropySource` gerado do
+//! `idl/optimus/entropy.oidl` (T-514; ADR 0054), com o teste de repetição do
+//! item 3: um bloco igual ao anterior, ou de bytes todos iguais, reprova o
+//! driver, que passa a devolver `Failed` até reiniciar.
 
 #![no_std]
 #![no_main]
@@ -16,12 +18,17 @@
 
 use core::cell::RefCell;
 
-use ostd::kabi::{Handle, ObjectType};
+use ostd::ipc::{self, Message};
+use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::Start;
 use ostd::svc::Session;
 use ostd::vm::{Mapping, SELF};
 use vdrv::{Dma, Irq, Regs};
 use virtio_core::{F_ACCESS_PLATFORM, Queue, Seg, Transport};
+
+mod entropy_servidor;
+
+use entropy_servidor::{Contexto, EntropySource, ID_ENTROPYSOURCE, RngError};
 
 ostd::entry!(main);
 
@@ -74,6 +81,96 @@ impl Rng<'_> {
     }
 }
 
+/// O serviço: o dispositivo, o último bloco (para o teste de repetição) e a
+/// saída da leitura atual.
+struct Service<'a> {
+    rng: Rng<'a>,
+    prev: Option<[u8; CHUNK]>,
+    out: [u8; CHUNK],
+    failed: bool,
+}
+
+/// Teste de repetição simplificado (NIST SP 800-90B, 4.4.1): bloco igual ao
+/// anterior ou de bytes todos iguais.
+fn repeats(block: &[u8; CHUNK], prev: Option<&[u8; CHUNK]>) -> bool {
+    block.iter().all(|&b| b == block[0]) || prev == Some(block)
+}
+
+impl EntropySource for Service<'_> {
+    fn read(&mut self, _ctx: &Contexto, len: u8) -> Result<&[u8], RngError> {
+        if self.failed {
+            return Err(RngError::Failed);
+        }
+        let mut block = [0u8; CHUNK];
+        let n = self.rng.read(&mut block).map_err(|_| RngError::Failed)?;
+        // Só um bloco inteiro entra no teste; o dispositivo devolve menos
+        // quando quer, e isso não é falha.
+        if n == CHUNK && repeats(&block, self.prev.as_ref()) {
+            self.failed = true;
+            ostd::debug::print("virtio-rng: teste de saúde falhou");
+            return Err(RngError::Failed);
+        }
+        if n == CHUNK {
+            self.prev = Some(block);
+        }
+        self.out = block;
+        Ok(&self.out[..n.min(usize::from(len))])
+    }
+}
+
+/// Atende o contrato `EntropySource` em `ep` até o endpoint ser revogado.
+fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, svc: &mut Service<'_>) -> Error {
+    let reply = match ostd::cap::create(quota, ObjectType::Reply, 0) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let (mut corpo, mut saida) = ([0u8; 16], [0u8; 96]);
+    let mut rec = match ipc::recv(ep, reply, 0) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    loop {
+        let ctx = Contexto { badge: rec.badge };
+        let resp = if let Some((rotulo, w)) = entropy_servidor::despacha_entropy_source_palavras(
+            svc,
+            rec.msg.label,
+            &rec.msg.words,
+            &ctx,
+        ) {
+            Ok(Message::new(rotulo, &w))
+        } else {
+            match ipc::copia(buf, &rec.msg, &mut corpo) {
+                Ok(n) => {
+                    let entrada = entropy_servidor::Entrada {
+                        rotulo: rec.msg.label,
+                        badge: rec.badge,
+                        corpo: &corpo[..n],
+                        caps: &[],
+                    };
+                    match entropy_servidor::despacha_entropy_source(
+                        svc,
+                        0,
+                        &entrada,
+                        &mut saida,
+                        &mut [],
+                    ) {
+                        Some(d) => ipc::monta(buf, d.rotulo, &saida[..d.corpo]),
+                        None => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
+                    }
+                }
+                Err(_) => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
+            }
+        };
+        let Ok(resp) = resp else {
+            return Error::InvalidArgument;
+        };
+        rec = match ipc::reply_recv(ep, reply, &resp, 0) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+    }
+}
+
 /// Duas leituras têm que dar bytes e diferir uma da outra; um dispositivo
 /// que devolve zeros ou sempre o mesmo não é fonte de entropia.
 fn self_test(rng: &mut Rng<'_>) -> Result<u32, &'static str> {
@@ -90,7 +187,7 @@ fn self_test(rng: &mut Rng<'_>) -> Result<u32, &'static str> {
     Ok(u32::from_le_bytes([h[0], h[1], h[2], h[3]]))
 }
 
-fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
+fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let (Some(irq), Some(domain)) = (vdrv::resource(s, b"irq0"), vdrv::resource(s, b"dma")) else {
         return Err("faltou irq0 ou dma");
     };
@@ -140,6 +237,19 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
     ostd::debug::print_fmt(format_args!(
         "virtio-rng: bytes do dispositivo variam (BLAKE3 {tag:08x})"
     ));
+    let ep = s
+        .boot
+        .provided(ID_ENTROPYSOURCE)
+        .map(Handle::from_raw)
+        .ok_or("descritor sem o endpoint do EntropySource")?;
+    let mut svc = Service {
+        rng,
+        prev: None,
+        out: [0; CHUNK],
+        failed: false,
+    };
+    let e = serve(ep, quota, &mut s.buffer, &mut svc);
+    ostd::debug::print_fmt(format_args!("virtio-rng: encerrado ({e:?})"));
     Ok(())
 }
 
@@ -157,7 +267,7 @@ fn main(start: Start) -> ! {
     }
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     let _ = s.ready();
-    if let Err(e) = run(&s, quota) {
+    if let Err(e) = run(&mut s, quota) {
         ostd::debug::print_fmt(format_args!("virtio-rng: falhou: {e}"));
     }
     ostd::thread::exit()

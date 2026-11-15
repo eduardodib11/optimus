@@ -2,8 +2,10 @@
 //! moderno em processo de usuário. Só tem o que o `devmgr` deu (`cfg`, o BAR
 //! das capabilities, `irq0` e `dma`) e com isso negocia o transporte, monta a
 //! fila de transmissão da porta 0 (fila 1) e escreve um texto nela, que o
-//! QEMU entrega ao seu `chardev`. A porta é só de saída por ora; a entrada
-//! (fila 0) e as portas extras vêm com o `Console` por OIDL.
+//! QEMU entrega ao seu `chardev`. Depois serve o contrato `Console` gerado do
+//! `idl/optimus/console.oidl` (T-514): quem tem o endpoint escreve na porta.
+//! A porta é só de saída por ora; a entrada (fila 0) e as portas extras
+//! vêm depois.
 
 #![no_std]
 #![no_main]
@@ -12,12 +14,17 @@
 
 use core::cell::RefCell;
 
-use ostd::kabi::{Handle, ObjectType};
+use ostd::ipc::{self, Message};
+use ostd::kabi::{Error, Handle, ObjectType};
 use ostd::rt::Start;
 use ostd::svc::Session;
 use ostd::vm::{Mapping, SELF};
 use vdrv::{Dma, Irq, Regs};
 use virtio_core::{F_ACCESS_PLATFORM, Mmio, Queue, Seg, Transport};
+
+mod console_servidor;
+
+use console_servidor::{Console, ConsoleError, Contexto, ID_CONSOLE};
 
 ostd::entry!(main);
 
@@ -52,29 +59,76 @@ struct Port<'a> {
 
 impl Port<'_> {
     /// Escreve `text` na porta e espera o dispositivo consumi-lo.
-    fn write(&mut self, text: &str) -> Result<(), &'static str> {
+    fn transmit(&mut self, text: &str) -> Result<(), ConsoleError> {
         let bytes = text.as_bytes();
-        let dst = self.buf.bytes_mut().ok_or("buffer só de leitura")?;
+        let dst = self.buf.bytes_mut().ok_or(ConsoleError::Io)?;
         dst.get_mut(..bytes.len())
-            .ok_or("texto maior que o buffer")?
+            .ok_or(ConsoleError::Io)?
             .copy_from_slice(bytes);
         let seg = Seg {
             addr: self.buf_iova,
             len: bytes.len() as u32,
             write: false,
         };
-        self.queue.push(&[seg]).map_err(|_| "push na fila")?;
+        self.queue.push(&[seg]).map_err(|_| ConsoleError::Io)?;
         self.notify.write16(self.notify_at, TRANSMIT_QUEUE);
-        self.irq.wait(TIMEOUT_NS)?;
+        self.irq
+            .wait(TIMEOUT_NS)
+            .map_err(|_| ConsoleError::Timeout)?;
         match self.queue.pop() {
             Ok(Some(_)) => Ok(()),
-            Ok(None) => Err("fila sem cadeia usada"),
-            Err(_) => Err("dispositivo devolveu cadeia inválida"),
+            // Sem cadeia usada ou cadeia inválida: o dispositivo não é confiável.
+            Ok(None) | Err(_) => Err(ConsoleError::Io),
         }
     }
 }
 
-fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
+impl Console for Port<'_> {
+    fn write(&mut self, _ctx: &Contexto, texto: &str) -> Result<u32, ConsoleError> {
+        self.transmit(texto)?;
+        // `texto` tem no máximo 128 bytes (`string<128>`).
+        Ok(texto.len() as u32)
+    }
+}
+
+/// Atende o contrato `Console` em `ep` até o endpoint ser revogado.
+fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, port: &mut Port<'_>) -> Error {
+    let reply = match ostd::cap::create(quota, ObjectType::Reply, 0) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let (mut corpo, mut saida) = ([0u8; 136], [0u8; 16]);
+    let mut rec = match ipc::recv(ep, reply, 0) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    loop {
+        let resp = match ipc::copia(buf, &rec.msg, &mut corpo) {
+            Ok(n) => {
+                let entrada = console_servidor::Entrada {
+                    rotulo: rec.msg.label,
+                    badge: rec.badge,
+                    corpo: &corpo[..n],
+                    caps: &[],
+                };
+                match console_servidor::despacha_console(port, 0, &entrada, &mut saida, &mut []) {
+                    Some(d) => ipc::monta(buf, d.rotulo, &saida[..d.corpo]),
+                    None => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
+                }
+            }
+            Err(_) => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
+        };
+        let Ok(resp) = resp else {
+            return Error::InvalidArgument;
+        };
+        rec = match ipc::reply_recv(ep, reply, &resp, 0) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+    }
+}
+
+fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let (Some(irq), Some(domain)) = (vdrv::resource(s, b"irq0"), vdrv::resource(s, b"dma")) else {
         return Err("faltou irq0 ou dma");
     };
@@ -120,8 +174,15 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
         buf_iova: buf_at,
         irq,
     };
-    port.write(HELLO)?;
+    port.transmit(HELLO).map_err(|_| "escrever na porta 0")?;
     ostd::debug::print("virtio-console: texto enviado à porta 0");
+    let ep = s
+        .boot
+        .provided(ID_CONSOLE)
+        .map(Handle::from_raw)
+        .ok_or("descritor sem o endpoint do Console")?;
+    let e = serve(ep, quota, &mut s.buffer, &mut port);
+    ostd::debug::print_fmt(format_args!("virtio-console: encerrado ({e:?})"));
     Ok(())
 }
 
@@ -139,7 +200,7 @@ fn main(start: Start) -> ! {
     }
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     let _ = s.ready();
-    if let Err(e) = run(&s, quota) {
+    if let Err(e) = run(&mut s, quota) {
         ostd::debug::print_fmt(format_args!("virtio-console: falhou: {e}"));
     }
     ostd::thread::exit()

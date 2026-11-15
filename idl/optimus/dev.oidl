@@ -30,6 +30,10 @@ struct Node {
     compatible: vec<string<63>, 8>
 }
 
+// Rota `INTx` do `_PRT` (T-513): o pino (0 = INTA) do dispositivo chega ao GSI.
+struct IrqRoute { device: u16, pin: u8, gsi: u32 }
+
 interface DeviceBus {
     publish(node: Node) -> result<(), DevError>;
+    publish_routes(routes: vec<IrqRoute, 128>) -> result<(), DevError>;
 }

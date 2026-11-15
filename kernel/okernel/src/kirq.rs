@@ -62,11 +62,15 @@ const LAST_VECTOR: u8 = 0xef;
 ///
 /// # Errors
 ///
+/// [`Error::AccessDenied`] para a função da IOMMU (ADR 0055, item 3);
 /// [`Error::Busy`] sem vetor livre; [`Error::QuotaExceeded`] sem cota.
 pub fn create_msi(
     quota: &Arc<MemoryQuota>,
     source: Option<u16>,
 ) -> Result<(Arc<Interrupt>, u64, u64), Error> {
+    if source.is_some_and(crate::kiommu::owns) {
+        return Err(Error::AccessDenied);
+    }
     let (irq, dest) = allocate(quota)?;
     let vector = irq.vector();
     let msi = crate::kiommu::remap_msi(vector, dest, source).map_or(

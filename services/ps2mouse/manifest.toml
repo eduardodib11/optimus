@@ -1,0 +1,20 @@
+# Driver do mouse PS/2 (T-516; ADR 0059): casa com o nó `PNP0F13` que o
+# `acpid` publica. O `devmgr` o parte com as portas 0x60 (`io0`) e 0x64
+# (`io1`), que o `acpid` herda do controlador 8042, e a IRQ 12 (`irq0`); o
+# movimento vai ao `inputd`. O teclado e a configuração do controlador
+# ficam com o `i8042d`.
+[service]
+name = "ps2mouse"
+binary = "ps2mouse"
+priority = 120
+restart = "never"
+
+[capabilities]
+needs = ["mem:quota:512KiB", "kernel:debug", "svc:optimus.input.Sink@1"]
+provides = []
+
+[match]
+compatible = ["PNP0F13"]
+
+[limits]
+max_threads = 1

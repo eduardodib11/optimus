@@ -18,6 +18,10 @@
     clippy::needless_lifetimes,
     clippy::explicit_auto_deref,
     clippy::needless_pass_by_value,
+    clippy::match_single_binding,
+    clippy::manual_range_patterns,
+    clippy::identity_op,
+    non_upper_case_globals,
     reason = "código gerado: estilo e campos que um serviço pode não usar"
 )]
 

@@ -75,6 +75,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "drvcli"
+version = "0.1.0"
+dependencies = [
+ "oidl-rt",
+ "optcrypt",
+ "ostd",
+ "osvc",
+]
+
+[[package]]
 name = "drvteste"
 version = "0.1.0"
 dependencies = [
@@ -229,6 +239,10 @@ name = "oelf"
 version = "0.1.0"
 
 [[package]]
+name = "ogpt"
+version = "0.1.0"
+
+[[package]]
 name = "oidl-rt"
 version = "0.1.0"
 
@@ -302,6 +316,10 @@ name = "optcrypt"
 version = "0.1.0"
 
 [[package]]
+name = "optfs-format"
+version = "0.1.0"
+
+[[package]]
 name = "ostd"
 version = "0.1.0"
 dependencies = [
@@ -338,6 +356,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "ps2mouse"
+version = "0.1.0"
+dependencies = [
+ "oinput",
+ "olegacy",
+ "optcrypt",
+ "ostd",
+ "osvc",
 ]
 
 [[package]]
@@ -524,8 +553,10 @@ dependencies = [
 name = "virtio-console"
 version = "0.1.0"
 dependencies = [
+ "oidl-rt",
  "optcrypt",
  "ostd",
+ "osvc",
  "vdrv",
  "virtio-core",
 ]
@@ -538,8 +569,10 @@ version = "0.1.0"
 name = "virtio-gpu"
 version = "0.1.0"
 dependencies = [
+ "oidl-rt",
  "optcrypt",
  "ostd",
+ "osvc",
  "vdrv",
  "virtio-core",
 ]
@@ -569,8 +602,10 @@ dependencies = [
 name = "virtio-rng"
 version = "0.1.0"
 dependencies = [
+ "oidl-rt",
  "optcrypt",
  "ostd",
+ "osvc",
  "vdrv",
  "virtio-core",
 ]

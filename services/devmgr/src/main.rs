@@ -31,6 +31,9 @@ ostd::entry!(main);
 
 /// `kind` das capabilities de origem do kernel no descritor (ADR 0034).
 const KIND_KERNEL: u8 = 5;
+/// Maior pedido que o `devmgr` recebe (o de `publish_routes` é o maior).
+const REQ_BYTES: usize = wire::MAX_ROUTES_BYTES;
+const _: () = assert!(wire::MAX_PUBLISH_BYTES <= REQ_BYTES);
 /// Teto de nós guardados.
 const MAX_NODES: usize = 256;
 /// Quanto o laço espera um pedido antes de olhar as faltas de DMA (ADR
@@ -116,6 +119,9 @@ impl Devmgr {
             Ok(node) => {
                 let outcome = odev::best_match(&self.drivers, node);
                 log(node, &res, &outcome);
+                if let (true, Some(bdf)) = (self.reg.route_count() > 0, res.bdf) {
+                    self.intx(bdf);
+                }
                 let id = match outcome {
                     Outcome::Driver(d) => self
                         .drivers
@@ -131,6 +137,37 @@ impl Devmgr {
                 None,
             ),
         }
+    }
+
+    /// Resolve e escreve a IRQ legada (`INTx`) de uma função PCI pela rota
+    /// do `_PRT`: o pino vem do registrador `0x3D` (T-513).
+    fn intx(&self, bdf: u16) {
+        let Some(pin) = self.ecam.and_then(|e| bind::interrupt_pin(e, bdf)) else {
+            return;
+        };
+        if let Some(gsi) = self.reg.legacy_gsi(bdf, pin) {
+            ostd::debug::print_fmt(format_args!(
+                "devmgr: {:02x}:{:02x}.{} INT{} -> GSI {gsi}",
+                bdf >> 8,
+                (bdf >> 3) & 0x1f,
+                bdf & 7,
+                char::from(b'A' + pin - 1)
+            ));
+        }
+    }
+
+    /// Atende um `publish_routes`: guarda as rotas `INTx` do `_PRT`.
+    fn routes(&mut self, req: &[u8]) -> (u64, usize) {
+        let Ok(routes) = wire::decode_routes(req) else {
+            return (osvc::REPLY_BAD_MESSAGE, 0);
+        };
+        ostd::debug::print_fmt(format_args!("devmgr: {} rotas _PRT", routes.len()));
+        self.reg.set_routes(routes);
+        let functions: Vec<u16> = self.reg.nodes().filter_map(|(_, r)| r.bdf).collect();
+        for bdf in functions {
+            self.intx(bdf);
+        }
+        (osvc::REPLY_OK, 0)
     }
 
     /// Parte o driver `id` com os recursos do nó (depois de responder a
@@ -245,7 +282,7 @@ impl Devmgr {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let mut req = [0u8; wire::MAX_PUBLISH_BYTES];
+        let mut req = [0u8; REQ_BYTES];
         let mut out = [0u8; 8];
         loop {
             let deadline = ostd::time::now_ns().saturating_add(POLL_NS);
@@ -263,6 +300,7 @@ impl Devmgr {
             };
             let ((label, n), start) = match wire::method_of(r.rotulo) {
                 Some(Method::Publish) => self.publish(&req[..r.corpo], &mut out),
+                Some(Method::PublishRoutes) => (self.routes(&req[..r.corpo]), None),
                 None => ((osvc::REPLY_UNKNOWN_METHOD, 0), None),
             };
             let _ = ipc::responde_corpo(reply, &mut self.s.buffer, label, &out[..n], 0);

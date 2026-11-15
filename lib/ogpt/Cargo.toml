@@ -1,0 +1,13 @@
+[package]
+name = "ogpt"
+description = "Parser de GPT do storaged (ADR 0056, item 11): CRC32, cópia de reserva e recusa de tabelas inválidas."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

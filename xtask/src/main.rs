@@ -30,6 +30,8 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("oelf", "lib/oelf/src/lib.rs", KERNEL_TARGET),
     ("optcrypt", "lib/optcrypt/src/lib.rs", KERNEL_TARGET),
     ("obfs", "lib/obfs/src/lib.rs", KERNEL_TARGET),
+    ("optfs-format", "lib/optfs-format/src/lib.rs", KERNEL_TARGET),
+    ("ogpt", "lib/ogpt/src/lib.rs", KERNEL_TARGET),
     ("oalloc", "lib/oalloc/src/lib.rs", KERNEL_TARGET),
     ("ocoll", "lib/ocoll/src/lib.rs", KERNEL_TARGET),
     ("olz4", "lib/olz4/src/lib.rs", KERNEL_TARGET),
@@ -69,6 +71,8 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("rtcd", "services/rtcd/src/main.rs", USER_TARGET),
     ("inputd", "services/inputd/src/main.rs", USER_TARGET),
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
+    ("ps2mouse", "services/ps2mouse/src/main.rs", USER_TARGET),
+    ("drvcli", "services/drvcli/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -77,6 +81,8 @@ const CRATES: &[(&str, &str, &str)] = &[
 const HOST_TESTED: &[&str] = &[
     "oalloc",
     "obfs",
+    "optfs-format",
+    "ogpt",
     "ocoll",
     "olz4",
     "oelf",
@@ -403,9 +409,8 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         // (o kernel ainda não reloca processos; ASLR de usuário depois).
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input"
-        | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "utest" | "okfuzz" => {
-            &["-C", "relocation-model=static"]
-        }
+        | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "ps2mouse" | "drvcli"
+        | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -460,6 +465,8 @@ const BOOTFS: &[(&str, &str)] = &[
     ("rtcd", "rtcd"),
     ("inputd", "inputd"),
     ("i8042d", "i8042d"),
+    ("ps2mouse", "ps2mouse"),
+    ("drvcli", "drvcli"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
 ];
@@ -562,11 +569,47 @@ fn ovmf() -> Result<(PathBuf, PathBuf)> {
         })
 }
 
+/// Variável com o QEMU dos boots com `amd-iommu`.
+const QEMU_AMD_VAR: &str = "OPTIMUS_QEMU_AMD";
+/// Versão mínima do QEMU com `amd-iommu` (ADR 0055; T-510): até o 10.0 ele
+/// nunca atualiza a cauda do log de eventos, e o kernel não lê falta nenhuma.
+const QEMU_AMD_MIN: (u32, u32) = (10, 1);
+
+/// O QEMU do boot: com `amd-iommu`, o de `OPTIMUS_QEMU_AMD` (ou o do
+/// `PATH`), conferida a versão mínima.
+fn qemu_bin(opts: &Options) -> Result<String> {
+    let path = String::from("qemu-system-x86_64");
+    if !opts.devices.contains(&"amd-iommu") {
+        return Ok(path);
+    }
+    let bin = env::var(QEMU_AMD_VAR).unwrap_or(path);
+    let out = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("rodando {bin} --version: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text
+        .split_whitespace()
+        .skip_while(|w| *w != "version")
+        .nth(1)
+        .unwrap_or("?");
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let found = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    if found < QEMU_AMD_MIN {
+        return Err(format!(
+            "o amd-iommu precisa do QEMU {}.{} ou mais novo, e {bin} é o {version}: \
+             aponte {QEMU_AMD_VAR} para um (README, \"QEMU para o AMD-Vi\")",
+            QEMU_AMD_MIN.0, QEMU_AMD_MIN.1
+        ));
+    }
+    Ok(bin)
+}
+
 fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     let (code, vars) = ovmf()?;
     let vars_copy = root().join("target/OVMF_VARS.fd");
     fs::copy(&vars, &vars_copy).map_err(|e| format!("copiando {}: {e}", vars.display()))?;
-    let mut cmd = Command::new("qemu-system-x86_64");
+    let mut cmd = Command::new(qemu_bin(opts)?);
     cmd.args([
         "-machine",
         "q35",
@@ -694,6 +737,10 @@ struct Scenario {
 const KEY_READY: &str = "i8042d: teclado pronto";
 /// Linha do `inputd` que encerra a injeção.
 const KEY_SEEN: &str = "inputd: tecla ";
+/// Linha do `ps2mouse` que libera o movimento injetado (T-516).
+const MOUSE_READY: &str = "ps2mouse: mouse pronto";
+/// Linha do `inputd` que encerra a injeção do movimento.
+const MOUSE_SEEN: &str = "inputd: ponteiro ";
 /// Intervalo entre injeções enquanto o `inputd` não mostra a tecla.
 const KEY_RETRY: Duration = Duration::from_millis(300);
 
@@ -792,7 +839,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 9 drivers no conjunto",
+        "devmgr: 11 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -832,6 +879,12 @@ macro_rules! m4_markers {
             "[\"PNP0303\"]: i8042d",
             "i8042d: teclado pronto",
             "inputd: tecla 0x1e apertada",
+            // T-516: o mouse PS/2 parte pelo nó `PNP0F13`. O movimento só é
+            // exigido na integração: com IOMMU o boot é mais lento e o
+            // `ps2mouse` fica pronto no fim da janela de supervisão.
+            "acpid: PNP0F13: 2 portas, 1 IRQs",
+            "[\"PNP0F13\"]: ps2mouse",
+            "ps2mouse: mouse pronto",
             // virtio: o `devmgr` casa cada função com o driver, que
             // negocia o transporte moderno e faz a operação do seu aceite.
             "1af4:1042 ",
@@ -842,6 +895,10 @@ macro_rules! m4_markers {
             "virtio-blk: setor escrito e lido com BLAKE3 igual",
             "virtio-rng: bytes do dispositivo variam",
             "virtio-console: texto enviado",
+            // T-514: o cliente conversa com o driver pelo contrato gerado.
+            "drvcli: console ok",
+            "drvcli: display ok",
+            "drvcli: entropy ok",
             "1af4:1052 ",
             "virtio-input: fila de eventos pronta",
             "virtio-input: tecla 0x1e encaminhada",
@@ -884,6 +941,12 @@ const M4_FORBIDDEN: &[&str] = &[
     "virtio-blk: falhou",
     "virtio-rng: falhou",
     "virtio-console: falhou",
+    "drvcli: console: falhou",
+    "drvcli: console: sem driver",
+    "drvcli: display: falhou",
+    "drvcli: display: sem driver",
+    "drvcli: entropy: falhou",
+    "drvcli: entropy: sem driver",
     "virtio-input: falhou",
     "virtio-net: falhou",
     "virtio-gpu: falhou",
@@ -898,6 +961,12 @@ const M4_IOMMU_FORBIDDEN: &[&str] = &[
     "virtio-blk: falhou",
     "virtio-rng: falhou",
     "virtio-console: falhou",
+    "drvcli: console: falhou",
+    "drvcli: console: sem driver",
+    "drvcli: display: falhou",
+    "drvcli: display: sem driver",
+    "drvcli: entropy: falhou",
+    "drvcli: entropy: sem driver",
     "virtio-input: falhou",
     "virtio-net: falhou",
     "virtio-gpu: falhou",
@@ -920,14 +989,18 @@ fn virtio_console_out() -> Result<()> {
     }
 }
 
-/// O mesmo aceite com `-device amd-iommu` (T-403), sem conferir o log de
-/// faltas: o `amd-iommu` do QEMU grava eventos fora do formato da AMD.
+/// O mesmo aceite com `-device amd-iommu` (T-403). A falta chega pela MSI
+/// do log de eventos em até 1 ms do DMA (ADR 0055; T-510), mas o
+/// `amd-iommu` do QEMU grava o endereço e o sentido fora do formato da AMD:
+/// só o dispositivo se confere.
 const AMD_IOMMU_SCENARIO: Scenario = Scenario {
-    name: "AMD-Vi isola o DMA do edu e a MSI dele acorda a notificação",
+    name: "AMD-Vi isola o DMA do edu e a falta chega pela interrupção",
     cmdline: "test=kernel ktest=dev.",
     markers: &[
         KTEST_START,
         "okernel: AMD-Vi ligado: 1 unidade(s)",
+        "okernel: falta de DMA: dev=00:",
+        "ktest: AMD-Vi: ",
         KTEST_END,
     ],
     forbidden: &[
@@ -936,6 +1009,7 @@ const AMD_IOMMU_SCENARIO: Scenario = Scenario {
         "PÂNICO",
         "sem edu ou sem IOMMU",
         "sem edu;",
+        "AMD-Vi sem interrupção de falta",
     ],
     ..KERNEL_SCENARIO
 };
@@ -1167,6 +1241,21 @@ fn spawn_reader(
     (wall_seen, reader)
 }
 
+/// A serial do cenário; com `OPTIMUS_SERIAL_DIR`, gravada também em
+/// `<dir>/<nome>.log`, para ler os carimbos do log depois.
+fn serial_of(sc: &Scenario, raw: &[u8]) -> String {
+    let serial = String::from_utf8_lossy(raw).into_owned();
+    if let Ok(dir) = env::var("OPTIMUS_SERIAL_DIR") {
+        let slug: String = sc
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        let _ = fs::write(Path::new(&dir).join(format!("{slug}.log")), &serial);
+    }
+    serial
+}
+
 /// Dá boot num cenário e devolve a serial, se ela conferir.
 fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let esp = image(opts, sc.cmdline, sc.rounds)?;
@@ -1201,7 +1290,8 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     let (wall_seen, reader) = spawn_reader(stdout, tx);
     let mut raw = Vec::new();
     let start = Instant::now();
-    let mut last_key: Option<Instant> = None;
+    // Última injeção da tecla e do mouse.
+    let mut last_key: (Option<Instant>, Option<Instant>) = (None, None);
     let seen_all = |raw: &[u8]| {
         let text = String::from_utf8_lossy(raw);
         sc.markers.iter().all(|m| text.contains(m))
@@ -1239,7 +1329,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
     };
     let _ = reader.join();
     raw.extend(rx.try_iter().flatten());
-    let serial = String::from_utf8_lossy(&raw);
+    let serial = serial_of(sc, &raw);
     let result = check_serial(&serial, sc.markers, sc.forbidden)
         .and_then(|()| check_hello(&serial, sc))
         .and_then(|()| {
@@ -1270,7 +1360,7 @@ fn boot_scenario(opts: &Options, sc: &Scenario) -> Result<String> {
         Ok(()) => {
             show_report(&serial, sc.harness);
             println!("xtask: smoke test de boot ok ({})", sc.name);
-            Ok(serial.into_owned())
+            Ok(serial)
         }
         Err(e) => Err(format!(
             "smoke test de boot falhou ({}): {e}; serial:\n{serial}",
@@ -1368,7 +1458,12 @@ fn check_panic_screen(monitor: &Path) -> Result {
 /// Injeta `key` pelo monitor quando o `i8042d` está pronto, e de novo a
 /// cada [`KEY_RETRY`] enquanto o `inputd` não mostrar a tecla (ela pode
 /// chegar antes de o driver ligar a IRQ).
-fn inject_key(monitor: &Path, key: &str, raw: &[u8], last: &mut Option<Instant>) {
+fn inject_key(
+    monitor: &Path,
+    key: &str,
+    raw: &[u8],
+    (last, last_mouse): &mut (Option<Instant>, Option<Instant>),
+) {
     let text = String::from_utf8_lossy(raw);
     // Com um `virtio-keyboard-pci` (1af4:1052) o QEMU entrega a tecla a ele
     // e não ao PS/2: espera a fila de eventos do driver e a tecla dele.
@@ -1384,6 +1479,15 @@ fn inject_key(monitor: &Path, key: &str, raw: &[u8], last: &mut Option<Instant>)
     {
         monitor_command(monitor, &format!("sendkey {key}"));
         *last = Some(Instant::now());
+    }
+    // Movimento do mouse PS/2 (T-516), com o mesmo reenvio, depois da tecla
+    // para não atrasá-la.
+    if text.contains(MOUSE_READY)
+        && !text.contains(MOUSE_SEEN)
+        && last_mouse.is_none_or(|t| t.elapsed() > KEY_RETRY)
+    {
+        monitor_command(monitor, "mouse_move 10 -5");
+        *last_mouse = Some(Instant::now());
     }
 }
 
@@ -1525,6 +1629,21 @@ fn check_serial(serial: &str, markers: &[&str], forbidden: &[&str]) -> Result {
     Ok(())
 }
 
+/// `cargo xtask test iommu`: os aceites com VT-d e com AMD-Vi (T-403,
+/// T-404, T-422, T-510).
+fn iommu(opts: &Options) -> Result {
+    let vtd = Options {
+        devices: vec!["intel-iommu", "edu"],
+        ..opts.clone()
+    };
+    smoke(&vtd, &[IOMMU_SCENARIO, DRIVER_SCENARIO])?;
+    let amd = Options {
+        devices: vec!["amd-iommu", "edu"],
+        ..opts.clone()
+    };
+    smoke(&amd, &[AMD_IOMMU_SCENARIO])
+}
+
 fn test(opts: &Options) -> Result {
     if matches!(opts.suite.as_str(), "unit" | "all") {
         status(cargo().args([
@@ -1551,16 +1670,7 @@ fn test(opts: &Options) -> Result {
         smoke(opts, &[KERNEL_SCENARIO])?;
     }
     if matches!(opts.suite.as_str(), "iommu" | "all") {
-        let iommu = Options {
-            devices: vec!["intel-iommu", "edu"],
-            ..opts.clone()
-        };
-        smoke(&iommu, &[IOMMU_SCENARIO, DRIVER_SCENARIO])?;
-        let amd = Options {
-            devices: vec!["amd-iommu", "edu"],
-            ..opts.clone()
-        };
-        smoke(&amd, &[AMD_IOMMU_SCENARIO])?;
+        iommu(opts)?;
     }
     if matches!(opts.suite.as_str(), "virtio" | "all") {
         let plain = Options {
@@ -1648,8 +1758,8 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 9 drivers no conjunto",
-    "devmgr: nó 00:00.0 8086:29c0 0 BARs: sem driver",
+    "devmgr: 11 drivers no conjunto",
+    "devmgr: nó 00:00.0 8086:29c0 0 BARs: drvcli",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
     // (teclado PS/2 e RTC) viram nós com portas e IRQ.
@@ -1659,6 +1769,12 @@ const INTEGRATION_MARKERS: &[&str] = &[
     // T-405: o `_PRT` do q35 (32 dispositivos, 4 pinos) sai no modo APIC e
     // toda rota resolve num GSI pelo `_CRS` da ligação.
     "acpid: _PRT: 128 rotas INTx, 128 com GSI",
+    // Aceite da T-513: as rotas chegam ao `devmgr`, que resolve a IRQ legada
+    // de cada função PCI pelo pino do registrador `0x3D` (q35: a placa de rede,
+    // no 00:02.0, usa INTA e cai no GSI 22).
+    "acpid: 128 rotas _PRT publicadas",
+    "devmgr: 128 rotas _PRT",
+    "devmgr: 00:02.0 INTA -> GSI 22",
     // Aceite da T-406 (RTC): o `devmgr` casa o nó `PNP0B00` com o `rtcd`,
     // que lê a hora pelas portas do CMOS ([`check_rtcd`] confere o valor).
     "[\"PNP0B00\"]: rtcd",
@@ -1672,6 +1788,12 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "i8042d: teclado pronto",
     "inputd: tecla 0x1e apertada",
     "inputd: tecla 0x1e solta",
+    // Aceite da T-516: o `ps2mouse` parte pelo nó `PNP0F13` (portas do 8042
+    // herdadas pelo `acpid`) e o movimento injetado chega ao `inputd`.
+    "acpid: PNP0F13: 2 portas, 1 IRQs",
+    "[\"PNP0F13\"]: ps2mouse",
+    "ps2mouse: mouse pronto",
+    "inputd: ponteiro dx=",
     "inputd: encerrado",
 ];
 

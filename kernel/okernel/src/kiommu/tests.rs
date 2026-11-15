@@ -12,6 +12,7 @@
 
 use alloc::sync::Arc;
 use core::ptr;
+use core::sync::atomic::Ordering;
 
 use okernel::cap::MemoryQuota;
 use okernel::dma::DmaDomain;
@@ -29,6 +30,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "dev.iommu_isola_o_edu",
         run: iommu_isola_o_edu,
+    },
+    Test {
+        name: "dev.falta_do_amdvi_pela_interrupcao",
+        run: falta_do_amdvi,
     },
     Test {
         name: "dev.msi_do_edu_acorda_a_notificacao",
@@ -226,6 +231,72 @@ fn iommu_isola_o_edu() -> Outcome {
     super::faults(&mut |_| {});
     drop((domain, mo));
     ensure!(quota.used() == used);
+    Ok(())
+}
+
+/// DMAs ruins seguidos do `edu` no AMD-Vi.
+const AMD_FAULTS: usize = 20;
+/// DMAs ruins sem tratar até o log de 256 eventos transbordar (o `edu` do
+/// QEMU gera 16 eventos por DMA barrado).
+const OVERFLOW_DMAS: usize = 20;
+
+/// ADR 0055 (T-510): no AMD-Vi, cada DMA barrado do `edu` chega ao tratador
+/// pela MSI do log de eventos, na mediana em até 1 ms do fim do DMA (o pior
+/// caso sob TCG fica no relatório), e o log continua registrando depois de
+/// um transbordo: só a falta perdida nele pode faltar.
+fn falta_do_amdvi() -> Outcome {
+    let Some((_, edu)) = edu()? else {
+        info!("ktest: sem edu; o aceite roda em `cargo xtask test iommu`");
+        return Ok(());
+    };
+    if super::kind() != Some("AMD-Vi") {
+        return Ok(());
+    }
+    // Restos dos testes anteriores saem antes.
+    super::faults(&mut |_| {});
+    let mut took = [u64::MAX; AMD_FAULTS];
+    for t in &mut took {
+        let before = super::FAULT_IRQS.load(Ordering::Relaxed);
+        // Fora de todo domínio: a IOMMU barra e grava o evento.
+        ensure!(edu.dma(0x30_0000, true));
+        let done = ktime::now_ns();
+        let deadline = done + 50_000_000;
+        // Interrupções abertas até a MSI ou o prazo; conta o instante em
+        // que o tratador entrou (registrar as faltas na serial demora).
+        while ktime::now_ns() < deadline {
+            ktime::set_timer_at(deadline);
+            crate::arch::x86_64::cpu::wait_for_interrupt();
+            if super::FAULT_IRQS.load(Ordering::Relaxed) != before {
+                *t = super::FAULT_IRQ_AT
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(done);
+                break;
+            }
+        }
+    }
+    let last = took[AMD_FAULTS - 1] != u64::MAX;
+    let seen = took.iter().filter(|&&t| t != u64::MAX).count();
+    took.sort_unstable();
+    let (median, worst) = (took[AMD_FAULTS / 2], took[seen.max(1) - 1]);
+    info!(
+        "ktest: AMD-Vi: {seen} de {AMD_FAULTS} faltas pela interrupção, mediana de {} µs e a pior em {} µs do fim do DMA; {} transbordo(s)",
+        median / 1000,
+        worst / 1000,
+        super::OVERFLOWS.load(Ordering::Relaxed)
+    );
+    ensure!(last && seen + 2 >= AMD_FAULTS && median <= 1_000_000);
+    // Transbordo (ADR 0055, item 2): com as interrupções fechadas o log
+    // enche; lido, ele é religado vazio, e a falta seguinte volta a chegar.
+    let overflows = super::OVERFLOWS.load(Ordering::Relaxed);
+    for _ in 0..OVERFLOW_DMAS {
+        ensure!(edu.dma(0x30_0000, true));
+    }
+    super::faults(&mut |_| {});
+    ensure!(super::OVERFLOWS.load(Ordering::Relaxed) > overflows);
+    ensure!(edu.dma(0x30_0000, true));
+    let mut after = 0;
+    super::faults(&mut |_| after += 1);
+    ensure!(after > 0);
     Ok(())
 }
 

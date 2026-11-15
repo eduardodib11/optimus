@@ -21,6 +21,8 @@ use crate::{Bus, Class, Node};
 pub enum Method {
     /// `publish(node) -> result<(), DevError>`.
     Publish = 0,
+    /// `publish_routes(routes) -> result<(), DevError>`.
+    PublishRoutes = 1,
 }
 
 /// `DevError` no fio.
@@ -66,8 +68,68 @@ pub fn method_of(label: u64) -> Option<Method> {
     }
     match label & 0xFFFF {
         0 => Some(Method::Publish),
+        1 => Some(Method::PublishRoutes),
         _ => None,
     }
+}
+
+/// Uma rota `INTx` do `_PRT`: o pino `pin` (0 é INTA) do dispositivo
+/// `device` da ponte PCI chega ao `gsi` (T-513).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrqRoute {
+    /// Dispositivo PCI no barramento.
+    pub device: u16,
+    /// Pino: 0 é INTA, 3 é INTD.
+    pub pin: u8,
+    /// GSI do IOAPIC.
+    pub gsi: u32,
+}
+
+/// Teto de rotas num `publish_routes` (o q35 tem 32 dispositivos × 4 pinos).
+pub const MAX_ROUTES: usize = 128;
+/// Bytes de uma `IrqRoute` no fio.
+const ROUTE_BYTES: usize = 8;
+/// Maior corpo de `publish_routes`.
+pub const MAX_ROUTES_BYTES: usize = 8 + MAX_ROUTES * ROUTE_BYTES;
+
+/// Codifica o pedido de `publish_routes`.
+///
+/// # Errors
+/// [`Error::TooLarge`] acima de [`MAX_ROUTES`] ou sem espaço em `out`.
+pub fn encode_routes(routes: &[IrqRoute], out: &mut [u8]) -> Result<usize> {
+    let mut w = Writer::new(out, 8)?;
+    let at = w.vec(routes.len(), ROUTE_BYTES, MAX_ROUTES)?;
+    for (k, r) in routes.iter().enumerate() {
+        w.seek(at + k * ROUTE_BYTES);
+        w.u16(r.device)?;
+        w.u8(r.pin)?;
+        w.u32(r.gsi)?;
+    }
+    Ok(w.finish())
+}
+
+/// Decodifica o pedido de `publish_routes`.
+///
+/// # Errors
+/// [`Error::BadMessage`] para corpo fora do formato ou pino acima de 3.
+pub fn decode_routes(body: &[u8]) -> Result<Vec<IrqRoute>> {
+    let mut r = Reader::new(body, 8)?;
+    let elems = r.vec(MAX_ROUTES, ROUTE_BYTES)?;
+    let mut out = Vec::with_capacity(elems.count());
+    for i in 0..elems.count() {
+        r.seek(elems.off() + i * ROUTE_BYTES);
+        let route = IrqRoute {
+            device: r.u16()?,
+            pin: r.u8()?,
+            gsi: r.u32()?,
+        };
+        if route.pin > 3 {
+            return Err(Error::BadMessage);
+        }
+        out.push(route);
+    }
+    r.finish()?;
+    Ok(out)
 }
 
 /// Um BAR do nó.

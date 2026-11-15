@@ -9,7 +9,7 @@ restart = "never"
 
 [capabilities]
 needs = ["mem:quota:768KiB", "kernel:debug"]
-provides = []
+provides = ["optimus.console.Console@1.0"]
 
 [match]
 pci = ["1af4:1043"]
