@@ -316,6 +316,13 @@ name = "optcrypt"
 version = "0.1.0"
 
 [[package]]
+name = "optfs"
+version = "0.1.0"
+dependencies = [
+ "optfs-format",
+]
+
+[[package]]
 name = "optfs-format"
 version = "0.1.0"
 
