@@ -94,6 +94,7 @@ fn spawn(
     boot: &Boot,
     control: Handle,
     devices: Option<&[(Handle, u32)]>,
+    reuse: Option<Handle>,
 ) -> Result<Started, Error> {
     let m = plan.broker.manifest(id).ok_or(Error::InvalidArgument)?;
     let elf = fs.find(&m.binary).ok_or(Error::InvalidArgument)?;
@@ -102,14 +103,17 @@ fn spawn(
         .iter()
         .find(|n| n.kind == oman::NeedKind::Mem)
         .map_or(0, |n| n.value);
-    let child = process::load(&Spec {
-        elf: elf.data,
-        quota: boot.quota,
-        quota_bytes: bytes,
-        own_aspace: SELF,
-        scratch_va: SCRATCH_VA,
-        priority: m.priority,
-    })?;
+    let child = process::load_in(
+        &Spec {
+            elf: elf.data,
+            quota: boot.quota,
+            quota_bytes: bytes,
+            own_aspace: SELF,
+            scratch_va: SCRATCH_VA,
+            priority: m.priority,
+        },
+        reuse,
+    )?;
     let mut pool: Vec<(&str, Handle)> = Vec::new();
     if boot.log.raw() != 0 {
         pool.push(("debug", boot.log));
@@ -222,6 +226,9 @@ struct Svcmgr<'a> {
     /// Recursos dos drivers que morreram sozinhos, guardados para o reinício
     /// (ADR 0067, item 3); `driver_stop` e o desligamento os apagam.
     kept: Vec<(u32, Vec<(Handle, u32)>)>,
+    /// A cota do filho morto desses drivers: o reinício a reaproveita, pois
+    /// objetos do morto (anéis que o `virtio-blk` ainda mapeia) a prendem.
+    kept_quota: Vec<(u32, Handle)>,
     /// Recursos que o `devmgr` deu a cada driver, até o `driver_start`.
     pending: Vec<(u32, Vec<(Handle, u32)>)>,
 }
@@ -262,14 +269,24 @@ impl Svcmgr<'_> {
         // Driver que morreu sozinho: parte de novo com os mesmos recursos.
         if let Some(i) = self.kept.iter().position(|(d, _)| *d == id) {
             let (_, res) = self.kept.swap_remove(i);
-            return self.launch_with(id, Some(&res));
+            let reuse = self
+                .kept_quota
+                .iter()
+                .position(|(d, _)| *d == id)
+                .map(|j| self.kept_quota.swap_remove(j).1);
+            return self.launch_with(id, Some(&res), reuse);
         }
-        self.launch_with(id, None)
+        self.launch_with(id, None, None)
     }
 
     /// Como [`Svcmgr::launch`]; um driver leva os recursos `devices`, que
     /// ficam com a instância (ou são apagados se ela não partir).
-    fn launch_with(&mut self, id: u32, devices: Option<&[(Handle, u32)]>) -> bool {
+    fn launch_with(
+        &mut self,
+        id: u32,
+        devices: Option<&[(Handle, u32)]>,
+        reuse: Option<Handle>,
+    ) -> bool {
         let r = spawn(
             &mut self.plan,
             &self.fs,
@@ -277,6 +294,7 @@ impl Svcmgr<'_> {
             &self.boot,
             self.control,
             devices,
+            reuse,
         );
         let handles: Vec<(Handle, u32)> = devices.unwrap_or(&[]).to_vec();
         match r {
@@ -310,13 +328,16 @@ impl Svcmgr<'_> {
     /// Fim da instância de `id` (item 9): revoga os endpoints e apaga o
     /// processo.
     fn retire(&mut self, id: u32) {
-        let Some(s) = usize::try_from(id)
+        let _ = self.retire_keep(id, false);
+    }
+
+    /// Como [`Svcmgr::retire`]; com `keep` devolve a cota do filho em vez de
+    /// apagá-la.
+    fn retire_keep(&mut self, id: u32, keep: bool) -> Option<Handle> {
+        let s = usize::try_from(id)
             .ok()
             .and_then(|i| self.live.get_mut(i))
-            .and_then(Option::take)
-        else {
-            return;
-        };
+            .and_then(Option::take)?;
         let _ = ostd::cap::bind_notify(s.child.cspace, self.deaths, 0);
         let _ = svcmgr::supervisor::revoke_instance(
             &mut self.plan.broker,
@@ -327,11 +348,18 @@ impl Svcmgr<'_> {
             let _ = ostd::cap::delete(h);
         }
         let c = s.child;
-        for h in [c.thread, c.aspace, c.cspace, c.quota] {
+        for h in [c.thread, c.aspace, c.cspace] {
             if h.raw() != 0 {
                 let _ = ostd::cap::delete(h);
             }
         }
+        if keep && c.quota.raw() != 0 {
+            return Some(c.quota);
+        }
+        if c.quota.raw() != 0 {
+            let _ = ostd::cap::delete(c.quota);
+        }
+        None
     }
 
     /// Olha as mortes sinalizadas e decide cada uma; parte os reinícios
@@ -356,10 +384,15 @@ impl Svcmgr<'_> {
             let kept = self.live[id as usize]
                 .as_mut()
                 .map(|s| core::mem::take(&mut s.devices));
-            self.retire(id);
+            let driver = kept.as_ref().is_some_and(|k| !k.is_empty());
+            let quota = self.retire_keep(id, driver);
             if let Some(k) = kept.filter(|k| !k.is_empty()) {
                 self.kept.retain(|(d, _)| *d != id);
                 self.kept.push((id, k));
+            }
+            if let Some(q) = quota {
+                self.kept_quota.retain(|(d, _)| *d != id);
+                self.kept_quota.push((id, q));
             }
             let now = ostd::time::now_ns();
             let n = name(&self.plan, id);
@@ -448,7 +481,7 @@ impl Svcmgr<'_> {
             Some(i) => self.pending.swap_remove(i).1,
             None => Vec::new(),
         };
-        if self.launch_with(id, Some(&devices)) {
+        if self.launch_with(id, Some(&devices), None) {
             Ok(())
         } else {
             Err(SvcError::Busy)
@@ -804,6 +837,9 @@ impl Svcmgr<'_> {
             }
             self.retire(id);
         }
+        for (_, q) in core::mem::take(&mut self.kept_quota) {
+            let _ = ostd::cap::delete(q);
+        }
         for (_, res) in core::mem::take(&mut self.kept) {
             for (h, _) in res {
                 let _ = ostd::cap::delete(h);
@@ -856,6 +892,7 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
         live,
         induced: Vec::new(),
         kept: Vec::new(),
+        kept_quota: Vec::new(),
         pending: Vec::new(),
     };
     let levels = s.plan.levels.clone();
