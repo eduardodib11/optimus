@@ -746,3 +746,155 @@ mod queda_de_energia {
         );
     }
 }
+
+mod cifra {
+    use super::*;
+    use crate::{Fs, Tx, VolumeCipher};
+    use optcrypt::secret::Secret;
+
+    fn key(b: u8) -> Secret<32> {
+        Secret::take(&mut [b; 32])
+    }
+
+    fn cipher(epoch: u32, salt: u8) -> VolumeCipher {
+        VolumeCipher::new([1; 16], 0, key(10), key(20), epoch, &[salt; 32])
+    }
+
+    fn disk() -> (Sim, Superblock) {
+        let mut d = Sim::new(4096);
+        let mut s = sb(1, 1);
+        s.volume_blocks = 4096;
+        s.integrity = Integrity::Aead;
+        d.write(SUPERBLOCKS[1], &s.encode(&Fake)).unwrap();
+        d.flush().unwrap();
+        (d, s)
+    }
+
+    const TEXT: &[u8] = b"segredo do usuario: nao pode aparecer no disco em claro";
+
+    /// Grava um arquivo cifrado e devolve a raiz e o endereço dos blocos.
+    fn gravado(d: &mut Sim, s1: &Superblock, c: &mut VolumeCipher) -> optfs_format::BlockPtr {
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(d, &Fake, &mut al, 2, 1).with_cipher(c);
+        let mut fs = Fs::create(&mut tx, [5; 32]).unwrap();
+        let f = fs.create_file(&mut tx, 1, "a.txt").unwrap();
+        let mut body = TEXT.to_vec();
+        body.resize(5000, 7);
+        fs.write(&mut tx, f, 0, &body).unwrap();
+        let mut new = sb(0, 0);
+        new.volume_blocks = 4096;
+        new.integrity = Integrity::Aead;
+        new.root = fs.root;
+        tx.commit(s1, new).unwrap();
+        fs.root
+    }
+
+    #[test]
+    fn grava_cifrado_remonta_e_le() {
+        let (mut d, s1) = disk();
+        let mut c = cipher(1, 9);
+        let root = gravado(&mut d, &s1, &mut c);
+        d.crash();
+        // Nenhum bloco do volume guarda o texto em claro.
+        for b in &d.durable {
+            assert!(!b.windows(TEXT.len()).any(|w| w == TEXT));
+        }
+        let m = mount(&mut d, &Fake).unwrap();
+        assert_eq!(m.sb.root, root);
+        assert_eq!(root.integrity, Integrity::Aead);
+        let mut c2 = cipher(1, 9);
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, 3, 1).with_cipher(&mut c2);
+        let fs = Fs::from_root(m.sb.root, [5; 32]);
+        let (f, _) = fs.lookup(&mut tx, 1, "a.txt").unwrap().unwrap();
+        let got = fs.read(&mut tx, f, 0, 6000).unwrap();
+        assert_eq!(&got[..TEXT.len()], TEXT);
+        assert_eq!(got.len(), 5000);
+    }
+
+    /// Lê o arquivo com a cifra dada; `Err` se algum bloco não confere.
+    fn tenta(d: &mut Sim, root: optfs_format::BlockPtr, c: &mut VolumeCipher) -> bool {
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(d, &Fake, &mut al, 3, 1).with_cipher(c);
+        let fs = Fs::from_root(root, [5; 32]);
+        let Ok(Some((f, _))) = fs.lookup(&mut tx, 1, "a.txt") else {
+            return false;
+        };
+        fs.read(&mut tx, f, 0, 6000).is_ok()
+    }
+
+    #[test]
+    fn adulteracao_de_qualquer_bloco_e_detectada() {
+        let (mut d, s1) = disk();
+        let mut c = cipher(1, 9);
+        let root = gravado(&mut d, &s1, &mut c);
+        d.crash();
+        assert!(tenta(&mut d, root, &mut cipher(1, 9)));
+        // Cada bloco gravado, um por vez: inverter um bit quebra a leitura.
+        let usados: Vec<usize> = (16..64)
+            .filter(|&a| d.durable[a].iter().any(|&x| x != 0))
+            .collect();
+        assert!(usados.len() >= 3);
+        for a in usados {
+            let mut ruim = Sim::new(4096);
+            ruim.durable = d.durable.clone();
+            ruim.durable[a][100] ^= 1;
+            assert!(!tenta(&mut ruim, root, &mut cipher(1, 9)), "bloco {a}");
+        }
+    }
+
+    #[test]
+    fn chave_errada_epoca_errada_e_bloco_movido_falham() {
+        let (mut d, s1) = disk();
+        let mut c = cipher(1, 9);
+        let root = gravado(&mut d, &s1, &mut c);
+        d.crash();
+        // Chave de dados trocada.
+        let mut errada = VolumeCipher::new([1; 16], 0, key(10), key(21), 1, &[9; 32]);
+        assert!(!tenta(&mut d, root, &mut errada));
+        // Mesmo número de época com outro sal (restauração de cópia antiga).
+        assert!(!tenta(&mut d, root, &mut cipher(1, 8)));
+        // Volume de outro UUID.
+        let mut outro = VolumeCipher::new([2; 16], 0, key(10), key(20), 1, &[9; 32]);
+        assert!(!tenta(&mut d, root, &mut outro));
+        // Dois blocos trocados de lugar: o AAD leva o endereço.
+        let usados: Vec<usize> = (16..64)
+            .filter(|&a| d.durable[a].iter().any(|&x| x != 0))
+            .collect();
+        let mut movido = Sim::new(4096);
+        movido.durable = d.durable.clone();
+        movido.durable.swap(usados[0], usados[1]);
+        assert!(!tenta(&mut movido, root, &mut cipher(1, 9)));
+    }
+
+    #[test]
+    fn epoca_anterior_abre_com_o_sal_registrado() {
+        let (mut d, s1) = disk();
+        let mut c = cipher(1, 9);
+        let root = gravado(&mut d, &s1, &mut c);
+        d.crash();
+        // Montagem seguinte: época 2 corrente, a 1 registrada pelo sal.
+        let mut c2 = cipher(2, 33);
+        assert!(!tenta(&mut d, root, &mut c2));
+        c2.add_epoch(1, &[9; 32]);
+        assert!(tenta(&mut d, root, &mut c2));
+    }
+
+    #[test]
+    fn ponteiro_em_claro_nao_passa_pela_cifra() {
+        // Volume gravado sem cifra, aberto com cifra: o ponteiro de hash é
+        // recusado (sem rebaixamento), e o inverso também.
+        let (mut d, s1) = disk();
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, 2, 1);
+        let mut fs = Fs::create(&mut tx, [5; 32]).unwrap();
+        let f = fs.create_file(&mut tx, 1, "a.txt").unwrap();
+        fs.write(&mut tx, f, 0, TEXT).unwrap();
+        let mut new = sb(0, 0);
+        new.root = fs.root;
+        tx.commit(&s1, new).unwrap();
+        let root = fs.root;
+        d.crash();
+        assert!(!tenta(&mut d, root, &mut cipher(1, 9)));
+    }
+}

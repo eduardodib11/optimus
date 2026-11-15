@@ -10,6 +10,7 @@
 //! os vazios): é correto, só menos compacto.
 
 use crate::alloc_map::Allocator;
+use crate::crypt::BlockCipher;
 use crate::io::{BlockIo, IoError};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -58,6 +59,7 @@ pub struct Tx<'a, IO: BlockIo, H: Sha256> {
     tree: u64,
     staged: BTreeMap<u64, Box<[u8; BLOCK_SIZE]>>,
     snap_floor: u64,
+    cipher: Option<&'a mut dyn BlockCipher>,
 }
 
 impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
@@ -71,7 +73,59 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
             tree,
             staged: BTreeMap::new(),
             snap_floor: 0,
+            cipher: None,
         }
+    }
+
+    /// Passa a cifrar e autenticar cada bloco novo (modo AEAD, ADR 0053) e
+    /// a recusar qualquer ponteiro que não seja AEAD: sem isso um atacante
+    /// trocaria um bloco por outro em claro com o hash dele.
+    #[must_use]
+    pub fn with_cipher(mut self, cipher: &'a mut dyn BlockCipher) -> Self {
+        self.cipher = Some(cipher);
+        self
+    }
+
+    /// Selo do bloco `b` já montado: AEAD com a cifra, hash sem ela. Com a
+    /// cifra, `b` vira texto cifrado no lugar.
+    fn seal(
+        &mut self,
+        kind: PtrKind,
+        addr: u64,
+        b: &mut [u8; BLOCK_SIZE],
+    ) -> Result<(Integrity, [u8; 12], [u8; 32]), IoError> {
+        match self.cipher.as_deref_mut() {
+            Some(c) => {
+                let (nonce, tag) = c.seal(kind, addr, self.txg, b)?;
+                let mut auth = [0u8; 32];
+                auth[..16].copy_from_slice(&tag);
+                Ok((Integrity::Aead, nonce, auth))
+            }
+            None => Ok((Integrity::Hash, [0; 12], self.h.sha256(b))),
+        }
+    }
+
+    /// Lê o bloco de `p` (do que está em memória ou do disco) e o confere;
+    /// com a cifra devolve o texto claro.
+    fn fetch(&mut self, p: &BlockPtr) -> Result<[u8; BLOCK_SIZE], IoError> {
+        let mut b = [0u8; BLOCK_SIZE];
+        match self.staged.get(&p.addr) {
+            Some(s) => b = **s,
+            None => self.io.read(p.addr, &mut b)?,
+        }
+        match (self.cipher.as_deref(), p.integrity) {
+            (Some(c), Integrity::Aead) => {
+                let tag: [u8; 16] = p.auth[..16].try_into().map_err(|_| IoError::Integrity)?;
+                c.open(p.kind, p.addr, p.birth, &p.nonce, &tag, &mut b)?;
+            }
+            (None, Integrity::Hash) => {
+                if self.h.sha256(&b) != p.auth {
+                    return Err(IoError::Integrity);
+                }
+            }
+            _ => return Err(IoError::Integrity),
+        }
+        Ok(b)
     }
 
     /// Blocos novos para o commit.
@@ -102,20 +156,10 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
 
     #[allow(clippy::many_single_char_names)]
     fn read(&mut self, p: &BlockPtr) -> Result<Node, IoError> {
-        if p.kind != PtrKind::Node
-            || p.integrity != Integrity::Hash
-            || p.physical as usize != BLOCK_SIZE
-        {
+        if p.kind != PtrKind::Node || p.physical as usize != BLOCK_SIZE {
             return Err(IoError::Integrity);
         }
-        let mut b = [0u8; BLOCK_SIZE];
-        match self.staged.get(&p.addr) {
-            Some(s) => b = **s,
-            None => self.io.read(p.addr, &mut b)?,
-        }
-        if self.h.sha256(&b) != p.auth {
-            return Err(IoError::Integrity);
-        }
+        let b = self.fetch(p)?;
         let hd = NodeHeader::decode(&b).map_err(|_| IoError::Integrity)?;
         if hd.addr != p.addr || hd.level != p.level || hd.txg != p.birth || hd.tree != self.tree {
             return Err(IoError::Integrity);
@@ -194,7 +238,7 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
                 }
             }
         }
-        let auth = self.h.sha256(&*b);
+        let (integrity, nonce, auth) = self.seal(PtrKind::Node, addr, &mut b)?;
         self.staged.insert(addr, b);
         Ok(BlockPtr {
             addr,
@@ -204,8 +248,8 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
             level,
             kind: PtrKind::Node,
             compression: Compression::None,
-            integrity: Integrity::Hash,
-            nonce: [0; 12],
+            integrity,
+            nonce,
             auth,
         })
     }
@@ -216,8 +260,9 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
     /// [`IoError::Full`] sem blocos livres.
     pub fn write_data(&mut self, data: &[u8; BLOCK_SIZE]) -> Result<BlockPtr, IoError> {
         let addr = self.alloc.alloc()?;
-        let auth = self.h.sha256(data);
-        self.staged.insert(addr, Box::new(*data));
+        let mut b = Box::new(*data);
+        let (integrity, nonce, auth) = self.seal(PtrKind::Data, addr, &mut b)?;
+        self.staged.insert(addr, b);
         Ok(BlockPtr {
             addr,
             birth: self.txg,
@@ -226,8 +271,8 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
             level: 0,
             kind: PtrKind::Data,
             compression: Compression::None,
-            integrity: Integrity::Hash,
-            nonce: [0; 12],
+            integrity,
+            nonce,
             auth,
         })
     }
@@ -237,18 +282,10 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
     /// # Errors
     /// [`IoError::Integrity`] se o bloco não confere.
     pub fn read_data(&mut self, p: &BlockPtr) -> Result<[u8; BLOCK_SIZE], IoError> {
-        if p.kind != PtrKind::Data || p.integrity != Integrity::Hash || p.physical != 4096 {
+        if p.kind != PtrKind::Data || p.physical != 4096 {
             return Err(IoError::Integrity);
         }
-        let mut b = [0u8; BLOCK_SIZE];
-        match self.staged.get(&p.addr) {
-            Some(s) => b = **s,
-            None => self.io.read(p.addr, &mut b)?,
-        }
-        if self.h.sha256(&b) != p.auth {
-            return Err(IoError::Integrity);
-        }
-        Ok(b)
+        self.fetch(p)
     }
 
     /// Txg do último snapshot: blocos nascidos até ele podem estar em um
