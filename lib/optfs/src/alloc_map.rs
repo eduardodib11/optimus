@@ -86,6 +86,18 @@ impl Allocator {
         self.pending.push((txg, b));
     }
 
+    /// Se o bloco já está na lista de liberados ainda não reutilizáveis.
+    #[must_use]
+    pub fn is_pending(&self, b: u64) -> bool {
+        self.pending.iter().any(|(_, x)| *x == b)
+    }
+
+    /// Total de blocos do volume.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.blocks
+    }
+
     /// Libera já um bloco que nasceu no txg corrente e nunca foi gravado.
     pub fn free_now(&mut self, b: u64) {
         self.set(b, false);

@@ -39,6 +39,8 @@ pub enum FsError {
     NotEmpty,
     /// Nome vazio, longo demais ou com `/` ou NUL.
     BadName,
+    /// Snapshot visto só para leitura.
+    ReadOnly,
 }
 
 impl From<IoError> for FsError {
@@ -73,6 +75,7 @@ pub struct Fs {
     pub root: BlockPtr,
     /// Chave do hash de nomes (ADR 0053: derivada por volume).
     pub name_key: [u8; 32],
+    read_only: bool,
 }
 
 fn key(object: u64, kind: KeyKind, offset: u64) -> Key {
@@ -163,6 +166,7 @@ impl Fs {
         let mut fs = Self {
             root: BlockPtr::null(),
             name_key,
+            read_only: false,
         };
         fs.put(tx, key(0, KeyKind::Inode, 0), &(ROOT_DIR + 1).to_le_bytes())?;
         fs.put(
@@ -176,12 +180,25 @@ impl Fs {
         Ok(fs)
     }
 
+    /// Dataset vivo sobre uma raiz já gravada (depois da montagem).
+    #[must_use]
+    pub fn from_root(root: BlockPtr, name_key: [u8; 32]) -> Self {
+        Self {
+            root,
+            name_key,
+            read_only: false,
+        }
+    }
+
     fn put<IO: BlockIo, H: Sha256>(
         &mut self,
         tx: &mut Tx<'_, IO, H>,
         k: Key,
         v: &[u8],
     ) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         self.root = tx.insert(&self.root, k, v)?;
         Ok(())
     }
@@ -191,6 +208,9 @@ impl Fs {
         tx: &mut Tx<'_, IO, H>,
         k: &Key,
     ) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         self.root = tx.remove(&self.root, k)?;
         Ok(())
     }
@@ -399,6 +419,9 @@ impl Fs {
         off: u64,
         data: &[u8],
     ) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         let ino = self.stat(tx, obj)?;
         if ino.kind == ObjKind::Dir {
             return Err(FsError::IsDir);
@@ -522,6 +545,214 @@ impl Fs {
         } else {
             self.put(tx, hk, &enc_dirents(&list))?;
         }
+        Ok(())
+    }
+}
+
+/// Snapshot: o estado do dataset ao fim do txg em que foi criado.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snap {
+    /// Identificador (cresce a cada snapshot).
+    pub id: u64,
+    /// Txg em que foi criado.
+    pub txg: u64,
+    /// Raiz da árvore de arquivos naquele instante.
+    pub root: BlockPtr,
+    /// Nome (até 63 bytes).
+    pub name: String,
+}
+
+const SNAP_COUNTER: u64 = 0;
+
+fn snap_key(id: u64) -> Key {
+    key(0, KeyKind::Xattr, id)
+}
+
+fn enc_snap(s: &Snap) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&s.txg.to_le_bytes());
+    v.extend_from_slice(&s.root.encode());
+    v.push(u8::try_from(s.name.len()).unwrap_or(0));
+    v.extend_from_slice(s.name.as_bytes());
+    v
+}
+
+fn dec_snap(id: u64, b: &[u8]) -> Result<Snap, IoError> {
+    let txg = u64_at(b, 0)?;
+    let root = BlockPtr::decode(b.get(8..80).ok_or(IoError::Integrity)?)
+        .map_err(|_| IoError::Integrity)?;
+    let n = usize::from(*b.get(80).ok_or(IoError::Integrity)?);
+    let name = core::str::from_utf8(b.get(81..81 + n).ok_or(IoError::Integrity)?)
+        .map_err(|_| IoError::Integrity)?;
+    Ok(Snap {
+        id,
+        txg,
+        root,
+        name: String::from(name),
+    })
+}
+
+/// Snapshots e rollback (ADR 0052, item 7). Os registros ficam na própria
+/// árvore de arquivos, no objeto 0, então um rollback para `S` devolve
+/// também a lista de snapshots que existia em `S`.
+///
+/// Diferença em relação à ADR: não há lista de mortos em disco. Um bloco
+/// liberado por uma escrita e nascido até o último snapshot fica preso (só
+/// `release` o ignora) e [`Fs::reclaim`], chamado ao apagar um snapshot ou
+/// ao fazer rollback, varre as árvores vivas e devolve o resto, sempre
+/// pela liberação adiada. A regra de nascimento da ADR (`nascimento >
+/// txg do último snapshot`) continua a que decide o caminho de escrita.
+impl Fs {
+    /// Abre o dataset sobre `root`: lê os snapshots, ajusta o limite de
+    /// nascimento do `tx` e devolve o dataset.
+    ///
+    /// # Errors
+    /// Erros da árvore.
+    pub fn open<IO: BlockIo, H: Sha256>(
+        tx: &mut Tx<'_, IO, H>,
+        root: BlockPtr,
+        name_key: [u8; 32],
+    ) -> Result<Self, FsError> {
+        let fs = Self::from_root(root, name_key);
+        let floor = fs.snapshots(tx)?.iter().map(|s| s.txg).max().unwrap_or(0);
+        tx.set_snap_floor(floor);
+        Ok(fs)
+    }
+
+    /// Os snapshots, do mais antigo ao mais novo.
+    ///
+    /// # Errors
+    /// Erros da árvore.
+    pub fn snapshots<IO: BlockIo, H: Sha256>(
+        &self,
+        tx: &mut Tx<'_, IO, H>,
+    ) -> Result<Vec<Snap>, FsError> {
+        let mut out = Vec::new();
+        let mut at = snap_key(SNAP_COUNTER + 1);
+        while let Some((k, v)) = tx.first_ge(&self.root, &at)? {
+            if k.object != 0 || k.kind != KeyKind::Xattr {
+                break;
+            }
+            out.push(dec_snap(k.offset, &v)?);
+            at = snap_key(k.offset + 1);
+        }
+        Ok(out)
+    }
+
+    /// Cria o snapshot `name` do estado atual. Custa um item. Convém
+    /// confirmar o txg logo depois: blocos nascidos no mesmo txg e
+    /// reescritos antes do commit ficam presos até o próximo `reclaim`.
+    ///
+    /// # Errors
+    /// [`FsError::Exists`], [`FsError::BadName`] (vazio ou com mais de 63
+    /// bytes), [`FsError::ReadOnly`].
+    pub fn snapshot<IO: BlockIo, H: Sha256>(
+        &mut self,
+        tx: &mut Tx<'_, IO, H>,
+        name: &str,
+    ) -> Result<u64, FsError> {
+        if name.is_empty() || name.len() > 63 {
+            return Err(FsError::BadName);
+        }
+        if self.snapshots(tx)?.iter().any(|s| s.name == name) {
+            return Err(FsError::Exists);
+        }
+        let ck = snap_key(SNAP_COUNTER);
+        let id = match tx.get(&self.root, &ck)? {
+            Some(v) => u64_at(&v, 0)?,
+            None => 1,
+        };
+        let snap = Snap {
+            id,
+            txg: tx.txg,
+            root: self.root,
+            name: String::from(name),
+        };
+        // Daqui em diante nenhuma escrita libera o que nasceu até este txg.
+        tx.set_snap_floor(tx.txg);
+        self.put(tx, ck, &(id + 1).to_le_bytes())?;
+        self.put(tx, snap_key(id), &enc_snap(&snap))?;
+        Ok(id)
+    }
+
+    /// O dataset como estava no snapshot `name`, só para leitura.
+    ///
+    /// # Errors
+    /// [`FsError::NotFound`].
+    pub fn view<IO: BlockIo, H: Sha256>(
+        &self,
+        tx: &mut Tx<'_, IO, H>,
+        name: &str,
+    ) -> Result<Self, FsError> {
+        let s = self
+            .snapshots(tx)?
+            .into_iter()
+            .find(|s| s.name == name)
+            .ok_or(FsError::NotFound)?;
+        Ok(Self {
+            root: s.root,
+            name_key: self.name_key,
+            read_only: true,
+        })
+    }
+
+    /// Libera o que nenhuma árvore (viva ou de snapshot) alcança mais.
+    ///
+    /// # Errors
+    /// Erros da árvore.
+    pub fn reclaim<IO: BlockIo, H: Sha256>(&self, tx: &mut Tx<'_, IO, H>) -> Result<u64, FsError> {
+        let mut roots = alloc::vec![self.root];
+        roots.extend(self.snapshots(tx)?.into_iter().map(|s| s.root));
+        Ok(tx.reclaim(&roots)?)
+    }
+
+    /// Apaga o snapshot `name` e devolve o espaço que só ele usava.
+    ///
+    /// # Errors
+    /// [`FsError::NotFound`].
+    pub fn delete_snapshot<IO: BlockIo, H: Sha256>(
+        &mut self,
+        tx: &mut Tx<'_, IO, H>,
+        name: &str,
+    ) -> Result<(), FsError> {
+        let s = self
+            .snapshots(tx)?
+            .into_iter()
+            .find(|s| s.name == name)
+            .ok_or(FsError::NotFound)?;
+        self.del(tx, &snap_key(s.id))?;
+        let floor = self.snapshots(tx)?.iter().map(|s| s.txg).max().unwrap_or(0);
+        tx.set_snap_floor(floor);
+        self.reclaim(tx)?;
+        Ok(())
+    }
+
+    /// Volta o dataset ao estado do snapshot `name`, descartando as
+    /// mudanças e os snapshots posteriores. O snapshot continua existindo.
+    ///
+    /// # Errors
+    /// [`FsError::NotFound`].
+    pub fn rollback<IO: BlockIo, H: Sha256>(
+        &mut self,
+        tx: &mut Tx<'_, IO, H>,
+        name: &str,
+    ) -> Result<(), FsError> {
+        let s = self
+            .snapshots(tx)?
+            .into_iter()
+            .find(|s| s.name == name)
+            .ok_or(FsError::NotFound)?;
+        self.root = s.root;
+        tx.set_snap_floor(s.txg);
+        // A árvore do snapshot não tem o próprio registro: devolve-o.
+        let ck = snap_key(SNAP_COUNTER);
+        let next = match tx.get(&self.root, &ck)? {
+            Some(v) => u64_at(&v, 0)?,
+            None => 1,
+        };
+        self.put(tx, ck, &next.max(s.id + 1).to_le_bytes())?;
+        self.put(tx, snap_key(s.id), &enc_snap(&s))?;
+        self.reclaim(tx)?;
         Ok(())
     }
 }

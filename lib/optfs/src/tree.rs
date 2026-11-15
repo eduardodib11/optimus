@@ -57,6 +57,7 @@ pub struct Tx<'a, IO: BlockIo, H: Sha256> {
     pub txg: u64,
     tree: u64,
     staged: BTreeMap<u64, Box<[u8; BLOCK_SIZE]>>,
+    snap_floor: u64,
 }
 
 impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
@@ -69,6 +70,7 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
             txg,
             tree,
             staged: BTreeMap::new(),
+            snap_floor: 0,
         }
     }
 
@@ -249,32 +251,79 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
         Ok(b)
     }
 
-    /// Depois da montagem, marca no alocador todo bloco que a árvore de
-    /// arquivos alcança: nós e blocos de dados (itens `Extent` com tag 1).
+    /// Txg do último snapshot: blocos nascidos até ele podem estar em um
+    /// snapshot e nunca são liberados por uma escrita (ADR 0052, item 7).
+    pub fn set_snap_floor(&mut self, txg: u64) {
+        self.snap_floor = txg;
+    }
+
+    /// Reúne em `out` todo bloco que a árvore de `root` alcança: nós e
+    /// blocos de dados (itens `Extent` com tag 1).
     ///
     /// # Errors
     /// [`IoError::Integrity`] se algum nó não confere.
-    pub fn mark_reachable(&mut self, root: &BlockPtr) -> Result<(), IoError> {
-        if root.is_null() {
+    pub fn collect(
+        &mut self,
+        root: &BlockPtr,
+        out: &mut alloc::collections::BTreeSet<u64>,
+    ) -> Result<(), IoError> {
+        if root.is_null() || !out.insert(root.addr) {
             return Ok(());
         }
-        self.alloc.mark_used(root.addr);
         match self.read(root)? {
             Node::Internal(v) => {
                 for (_, c) in &v {
-                    self.mark_reachable(c)?;
+                    self.collect(c, out)?;
                 }
             }
             Node::Leaf(v) => {
                 for (k, x) in &v {
                     if k.kind == optfs_format::KeyKind::Extent && x.first() == Some(&1) {
                         let p = BlockPtr::decode(&x[1..]).map_err(|_| IoError::Integrity)?;
-                        self.alloc.mark_used(p.addr);
+                        out.insert(p.addr);
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Depois da montagem, marca no alocador todo bloco alcançado pelas
+    /// árvores de `roots` (a viva e as dos snapshots).
+    ///
+    /// # Errors
+    /// [`IoError::Integrity`] se algum nó não confere.
+    pub fn mark_reachable(&mut self, roots: &[BlockPtr]) -> Result<(), IoError> {
+        let mut set = alloc::collections::BTreeSet::new();
+        for r in roots {
+            self.collect(r, &mut set)?;
+        }
+        for b in set {
+            self.alloc.mark_used(b);
+        }
+        Ok(())
+    }
+
+    /// Libera, no txg corrente, os blocos em uso que nenhuma das árvores
+    /// de `roots` alcança mais (depois de apagar ou desfazer snapshots). A
+    /// liberação é adiada como qualquer outra: o superbloco de reserva
+    /// ainda pode alcançá-los.
+    ///
+    /// # Errors
+    /// [`IoError::Integrity`] se algum nó não confere.
+    pub fn reclaim(&mut self, roots: &[BlockPtr]) -> Result<u64, IoError> {
+        let mut set = alloc::collections::BTreeSet::new();
+        for r in roots {
+            self.collect(r, &mut set)?;
+        }
+        let mut freed = 0;
+        for b in optfs_format::FIRST_ALLOC..self.alloc.total().saturating_sub(1) {
+            if self.alloc.is_used(b) && !set.contains(&b) && !self.alloc.is_pending(b) {
+                self.alloc.free(self.txg, b);
+                freed += 1;
+            }
+        }
+        Ok(freed)
     }
 
     /// Blocos livres no alocador.
@@ -289,6 +338,10 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
     }
 
     fn release(&mut self, p: &BlockPtr) {
+        if p.birth <= self.snap_floor {
+            // Um snapshot pode estar usando o bloco: fica até o `reclaim`.
+            return;
+        }
         if p.birth == self.txg && self.staged.remove(&p.addr).is_some() {
             // Nasceu neste txg e ainda não foi ao disco: nenhum superbloco
             // o alcança, então o bloco volta já.
