@@ -1,6 +1,6 @@
-// InputDevice (T-514; ADR 0046, item 5; ADR 0062): o driver de entrada
+// InputDevice (T-514; ADR 0046, item 5; ADR 0064): o driver de entrada
 // (hoje o `virtio-input`) serve este contrato ao `inputd`/`displayd`. Mesmo
-// modelo do `BlockDevice` (ADR 0061): `session()` dá um endpoint com
+// modelo do `BlockDevice` (ADR 0063): `session()` dá um endpoint com
 // `SEND|GRANT`, e o cliente cria o anel de eventos e o entrega por
 // `attach_events(ring, signal)`, com o `SIGNAL` da sua `Notification`.
 //

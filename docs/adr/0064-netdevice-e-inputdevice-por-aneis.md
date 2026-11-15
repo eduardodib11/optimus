@@ -1,13 +1,13 @@
-# ADR 0062: `NetDevice` e `InputDevice` por anéis SPSC
+# ADR 0064: `NetDevice` e `InputDevice` por anéis SPSC
 
 - Status: aceita (modo autônomo de Eduardo, 2026-11-15), aguardando a revisão dele
 - Data: 2026-11-15
 - Origem: backlog do M5, T-514 (interfaces dos drivers virtio de rede e de entrada)
-- Relaciona-se com: ADR 0036 (anel SPSC), 0046 (item 5), 0060 (laço do driver), 0061 (`BlockDevice`, sessão com `GRANT`)
+- Relaciona-se com: ADR 0036 (anel SPSC), 0046 (item 5), 0060 (laço do driver), 0063 (`BlockDevice`, sessão com `GRANT`)
 
 ## Decisão
 
-1. **Mesmo modelo do `BlockDevice` (ADR 0061).** Cada contrato tem `info()`, `session()` (endpoint com `SEND|GRANT`, badge 1) e entrega de capabilities só pela sessão. O driver cria o anel que consome e o cliente cria o anel que consome; as capabilities do anel do driver vão em respostas, e a do cliente vai em `attach_*` pela sessão. Um segundo `attach_*` é recusado.
+1. **Mesmo modelo do `BlockDevice` (ADR 0063).** Cada contrato tem `info()`, `session()` (endpoint com `SEND|GRANT`, badge 1) e entrega de capabilities só pela sessão. O driver cria o anel que consome e o cliente cria o anel que consome; as capabilities do anel do driver vão em respostas, e a do cliente vai em `attach_*` pela sessão. Um segundo `attach_*` é recusado.
 2. **`NetDevice` (`optimus.net`).** Dois anéis de 16 KiB de dados: transmissão (o driver consome; `tx_ring`, `tx_signal`) e recepção (o cliente consome; `attach_rx`). Cada registro (tipo 1) é um quadro Ethernet sem o cabeçalho do virtio, de 14 a 1514 bytes; o driver acrescenta o cabeçalho zerado. `info()` dá o MAC (48 bits baixos), o MTU (1500), o maior quadro e o tamanho dos anéis. Quadro inválido na transmissão é descartado; anel de recepção cheio descarta o quadro e o anel conta em `dropped`.
 3. **`InputDevice` (`optimus.input`).** Um anel de eventos de 4 KiB que o cliente cria e liga (`attach_events`). Cada registro (tipo 1) é um evento `evdev` cru, de 8 bytes (`type` `u16`, `code` `u16`, `value` `u32`), como o dispositivo o mandou. O driver guarda até 16 eventos que chegam antes do `attach_events` e os entrega ao ligar; anel cheio descarta o evento mais novo (ADR 0036). O envio ao `inputd` por `optimus.input.Sink` continua como está até o `inputd` migrar para o contrato.
 4. **Laço.** O dos dois drivers é o da ADR 0060: `recv` com prazo de 5 ms, e a cada volta o driver confere a IRQ (`irq_ack`), colhe as filas e lê o anel de transmissão. O `NetDevice` só tem um buffer de transmissão em voo (o do T-412).

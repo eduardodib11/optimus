@@ -4,7 +4,7 @@
 //! evento `evdev` (`type`, `code`, `value`); cada evento é traduzido por
 //! [`oinput::Evdev`] e vai ao `inputd` por `optimus.input.Sink@1`. O
 //! dispositivo não é de confiança: o que não traduz é descartado. Serve
-//! também o contrato `InputDevice` (T-514; ADR 0062): os eventos `evdev` crus
+//! também o contrato `InputDevice` (T-514; ADR 0064): os eventos `evdev` crus
 //! vão a um anel SPSC do cliente, no laço único da ADR 0060 (`recv` de 5 ms).
 
 #![no_std]
@@ -55,7 +55,7 @@ const EVENTS_VA: u64 = 0x20_0040_0000;
 const RING_BYTES: u32 = 4096;
 const REC_KIND: u16 = 1;
 const PENDING: usize = 16;
-/// Badge da sessão (com `GRANT`), como no `BlockDevice` (ADR 0061).
+/// Badge da sessão (com `GRANT`), como no `BlockDevice` (ADR 0063).
 const SESSION_BADGE: u64 = 1;
 
 struct Input<'a> {

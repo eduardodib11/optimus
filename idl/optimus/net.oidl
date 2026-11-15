@@ -1,6 +1,6 @@
-// NetDevice (T-514; ADR 0046, item 5; ADR 0062): o driver de rede (hoje o
+// NetDevice (T-514; ADR 0046, item 5; ADR 0064): o driver de rede (hoje o
 // `virtio-net`) serve este contrato ao futuro `netd`. Mesmo modelo do
-// `BlockDevice` (ADR 0061): `session()` dá um endpoint com `SEND|GRANT`, e os
+// `BlockDevice` (ADR 0063): `session()` dá um endpoint com `SEND|GRANT`, e os
 // quadros Ethernet (sem o cabeçalho do virtio) vão por anéis SPSC:
 //
 // - transmissão: o driver consome e cria o anel (`tx_ring`, `tx_signal`); o

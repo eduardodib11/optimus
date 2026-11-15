@@ -1,4 +1,4 @@
-# ADR 0061: `BlockDevice`, papéis dos anéis e sessão com `GRANT`
+# ADR 0063: `BlockDevice`, papéis dos anéis e sessão com `GRANT`
 
 - Status: aceita (modo autônomo de Eduardo, 2026-11-14), aguardando a revisão dele
 - Data: 2026-11-14
