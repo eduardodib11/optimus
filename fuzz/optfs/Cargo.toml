@@ -1,0 +1,41 @@
+[package]
+name = "optfs-fuzz"
+description = "Alvos de fuzz do OptFS e do GPT (T-529; ADRs 0052 e 0056). Fora da imagem: só ferramenta de fuzzing, nightly."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Crate própria, fora do workspace principal: `libfuzzer-sys` nunca entra na
+# imagem do sistema nem no `cargo xtask build`.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ogpt = { path = "../../lib/ogpt" }
+optfs = { path = "../../lib/optfs" }
+optfs-format = { path = "../../lib/optfs-format" }
+
+[[bin]]
+name = "gpt"
+path = "fuzz_targets/gpt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superbloco"
+path = "fuzz_targets/superbloco.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arvore"
+path = "fuzz_targets/arvore.rs"
+test = false
+doc = false
+bench = false

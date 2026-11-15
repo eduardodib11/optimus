@@ -124,7 +124,7 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
         let mut at = NODE_HEADER_LEN;
         let bad = IoError::Integrity;
         if hd.level == 0 {
-            let mut v = Vec::with_capacity(n);
+            let mut v = Vec::with_capacity(n.min(64));
             for _ in 0..n {
                 let k = Key::decode(b.get(at..at + Key::LEN).ok_or(bad)?).map_err(|_| bad)?;
                 let l = usize::from(u16::from_le_bytes([
@@ -140,11 +140,11 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
             }
             Ok(Node::Leaf(v))
         } else {
-            let mut v = Vec::with_capacity(n);
+            let mut v = Vec::with_capacity(n.min(64));
             for _ in 0..n {
                 let k = Key::decode(b.get(at..at + Key::LEN).ok_or(bad)?).map_err(|_| bad)?;
                 let cp = BlockPtr::decode(b.get(at + 24..at + 96).ok_or(bad)?).map_err(|_| bad)?;
-                if cp.level + 1 != hd.level
+                if u16::from(cp.level) + 1 != u16::from(hd.level)
                     || v.last().is_some_and(|(p, _): &(Key, BlockPtr)| *p >= k)
                 {
                     return Err(bad);
@@ -423,7 +423,10 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
         match parts.len() {
             0 => Ok(BlockPtr::null()),
             1 => Ok(parts.remove(0).1),
-            _ => self.write(&Node::Internal(parts), level + 1),
+            _ => self.write(
+                &Node::Internal(parts),
+                level.checked_add(1).ok_or(IoError::Integrity)?,
+            ),
         }
     }
 

@@ -99,6 +99,16 @@ fn superbloco_rasgado_cai_para_o_anterior() {
 }
 
 #[test]
+fn txg_no_limite_do_u64_nao_causa_overflow() {
+    let (mut d, _) = formatted();
+    let last = sb(u64::MAX, 1);
+    assert_eq!(
+        commit(&mut d, &Fake, &last, sb(0, 2), []).unwrap_err(),
+        IoError::Full
+    );
+}
+
+#[test]
 fn recusa_escrever_em_regiao_reservada() {
     let (mut d, s1) = formatted();
     let blk = [0u8; BLOCK_SIZE];
@@ -585,5 +595,154 @@ mod snapshots {
         let mut tx = Tx::new(&mut d, &Fake, &mut al, prev.txg + 1, 1);
         let fs = Fs::open(&mut tx, prev.root, [5; 32]).unwrap();
         assert_eq!(fs.read(&mut tx, 2, 0, 50_000).unwrap(), pat(40_000, 2));
+    }
+}
+
+/// T-533 (versão de host): 200 quedas em pontos aleatórios de um trabalho
+/// de escrita; depois de cada uma, o que se monta é exatamente o último
+/// estado confirmado.
+mod queda_de_energia {
+    use super::*;
+    use crate::{Fs, Tx};
+    use std::collections::BTreeMap;
+
+    fn next(r: &mut u64) -> u64 {
+        *r = r
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *r >> 33
+    }
+
+    fn content(seed: u64, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (seed as u8).wrapping_add((i as u8).wrapping_mul(31)))
+            .collect()
+    }
+
+    type Model = BTreeMap<String, Vec<u8>>;
+
+    /// O que está montado, lido por inteiro.
+    fn state(d: &mut Sim, m: &crate::Mounted) -> Model {
+        let mut out = Model::new();
+        if m.sb.root.is_null() {
+            return out;
+        }
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(d, &Fake, &mut al, m.sb.txg + 1, 1);
+        let fs = Fs::open(&mut tx, m.sb.root, [5; 32]).unwrap();
+        for (name, obj, _) in fs.readdir(&mut tx, 1).unwrap() {
+            out.insert(name, fs.read(&mut tx, obj, 0, 100_000).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    fn duzentas_quedas_nunca_perdem_commit_confirmado() {
+        let mut rng = 0x00c0_ffee_u64;
+        let mut d = Sim::new(4096);
+        let mut s = sb(1, 1);
+        s.volume_blocks = 4096;
+        s.root = BlockPtr::null();
+        d.write(SUPERBLOCKS[1], &s.encode(&Fake)).unwrap();
+        d.flush().unwrap();
+        let mut prev;
+        let mut model = Model::new();
+        // Um commit que falhou pode ter chegado ao disco mesmo assim (a
+        // queda veio depois do superbloco e antes do `flush` voltar).
+        let mut maybe: Option<Model> = None;
+        let (mut confirmed, mut adopted) = (0u32, 0u32);
+        let mut crashes = 0;
+        while crashes < 200 {
+            // Monta e reconstrói o alocador, como depois de uma queda real.
+            let m = mount(&mut d, &Fake).unwrap();
+            prev = m.sb;
+            let got = state(&mut d, &m);
+            if got != model {
+                assert_eq!(
+                    Some(&got),
+                    maybe.as_ref(),
+                    "montou algo que nunca foi confirmado nem tentado"
+                );
+                model = got;
+                adopted += 1;
+            }
+            maybe = None;
+            let mut al = Allocator::new(4096);
+            {
+                let mut tx = Tx::new(&mut d, &Fake, &mut al, prev.txg + 1, 1);
+                let mut roots = Vec::new();
+                if !prev.root.is_null() {
+                    roots.push(prev.root);
+                }
+                tx.mark_reachable(&roots).unwrap();
+            }
+            // Trabalha até o disco cair num ponto aleatório.
+            d.budget = Some(next(&mut rng) as usize % 400);
+            loop {
+                let t = prev.txg + 1;
+                let mut tx = Tx::new(&mut d, &Fake, &mut al, t, 1);
+                let mut fs = if prev.root.is_null() {
+                    Fs::create(&mut tx, [5; 32]).unwrap()
+                } else {
+                    Fs::open(&mut tx, prev.root, [5; 32]).unwrap()
+                };
+                let mut next_model = model.clone();
+                let mut failed = false;
+                for _ in 0..=(next(&mut rng) % 4) {
+                    let name = format!("f{}", next(&mut rng) % 6);
+                    let r = match next(&mut rng) % 3 {
+                        0 if next_model.contains_key(&name) => {
+                            next_model.remove(&name);
+                            fs.unlink(&mut tx, 1, &name)
+                        }
+                        _ => {
+                            let len = (next(&mut rng) % 9000) as usize;
+                            let data = content(next(&mut rng), len);
+                            let mut res = Ok(());
+                            // Reescreve o arquivo inteiro: sem restos antigos.
+                            if next_model.contains_key(&name) {
+                                res = fs.unlink(&mut tx, 1, &name);
+                            }
+                            if res.is_ok() {
+                                res = fs
+                                    .create_file(&mut tx, 1, &name)
+                                    .and_then(|o| fs.write(&mut tx, o, 0, &data));
+                                next_model.insert(name.clone(), data);
+                            }
+                            res
+                        }
+                    };
+                    if r.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    break;
+                }
+                let mut new = sb(0, 0);
+                new.root = fs.root;
+                if let Ok(sb) = tx.commit(&prev, new) {
+                    prev = sb;
+                    confirmed += 1;
+                    model = next_model;
+                } else {
+                    maybe = Some(next_model);
+                    break;
+                }
+            }
+            // O disco caiu: parte do cache chegou ao disco, o resto some.
+            d.crash_partial(&mut rng);
+            crashes += 1;
+        }
+        let m = mount(&mut d, &Fake).unwrap();
+        let got = state(&mut d, &m);
+        assert!(got == model || Some(&got) == maybe.as_ref());
+        // A carga de fato confirma commits e cai em vários pontos.
+        assert!(confirmed > 200, "{confirmed} commits confirmados");
+        eprintln!(
+            "quedas: {crashes}, commits confirmados: {confirmed}, tentados que sobreviveram: {adopted}"
+        );
     }
 }

@@ -60,6 +60,8 @@ pub fn commit<'a>(
     mut new: Superblock,
     blocks: impl IntoIterator<Item = (u64, &'a [u8; BLOCK_SIZE])>,
 ) -> Result<Superblock, IoError> {
+    // O txg vem do disco: no limite do `u64` não há próximo commit.
+    let txg = prev.txg.checked_add(1).ok_or(IoError::Full)?;
     let end = io.blocks();
     for (n, data) in blocks {
         if n < FIRST_ALLOC || n >= end.saturating_sub(1) {
@@ -68,7 +70,7 @@ pub fn commit<'a>(
         io.write(n, data)?;
     }
     io.flush()?;
-    new.txg = prev.txg + 1;
+    new.txg = txg;
     new.volume_blocks = prev.volume_blocks;
     new.uuid = prev.uuid;
     io.write(SUPERBLOCKS[(new.txg % 2) as usize], &new.encode(h))?;

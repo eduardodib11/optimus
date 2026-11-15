@@ -1,6 +1,6 @@
 name: Fuzzing dos parsers de dispositivo (noturno)
 
-# T-421 (backlog M4): cada alvo de libFuzzer roda 30 min por noite, sem
+# T-421 (backlog M4) e T-529 (backlog M5, OptFS e GPT): cada alvo de libFuzzer roda 30 min por noite, sem
 # pânico (AML do acpid, varredura PCIe do opci, capabilities e fila do virtio-core). A campanha de 4 h
 # fica para o Gate 2 (`minutes` = 240). Alvos novos entram na matriz.
 # Uma falha grava o artefato em `crash-*` e sai com código diferente de zero.
@@ -33,6 +33,12 @@ jobs:
             target: queue
           - dir: fuzz/opci
             target: scan
+          - dir: fuzz/optfs
+            target: gpt
+          - dir: fuzz/optfs
+            target: superbloco
+          - dir: fuzz/optfs
+            target: arvore
     steps:
       - uses: actions/checkout@v5
       - name: Nightly e cargo-fuzz (só ferramenta de fuzzing)
