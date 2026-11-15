@@ -131,11 +131,36 @@ fn u64le(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap_or([0; 8]))
 }
 
+impl Table {
+    /// Tabela vazia, para [`parse_into`].
+    #[must_use]
+    #[allow(clippy::large_stack_arrays)] // 17 KiB: o chamador escolhe onde fica
+    pub const fn empty() -> Self {
+        Self {
+            disk_guid: [0; 16],
+            parts: [None; MAX_PARTS],
+            len: 0,
+        }
+    }
+}
+
 /// Lê a tabela do disco: cópia primária, depois a de reserva.
 ///
 /// # Errors
 /// [`Error::BadDisk`], [`Error::Io`] ou [`Error::NoValidCopy`].
 pub fn parse(disk: &mut impl Disk) -> Result<Table, Error> {
+    let mut table = Table::empty();
+    parse_into(disk, &mut table)?;
+    Ok(table)
+}
+
+/// Como [`parse`], mas escreve em `table`, que o chamador guarda onde a
+/// pilha for pequena (a tabela passa de 17 KiB). Com erro, `table` fica
+/// vazia.
+///
+/// # Errors
+/// [`Error::BadDisk`], [`Error::Io`] ou [`Error::NoValidCopy`].
+pub fn parse_into(disk: &mut impl Disk, table: &mut Table) -> Result<(), Error> {
     let ss = disk.sector_size();
     let total = disk.sectors();
     if (ss != 512 && ss != 4096) || total < 6 {
@@ -143,12 +168,13 @@ pub fn parse(disk: &mut impl Disk) -> Result<Table, Error> {
     }
     let mut io_err = false;
     for lba in [1, total - 1] {
-        match read_copy(disk, lba, ss, total) {
-            Ok(t) => return Ok(t),
+        match read_copy(disk, lba, ss, total, table) {
+            Ok(()) => return Ok(()),
             Err(Error::Io) => io_err = true,
             Err(_) => {}
         }
     }
+    clear(table);
     Err(if io_err {
         Error::Io
     } else {
@@ -156,8 +182,22 @@ pub fn parse(disk: &mut impl Disk) -> Result<Table, Error> {
     })
 }
 
+fn clear(table: &mut Table) {
+    for p in &mut table.parts {
+        *p = None;
+    }
+    table.len = 0;
+}
+
 #[allow(clippy::large_stack_arrays)] // 17 KiB, cabe na pilha de usuário
-fn read_copy(disk: &mut impl Disk, lba: u64, ss: usize, total: u64) -> Result<Table, Error> {
+fn read_copy(
+    disk: &mut impl Disk,
+    lba: u64,
+    ss: usize,
+    total: u64,
+    table: &mut Table,
+) -> Result<(), Error> {
+    clear(table);
     let mut sec = [0u8; 4096];
     let sec = &mut sec[..ss];
     if !disk.read(lba, sec) {
@@ -191,11 +231,7 @@ fn read_copy(disk: &mut impl Disk, lba: u64, ss: usize, total: u64) -> Result<Ta
     if !ok_place {
         return bad;
     }
-    let mut table = Table {
-        disk_guid: h[56..72].try_into().map_err(|_| Error::NoValidCopy)?,
-        parts: [None; MAX_PARTS],
-        len: 0,
-    };
+    table.disk_guid = h[56..72].try_into().map_err(|_| Error::NoValidCopy)?;
     let want_crc = u32le(h, 88);
     let mut crc = Crc::new();
     let mut done = 0;
@@ -244,7 +280,7 @@ fn read_copy(disk: &mut impl Disk, lba: u64, ss: usize, total: u64) -> Result<Ta
             return bad;
         }
     }
-    Ok(table)
+    Ok(())
 }
 
 #[cfg(test)]

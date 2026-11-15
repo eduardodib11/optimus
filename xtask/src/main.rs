@@ -74,6 +74,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("i8042d", "services/i8042d/src/main.rs", USER_TARGET),
     ("ps2mouse", "services/ps2mouse/src/main.rs", USER_TARGET),
     ("drvcli", "services/drvcli/src/main.rs", USER_TARGET),
+    ("storaged", "services/storaged/src/main.rs", USER_TARGET),
     ("keyd", "services/keyd/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
@@ -416,7 +417,7 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input"
         | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "ps2mouse" | "drvcli"
-        | "keyd" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        | "keyd" | "storaged" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
         _ => &[],
     }
 }
@@ -473,6 +474,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("i8042d", "i8042d"),
     ("ps2mouse", "ps2mouse"),
     ("drvcli", "drvcli"),
+    ("storaged", "storaged"),
     ("keyd", "keyd"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
@@ -612,6 +614,80 @@ fn qemu_bin(opts: &Options) -> Result<String> {
     Ok(bin)
 }
 
+/// Setores do disco de teste (16 MiB de setores de 512 bytes).
+const DISK_SECTORS: u64 = 32768;
+/// Partições do disco de teste (SDD 9.1): nome, primeiro e último setor.
+/// Alinhadas a 1 MiB, como a GPT padrão; a última vai até o fim da área
+/// utilizável.
+const DISK_PARTS: &[(&str, u64, u64)] = &[
+    ("sys-a", 2048, 10239),
+    ("sys-b", 10240, 18431),
+    ("data", 18432, 32734),
+];
+
+/// CRC32 (IEEE) da GPT.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for b in data {
+        crc ^= u32::from(*b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+/// Imagem do disco de teste do `storaged` (T-520): GPT com as cópias
+/// primária e de reserva e as partições de [`DISK_PARTS`], o resto zerado.
+/// Os setores entre a tabela e a primeira partição ficam livres para os
+/// autotestes dos drivers.
+#[allow(clippy::cast_possible_truncation)]
+fn gpt_disk() -> Vec<u8> {
+    const SS: usize = 512;
+    let total = DISK_SECTORS;
+    let mut d = vec![0u8; total as usize * SS];
+    let mut ents = vec![0u8; 128 * 128];
+    for (i, (name, first, last)) in DISK_PARTS.iter().enumerate() {
+        let e = &mut ents[i * 128..(i + 1) * 128];
+        // GUID de tipo de dados básicos do Linux e um GUID único qualquer.
+        e[..16].copy_from_slice(&[
+            0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47,
+            0x7D, 0xE4,
+        ]);
+        e[16] = u8::try_from(i + 1).unwrap_or(0);
+        e[32..40].copy_from_slice(&first.to_le_bytes());
+        e[40..48].copy_from_slice(&last.to_le_bytes());
+        for (j, c) in name.encode_utf16().enumerate() {
+            e[56 + 2 * j..58 + 2 * j].copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    let ent_sectors = (ents.len() / SS) as u64;
+    let first_usable = 2 + ent_sectors;
+    let last_usable = total - 2 - ent_sectors;
+    for (hdr, table, other) in [(1, 2, total - 1), (total - 1, total - 1 - ent_sectors, 1)] {
+        let mut h = [0u8; 92];
+        h[..8].copy_from_slice(b"EFI PART");
+        h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        h[12..16].copy_from_slice(&92u32.to_le_bytes());
+        h[24..32].copy_from_slice(&hdr.to_le_bytes());
+        h[32..40].copy_from_slice(&other.to_le_bytes());
+        h[40..48].copy_from_slice(&first_usable.to_le_bytes());
+        h[48..56].copy_from_slice(&last_usable.to_le_bytes());
+        h[56..72].fill(0x5A);
+        h[72..80].copy_from_slice(&table.to_le_bytes());
+        h[80..84].copy_from_slice(&128u32.to_le_bytes());
+        h[84..88].copy_from_slice(&128u32.to_le_bytes());
+        h[88..92].copy_from_slice(&crc32(&ents).to_le_bytes());
+        let crc = crc32(&h);
+        h[16..20].copy_from_slice(&crc.to_le_bytes());
+        let at = hdr as usize * SS;
+        d[at..at + 92].copy_from_slice(&h);
+        let at = table as usize * SS;
+        d[at..at + ents.len()].copy_from_slice(&ents);
+    }
+    d
+}
+
 fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     let (code, vars) = ovmf()?;
     let vars_copy = root().join("target/OVMF_VARS.fd");
@@ -629,8 +705,7 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     // Disco de teste (zerado a cada rodada) para os `virtio-blk-pci`.
     if opts.devices.iter().any(|d| d.starts_with("virtio-blk-pci")) {
         let disk = root().join("target/disk.img");
-        fs::write(&disk, vec![0u8; 1 << 20])
-            .map_err(|e| format!("gravando {}: {e}", disk.display()))?;
+        fs::write(&disk, gpt_disk()).map_err(|e| format!("gravando {}: {e}", disk.display()))?;
         cmd.args([
             "-drive",
             &format!("if=none,id=vd0,format=raw,file={}", disk.display()),
@@ -849,7 +924,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 11 drivers no conjunto",
+        "devmgr: 12 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -935,14 +1010,18 @@ macro_rules! m4_markers {
             "1af4:1044 ",
             "1af4:1043 ",
             "svcmgr: virtio-blk em Running",
-            "virtio-blk: 2048 setores",
+            "virtio-blk: 32768 setores",
             "virtio-blk: setor escrito e lido com BLAKE3 igual",
+            // T-520: o `storaged` lê a GPT pelo `BlockDevice` e serve as
+            // partições; o `drvcli` escreve e lê blocos pelo contrato.
+            "storaged: 3 partições: sys-a sys-b data",
+            "storaged: contrato BlockStore pronto",
             "virtio-rng: bytes do dispositivo variam",
             "virtio-console: texto enviado",
             // T-514: o cliente conversa com o driver pelo contrato gerado.
             "drvcli: console ok",
             "drvcli: display ok",
-            "drvcli: block ok",
+            "drvcli: storage ok",
             "drvcli: net ok",
             "drvcli: input ok",
             "drvcli: input evento 0x1e",
@@ -997,8 +1076,10 @@ const M4_FORBIDDEN: &[&str] = &[
     "drvcli: console: sem driver",
     "drvcli: display: falhou",
     "drvcli: display: sem driver",
-    "drvcli: block: falhou",
-    "drvcli: block: sem driver",
+    "drvcli: storage: falhou",
+    "drvcli: storage: sem serviço",
+    "storaged: falhou",
+    "storaged: GPT inválida",
     "drvcli: net: falhou",
     "drvcli: net: sem driver",
     "drvcli: input: falhou",
@@ -1023,8 +1104,10 @@ const M4_IOMMU_FORBIDDEN: &[&str] = &[
     "drvcli: console: sem driver",
     "drvcli: display: falhou",
     "drvcli: display: sem driver",
-    "drvcli: block: falhou",
-    "drvcli: block: sem driver",
+    "drvcli: storage: falhou",
+    "drvcli: storage: sem serviço",
+    "storaged: falhou",
+    "storaged: GPT inválida",
     "drvcli: net: falhou",
     "drvcli: net: sem driver",
     "drvcli: input: falhou",
@@ -1958,8 +2041,9 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 11 drivers no conjunto",
+    "devmgr: 12 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: drvcli",
+    "devmgr: nó 00:1f.0 8086:2918 0 BARs: storaged",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
     // (teclado PS/2 e RTC) viram nós com portas e IRQ.

@@ -1,0 +1,21 @@
+[package]
+name = "storaged"
+description = "storaged: GPT e BlockStore sobre o BlockDevice do driver de disco (T-520; ADR 0056)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "storaged"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+oidl-rt = { path = "../../lib/oidl-rt" }
+ogpt = { path = "../../lib/ogpt" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true

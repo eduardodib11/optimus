@@ -1,0 +1,53 @@
+// Armazenamento (T-520; ADR 0056, itens 3 a 6, e ADR 0066): o `storaged` lê
+// a GPT do disco e serve duas interfaces no mesmo endpoint, que o `svcmgr`
+// entrega como `optimus.storage.Storage`.
+//
+// 1. `Storage.open(nome)` devolve um endpoint `BlockStore` da partição
+//    (`sys-a`, `sys-b` ou `data`) com `SEND` e `GRANT` (para levar capabilities nas chamadas), e o badge dele já diz qual
+//    partição e se é só de leitura (as `sys-*` são, no M5).
+// 2. O cliente cria o anel de conclusões e a região de dados numa área sua
+//    (`MemoryObject`): os primeiros `ostd::ring::object_bytes(4096)` bytes
+//    (8 KiB) são o anel de conclusões (o cliente o consome) e o resto, de
+//    `data_blocks` blocos de 4 KiB, é a região de dados. `open_queue` a
+//    recebe com a `Notification` (`SIGNAL`) em que o cliente espera.
+// 3. O `storaged` cria o anel de submissões (ele o consome) e o entrega por
+//    `submit_ring`, com o `kick` (`SIGNAL`) para o cliente acordá-lo.
+//
+// Submissão (carga de 24 bytes, tipo 1): `id: u64`, `op: u8` (0 READ,
+// 1 WRITE, 2 FLUSH), `flags: u8` (bit 0 = FUA), `count: u16` (blocos de
+// 4 KiB), `offset: u32` (bytes na região de dados, alinhado a 4 KiB) e
+// `block: u64`. Conclusão (carga de 16 bytes, tipo 1): `id: u64` e
+// `status: u8` (0 ok ou um `IoError`).
+//
+// Os métodos que o item 3 da ADR 0056 junta num só (`open_queue` devolvendo
+// `Queue`) são separados em `open_queue`, `submit_ring` e `kick`, como no
+// `BlockDevice` (T-514): o OIDL não leva `handle` dentro de `struct`.
+package optimus.storage @1.0;
+
+enum IoError : u8 { Io, OutOfRange, ReadOnly, Reset, Full, BadRequest }
+
+// `blocks` de 4 KiB; `max_depth` pedidos em voo por fila; `max_blocks` por
+// pedido; `flush` se o dispositivo tem cache a descarregar.
+struct Info {
+    blocks: u64,
+    read_only: bool,
+    flush: bool,
+    max_depth: u16,
+    max_blocks: u16
+}
+
+interface Storage {
+    // Abre o `BlockStore` da partição de nome `name` (até 36 caracteres,
+    // como na GPT).
+    open(name: string<36>) -> result<handle<Endpoint>, IoError>;
+}
+
+interface BlockStore {
+    info() -> result<Info, IoError>;
+    open_queue(area: handle<MemoryObject>, done: handle<Notification>, depth: u16, priority: u8, data_blocks: u16) -> result<u32, IoError>;
+    submit_ring(queue: u32) -> result<handle<MemoryObject>, IoError>;
+    kick(queue: u32) -> result<handle<Notification>, IoError>;
+    close_queue(queue: u32) -> result<(), IoError>;
+    // Devolve a sessão (e fecha as filas dela).
+    release() -> result<(), IoError>;
+}

@@ -1,4 +1,4 @@
-# ADR 0061: Snapshots do OptFS com registros na árvore de arquivos e `reclaim` por varredura
+# ADR 0065: Snapshots do OptFS com registros na árvore de arquivos e `reclaim` por varredura
 
 - Status: aceita em modo autônomo (2026-11-15), **aguardando revisão do Eduardo**
 - Data: 2026-11-15
