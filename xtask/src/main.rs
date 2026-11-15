@@ -218,6 +218,8 @@ struct Options {
     chaos: Option<u64>,
     /// Entrada `svcmgr.mata` do bootfs (T-541): `<serviço> <atraso em ms>`.
     kill: Option<String>,
+    /// Entrada `svcmgr.janela` do bootfs: ms a mais de supervisão.
+    window: Option<u64>,
     /// Dispositivos extras do QEMU, antes dos de sempre (a `intel-iommu`
     /// precisa vir antes dos dispositivos PCI).
     devices: Vec<&'static str>,
@@ -243,6 +245,7 @@ impl Default for Options {
             fail_on_purpose: false,
             chaos: None,
             kill: None,
+            window: None,
             devices: Vec::new(),
             objects: Vec::new(),
         }
@@ -541,6 +544,12 @@ fn bootfs(opts: &Options, output: &Path, rounds: Option<u64>) -> Result {
         fs::write(&file, format!("{n}\n"))
             .map_err(|e| format!("gravando {}: {e}", file.display()))?;
         cmd.arg(format!("svcmgr.caos={}", file.display()));
+    }
+    if let Some(ms) = opts.window {
+        let file = root().join("target/svcmgr.janela");
+        fs::write(&file, format!("{ms}\n"))
+            .map_err(|e| format!("gravando {}: {e}", file.display()))?;
+        cmd.arg(format!("svcmgr.janela={}", file.display()));
     }
     if let Some(k) = &opts.kill {
         let file = root().join("target/svcmgr.mata");
@@ -2334,6 +2343,7 @@ fn persist(opts: &Options) -> Result {
             "virtio-net-pci,netdev=vn0,disable-legacy=on",
             "virtio-gpu-pci,id=vgpu,disable-legacy=on",
         ],
+        window: Some(10_000),
         ..opts.clone()
     };
     build_test(&plain)?;

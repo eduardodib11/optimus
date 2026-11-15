@@ -932,7 +932,14 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
         // novos commits) cabe depois da queda.
         s.supervise(ostd::time::now_ns().saturating_add(MATA_EXTRA_NS));
     }
-    s.supervise(ostd::time::now_ns().saturating_add(SUPERVISE_NS));
+    // `svcmgr.janela` = ms a mais de supervisão (T-540: o volume cifrado
+    // espera o Argon2id do `keyd` sob TCG).
+    let extra =
+        s.fs.find("svcmgr.janela")
+            .and_then(|e| core::str::from_utf8(e.data).ok())
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .map_or(0, |ms| ms.saturating_mul(1_000_000));
+    s.supervise(ostd::time::now_ns().saturating_add(SUPERVISE_NS.saturating_add(extra)));
     s.shutdown();
     for h in [s.deaths, s.reply, s.control] {
         let _ = ostd::cap::delete(h);
