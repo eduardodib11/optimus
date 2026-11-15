@@ -282,7 +282,11 @@ impl Fs {
         }
         let cnt = key(0, KeyKind::Inode, 0);
         let obj = u64_at(&tx.get(&self.root, &cnt)?.ok_or(IoError::Integrity)?, 0)?;
-        self.put(tx, cnt, &(obj + 1).to_le_bytes())?;
+        self.put(
+            tx,
+            cnt,
+            &obj.checked_add(1).ok_or(IoError::Full)?.to_le_bytes(),
+        )?;
         self.put(
             tx,
             key(obj, KeyKind::Inode, 0),
@@ -534,7 +538,10 @@ impl Fs {
                 tx.free_ptr(&BlockPtr::decode(&v[1..]).map_err(|_| IoError::Integrity)?);
             }
             self.del(tx, &k)?;
-            at = key(obj, KeyKind::Extent, k.offset + 1);
+            let Some(next) = k.offset.checked_add(1) else {
+                break;
+            };
+            at = key(obj, KeyKind::Extent, next);
         }
         self.del(tx, &key(obj, KeyKind::Inode, 0))?;
         let mut list = self.dirents(tx, dir, name)?;
@@ -634,7 +641,10 @@ impl Fs {
                 break;
             }
             out.push(dec_snap(k.offset, &v)?);
-            at = snap_key(k.offset + 1);
+            let Some(next) = k.offset.checked_add(1) else {
+                break;
+            };
+            at = snap_key(next);
         }
         Ok(out)
     }
@@ -670,7 +680,7 @@ impl Fs {
         };
         // Daqui em diante nenhuma escrita libera o que nasceu até este txg.
         tx.set_snap_floor(tx.txg);
-        self.put(tx, ck, &(id + 1).to_le_bytes())?;
+        self.put(tx, ck, &id.saturating_add(1).to_le_bytes())?;
         self.put(tx, snap_key(id), &enc_snap(&snap))?;
         Ok(id)
     }
@@ -750,7 +760,7 @@ impl Fs {
             Some(v) => u64_at(&v, 0)?,
             None => 1,
         };
-        self.put(tx, ck, &next.max(s.id + 1).to_le_bytes())?;
+        self.put(tx, ck, &next.max(s.id.saturating_add(1)).to_le_bytes())?;
         self.put(tx, snap_key(s.id), &enc_snap(&s))?;
         self.reclaim(tx)?;
         Ok(())

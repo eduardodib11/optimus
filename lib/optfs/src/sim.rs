@@ -33,6 +33,20 @@ impl Sim {
             None => Ok(()),
         }
     }
+    /// Queda de energia em que parte das escritas ainda no cache chegou ao
+    /// disco, em ordem qualquer (cada uma com 50% de chance, pelo `rng`).
+    pub fn crash_partial(&mut self, rng: &mut u64) {
+        for (b, d) in std::mem::take(&mut self.cache) {
+            *rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            if *rng >> 33 & 1 == 1 {
+                self.durable[b as usize] = d;
+            }
+        }
+        self.budget = None;
+    }
+
     /// Queda de energia: o cache some.
     pub fn crash(&mut self) {
         self.cache.clear();
