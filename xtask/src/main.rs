@@ -292,7 +292,7 @@ fn parse(args: &[String]) -> Result<Options> {
                 );
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
-            | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "all" => {
+            | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "storage" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -1805,6 +1805,22 @@ fn iommu(opts: &Options) -> Result {
     smoke(&amd, &[AMD_IOMMU_SCENARIO, AMD_DRIVER_SCENARIO])
 }
 
+/// Conjunto do armazenamento (T-531): formato, GPT e `OptFS` (commit, árvore,
+/// arquivos, snapshots, 200 quedas de energia). Os cenários em QEMU do
+/// `storaged` entram aqui quando ele existir. O `unit`/`all` já roda os
+/// mesmos testes; este atalho é para o ciclo de desenvolvimento e o CI.
+fn storage() -> Result {
+    status(cargo().args([
+        "test",
+        "--package",
+        "optfs-format",
+        "--package",
+        "ogpt",
+        "--package",
+        "optfs",
+    ]))
+}
+
 fn test(opts: &Options) -> Result {
     if matches!(opts.suite.as_str(), "unit" | "all") {
         status(cargo().args([
@@ -1867,6 +1883,9 @@ fn test(opts: &Options) -> Result {
     }
     if opts.suite == "keyd" {
         keyd_entropy(opts)?;
+    }
+    if opts.suite == "storage" {
+        storage()?;
     }
     if opts.suite == "smp" {
         smp(opts)?;
