@@ -11,6 +11,8 @@
 // Os casts truncam de propósito: as metades de 32 bits de endereços de 64.
 #![allow(clippy::cast_possible_truncation)]
 
+pub mod serve;
+
 use core::cell::RefCell;
 
 use ostd::kabi::{Handle, timer};

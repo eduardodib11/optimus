@@ -22,7 +22,7 @@ mod block_servidor;
 use core::cell::RefCell;
 
 use block_servidor::{BlockDevice, BlockError, BlockInfo, Contexto, ID_BLOCKDEVICE};
-use ostd::ipc::{self, Message};
+use ostd::ipc;
 use ostd::kabi::{Error, Handle, ObjectType, Rights};
 use ostd::ring::{Consumer, Producer};
 use ostd::rt::Start;
@@ -469,66 +469,34 @@ impl BlockDevice for Servico<'_> {
 
 /// Atende o contrato `BlockDevice` em `ep` até o endpoint ser revogado.
 fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, svc: &mut Servico<'_>) -> Error {
-    let reply = match ostd::cap::create(quota, ObjectType::Reply, 0) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    let (mut corpo, mut saida) = ([0u8; 64], [0u8; 64]);
-    let mut resp: Option<Message> = None;
-    loop {
-        let deadline = ostd::time::now_ns().saturating_add(POLL_NS);
-        let got = match resp.take() {
-            Some(r) => ipc::reply_recv(ep, reply, &r, deadline),
-            None => ipc::recv(ep, reply, deadline),
-        };
-        let rec = match got {
-            Ok(rec) => rec,
-            Err(Error::TimedOut | Error::PeerClosed) => {
-                svc.pump();
-                continue;
-            }
-            Err(e) => return e,
-        };
-        svc.pump();
-        let ctx_badge = rec.badge;
-        let mut caps = [0u64; 4];
-        let ncaps = usize::from(rec.msg.info.caps).min(caps.len());
-        for (dst, src) in caps.iter_mut().zip(buf.get().caps.iter()).take(ncaps) {
-            *dst = u64::from(*src);
-        }
-        let mut caps_out = [0u64; 1];
-        let built = match ipc::copia(buf, &rec.msg, &mut corpo) {
-            Ok(n) => {
-                let entrada = block_servidor::Entrada {
-                    rotulo: rec.msg.label,
-                    badge: ctx_badge,
-                    corpo: &corpo[..n],
-                    caps: &caps[..ncaps],
-                };
-                match block_servidor::despacha_block_device(
-                    svc,
-                    0,
-                    &entrada,
-                    &mut saida,
-                    &mut caps_out,
-                ) {
-                    Some(d) => ipc::monta(buf, d.rotulo, &saida[..d.corpo]).map(|mut m| {
-                        if d.caps == 1 {
-                            buf.get().caps[0] = caps_out[0] as u32;
-                            m.info.caps = 1;
-                        }
-                        m
-                    }),
-                    None => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
-                }
-            }
-            Err(_) => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
-        };
-        match built {
-            Ok(m) => resp = Some(m),
-            Err(e) => return e,
-        }
-    }
+    let svc = RefCell::new(svc);
+    vdrv::serve::serve(
+        ep,
+        quota,
+        buf,
+        POLL_NS,
+        &mut || svc.borrow_mut().pump(),
+        &mut |req, saida, caps_out| {
+            let entrada = block_servidor::Entrada {
+                rotulo: req.rotulo,
+                badge: req.badge,
+                corpo: req.corpo,
+                caps: req.caps,
+            };
+            let d = block_servidor::despacha_block_device(
+                &mut **svc.borrow_mut(),
+                0,
+                &entrada,
+                saida,
+                caps_out,
+            )?;
+            Some(vdrv::serve::Resp {
+                rotulo: d.rotulo,
+                corpo: d.corpo,
+                caps: d.caps,
+            })
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)]

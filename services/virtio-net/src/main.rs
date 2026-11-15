@@ -2,16 +2,22 @@
 //! processo de usuário. Lê o MAC da configuração do dispositivo, monta a
 //! fila de recepção (0) com buffers de 2 KiB e a de transmissão (1), manda
 //! um ARP "quem tem 10.0.2.2" e espera a resposta do QEMU (rede de usuário).
-//! O `NetDevice` por OIDL vem na parte 2.
+//! Depois serve o contrato `NetDevice` (T-514; ADR 0062): os quadros vão e
+//! voltam por anéis SPSC, no laço único da ADR 0060 (`recv` de 5 ms).
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
 #![allow(clippy::cast_possible_truncation)]
 
+mod net_servidor;
+
 use core::cell::RefCell;
 
-use ostd::kabi::{Handle, ObjectType};
+use net_servidor::{Contexto, ID_NETDEVICE, NetDevice, NetError, NetInfo};
+use ostd::ipc;
+use ostd::kabi::{Error, Handle, ObjectType, Rights};
+use ostd::ring::{Consumer, Producer};
 use ostd::rt::Start;
 use ostd::svc::Session;
 use ostd::vm::{Mapping, SELF};
@@ -51,6 +57,17 @@ const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 /// Prazo de cada espera e número delas.
 const WAIT_NS: u64 = 500_000_000;
 const WAITS: u32 = 6;
+/// O contrato: anéis de quadros (16 KiB de dados cada), o maior quadro e o
+/// prazo do `recv` do laço (ADR 0060).
+const TXRING_VA: u64 = 0x20_0050_0000;
+const RXRING_VA: u64 = 0x20_0060_0000;
+const RING_BYTES: u32 = 16384;
+const MAX_FRAME: usize = 1514;
+const POLL_NS: u64 = 5_000_000;
+const RING_KIND: u16 = 0x0E01;
+const REC_KIND: u16 = 1;
+/// Badge da sessão (com `GRANT`), como no `BlockDevice` (ADR 0061).
+const SESSION_BADGE: u64 = 1;
 
 struct Nic<'a> {
     rx: Queue<Dma<'a>, QUEUE_SIZE>,
@@ -161,7 +178,171 @@ impl Nic<'_> {
     }
 }
 
-fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
+/// O driver em serviço: a placa e o estado do contrato `NetDevice`.
+struct Servico<'a> {
+    nic: Nic<'a>,
+    ep: Handle,
+    tx_obj: Handle,
+    tx_ntfy: Handle,
+    /// Anel de transmissão (o driver consome).
+    tx_cons: Consumer,
+    /// Anel de recepção (o cliente consome), depois do `attach_rx`.
+    rx_prod: Option<Producer>,
+    /// O buffer único de transmissão está com o dispositivo.
+    tx_busy: bool,
+}
+
+impl Servico<'_> {
+    /// Repassa os quadros recebidos ao cliente e devolve os buffers.
+    fn forward_rx(&mut self) {
+        loop {
+            let chain = match self.nic.rx.pop() {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+            let slot = chain.head;
+            if usize::from(slot) >= QUEUE_SIZE {
+                continue;
+            }
+            let len = (chain.len as usize).min(RX_BUF);
+            let at = usize::from(slot) % PER_PAGE * RX_BUF;
+            if let Some(prod) = self.rx_prod.as_mut()
+                && let Some(frame) = self.nic.rxbuf[usize::from(slot) / PER_PAGE]
+                    .bytes()
+                    .get(at + HDR..at + len)
+                && frame.len() >= 14
+            {
+                // Cheio: o anel descarta e conta em `dropped`.
+                let _ = prod.push(REC_KIND, frame);
+            }
+            let _ = self.nic.give_rx(slot);
+        }
+        self.nic.notify.write16(self.nic.rx_notify, 0);
+    }
+
+    /// Passa ao dispositivo o próximo quadro do anel de transmissão.
+    fn send_next(&mut self) {
+        if self.tx_busy {
+            return;
+        }
+        let mut frame = [0u8; ostd::ring::MAX_PAYLOAD];
+        let n = match self.tx_cons.pop(&mut frame) {
+            Ok(Some((REC_KIND, n))) if (14..=MAX_FRAME).contains(&n) => n,
+            // Quadro de tamanho impossível ou registro estranho: descarta.
+            _ => return,
+        };
+        let Some(bytes) = self.nic.txbuf.bytes_mut() else {
+            return;
+        };
+        bytes[..HDR].fill(0);
+        bytes[HDR..HDR + n].copy_from_slice(&frame[..n]);
+        let seg = Seg {
+            addr: self.nic.txbuf_iova,
+            len: (HDR + n) as u32,
+            write: false,
+        };
+        if self.nic.tx.push(&[seg]).is_ok() {
+            self.nic.notify.write16(self.nic.tx_notify, 1);
+            self.tx_busy = true;
+        }
+    }
+
+    /// Um passo do laço: IRQ, transmissão concluída, recepção, envio.
+    fn pump(&mut self) {
+        if let Ok(bits) = ostd::cap::ntfy_poll(self.nic.irq.ntfy)
+            && bits & 1 != 0
+        {
+            let _ = ostd::dev::irq_ack(self.nic.irq.irq);
+        }
+        while matches!(self.nic.tx.pop(), Ok(Some(_))) {
+            self.tx_busy = false;
+        }
+        self.forward_rx();
+        self.send_next();
+    }
+}
+
+impl NetDevice for Servico<'_> {
+    fn info(&mut self, _ctx: &Contexto) -> Result<NetInfo, NetError> {
+        let mut raw = [0u8; 8];
+        raw[..6].copy_from_slice(&self.nic.mac);
+        Ok(NetInfo {
+            mac: u64::from_le_bytes(raw),
+            ring_bytes: RING_BYTES,
+            mtu: 1500,
+            max_frame: MAX_FRAME as u16,
+        })
+    }
+
+    fn session(&mut self, _ctx: &Contexto) -> Result<u64, NetError> {
+        vdrv::serve::grant(self.ep, Rights::SEND | Rights::GRANT, SESSION_BADGE)
+            .map_err(|_| NetError::Io)
+    }
+
+    fn tx_ring(&mut self, _ctx: &Contexto) -> Result<u64, NetError> {
+        vdrv::serve::grant(self.tx_obj, Rights::MAP | Rights::READ | Rights::WRITE, 0)
+            .map_err(|_| NetError::Io)
+    }
+
+    fn tx_signal(&mut self, _ctx: &Contexto) -> Result<u64, NetError> {
+        vdrv::serve::grant(self.tx_ntfy, Rights::SIGNAL, 0).map_err(|_| NetError::Io)
+    }
+
+    fn attach_rx(&mut self, ctx: &Contexto, ring: u64, signal: u64) -> Result<(), NetError> {
+        if ctx.badge & 0xFFFF_FFFF != SESSION_BADGE || self.rx_prod.is_some() {
+            return Err(NetError::BadRequest);
+        }
+        let (Ok(ring), Ok(signal)) = (u32::try_from(ring), u32::try_from(signal)) else {
+            return Err(NetError::BadRequest);
+        };
+        let prod = Producer::open(
+            Handle::from_raw(ring),
+            RXRING_VA,
+            RING_BYTES,
+            Handle::from_raw(signal),
+            1,
+        )
+        .map_err(|_| NetError::BadRequest)?;
+        self.rx_prod = Some(prod);
+        Ok(())
+    }
+}
+
+/// Atende o contrato `NetDevice` em `ep` até o endpoint ser revogado.
+fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, svc: &mut Servico<'_>) -> Error {
+    let svc = RefCell::new(svc);
+    vdrv::serve::serve(
+        ep,
+        quota,
+        buf,
+        POLL_NS,
+        &mut || svc.borrow_mut().pump(),
+        &mut |req, saida, caps_out| {
+            let entrada = net_servidor::Entrada {
+                rotulo: req.rotulo,
+                badge: req.badge,
+                corpo: req.corpo,
+                caps: req.caps,
+            };
+            let d = net_servidor::despacha_net_device(
+                &mut **svc.borrow_mut(),
+                0,
+                &entrada,
+                saida,
+                caps_out,
+            )?;
+            Some(vdrv::serve::Resp {
+                rotulo: d.rotulo,
+                corpo: d.corpo,
+                caps: d.caps,
+            })
+        },
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let (Some(irq), Some(domain)) = (vdrv::resource(s, b"irq0"), vdrv::resource(s, b"dma")) else {
         return Err("faltou irq0 ou dma");
     };
@@ -248,6 +429,29 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
     ));
     nic.self_test()?;
     ostd::debug::print("virtio-net: ARP enviado e resposta recebida");
+    // O contrato: o anel de transmissão é do driver.
+    let tx_obj = mem(ostd::ring::object_bytes(RING_BYTES)).map_err(|_| "anel de transmissão")?;
+    let tx_ntfy =
+        ostd::cap::create(quota, ObjectType::Notification, 0).map_err(|_| "notificação do anel")?;
+    let tx_cons = Consumer::create(tx_obj, TXRING_VA, RING_BYTES, RING_KIND, tx_ntfy)
+        .map_err(|_| "criar o anel de transmissão")?;
+    let ep = s
+        .boot
+        .provided(ID_NETDEVICE)
+        .map(Handle::from_raw)
+        .ok_or("descritor sem o endpoint do NetDevice")?;
+    let mut svc = Servico {
+        nic,
+        ep,
+        tx_obj,
+        tx_ntfy,
+        tx_cons,
+        rx_prod: None,
+        tx_busy: false,
+    };
+    ostd::debug::print("virtio-net: contrato NetDevice pronto");
+    let e = serve(ep, quota, &mut s.buffer, &mut svc);
+    ostd::debug::print_fmt(format_args!("virtio-net: encerrado ({e:?})"));
     Ok(())
 }
 
@@ -265,7 +469,7 @@ fn main(start: Start) -> ! {
     }
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     let _ = s.ready();
-    if let Err(e) = run(&s, quota) {
+    if let Err(e) = run(&mut s, quota) {
         ostd::debug::print_fmt(format_args!("virtio-net: falhou: {e}"));
     }
     ostd::thread::exit()
