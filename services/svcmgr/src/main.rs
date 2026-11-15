@@ -127,15 +127,51 @@ fn spawn(
         pool.push(("acpi", boot.acpi));
     }
     let kernel = &mut svcmgr::kernel::Kernel;
+    let started = deliver_and_start(plan, id, &child, control, &pool, devices, kernel);
+    match started {
+        Ok(desc) => Ok(Started {
+            desc,
+            child,
+            devices: Vec::new(),
+        }),
+        Err(e) => {
+            // Partida que não terminou: sem isto o processo e a cota dele
+            // ficariam presos a cada tentativa (T-541).
+            discard(child);
+            Err(e)
+        }
+    }
+}
+
+/// Apaga um filho que não chegou a `Running`.
+fn discard(child: process::Child) {
+    let _ = ostd::cap::destroy(child.cspace);
+    for h in [child.thread, child.aspace, child.cspace, child.quota] {
+        if h.raw() != 0 {
+            let _ = ostd::cap::delete(h);
+        }
+    }
+}
+
+/// Entrega as capabilities a `child` e o inicia.
+fn deliver_and_start(
+    plan: &mut Plan,
+    id: u32,
+    child: &process::Child,
+    control: Handle,
+    pool: &[(&str, Handle)],
+    devices: Option<&[(Handle, u32)]>,
+    kernel: &mut svcmgr::kernel::Kernel,
+) -> Result<svcmgr::broker::Boot, Error> {
     let delivered = match devices {
         Some(d) => {
             let (cs, q) = (child.cspace, child.quota);
             plan.broker
-                .deliver_driver(id, cs, control, q, &pool, d, kernel)
+                .deliver_driver(id, cs, control, q, pool, d, kernel)
         }
         None => plan
             .broker
-            .deliver(id, child.cspace, control, child.quota, &pool, kernel),
+            .deliver(id, child.cspace, control, child.quota, pool, kernel),
     };
     let desc = delivered.map_err(|e| {
         ostd::debug::print_fmt(format_args!("svcmgr: entrega recusada: {e:?}"));
@@ -153,12 +189,11 @@ fn spawn(
         0,
     ];
     child.start(args)?;
-    Ok(Started {
-        desc,
-        child,
-        devices: Vec::new(),
-    })
+    Ok(desc)
 }
+
+/// Espera entre duas tentativas de reiniciar um serviço que não partiu.
+const RETRY_NS: u64 = 250_000_000;
 
 /// Quanto o laço espera por mensagem antes de olhar as mortes, em ns.
 const TICK_NS: u64 = 20_000_000;
@@ -350,6 +385,10 @@ impl Svcmgr<'_> {
             if self.launch(id) {
                 let n = name(&self.plan, id);
                 ostd::debug::print_fmt(format_args!("svcmgr: {n} reiniciado"));
+            } else {
+                // Sem recuo, a falha repetiria a cada volta do laço.
+                self.sup
+                    .induced(id, ostd::time::now_ns().saturating_add(RETRY_NS));
             }
         }
     }
