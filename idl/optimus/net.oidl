@@ -1,0 +1,32 @@
+// NetDevice (T-514; ADR 0046, item 5; ADR 0062): o driver de rede (hoje o
+// `virtio-net`) serve este contrato ao futuro `netd`. Mesmo modelo do
+// `BlockDevice` (ADR 0061): `session()` dá um endpoint com `SEND|GRANT`, e os
+// quadros Ethernet (sem o cabeçalho do virtio) vão por anéis SPSC:
+//
+// - transmissão: o driver consome e cria o anel (`tx_ring`, `tx_signal`); o
+//   cliente é o produtor e grava um quadro por registro (tipo 1);
+// - recepção: o cliente consome e cria o anel, e o entrega por
+//   `attach_rx(ring, signal)` com o `SIGNAL` da sua `Notification`; o driver
+//   grava um quadro recebido por registro (tipo 1). Anel cheio descarta o
+//   quadro (`dropped` do anel).
+package optimus.net @1.0;
+
+enum NetError : u8 { Io, BadRequest }
+
+// `mac` nos 48 bits baixos (o primeiro byte do endereço é o mais baixo);
+// `max_frame` bytes por quadro; `ring_bytes` de dados em cada anel.
+struct NetInfo {
+    mac: u64,
+    ring_bytes: u32,
+    mtu: u16,
+    max_frame: u16
+}
+
+interface NetDevice {
+    info() -> result<NetInfo, NetError>;
+    session() -> result<handle<Endpoint>, NetError>;
+    tx_ring() -> result<handle<MemoryObject>, NetError>;
+    tx_signal() -> result<handle<Notification>, NetError>;
+    // Só pela sessão (com `GRANT`).
+    attach_rx(ring: handle<MemoryObject>, signal: handle<Notification>) -> result<(), NetError>;
+}

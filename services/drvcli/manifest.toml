@@ -13,11 +13,12 @@ restart = "never"
 
 [capabilities]
 needs = [
-  "mem:quota:576KiB",
+  "mem:quota:704KiB",
   "kernel:debug",
   "svc:optimus.console.Console@1?",
   "svc:optimus.display.DisplayDevice@1?",
   "svc:optimus.block.BlockDevice@1?",
+  "svc:optimus.net.NetDevice@1?",
   "svc:optimus.dev.EntropySource@1?",
 ]
 provides = []
