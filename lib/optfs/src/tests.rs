@@ -325,14 +325,11 @@ mod arquivos {
         assert_eq!(m.sb.root, root);
         let mut al = Allocator::new(4096);
         let mut tx = Tx::new(&mut d, &Fake, &mut al, 3, 1);
-        let fs = Fs {
-            root: m.sb.root,
-            name_key,
-        };
+        let fs = Fs::from_root(m.sb.root, name_key);
         // O alocador remontado reconhece os blocos em uso: 19 de dados do
         // arquivo grande, 1 do pequeno e os nós.
         let before = tx.free_blocks();
-        tx.mark_reachable(&fs.root).unwrap();
+        tx.mark_reachable(&[fs.root]).unwrap();
         assert!(before - tx.free_blocks() >= 20);
         assert_eq!(
             fs.lookup(&mut tx, 1, "docs").unwrap(),
@@ -395,10 +392,7 @@ mod arquivos {
         let free0 = al.free_blocks();
         for txg in [3, 4, 5] {
             let mut tx = Tx::new(&mut d, &Fake, &mut al, txg, 1);
-            let mut fs = Fs {
-                root,
-                name_key: [5; 32],
-            };
+            let mut fs = Fs::from_root(root, [5; 32]);
             if txg == 3 {
                 fs.unlink(&mut tx, 1, "f").unwrap();
             }
@@ -417,5 +411,179 @@ mod arquivos {
             al.free_blocks(),
             free0
         );
+    }
+}
+
+mod snapshots {
+    use super::*;
+    use crate::{Fs, FsError, Tx};
+
+    fn big() -> (Sim, Superblock) {
+        let mut d = Sim::new(4096);
+        let mut s = sb(1, 1);
+        s.volume_blocks = 4096;
+        s.root = BlockPtr::null();
+        d.write(SUPERBLOCKS[1], &s.encode(&Fake)).unwrap();
+        d.flush().unwrap();
+        (d, s)
+    }
+
+    fn pat(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(13).wrapping_add(seed))
+            .collect()
+    }
+
+    /// Um txg: abre, roda `f`, confirma. Devolve o novo superbloco.
+    fn txg(
+        d: &mut Sim,
+        al: &mut Allocator,
+        prev: &Superblock,
+        f: impl FnOnce(&mut Tx<'_, Sim, Fake>, &mut Fs),
+    ) -> Superblock {
+        let t = prev.txg + 1;
+        let mut tx = Tx::new(d, &Fake, al, t, 1);
+        let mut fs = if prev.root.is_null() {
+            Fs::create(&mut tx, [5; 32]).unwrap()
+        } else {
+            Fs::open(&mut tx, prev.root, [5; 32]).unwrap()
+        };
+        f(&mut tx, &mut fs);
+        let mut new = sb(0, 0);
+        new.root = fs.root;
+        tx.commit(prev, new).unwrap()
+    }
+
+    #[test]
+    fn snapshot_guarda_o_passado_apesar_de_escritas_e_remontagem() {
+        let (mut d, s1) = big();
+        let mut al = Allocator::new(4096);
+        let v1 = pat(20_000, 1);
+        let s2 = txg(&mut d, &mut al, &s1, |tx, fs| {
+            let f = fs.create_file(tx, 1, "a").unwrap();
+            fs.write(tx, f, 0, &v1).unwrap();
+            fs.snapshot(tx, "s1").unwrap();
+        });
+        // Muda tudo depois do snapshot, em vários txgs (o alocador reusa
+        // blocos liberados: se o snapshot os perdesse, a leitura falharia).
+        let v2 = pat(20_000, 77);
+        let mut prev = s2;
+        for i in 0..4 {
+            prev = txg(&mut d, &mut al, &prev, |tx, fs| {
+                fs.write(tx, 2, 0, &v2).unwrap();
+                fs.create_file(tx, 1, &format!("b{i}")).unwrap();
+            });
+        }
+        d.crash();
+        let m = mount(&mut d, &Fake).unwrap();
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, m.sb.txg + 1, 1);
+        let fs = Fs::open(&mut tx, m.sb.root, [5; 32]).unwrap();
+        let snaps = fs.snapshots(&mut tx).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].name, "s1");
+        let mut roots = vec![fs.root];
+        roots.extend(snaps.iter().map(|s| s.root));
+        tx.mark_reachable(&roots).unwrap();
+        assert_eq!(fs.read(&mut tx, 2, 0, 30_000).unwrap(), v2);
+        let old = fs.view(&mut tx, "s1").unwrap();
+        assert_eq!(old.read(&mut tx, 2, 0, 30_000).unwrap(), v1);
+        assert!(old.lookup(&mut tx, 1, "b0").unwrap().is_none());
+        assert!(fs.lookup(&mut tx, 1, "b0").unwrap().is_some());
+        let mut ro = old;
+        assert_eq!(ro.write(&mut tx, 2, 0, b"x"), Err(FsError::ReadOnly));
+        assert_eq!(ro.create_file(&mut tx, 1, "z"), Err(FsError::ReadOnly));
+    }
+
+    #[test]
+    fn rollback_restaura_o_snapshot_e_devolve_o_espaco() {
+        let (mut d, s1) = big();
+        let mut al = Allocator::new(4096);
+        let v1 = pat(30_000, 1);
+        let mut prev = txg(&mut d, &mut al, &s1, |tx, fs| {
+            let f = fs.create_file(tx, 1, "a").unwrap();
+            fs.write(tx, f, 0, &v1).unwrap();
+            fs.snapshot(tx, "s1").unwrap();
+        });
+        let base_free = al.free_blocks();
+        prev = txg(&mut d, &mut al, &prev, |tx, fs| {
+            fs.write(tx, 2, 0, &pat(30_000, 50)).unwrap();
+            fs.create_file(tx, 1, "b").unwrap();
+            fs.snapshot(tx, "s2").unwrap();
+        });
+        prev = txg(&mut d, &mut al, &prev, |tx, fs| {
+            fs.write(tx, 2, 100, &pat(5_000, 9)).unwrap();
+        });
+        assert!(al.free_blocks() < base_free - 10);
+        prev = txg(&mut d, &mut al, &prev, |tx, fs| {
+            fs.rollback(tx, "s1").unwrap();
+            assert_eq!(fs.read(tx, 2, 0, 40_000).unwrap(), v1);
+            assert!(fs.lookup(tx, 1, "b").unwrap().is_none());
+            let names: Vec<String> = fs
+                .snapshots(tx)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            assert_eq!(names, ["s1"]);
+        });
+        // Dois commits vazios e o espaço do futuro descartado volta.
+        for _ in 0..2 {
+            prev = txg(&mut d, &mut al, &prev, |_, _| {});
+        }
+        assert!(
+            al.free_blocks() + 3 >= base_free,
+            "livres {} contra {base_free} antes da mudança",
+            al.free_blocks()
+        );
+        // Depois de uma queda a raiz montada é a do rollback, e o snapshot
+        // s1 ainda lê o conteúdo original.
+        d.crash();
+        let m = mount(&mut d, &Fake).unwrap();
+        let mut al2 = Allocator::new(4096);
+        let mut tx = Tx::new(&mut d, &Fake, &mut al2, m.sb.txg + 1, 1);
+        let fs = Fs::open(&mut tx, m.sb.root, [5; 32]).unwrap();
+        assert_eq!(fs.read(&mut tx, 2, 0, 40_000).unwrap(), v1);
+        assert_eq!(
+            fs.view(&mut tx, "s1")
+                .unwrap()
+                .read(&mut tx, 2, 0, 40_000)
+                .unwrap(),
+            v1
+        );
+        assert_eq!(fs.view(&mut tx, "s2").err(), Some(FsError::NotFound));
+    }
+
+    #[test]
+    fn apagar_snapshot_devolve_so_o_que_ele_usava() {
+        let (mut d, s1) = big();
+        let mut al = Allocator::new(4096);
+        let mut prev = txg(&mut d, &mut al, &s1, |tx, fs| {
+            let f = fs.create_file(tx, 1, "a").unwrap();
+            fs.write(tx, f, 0, &pat(40_000, 1)).unwrap();
+            fs.snapshot(tx, "velho").unwrap();
+        });
+        prev = txg(&mut d, &mut al, &prev, |tx, fs| {
+            fs.write(tx, 2, 0, &pat(40_000, 2)).unwrap();
+        });
+        let with_snap = al.free_blocks();
+        prev = txg(&mut d, &mut al, &prev, |tx, fs| {
+            fs.delete_snapshot(tx, "velho").unwrap();
+            assert_eq!(fs.delete_snapshot(tx, "velho"), Err(FsError::NotFound));
+            assert!(fs.snapshots(tx).unwrap().is_empty());
+        });
+        for _ in 0..2 {
+            prev = txg(&mut d, &mut al, &prev, |_, _| {});
+        }
+        // Os 10 blocos de dados do conteúdo antigo voltam.
+        assert!(
+            al.free_blocks() >= with_snap + 10,
+            "{} contra {with_snap}",
+            al.free_blocks()
+        );
+        // O conteúdo vivo continua íntegro.
+        let mut tx = Tx::new(&mut d, &Fake, &mut al, prev.txg + 1, 1);
+        let fs = Fs::open(&mut tx, prev.root, [5; 32]).unwrap();
+        assert_eq!(fs.read(&mut tx, 2, 0, 50_000).unwrap(), pat(40_000, 2));
     }
 }

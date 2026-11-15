@@ -22,7 +22,7 @@ mod tree;
 mod txg;
 
 pub use alloc_map::Allocator;
-pub use fs::{Fs, FsError, Inode, ObjKind};
+pub use fs::{Fs, FsError, Inode, ObjKind, Snap};
 pub use io::{BlockIo, IoError};
 pub use tree::{MAX_VALUE, Tx};
 pub use txg::{Mounted, commit, mount};
