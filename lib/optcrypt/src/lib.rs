@@ -29,6 +29,7 @@ pub mod chacha20;
 pub mod drbg;
 pub mod hkdf;
 pub mod hmac;
+pub mod keyring;
 pub mod poly1305;
 pub mod secret;
 pub mod sha256;
