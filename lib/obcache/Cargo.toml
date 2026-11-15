@@ -1,0 +1,13 @@
+[package]
+name = "obcache"
+description = "obcache: cache de blocos de 4 KiB com limite de memória e despejo LRU (T-521, ADR 0056 item 7)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

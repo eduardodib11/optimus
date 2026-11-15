@@ -898,3 +898,48 @@ mod cifra {
         assert!(!tenta(&mut d, root, &mut cipher(1, 9)));
     }
 }
+
+mod cache {
+    use super::*;
+    use crate::{CachedIo, Fs, Tx};
+
+    #[test]
+    fn leituras_repetidas_acertam_e_o_conteudo_e_o_mesmo() {
+        let mut d = Sim::new(4096);
+        let mut s1 = sb(1, 1);
+        s1.volume_blocks = 4096;
+        d.write(SUPERBLOCKS[1], &s1.encode(&Fake)).unwrap();
+        d.flush().unwrap();
+        // 8 blocos de cache para um arquivo de 20 blocos: há despejo.
+        let mut io = CachedIo::new(d, 8 * BLOCK_SIZE);
+        let mut al = Allocator::new(4096);
+        let mut tx = Tx::new(&mut io, &Fake, &mut al, 2, 1);
+        let mut fs = Fs::create(&mut tx, [5; 32]).unwrap();
+        let f = fs.create_file(&mut tx, 1, "a").unwrap();
+        let body: Vec<u8> = (0..80_000u32).map(|i| (i * 7) as u8).collect();
+        fs.write(&mut tx, f, 0, &body).unwrap();
+        let mut new = sb(0, 0);
+        new.volume_blocks = 4096;
+        new.root = fs.root;
+        tx.commit(&s1, new).unwrap();
+        let root = fs.root;
+        for _ in 0..3 {
+            let mut tx = Tx::new(&mut io, &Fake, &mut al, 3, 1);
+            let fs = Fs::from_root(root, [5; 32]);
+            assert_eq!(fs.read(&mut tx, f, 0, 80_000).unwrap(), body);
+        }
+        let st = io.cache_mut().stats();
+        assert!(st.hits > 0 && st.evictions > 0, "{st:?}");
+        assert!(io.cache_mut().len() <= 8);
+        // Pressão: o cache encolhe e a leitura continua certa.
+        io.cache_mut().trim(0);
+        let mut tx = Tx::new(&mut io, &Fake, &mut al, 3, 1);
+        let fs = Fs::from_root(root, [5; 32]);
+        assert_eq!(fs.read(&mut tx, f, 0, 80_000).unwrap(), body);
+        // O dispositivo continua o mesmo: a queda não perde nada que o
+        // cache esconda (write-through).
+        let mut d = io.into_inner();
+        d.crash();
+        assert_eq!(mount(&mut d, &Fake).unwrap().sb.root, root);
+    }
+}

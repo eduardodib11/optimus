@@ -2032,6 +2032,8 @@ fn storage() -> Result {
         "ogpt",
         "--package",
         "optfs",
+        "--package",
+        "obcache",
     ]))
 }
 
