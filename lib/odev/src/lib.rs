@@ -165,9 +165,28 @@ pub fn score(driver: &Driver, node: &Node) -> u8 {
         .unwrap_or(0)
 }
 
-/// Escolhe o driver mais específico para o nó.
+/// Classe e subclasse PCI de uma IOMMU (08:06).
+const IOMMU_CLASS: (u8, u8) = (0x08, 0x06);
+
+impl Node {
+    /// Nó de uma IOMMU (classe 08:06), cuja função é do kernel (ADR 0055,
+    /// item 3).
+    #[must_use]
+    pub fn is_iommu(&self) -> bool {
+        self.bus == Bus::Pci
+            && self
+                .class
+                .is_some_and(|c| (c.class, c.subclass) == IOMMU_CLASS)
+    }
+}
+
+/// Escolhe o driver mais específico para o nó. Uma IOMMU nunca casa: a
+/// função dela é do kernel (ADR 0055, item 3).
 #[must_use]
 pub fn best_match<'a>(drivers: &'a [Driver], node: &Node) -> Outcome<'a> {
+    if node.is_iommu() {
+        return Outcome::None;
+    }
     let mut best: Option<(&Driver, u8)> = None;
     let mut tie: Option<&Driver> = None;
     for d in drivers {
