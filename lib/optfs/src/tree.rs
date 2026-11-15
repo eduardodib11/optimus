@@ -208,6 +208,86 @@ impl<'a, IO: BlockIo, H: Sha256> Tx<'a, IO, H> {
         })
     }
 
+    /// Grava um bloco de dados novo (ainda em memória até o commit).
+    ///
+    /// # Errors
+    /// [`IoError::Full`] sem blocos livres.
+    pub fn write_data(&mut self, data: &[u8; BLOCK_SIZE]) -> Result<BlockPtr, IoError> {
+        let addr = self.alloc.alloc()?;
+        let auth = self.h.sha256(data);
+        self.staged.insert(addr, Box::new(*data));
+        Ok(BlockPtr {
+            addr,
+            birth: self.txg,
+            logical: 4096,
+            physical: 4096,
+            level: 0,
+            kind: PtrKind::Data,
+            compression: Compression::None,
+            integrity: Integrity::Hash,
+            nonce: [0; 12],
+            auth,
+        })
+    }
+
+    /// Lê um bloco de dados, conferido pelo hash do ponteiro.
+    ///
+    /// # Errors
+    /// [`IoError::Integrity`] se o bloco não confere.
+    pub fn read_data(&mut self, p: &BlockPtr) -> Result<[u8; BLOCK_SIZE], IoError> {
+        if p.kind != PtrKind::Data || p.integrity != Integrity::Hash || p.physical != 4096 {
+            return Err(IoError::Integrity);
+        }
+        let mut b = [0u8; BLOCK_SIZE];
+        match self.staged.get(&p.addr) {
+            Some(s) => b = **s,
+            None => self.io.read(p.addr, &mut b)?,
+        }
+        if self.h.sha256(&b) != p.auth {
+            return Err(IoError::Integrity);
+        }
+        Ok(b)
+    }
+
+    /// Depois da montagem, marca no alocador todo bloco que a árvore de
+    /// arquivos alcança: nós e blocos de dados (itens `Extent` com tag 1).
+    ///
+    /// # Errors
+    /// [`IoError::Integrity`] se algum nó não confere.
+    pub fn mark_reachable(&mut self, root: &BlockPtr) -> Result<(), IoError> {
+        if root.is_null() {
+            return Ok(());
+        }
+        self.alloc.mark_used(root.addr);
+        match self.read(root)? {
+            Node::Internal(v) => {
+                for (_, c) in &v {
+                    self.mark_reachable(c)?;
+                }
+            }
+            Node::Leaf(v) => {
+                for (k, x) in &v {
+                    if k.kind == optfs_format::KeyKind::Extent && x.first() == Some(&1) {
+                        let p = BlockPtr::decode(&x[1..]).map_err(|_| IoError::Integrity)?;
+                        self.alloc.mark_used(p.addr);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Blocos livres no alocador.
+    #[must_use]
+    pub fn free_blocks(&self) -> u64 {
+        self.alloc.free_blocks()
+    }
+
+    /// Libera um bloco que a árvore deixou de usar (ver `release`).
+    pub fn free_ptr(&mut self, p: &BlockPtr) {
+        self.release(p);
+    }
+
     fn release(&mut self, p: &BlockPtr) {
         if p.birth == self.txg && self.staged.remove(&p.addr).is_some() {
             // Nasceu neste txg e ainda não foi ao disco: nenhum superbloco

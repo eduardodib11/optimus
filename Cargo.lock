@@ -319,6 +319,7 @@ version = "0.1.0"
 name = "optfs"
 version = "0.1.0"
 dependencies = [
+ "optcrypt",
  "optfs-format",
 ]
 
