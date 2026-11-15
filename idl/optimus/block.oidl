@@ -1,0 +1,50 @@
+// BlockDevice (T-514; ADR 0056, item 10): o driver de disco (hoje o
+// `virtio-blk`) serve este contrato ao `storaged`. É o mesmo modelo de fila
+// do `BlockStore`: anéis SPSC (ADR 0036) e registros do item 4 da ADR 0056,
+// mas com os papéis que o `svcmgr` permite (o cliente só tem `SEND`, então
+// nada que o cliente cria cruza para o driver sem um `GRANT`):
+//
+// 1. `session()` devolve um endpoint do driver com `SEND|GRANT`; as chamadas
+//    que levam capabilities (`attach_done`) vão por ele.
+// 2. O driver cria o anel de submissões (ele o consome) e a região de dados
+//    (memória de DMA dele) e as entrega por `submit_ring`, `submit_signal` e
+//    `data_region`. O `storaged` copia os dados de e para essa região, como
+//    diz a ADR 0056 (uma cópia no M5).
+// 3. O `storaged` cria o anel de conclusões (ele o consome) e o entrega por
+//    `attach_done`, com o `SIGNAL` da sua `Notification`.
+//
+// Submissão (carga de 24 bytes, tipo 1): `id: u64`, `op: u8` (0 READ,
+// 1 WRITE, 2 FLUSH), `flags: u8` (zero; FUA o `storaged` emula), `count: u16`
+// (setores), `offset: u32` (bytes na região de dados, alinhado a 4 KiB) e
+// `sector: u64`. Conclusão (carga de 16 bytes, tipo 1): `id: u64` e
+// `status: u8` (0 ok ou um `BlockError`).
+package optimus.block @1.0;
+
+enum BlockError : u8 { Io, OutOfRange, ReadOnly, Reset, Full, BadRequest }
+
+// `sectors` de `sector_size` bytes; `max_sectors` por pedido; `depth` pedidos
+// em voo; `data_bytes` da região de dados; `ring_bytes` de dados em cada anel
+// (o de conclusões, que o `storaged` cria, tem esse tamanho); `flush` se
+// `FLUSH` tem efeito (sem ele o dispositivo é write-through e o `FLUSH`
+// conclui na hora, depois dos pedidos anteriores).
+struct BlockInfo {
+    sectors: u64,
+    sector_size: u32,
+    data_bytes: u32,
+    ring_bytes: u32,
+    max_sectors: u16,
+    depth: u16,
+    read_only: bool,
+    flush: bool
+}
+
+interface BlockDevice {
+    info() -> result<BlockInfo, BlockError>;
+    session() -> result<handle<Endpoint>, BlockError>;
+    submit_ring() -> result<handle<MemoryObject>, BlockError>;
+    submit_signal() -> result<handle<Notification>, BlockError>;
+    data_region() -> result<handle<MemoryObject>, BlockError>;
+    // Só pela sessão (com `GRANT`): `ring` é o anel de conclusões e `signal`
+    // o `SIGNAL` da `Notification` de quem o consome.
+    attach_done(ring: handle<MemoryObject>, signal: handle<Notification>) -> result<(), BlockError>;
+}

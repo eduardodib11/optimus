@@ -17,6 +17,7 @@ needs = [
   "kernel:debug",
   "svc:optimus.console.Console@1?",
   "svc:optimus.display.DisplayDevice@1?",
+  "svc:optimus.block.BlockDevice@1?",
   "svc:optimus.dev.EntropySource@1?",
 ]
 provides = []

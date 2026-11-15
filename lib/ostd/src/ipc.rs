@@ -221,6 +221,36 @@ pub fn call_corpo(
     Ok((rec.msg.label, n))
 }
 
+/// Como [`call_corpo`], mais as capabilities `caps` do chamador (até
+/// [`kabi::MSG_MAX_CAPS`]). A capability do `ep` precisa de `GRANT`. Os
+/// handles novos da resposta (se houver) ficam em `buf.get().caps`.
+///
+/// # Errors
+///
+/// `InvalidArgument` se o corpo, a resposta ou as capabilities não cabem; os
+/// do kernel.
+pub fn call_corpo_caps(
+    ep: Handle,
+    buf: &mut Buffer,
+    rotulo: u64,
+    corpo: &[u8],
+    caps: &[Handle],
+    saida: &mut [u8],
+    deadline: u64,
+) -> Result<(u64, usize), Error> {
+    if caps.len() > kabi::MSG_MAX_CAPS {
+        return Err(Error::InvalidArgument);
+    }
+    let mut msg = monta(buf, rotulo, corpo)?;
+    for (dst, c) in buf.get().caps.iter_mut().zip(caps) {
+        *dst = c.raw();
+    }
+    msg.info.caps = u8::try_from(caps.len()).map_err(|_| Error::InvalidArgument)?;
+    let rec = call(ep, &msg, deadline)?;
+    let n = copia(buf, &rec.msg, saida)?;
+    Ok((rec.msg.label, n))
+}
+
 /// Uma mensagem recebida com corpo: badge, rótulo e bytes copiados.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Recebido {

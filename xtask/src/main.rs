@@ -942,6 +942,7 @@ macro_rules! m4_markers {
             // T-514: o cliente conversa com o driver pelo contrato gerado.
             "drvcli: console ok",
             "drvcli: display ok",
+            "drvcli: block ok",
             "drvcli: entropy ok",
             // T-518: o `keyd` soma a contribuição do virtio-rng à semente.
             "keyd: contribuição virtio=",
@@ -993,6 +994,8 @@ const M4_FORBIDDEN: &[&str] = &[
     "drvcli: console: sem driver",
     "drvcli: display: falhou",
     "drvcli: display: sem driver",
+    "drvcli: block: falhou",
+    "drvcli: block: sem driver",
     "drvcli: entropy: falhou",
     "drvcli: entropy: sem driver",
     "virtio-input: falhou",
@@ -1013,6 +1016,8 @@ const M4_IOMMU_FORBIDDEN: &[&str] = &[
     "drvcli: console: sem driver",
     "drvcli: display: falhou",
     "drvcli: display: sem driver",
+    "drvcli: block: falhou",
+    "drvcli: block: sem driver",
     "drvcli: entropy: falhou",
     "drvcli: entropy: sem driver",
     "virtio-input: falhou",
