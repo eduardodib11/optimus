@@ -222,8 +222,9 @@ impl Devmgr {
             .map_or("?", |d| d.name.as_str())
     }
 
-    /// Trata cada driver cujo bit de falta de DMA veio em `bits`.
-    fn faulted(&mut self, bits: u64) {
+    /// Trata cada driver cujo bit de falta de DMA veio em `bits`; `woke` é
+    /// quando a thread de faltas acordou com eles.
+    fn faulted(&mut self, bits: u64, woke: u64) {
         let hit: Vec<u32> = self
             .bound
             .iter()
@@ -231,15 +232,16 @@ impl Devmgr {
             .map(|b| b.driver)
             .collect();
         for id in hit {
-            self.contain(id);
+            self.contain(id, woke);
         }
     }
 
     /// Contém o driver `id` que fez DMA fora do domínio (ADR 0051, itens 3
     /// e 4): o `svcmgr` o para, os recursos dele saem (o domínio morre e a
     /// IOMMU passa a barrar o dispositivo) e, dentro do teto de faltas, o
-    /// driver parte de novo com recursos novos.
-    fn contain(&mut self, id: u32) {
+    /// driver parte de novo com recursos novos. O log registra o tempo
+    /// desde `woke` até os recursos saírem (ADR 0055, item 7).
+    fn contain(&mut self, id: u32, woke: u64) {
         let Some(i) = self.bound.iter().position(|b| b.driver == id) else {
             return;
         };
@@ -260,6 +262,10 @@ impl Devmgr {
             let _ = ostd::cap::delete(h);
         }
         let now = ostd::time::now_ns();
+        ostd::debug::print_fmt(format_args!(
+            "devmgr: {name} contido {} µs depois da falta",
+            now.saturating_sub(woke) / 1000
+        ));
         let k = self
             .history
             .iter()
@@ -303,9 +309,12 @@ impl Devmgr {
                 // A thread de faltas volta a esperar já; as faltas que
                 // chegarem enquanto esta é tratada ficam como bits.
                 let _ = ipc::send(reply, &ipc::Message::new(osvc::REPLY_OK, &[]), 0);
-                let mut bits = [0u8; 8];
-                bits.copy_from_slice(&req[..8]);
-                self.faulted(u64::from_le_bytes(bits));
+                let word = |i: usize| {
+                    let mut w = [0u8; 8];
+                    w.copy_from_slice(&req[i * 8..i * 8 + 8]);
+                    u64::from_le_bytes(w)
+                };
+                self.faulted(word(0), word(1));
                 continue;
             }
             let ((label, n), start) = match wire::method_of(r.rotulo) {
@@ -322,11 +331,12 @@ impl Devmgr {
 }
 
 /// A thread de faltas (ADR 0055, item 6): espera, sem prazo, a notificação
-/// e manda os bits ao laço por `send`, a capability de envio com
-/// [`FAULT_BADGE`]. Termina quando o endpoint some.
+/// e manda os bits e o instante em que acordou ao laço por `send`, a
+/// capability de envio com [`FAULT_BADGE`]. Termina quando o endpoint some.
 fn wait_faults(faults: Handle, send: Handle) {
     while let Ok(bits) = ostd::cap::ntfy_wait(faults) {
-        if ipc::call(send, &ipc::Message::new(0, &[bits]), 0).is_err() {
+        let woke = ostd::time::now_ns();
+        if ipc::call(send, &ipc::Message::new(0, &[bits, woke]), 0).is_err() {
             return;
         }
     }

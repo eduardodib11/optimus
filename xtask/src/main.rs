@@ -851,6 +851,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
         // T-422 (ADR 0051): o `devmgr` contém o driver que faltou, o
         // `svcmgr` o para e ele parte de novo, agora sem o DMA ruim.
         "devmgr: falta de DMA do driver drvteste: contido",
+        CONTAINED,
         "svcmgr: drvteste parado pelo devmgr",
         "devmgr: driver drvteste reiniciado",
         "drvteste: reiniciado pelo devmgr, DMA válido ok",
@@ -862,6 +863,39 @@ const DRIVER_SCENARIO: Scenario = Scenario {
         "drvteste: falhou",
         "driver não partiu",
         "isolado após",
+    ],
+    ..SCENARIOS[0]
+};
+
+/// Linha do `devmgr` com o tempo da falta à contenção (T-511).
+const CONTAINED: &str = "µs depois da falta";
+
+/// Aceite da T-511 (ADR 0055): o mesmo roteiro da T-422 com `amd-iommu`.
+/// A falta do `drvteste` chega ao `devmgr` pela MSI do log de eventos, e
+/// ele contém e reinicia o driver como no VT-d.
+const AMD_DRIVER_SCENARIO: Scenario = Scenario {
+    name: "devmgr contém e reinicia o drvteste com AMD-Vi",
+    markers: &[
+        "okernel: AMD-Vi ligado: 1 unidade(s)",
+        "1234:11e8 1 BARs: drvteste",
+        "svcmgr: drvteste em Running",
+        "drvteste: DMA e MSI pelo edu ok",
+        "drvteste: DMA fora do domínio pedido",
+        "okernel: falta de DMA: dev=00:",
+        "devmgr: falta de DMA do driver drvteste: contido",
+        CONTAINED,
+        "svcmgr: drvteste parado pelo devmgr",
+        "devmgr: driver drvteste reiniciado",
+        "drvteste: reiniciado pelo devmgr, DMA válido ok",
+        "okernel: desligando",
+    ],
+    forbidden: &[
+        "okernel: FALTA",
+        "PÂNICO",
+        "drvteste: falhou",
+        "driver não partiu",
+        "isolado após",
+        "AMD-Vi sem interrupção de falta",
     ],
     ..SCENARIOS[0]
 };
@@ -1115,6 +1149,11 @@ fn smoke(opts: &Options, scenarios: &[Scenario]) -> Result {
     for scenario in scenarios {
         let serial = boot_scenario(opts, scenario)?;
         bases.extend(direct_map_base(&serial));
+        // T-511 (ADR 0055, item 7): da falta à contenção, pelo `devmgr`.
+        if let Some(line) = serial.lines().find(|l| l.contains(CONTAINED)) {
+            let text = line.split_once("devmgr: ").map_or(line, |(_, t)| t);
+            println!("xtask: {}: {}", scenario.name, text.trim());
+        }
     }
     check_direct_map_bases(&bases)
 }
@@ -1631,8 +1670,8 @@ fn check_serial(serial: &str, markers: &[&str], forbidden: &[&str]) -> Result {
     Ok(())
 }
 
-/// `cargo xtask test iommu`: os aceites com VT-d e com AMD-Vi (T-403,
-/// T-404, T-422, T-510).
+/// `cargo xtask test iommu`: os aceites do kernel e do `devmgr` com VT-d e
+/// com AMD-Vi (T-403, T-404, T-422, T-510, T-511).
 fn iommu(opts: &Options) -> Result {
     let vtd = Options {
         devices: vec!["intel-iommu", "edu"],
@@ -1643,7 +1682,7 @@ fn iommu(opts: &Options) -> Result {
         devices: vec!["amd-iommu", "edu"],
         ..opts.clone()
     };
-    smoke(&amd, &[AMD_IOMMU_SCENARIO])
+    smoke(&amd, &[AMD_IOMMU_SCENARIO, AMD_DRIVER_SCENARIO])
 }
 
 fn test(opts: &Options) -> Result {
