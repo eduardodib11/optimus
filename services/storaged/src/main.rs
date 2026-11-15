@@ -1,4 +1,4 @@
-//! `storaged` (T-520; ADR 0056 e 0064): lê a GPT do disco e serve cada
+//! `storaged` (T-520; ADR 0056 e 0066): lê a GPT do disco e serve cada
 //! partição como `BlockStore`.
 //!
 //! 1. espera o driver (`optimus.block.BlockDevice`) pelo `svcmgr` e pega os

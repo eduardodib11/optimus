@@ -1,4 +1,4 @@
-# ADR 0064: `storaged`, descoberta por partição e filas do `BlockStore`
+# ADR 0066: `storaged`, descoberta por partição e filas do `BlockStore`
 
 - Status: aceita em modo autônomo (2026-11-15), **aguardando revisão do Eduardo**
 - Data: 2026-11-15

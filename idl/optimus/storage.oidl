@@ -1,4 +1,4 @@
-// Armazenamento (T-520; ADR 0056, itens 3 a 6, e ADR 0064): o `storaged` lê
+// Armazenamento (T-520; ADR 0056, itens 3 a 6, e ADR 0066): o `storaged` lê
 // a GPT do disco e serve duas interfaces no mesmo endpoint, que o `svcmgr`
 // entrega como `optimus.storage.Storage`.
 //
