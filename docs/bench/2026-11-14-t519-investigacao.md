@@ -163,5 +163,6 @@ ADR própria.
 
 Na rodada do AMD 7763 o `timer.mil_no_prazo` falhou em KVM (p99 do atraso
 na faixa de 250 µs, pior caso 136 µs, limite de 100 µs). O teste não passa
-pelo IPC; a mesma falha já tinha aparecido no 8370C com o código da
-`main` (ver acima).
+pelo IPC e não muda com este lote; a mesma falha já tinha aparecido no
+8370C antes dele, só com o item 1 (ver acima), e a outra rodada do lote
+(no 6975P-C) passou.
