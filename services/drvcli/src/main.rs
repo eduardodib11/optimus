@@ -16,6 +16,7 @@ use ostd::svc::Session;
 use ostd::vm::{Mapping, SELF};
 
 mod console_cliente;
+mod crash_step;
 mod display_cliente;
 mod entropy_cliente;
 mod input_cliente;
@@ -295,6 +296,15 @@ fn block_steps(buf: &mut ostd::ipc::Buffer, quota: Handle, data: Handle) -> Opti
 fn storage_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
     let storage = StorageCliente::new(ep);
     let buf = &mut s.buffer;
+    // Disco do teste de queda (T-533): a partição `crash` troca todo o resto.
+    if let Ok(Ok(crash)) = storage.open(buf, "crash") {
+        let info = BlockStoreCliente::new(crash).info(buf).ok()?.ok()?;
+        let mut q = open_fila(buf, quota, crash)?;
+        if crash_step::run(&mut q, info.blocks).is_none() {
+            ostd::debug::print("fsstress: erro");
+        }
+        return None;
+    }
     // Partição que não existe.
     if !matches!(storage.open(buf, "nada"), Ok(Err(_))) {
         return None;
