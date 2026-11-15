@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, sync::mpsc, thread};
 
@@ -293,7 +294,8 @@ fn parse(args: &[String]) -> Result<Options> {
                 );
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
-            | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "storage" | "all" => {
+            | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "storage" | "crash"
+            | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -626,6 +628,12 @@ const DISK_PARTS: &[(&str, u64, u64)] = &[
 ];
 
 /// CRC32 (IEEE) da GPT.
+/// Como `qemu` prepara o disco de teste: zerado (padrão), zerado com a
+/// partição `crash` ou o da rodada anterior (T-533).
+static DISK_MODE: AtomicU8 = AtomicU8::new(0);
+const DISK_CRASH: u8 = 1;
+const DISK_KEEP: u8 = 2;
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     for b in data {
@@ -642,12 +650,18 @@ fn crc32(data: &[u8]) -> u32 {
 /// Os setores entre a tabela e a primeira partição ficam livres para os
 /// autotestes dos drivers.
 #[allow(clippy::cast_possible_truncation)]
-fn gpt_disk() -> Vec<u8> {
+fn gpt_disk(crash: bool) -> Vec<u8> {
     const SS: usize = 512;
     let total = DISK_SECTORS;
     let mut d = vec![0u8; total as usize * SS];
     let mut ents = vec![0u8; 128 * 128];
     for (i, (name, first, last)) in DISK_PARTS.iter().enumerate() {
+        // No teste de queda (T-533) a `data` vira `crash` (ver `crash_step`).
+        let name = if crash && *name == "data" {
+            "crash"
+        } else {
+            name
+        };
         let e = &mut ents[i * 128..(i + 1) * 128];
         // GUID de tipo de dados básicos do Linux e um GUID único qualquer.
         e[..16].copy_from_slice(&[
@@ -705,7 +719,12 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
     // Disco de teste (zerado a cada rodada) para os `virtio-blk-pci`.
     if opts.devices.iter().any(|d| d.starts_with("virtio-blk-pci")) {
         let disk = root().join("target/disk.img");
-        fs::write(&disk, gpt_disk()).map_err(|e| format!("gravando {}: {e}", disk.display()))?;
+        // O teste de queda reaproveita o disco da rodada anterior.
+        if DISK_MODE.load(Ordering::SeqCst) != DISK_KEEP {
+            let crash = DISK_MODE.load(Ordering::SeqCst) == DISK_CRASH;
+            fs::write(&disk, gpt_disk(crash))
+                .map_err(|e| format!("gravando {}: {e}", disk.display()))?;
+        }
         cmd.args([
             "-drive",
             &format!("if=none,id=vd0,format=raw,file={}", disk.display()),
@@ -2016,6 +2035,160 @@ fn storage() -> Result {
     ]))
 }
 
+/// `Sha256` do `optfs` no host.
+struct HostSha;
+
+impl optfs_format::Sha256 for HostSha {
+    fn sha256(&self, data: &[u8]) -> [u8; 32] {
+        optcrypt::sha256::hash(data)
+    }
+}
+
+/// A partição `crash` do disco de teste na memória, como `BlockIo`.
+struct DiskImage {
+    bytes: Vec<u8>,
+}
+
+impl optfs::BlockIo for DiskImage {
+    fn blocks(&self) -> u64 {
+        (self.bytes.len() / 4096) as u64
+    }
+
+    fn read(
+        &mut self,
+        block: u64,
+        buf: &mut [u8; 4096],
+    ) -> std::result::Result<(), optfs::IoError> {
+        let at = usize::try_from(block).map_err(|_| optfs::IoError::Io)? * 4096;
+        buf.copy_from_slice(self.bytes.get(at..at + 4096).ok_or(optfs::IoError::Io)?);
+        Ok(())
+    }
+
+    fn write(&mut self, _: u64, _: &[u8; 4096]) -> std::result::Result<(), optfs::IoError> {
+        Err(optfs::IoError::Io)
+    }
+
+    fn flush(&mut self) -> std::result::Result<(), optfs::IoError> {
+        Ok(())
+    }
+}
+
+/// Conteúdo do arquivo `f` no txg `txg` (o mesmo do `crash_step`).
+#[allow(clippy::cast_possible_truncation)]
+fn crash_pattern(txg: u64) -> Vec<u8> {
+    let seed = txg.to_le_bytes()[0];
+    (0..6000usize)
+        .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+        .collect()
+}
+
+/// Confere o disco depois da queda: o volume monta, o txg montado não
+/// perde nenhum commit confirmado (`confirmed`), toda a árvore passa na
+/// conferência e o arquivo tem o conteúdo do txg montado. Devolve o txg.
+#[allow(clippy::cast_possible_truncation)]
+fn crash_verify(confirmed: u64) -> Result<u64> {
+    let disk = root().join("target/disk.img");
+    let img = fs::read(&disk).map_err(|e| format!("lendo {}: {e}", disk.display()))?;
+    let (_, first, last) = DISK_PARTS[2];
+    let (from, to) = (first as usize * 512, (last + 1) as usize * 512);
+    let blocks = ((to - from) / 4096) as u64;
+    let mut io = DiskImage {
+        bytes: img[from..from + blocks as usize * 4096].to_vec(),
+    };
+    let sha = HostSha;
+    let m = optfs::mount(&mut io, &sha).map_err(|e| format!("o volume não monta: {e:?}"))?;
+    if m.sb.txg < confirmed {
+        return Err(format!(
+            "commit confirmado perdido: txg {confirmed} na serial, {} no disco",
+            m.sb.txg
+        ));
+    }
+    let mut al = optfs::Allocator::new(blocks);
+    let mut tx = optfs::Tx::new(&mut io, &sha, &mut al, m.sb.txg + 1, 1);
+    tx.mark_reachable(&[m.sb.root])
+        .map_err(|e| format!("árvore do txg {} corrompida: {e:?}", m.sb.txg))?;
+    let fs = optfs::Fs::from_root(m.sb.root, [7; 32]);
+    let (f, _) = fs
+        .lookup(&mut tx, 1, "f")
+        .map_err(|e| format!("lookup: {e:?}"))?
+        .ok_or("arquivo f sumiu")?;
+    let got = fs
+        .read(&mut tx, f, 0, 6000)
+        .map_err(|e| format!("lendo f: {e:?}"))?;
+    if got != crash_pattern(m.sb.txg) {
+        return Err(format!("conteúdo de f não é o do txg {}", m.sb.txg));
+    }
+    Ok(m.sb.txg)
+}
+
+/// Aceite da T-533: derruba o QEMU em pontos aleatórios enquanto o
+/// `drvcli` grava commits (`OPTIMUS_CRASH_ROUNDS`, 5 por padrão; 200 na
+/// campanha noturna) e confere o disco depois de cada queda. O disco passa
+/// de uma rodada à seguinte, então o volume remonta várias vezes.
+fn crash(opts: &Options) -> Result {
+    let rounds: u64 = env::var("OPTIMUS_CRASH_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| d.as_secs() ^ u64::from(d.subsec_nanos()))
+        | 1;
+    println!("xtask: queda de energia: {rounds} rodadas, semente {seed}");
+    let plain = Options {
+        devices: vec![
+            "virtio-blk-pci,drive=vd0,disable-legacy=on",
+            "virtio-rng-pci,disable-legacy=on",
+            "virtio-serial-pci,disable-legacy=on",
+            "virtconsole,chardev=vcon",
+            "virtio-keyboard-pci,disable-legacy=on",
+            "virtio-net-pci,netdev=vn0,disable-legacy=on",
+            "virtio-gpu-pci,id=vgpu,disable-legacy=on",
+        ],
+        ..opts.clone()
+    };
+    build_test(&plain)?;
+    DISK_MODE.store(DISK_CRASH, Ordering::SeqCst);
+    for round in 1..=rounds {
+        // xorshift64: derruba depois de 1 a 3 commits desta rodada (a janela de
+        // supervisão do `svcmgr` dá tempo para uns 4).
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let n = 1 + seed % 3;
+        let marker: &'static str = Box::leak(format!("fsstress: commit {n} txg ").into_boxed_str());
+        let markers: &'static [&'static str] = Box::leak(vec![marker].into_boxed_slice());
+        let sc = Scenario {
+            name: "queda de energia",
+            markers,
+            forbidden: &["fsstress: erro", "okernel: FALTA"],
+            key: None,
+            ..VIRTIO_SCENARIO
+        };
+        let serial = boot_scenario(&plain, &sc)?;
+        DISK_MODE.store(DISK_KEEP, Ordering::SeqCst);
+        let confirmed = serial
+            .lines()
+            .filter_map(|l| {
+                l.split_once("fsstress: commit ")?
+                    .1
+                    .split_once(" txg ")?
+                    .1
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0);
+        let mounted = crash_verify(confirmed)?;
+        println!(
+            "xtask: queda {round}/{rounds}: confirmado txg {confirmed}, montado txg {mounted}"
+        );
+    }
+    DISK_MODE.store(0, Ordering::SeqCst);
+    Ok(())
+}
+
 fn test(opts: &Options) -> Result {
     if matches!(opts.suite.as_str(), "unit" | "all") {
         status(cargo().args([
@@ -2081,6 +2254,9 @@ fn test(opts: &Options) -> Result {
     }
     if opts.suite == "storage" {
         storage()?;
+    }
+    if opts.suite == "crash" {
+        crash(opts)?;
     }
     if opts.suite == "smp" {
         smp(opts)?;

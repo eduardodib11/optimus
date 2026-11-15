@@ -8,7 +8,7 @@ use optfs::{Allocator, BlockIo, Fs, IoError, Tx, mount};
 use optfs_format::{BLOCK_SIZE, BlockPtr, Integrity, SUPERBLOCKS, Sha256, Superblock};
 use ostd::vec::Vec;
 
-struct Sha;
+pub(super) struct Sha;
 
 impl Sha256 for Sha {
     fn sha256(&self, data: &[u8]) -> [u8; 32] {
@@ -18,7 +18,7 @@ impl Sha256 for Sha {
 
 /// `BlockIo` sobre uma fila do `BlockStore`, um bloco por pedido, com a
 /// conferência da ordem de escrita.
-struct QueueIo<'a> {
+pub(super) struct QueueIo<'a> {
     f: &'a mut Fila,
     blocks: u64,
     id: u64,
@@ -28,7 +28,17 @@ struct QueueIo<'a> {
     ordem_ok: bool,
 }
 
-impl QueueIo<'_> {
+impl<'a> QueueIo<'a> {
+    pub(super) fn new(f: &'a mut Fila, blocks: u64) -> Self {
+        Self {
+            f,
+            blocks,
+            id: 100,
+            dirty: 0,
+            ordem_ok: true,
+        }
+    }
+
     fn run(&mut self, op: u8, flags: u8, block: u64) -> Result<(), IoError> {
         self.id += 1;
         let count = u16::from(op != 2);
@@ -81,13 +91,7 @@ fn pattern(n: usize, seed: u8) -> Vec<u8> {
 #[inline(never)]
 pub fn run(f: &mut Fila, blocks: u64) -> Option<()> {
     let h = Sha;
-    let mut io = QueueIo {
-        f,
-        blocks,
-        id: 100,
-        dirty: 0,
-        ordem_ok: true,
-    };
+    let mut io = QueueIo::new(f, blocks);
     let s1 = Superblock {
         uuid: [1; 16],
         txg: 1,

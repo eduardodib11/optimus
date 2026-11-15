@@ -1,0 +1,48 @@
+name: Queda de energia do OptFS (noturno)
+
+# T-533 (backlog M5): `cargo xtask test crash` derruba o QEMU em pontos
+# aleatórios enquanto o drvcli grava commits no OptFS e confere o disco
+# depois de cada queda. Toda noite: 200 quedas; à mão, o número que pedir.
+
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Número de quedas
+        required: false
+        default: "200"
+
+jobs:
+  queda:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain fixada em rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: QEMU e OVMF
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+      - name: Quedas de energia
+        env:
+          ROUNDS_IN: ${{ inputs.rounds }}
+        run: |
+          set -o pipefail
+          mkdir -p target/crash
+          OPTIMUS_CRASH_ROUNDS="${ROUNDS_IN:-200}" cargo xtask test crash 2>&1 | tee target/crash/crash.log
+      - name: Resumo da campanha
+        if: always()
+        run: |
+          {
+            echo "## Queda de energia do OptFS"
+            echo
+            echo "Commit: \`$GITHUB_SHA\`"
+            echo
+            grep -E "^xtask: (queda|smoke)" target/crash/crash.log | tail -n 20 | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: queda-de-energia
+          path: target/crash/
