@@ -17,10 +17,12 @@ extern crate alloc;
 
 mod alloc_map;
 mod io;
+mod tree;
 mod txg;
 
 pub use alloc_map::Allocator;
 pub use io::{BlockIo, IoError};
+pub use tree::{MAX_VALUE, Tx};
 pub use txg::{Mounted, commit, mount};
 
 #[cfg(test)]

@@ -86,6 +86,11 @@ impl Allocator {
         self.pending.push((txg, b));
     }
 
+    /// Libera já um bloco que nasceu no txg corrente e nunca foi gravado.
+    pub fn free_now(&mut self, b: u64) {
+        self.set(b, false);
+    }
+
     /// O txg `txg` foi confirmado: o que foi liberado em `txg - 1` ou
     /// antes volta a ser alocável.
     pub fn confirmed(&mut self, txg: u64) {
