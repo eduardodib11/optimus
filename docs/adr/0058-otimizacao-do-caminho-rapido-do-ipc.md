@@ -1,6 +1,6 @@
 # ADR 0058: Otimização do caminho rápido do IPC (plano B da T-519)
 
-- Status: proposta
+- Status: aceita (aprovada por Eduardo em 2026-11-14)
 - Data: 2026-11-14
 - Origem: backlog do M5, T-519 (aberta pelo Eduardo em 2026-11-14 em vez de aceitar a ressalva da T-430); SDD v1.0, seções 6.4, 6.7 e 20.3
 - Relaciona-se com: ADR 0027 (registradores de mensagem), ADR 0031 (item 7, TLB e PCID), ADR 0032 (item 7, a troca), ADR 0039 (item 3, TLS)
