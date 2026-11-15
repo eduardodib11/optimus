@@ -295,7 +295,7 @@ fn parse(args: &[String]) -> Result<Options> {
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
             | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "storage" | "crash"
-            | "all" => {
+            | "persist" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -633,6 +633,8 @@ const DISK_PARTS: &[(&str, u64, u64)] = &[
 static DISK_MODE: AtomicU8 = AtomicU8::new(0);
 const DISK_CRASH: u8 = 1;
 const DISK_KEEP: u8 = 2;
+/// Disco zerado com a partição `cifra` (T-540).
+const DISK_PERSIST: u8 = 3;
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -650,17 +652,16 @@ fn crc32(data: &[u8]) -> u32 {
 /// Os setores entre a tabela e a primeira partição ficam livres para os
 /// autotestes dos drivers.
 #[allow(clippy::cast_possible_truncation)]
-fn gpt_disk(crash: bool) -> Vec<u8> {
+fn gpt_disk(renamed: Option<&str>) -> Vec<u8> {
     const SS: usize = 512;
     let total = DISK_SECTORS;
     let mut d = vec![0u8; total as usize * SS];
     let mut ents = vec![0u8; 128 * 128];
     for (i, (name, first, last)) in DISK_PARTS.iter().enumerate() {
         // No teste de queda (T-533) a `data` vira `crash` (ver `crash_step`).
-        let name = if crash && *name == "data" {
-            "crash"
-        } else {
-            name
+        let name = match renamed {
+            Some(r) if *name == "data" => r,
+            _ => name,
         };
         let e = &mut ents[i * 128..(i + 1) * 128];
         // GUID de tipo de dados básicos do Linux e um GUID único qualquer.
@@ -721,8 +722,12 @@ fn qemu(opts: &Options, esp: &Path) -> Result<Command> {
         let disk = root().join("target/disk.img");
         // O teste de queda reaproveita o disco da rodada anterior.
         if DISK_MODE.load(Ordering::SeqCst) != DISK_KEEP {
-            let crash = DISK_MODE.load(Ordering::SeqCst) == DISK_CRASH;
-            fs::write(&disk, gpt_disk(crash))
+            let renamed = match DISK_MODE.load(Ordering::SeqCst) {
+                DISK_CRASH => Some("crash"),
+                DISK_PERSIST => Some("cifra"),
+                _ => None,
+            };
+            fs::write(&disk, gpt_disk(renamed))
                 .map_err(|e| format!("gravando {}: {e}", disk.display()))?;
         }
         cmd.args([
@@ -853,6 +858,15 @@ struct Scenario {
 /// errando uma vez e, depois, errar três vezes para o volume ficar trancado.
 const CONSOLE_INPUT: &str =
     "optimus-entrada\nsenha-de-teste\nsenha-de-teste\nerrada\nsenha-de-teste\nx1\nx2\nx3\n";
+/// Entrada do console no cenário de volume cifrado (T-540): a primeira
+/// linha é do `drvcli`; o boot de criação digita a senha nova duas vezes e
+/// uma de desbloqueio, e o boot seguinte só a de desbloqueio.
+const PERSIST_FIRST_INPUT: &str =
+    "optimus-entrada\nsenha-de-teste\nsenha-de-teste\nsenha-de-teste\n";
+const PERSIST_NEXT_INPUT: &str = "optimus-entrada\nsenha-de-teste\n";
+/// Qual entrada o [`ConsoleFeed`] digita: 0 = [`CONSOLE_INPUT`], 1 e 2 = as
+/// do cenário cifrado.
+static CONSOLE_MODE: AtomicU8 = AtomicU8::new(0);
 /// Senha de teste: não pode aparecer na serial nem ser repetida no console.
 const TEST_PASSWORD: &str = "senha-de-teste";
 
@@ -883,12 +897,23 @@ impl ConsoleFeed {
             && serial.contains("virtio-console: texto enviado")
             && let Ok(mut c) =
                 std::os::unix::net::UnixStream::connect(root().join("target/vcon.sock"))
-            && c.write_all(CONSOLE_INPUT.as_bytes()).is_ok()
+            && c.write_all(
+                match CONSOLE_MODE.load(Ordering::SeqCst) {
+                    1 => PERSIST_FIRST_INPUT,
+                    2 => PERSIST_NEXT_INPUT,
+                    _ => CONSOLE_INPUT,
+                }
+                .as_bytes(),
+            )
+            .is_ok()
         {
             self.sent = true;
             self.conn = Some(c);
         }
-        if self.conn.is_some() && serial.contains("drvcli: keyd: volume trancado sem a senha") {
+        if self.conn.is_some()
+            && (serial.contains("drvcli: keyd: volume trancado sem a senha")
+                || serial.contains("drvcli: optfs cifrado: "))
+        {
             self.conn = None;
         }
     }
@@ -2191,6 +2216,107 @@ fn crash(opts: &Options) -> Result {
     Ok(())
 }
 
+/// Texto que o cenário cifrado grava (`persist_step::SEGREDO`): não pode
+/// aparecer em claro no disco.
+const PERSIST_SECRET: &[u8] = b"segredo-do-usuario-optfs-cifrado-T540";
+
+/// Aceite da T-540: o volume cifrado atravessa reinícios. O primeiro boot
+/// cria o volume pelo `keyd` e grava; o segundo desbloqueia o mesmo
+/// cabeçalho, relê o conteúdo e grava numa época nova; um terceiro, com o
+/// cabeçalho adulterado, recusa montar. Depois de cada boot o xtask confere
+/// que o texto do usuário não está em claro no disco.
+fn persist(opts: &Options) -> Result {
+    let plain = Options {
+        devices: vec![
+            "virtio-blk-pci,drive=vd0,disable-legacy=on",
+            "virtio-rng-pci,disable-legacy=on",
+            "virtio-serial-pci,disable-legacy=on",
+            "virtconsole,chardev=vcon",
+            "virtio-keyboard-pci,disable-legacy=on",
+            "virtio-net-pci,netdev=vn0,disable-legacy=on",
+            "virtio-gpu-pci,id=vgpu,disable-legacy=on",
+        ],
+        ..opts.clone()
+    };
+    build_test(&plain)?;
+    let scenario = |name: &'static str, markers: &'static [&'static str]| Scenario {
+        name,
+        markers,
+        forbidden: &[
+            "drvcli: optfs cifrado: erro",
+            "drvcli: optfs cifrado: sem keyd",
+            "okernel: FALTA",
+            "PÂNICO",
+        ],
+        key: None,
+        ..VIRTIO_SCENARIO
+    };
+    let disk = root().join("target/disk.img");
+    let no_plaintext = |when: &str| -> Result {
+        let bytes = fs::read(&disk).map_err(|e| format!("lendo {}: {e}", disk.display()))?;
+        if bytes
+            .windows(PERSIST_SECRET.len())
+            .any(|w| w == PERSIST_SECRET)
+        {
+            return Err(format!(
+                "o texto do usuário está em claro no disco ({when})"
+            ));
+        }
+        Ok(())
+    };
+    DISK_MODE.store(DISK_PERSIST, Ordering::SeqCst);
+    CONSOLE_MODE.store(1, Ordering::SeqCst);
+    let run = || -> Result {
+        boot_scenario(
+            &plain,
+            &scenario(
+                "volume cifrado: criação e gravação",
+                &["drvcli: optfs cifrado: gravado"],
+            ),
+        )?;
+        DISK_MODE.store(DISK_KEEP, Ordering::SeqCst);
+        CONSOLE_MODE.store(2, Ordering::SeqCst);
+        no_plaintext("depois do primeiro boot")?;
+        boot_scenario(
+            &plain,
+            &scenario(
+                "volume cifrado: reinício e leitura",
+                &[
+                    "drvcli: optfs cifrado: relido igual",
+                    "drvcli: optfs cifrado: duas épocas lidas",
+                ],
+            ),
+        )?;
+        no_plaintext("depois do segundo boot")?;
+        // Adultera o cabeçalho (o sal da época 1): o MAC não confere.
+        let mut bytes = fs::read(&disk).map_err(|e| e.to_string())?;
+        let hdr = 18432 * 512;
+        bytes[hdr + 24 + 202 + 4 + 4] ^= 0xFF;
+        fs::write(&disk, bytes).map_err(|e| e.to_string())?;
+        let sc = Scenario {
+            forbidden: &[
+                "okernel: FALTA",
+                "PÂNICO",
+                "drvcli: optfs cifrado: relido igual",
+            ],
+            ..scenario(
+                "volume cifrado: cabeçalho adulterado não monta",
+                &["drvcli: optfs cifrado: erro"],
+            )
+        };
+        boot_scenario(&plain, &sc)?;
+        println!(
+            "xtask: volume cifrado: gravou, remontou em outra época e recusou o cabeçalho adulterado"
+        );
+        Ok(())
+    };
+    let r = run();
+    DISK_MODE.store(0, Ordering::SeqCst);
+    CONSOLE_MODE.store(0, Ordering::SeqCst);
+    r
+}
+
+#[allow(clippy::too_many_lines, reason = "uma entrada por suíte")]
 fn test(opts: &Options) -> Result {
     if matches!(opts.suite.as_str(), "unit" | "all") {
         status(cargo().args([
@@ -2259,6 +2385,9 @@ fn test(opts: &Options) -> Result {
     }
     if opts.suite == "crash" {
         crash(opts)?;
+    }
+    if matches!(opts.suite.as_str(), "persist" | "all") {
+        persist(opts)?;
     }
     if opts.suite == "smp" {
         smp(opts)?;

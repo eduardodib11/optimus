@@ -23,6 +23,7 @@ mod input_cliente;
 mod keyd_cliente;
 mod net_cliente;
 mod optfs_step;
+mod persist_step;
 mod storage_cliente;
 
 use console_cliente::ConsoleCliente;
@@ -295,6 +296,24 @@ fn block_steps(buf: &mut ostd::ipc::Buffer, quota: Handle, data: Handle) -> Opti
 /// `sys-a` é só de leitura.
 fn storage_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
     let storage = StorageCliente::new(ep);
+    // Volume cifrado entre dois boots (T-540): a partição `cifra` troca todo
+    // o resto, e o `keyd` pede as senhas no console.
+    if let Ok(Ok(cifra)) = storage.open(&mut s.buffer, "cifra") {
+        let info = BlockStoreCliente::new(cifra)
+            .info(&mut s.buffer)
+            .ok()?
+            .ok()?;
+        let mut q = open_fila(&mut s.buffer, quota, cifra)?;
+        let Some(ep) = connect(s, b"optimus.keyd.Keyring") else {
+            ostd::debug::print("drvcli: optfs cifrado: sem keyd");
+            return None;
+        };
+        if persist_step::run(&mut q, info.blocks, &KeyringCliente::new(ep), &mut s.buffer).is_none()
+        {
+            ostd::debug::print("drvcli: optfs cifrado: erro");
+        }
+        return None;
+    }
     let buf = &mut s.buffer;
     // Disco do teste de queda (T-533): a partição `crash` troca todo o resto.
     if let Ok(Ok(crash)) = storage.open(buf, "crash") {
