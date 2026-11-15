@@ -15,6 +15,7 @@ use ostd::rt::Start;
 use ostd::svc::Session;
 use ostd::vm::{Mapping, SELF};
 
+mod caos_step;
 mod console_cliente;
 mod crash_step;
 mod display_cliente;
@@ -296,6 +297,15 @@ fn block_steps(buf: &mut ostd::ipc::Buffer, quota: Handle, data: Handle) -> Opti
 /// `sys-a` é só de leitura.
 fn storage_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
     let storage = StorageCliente::new(ep);
+    // Queda do `storaged` (T-541): a partição `caos` troca todo o resto.
+    if let Ok(Ok(_)) = storage.open(&mut s.buffer, "caos") {
+        if caos_step::run(s, ep, quota).is_some() {
+            ostd::debug::print("fsstress: caos do storaged ok");
+        } else {
+            ostd::debug::print("fsstress: erro");
+        }
+        return None;
+    }
     // Volume cifrado entre dois boots (T-540): a partição `cifra` troca todo
     // o resto, e o `keyd` pede as senhas no console.
     if let Ok(Ok(cifra)) = storage.open(&mut s.buffer, "cifra") {

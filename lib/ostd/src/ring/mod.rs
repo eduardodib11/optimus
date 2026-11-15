@@ -356,12 +356,17 @@ impl Producer {
             return Err(Error::InvalidArgument);
         }
         let tail = shared.u64_at(OFF_TAIL).load(Ordering::Acquire);
+        // Um anel que já andou (o produtor novo continua o anterior, como o
+        // `storaged` reiniciado no anel do driver) tem `head` e `tail`
+        // adiantados: começar `head` em 0 faria `tail - head` passar do
+        // tamanho do anel.
+        let head = shared.u64_at(OFF_HEAD).load(Ordering::Acquire);
         Ok(Self {
             shared,
             ntfy,
             bits,
             tail,
-            head: 0,
+            head,
         })
     }
 

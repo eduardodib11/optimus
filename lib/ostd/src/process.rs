@@ -99,11 +99,25 @@ impl Child {
 /// `InvalidArgument` para ELF inválido, relocável ou com segmento que
 /// não cabe; os das syscalls de cada passo.
 pub fn load(spec: &Spec<'_>) -> Result<Child, Error> {
+    load_in(spec, None)
+}
+
+/// Como [`load`], mas o filho usa a cota `reuse` (de um filho anterior do
+/// mesmo serviço) em vez de reservar outra: um reinício não precisa da cota
+/// nova enquanto objetos do morto ainda prendem a antiga.
+///
+/// # Errors
+///
+/// Os de [`load`].
+pub fn load_in(spec: &Spec<'_>, reuse: Option<Handle>) -> Result<Child, Error> {
     let elf = oelf::Elf::parse_user(spec.elf).map_err(|_| Error::InvalidArgument)?;
     if elf.is_relocatable() {
         return Err(Error::InvalidArgument);
     }
-    let quota = create(spec.quota, ObjectType::MemoryQuota, spec.quota_bytes)?;
+    let quota = match reuse {
+        Some(q) => q,
+        None => create(spec.quota, ObjectType::MemoryQuota, spec.quota_bytes)?,
+    };
     let cspace = create(quota, ObjectType::CapSpace, 0)?;
     let aspace = create(quota, ObjectType::AddressSpace, 0)?;
     for seg in elf.segments() {

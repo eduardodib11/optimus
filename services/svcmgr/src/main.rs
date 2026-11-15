@@ -83,7 +83,7 @@ struct Started {
     child: process::Child,
     /// Recursos de dispositivo que o `devmgr` deu (só num driver): as
     /// cópias do `svcmgr` ficam até o fim da instância.
-    devices: Vec<Handle>,
+    devices: Vec<(Handle, u32)>,
 }
 
 /// Parte o serviço `id`: carrega, entrega as capabilities e inicia.
@@ -94,6 +94,7 @@ fn spawn(
     boot: &Boot,
     control: Handle,
     devices: Option<&[(Handle, u32)]>,
+    reuse: Option<Handle>,
 ) -> Result<Started, Error> {
     let m = plan.broker.manifest(id).ok_or(Error::InvalidArgument)?;
     let elf = fs.find(&m.binary).ok_or(Error::InvalidArgument)?;
@@ -102,14 +103,17 @@ fn spawn(
         .iter()
         .find(|n| n.kind == oman::NeedKind::Mem)
         .map_or(0, |n| n.value);
-    let child = process::load(&Spec {
-        elf: elf.data,
-        quota: boot.quota,
-        quota_bytes: bytes,
-        own_aspace: SELF,
-        scratch_va: SCRATCH_VA,
-        priority: m.priority,
-    })?;
+    let child = process::load_in(
+        &Spec {
+            elf: elf.data,
+            quota: boot.quota,
+            quota_bytes: bytes,
+            own_aspace: SELF,
+            scratch_va: SCRATCH_VA,
+            priority: m.priority,
+        },
+        reuse,
+    )?;
     let mut pool: Vec<(&str, Handle)> = Vec::new();
     if boot.log.raw() != 0 {
         pool.push(("debug", boot.log));
@@ -127,15 +131,51 @@ fn spawn(
         pool.push(("acpi", boot.acpi));
     }
     let kernel = &mut svcmgr::kernel::Kernel;
+    let started = deliver_and_start(plan, id, &child, control, &pool, devices, kernel);
+    match started {
+        Ok(desc) => Ok(Started {
+            desc,
+            child,
+            devices: Vec::new(),
+        }),
+        Err(e) => {
+            // Partida que não terminou: sem isto o processo e a cota dele
+            // ficariam presos a cada tentativa (T-541).
+            discard(child);
+            Err(e)
+        }
+    }
+}
+
+/// Apaga um filho que não chegou a `Running`.
+fn discard(child: process::Child) {
+    let _ = ostd::cap::destroy(child.cspace);
+    for h in [child.thread, child.aspace, child.cspace, child.quota] {
+        if h.raw() != 0 {
+            let _ = ostd::cap::delete(h);
+        }
+    }
+}
+
+/// Entrega as capabilities a `child` e o inicia.
+fn deliver_and_start(
+    plan: &mut Plan,
+    id: u32,
+    child: &process::Child,
+    control: Handle,
+    pool: &[(&str, Handle)],
+    devices: Option<&[(Handle, u32)]>,
+    kernel: &mut svcmgr::kernel::Kernel,
+) -> Result<svcmgr::broker::Boot, Error> {
     let delivered = match devices {
         Some(d) => {
             let (cs, q) = (child.cspace, child.quota);
             plan.broker
-                .deliver_driver(id, cs, control, q, &pool, d, kernel)
+                .deliver_driver(id, cs, control, q, pool, d, kernel)
         }
         None => plan
             .broker
-            .deliver(id, child.cspace, control, child.quota, &pool, kernel),
+            .deliver(id, child.cspace, control, child.quota, pool, kernel),
     };
     let desc = delivered.map_err(|e| {
         ostd::debug::print_fmt(format_args!("svcmgr: entrega recusada: {e:?}"));
@@ -153,12 +193,14 @@ fn spawn(
         0,
     ];
     child.start(args)?;
-    Ok(Started {
-        desc,
-        child,
-        devices: Vec::new(),
-    })
+    Ok(desc)
 }
+
+/// Supervisão a mais depois de `svcmgr.mata` (T-541), em ns.
+const MATA_EXTRA_NS: u64 = 6_000_000_000;
+
+/// Espera entre duas tentativas de reiniciar um serviço que não partiu.
+const RETRY_NS: u64 = 250_000_000;
 
 /// Quanto o laço espera por mensagem antes de olhar as mortes, em ns.
 const TICK_NS: u64 = 20_000_000;
@@ -184,6 +226,12 @@ struct Svcmgr<'a> {
     live: Vec<Option<Started>>,
     /// Mortes que o próprio `svcmgr` causou (teste de caos).
     induced: Vec<u32>,
+    /// Recursos dos drivers que morreram sozinhos, guardados para o reinício
+    /// (ADR 0067, item 3); `driver_stop` e o desligamento os apagam.
+    kept: Vec<(u32, Vec<(Handle, u32)>)>,
+    /// A cota do filho morto desses drivers: o reinício a reaproveita, pois
+    /// objetos do morto (anéis que o `virtio-blk` ainda mapeia) a prendem.
+    kept_quota: Vec<(u32, Handle)>,
     /// Recursos que o `devmgr` deu a cada driver, até o `driver_start`.
     pending: Vec<(u32, Vec<(Handle, u32)>)>,
 }
@@ -221,12 +269,27 @@ fn name(plan: &Plan, id: u32) -> &str {
 impl Svcmgr<'_> {
     /// Parte `id` e liga a morte do processo ao bit dele em `deaths`.
     fn launch(&mut self, id: u32) -> bool {
-        self.launch_with(id, None)
+        // Driver que morreu sozinho: parte de novo com os mesmos recursos.
+        if let Some(i) = self.kept.iter().position(|(d, _)| *d == id) {
+            let (_, res) = self.kept.swap_remove(i);
+            let reuse = self
+                .kept_quota
+                .iter()
+                .position(|(d, _)| *d == id)
+                .map(|j| self.kept_quota.swap_remove(j).1);
+            return self.launch_with(id, Some(&res), reuse);
+        }
+        self.launch_with(id, None, None)
     }
 
     /// Como [`Svcmgr::launch`]; um driver leva os recursos `devices`, que
     /// ficam com a instância (ou são apagados se ela não partir).
-    fn launch_with(&mut self, id: u32, devices: Option<&[(Handle, u32)]>) -> bool {
+    fn launch_with(
+        &mut self,
+        id: u32,
+        devices: Option<&[(Handle, u32)]>,
+        reuse: Option<Handle>,
+    ) -> bool {
         let r = spawn(
             &mut self.plan,
             &self.fs,
@@ -234,8 +297,9 @@ impl Svcmgr<'_> {
             &self.boot,
             self.control,
             devices,
+            reuse,
         );
-        let handles: Vec<Handle> = devices.unwrap_or(&[]).iter().map(|d| d.0).collect();
+        let handles: Vec<(Handle, u32)> = devices.unwrap_or(&[]).to_vec();
         match r {
             Ok(mut s) => {
                 s.devices = handles;
@@ -252,7 +316,7 @@ impl Svcmgr<'_> {
             Err(e) => {
                 let n = name(&self.plan, id);
                 ostd::debug::print_fmt(format_args!("svcmgr: {n} não partiu: {e:?}"));
-                for h in handles {
+                for (h, _) in handles {
                     let _ = ostd::cap::delete(h);
                 }
                 false
@@ -267,28 +331,38 @@ impl Svcmgr<'_> {
     /// Fim da instância de `id` (item 9): revoga os endpoints e apaga o
     /// processo.
     fn retire(&mut self, id: u32) {
-        let Some(s) = usize::try_from(id)
+        let _ = self.retire_keep(id, false);
+    }
+
+    /// Como [`Svcmgr::retire`]; com `keep` devolve a cota do filho em vez de
+    /// apagá-la.
+    fn retire_keep(&mut self, id: u32, keep: bool) -> Option<Handle> {
+        let s = usize::try_from(id)
             .ok()
             .and_then(|i| self.live.get_mut(i))
-            .and_then(Option::take)
-        else {
-            return;
-        };
+            .and_then(Option::take)?;
         let _ = ostd::cap::bind_notify(s.child.cspace, self.deaths, 0);
         let _ = svcmgr::supervisor::revoke_instance(
             &mut self.plan.broker,
             id,
             &mut svcmgr::kernel::Kernel,
         );
-        for &h in &s.devices {
+        for &(h, _) in &s.devices {
             let _ = ostd::cap::delete(h);
         }
         let c = s.child;
-        for h in [c.thread, c.aspace, c.cspace, c.quota] {
+        for h in [c.thread, c.aspace, c.cspace] {
             if h.raw() != 0 {
                 let _ = ostd::cap::delete(h);
             }
         }
+        if keep && c.quota.raw() != 0 {
+            return Some(c.quota);
+        }
+        if c.quota.raw() != 0 {
+            let _ = ostd::cap::delete(c.quota);
+        }
+        None
     }
 
     /// Olha as mortes sinalizadas e decide cada uma; parte os reinícios
@@ -309,7 +383,20 @@ impl Svcmgr<'_> {
             } else {
                 Exit::Failed
             };
-            self.retire(id);
+            // Um driver que morreu sozinho guarda os recursos para o reinício.
+            let kept = self.live[id as usize]
+                .as_mut()
+                .map(|s| core::mem::take(&mut s.devices));
+            let driver = kept.as_ref().is_some_and(|k| !k.is_empty());
+            let quota = self.retire_keep(id, driver);
+            if let Some(k) = kept.filter(|k| !k.is_empty()) {
+                self.kept.retain(|(d, _)| *d != id);
+                self.kept.push((id, k));
+            }
+            if let Some(q) = quota {
+                self.kept_quota.retain(|(d, _)| *d != id);
+                self.kept_quota.push((id, q));
+            }
             let now = ostd::time::now_ns();
             let n = name(&self.plan, id);
             if let Some(i) = self.induced.iter().position(|&x| x == id) {
@@ -334,6 +421,10 @@ impl Svcmgr<'_> {
             if self.launch(id) {
                 let n = name(&self.plan, id);
                 ostd::debug::print_fmt(format_args!("svcmgr: {n} reiniciado"));
+            } else {
+                // Sem recuo, a falha repetiria a cada volta do laço.
+                self.sup
+                    .induced(id, ostd::time::now_ns().saturating_add(RETRY_NS));
             }
         }
     }
@@ -393,7 +484,7 @@ impl Svcmgr<'_> {
             Some(i) => self.pending.swap_remove(i).1,
             None => Vec::new(),
         };
-        if self.launch_with(id, Some(&devices)) {
+        if self.launch_with(id, Some(&devices), None) {
             Ok(())
         } else {
             Err(SvcError::Busy)
@@ -648,6 +739,47 @@ impl Svcmgr<'_> {
         }
     }
 
+    /// Mata o processo de `id` ([`kill`]) e espera que volte a `Running`
+    /// em [`READY_NS`]. Devolve o tempo da volta, em ns.
+    fn kill_and_wait(&mut self, id: u32) -> Option<u64> {
+        let cspace = self.started(id).map(|s| s.child.cspace)?;
+        let t0 = ostd::time::now_ns();
+        self.induced.push(id);
+        if kill(cspace).is_err() {
+            self.induced.retain(|&x| x != id);
+            return None;
+        }
+        let deadline = t0.saturating_add(READY_NS);
+        loop {
+            if ostd::time::now_ns() >= deadline {
+                return None;
+            }
+            if self.serve_one(deadline) == Some(id) {
+                return Some(ostd::time::now_ns().saturating_sub(t0));
+            }
+        }
+    }
+
+    /// Teste de queda de serviço (T-541): depois de `delay_ns` mata o
+    /// serviço `nome` e registra a volta. Os clientes recebem `PeerClosed`.
+    fn kill_named(&mut self, nome: &str, delay_ns: u64) {
+        self.supervise(ostd::time::now_ns().saturating_add(delay_ns));
+        let id = (0..self.live.len())
+            .filter_map(|i| u32::try_from(i).ok())
+            .find(|&id| name(&self.plan, id) == nome && self.started(id).is_some());
+        let Some(id) = id else {
+            ostd::debug::print_fmt(format_args!("svcmgr: mata: {nome} não está vivo"));
+            return;
+        };
+        match self.kill_and_wait(id) {
+            Some(ns) => ostd::debug::print_fmt(format_args!(
+                "svcmgr: mata: {nome} voltou em {} ms",
+                ns / 1_000_000
+            )),
+            None => ostd::debug::print_fmt(format_args!("svcmgr: mata: {nome} não voltou")),
+        }
+    }
+
     /// Teste de caos (T-366; §18, "volta em ≤ 1 s"): `rounds` vezes, mata
     /// um serviço em `Running` escolhido ao acaso ([`kill`], o processo
     /// inteiro) e espera que volte a `Running`. Registra o tempo de cada volta; quem não volta em [`READY_NS`] conta como falha.
@@ -675,24 +807,7 @@ impl Svcmgr<'_> {
                 ostd::debug::print("svcmgr: caos: nenhum serviço vivo");
                 return;
             };
-            let Some(cspace) = self.started(id).map(|s| s.child.cspace) else {
-                continue;
-            };
-            let t0 = ostd::time::now_ns();
-            self.induced.push(id);
-            if kill(cspace).is_err() {
-                self.induced.retain(|&x| x != id);
-                continue;
-            }
-            let deadline = t0.saturating_add(READY_NS);
-            let back = loop {
-                if ostd::time::now_ns() >= deadline {
-                    break None;
-                }
-                if self.serve_one(deadline) == Some(id) {
-                    break Some(ostd::time::now_ns().saturating_sub(t0));
-                }
-            };
+            let back = self.kill_and_wait(id);
             let n = name(&self.plan, id);
             if let Some(ns) = back {
                 worst = worst.max(ns);
@@ -724,6 +839,14 @@ impl Svcmgr<'_> {
                 let _ = ostd::cap::destroy(cspace);
             }
             self.retire(id);
+        }
+        for (_, q) in core::mem::take(&mut self.kept_quota) {
+            let _ = ostd::cap::delete(q);
+        }
+        for (_, res) in core::mem::take(&mut self.kept) {
+            for (h, _) in res {
+                let _ = ostd::cap::delete(h);
+            }
         }
         let levels = self.plan.levels.clone();
         for level in levels.iter().rev() {
@@ -771,6 +894,8 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
         sup: Supervisor::new(&policies),
         live,
         induced: Vec::new(),
+        kept: Vec::new(),
+        kept_quota: Vec::new(),
         pending: Vec::new(),
     };
     let levels = s.plan.levels.clone();
@@ -795,7 +920,26 @@ fn start_all(boot: &Boot, buffer: Buffer) -> Result<(), Error> {
     {
         s.chaos(rounds);
     }
-    s.supervise(ostd::time::now_ns().saturating_add(SUPERVISE_NS));
+    // T-541: `svcmgr.mata` = `<serviço> <atraso em ms>`.
+    if let Some((nome, ms)) =
+        s.fs.find("svcmgr.mata")
+            .and_then(|e| core::str::from_utf8(e.data).ok())
+            .and_then(|t| t.trim().split_once(' '))
+            .and_then(|(n, ms)| Some((n, ms.trim().parse::<u64>().ok()?)))
+    {
+        s.kill_named(nome, ms.saturating_mul(1_000_000));
+        // A recuperação dos clientes (prazo de conclusão de 2 s, remontagem e
+        // novos commits) cabe depois da queda.
+        s.supervise(ostd::time::now_ns().saturating_add(MATA_EXTRA_NS));
+    }
+    // `svcmgr.janela` = ms a mais de supervisão (T-540: o volume cifrado
+    // espera o Argon2id do `keyd` sob TCG).
+    let extra =
+        s.fs.find("svcmgr.janela")
+            .and_then(|e| core::str::from_utf8(e.data).ok())
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .map_or(0, |ms| ms.saturating_mul(1_000_000));
+    s.supervise(ostd::time::now_ns().saturating_add(SUPERVISE_NS.saturating_add(extra)));
     s.shutdown();
     for h in [s.deaths, s.reply, s.control] {
         let _ = ostd::cap::delete(h);

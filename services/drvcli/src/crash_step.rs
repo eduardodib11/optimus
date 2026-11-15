@@ -11,12 +11,12 @@ use optfs_format::{BlockPtr, Integrity, SUPERBLOCKS, Superblock};
 use ostd::vec::Vec;
 
 /// Chave de nomes, UUID e arquivo do teste (o `xtask` usa os mesmos).
-const KEY: [u8; 32] = [7; 32];
-const UUID: [u8; 16] = [1; 16];
-const FILE_LEN: usize = 6000;
+pub(super) const KEY: [u8; 32] = [7; 32];
+pub(super) const UUID: [u8; 16] = [1; 16];
+pub(super) const FILE_LEN: usize = 6000;
 
 /// Conteúdo do arquivo no txg `txg`.
-fn pattern(txg: u64) -> Vec<u8> {
+pub(super) fn pattern(txg: u64) -> Vec<u8> {
     let seed = txg.to_le_bytes()[0];
     (0..FILE_LEN)
         .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
