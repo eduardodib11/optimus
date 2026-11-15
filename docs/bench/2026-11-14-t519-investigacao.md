@@ -131,3 +131,37 @@ quebrada de propósito, que pulava o `XRSTOR` sem olhar a área de quem
 entra, fez o teste falhar em KVM (499 de 500 voltas com estado errado na
 thread que suja a FPU). No TCG o teste passa nas duas versões, porque o
 QEMU sem KVM não zera o XINUSE como o hardware; a validação vale em KVM.
+
+## Item 2 da ADR 0058, primeiro lote (2026-11-15)
+
+Perfil da `main` em `c3c28ff` (`cargo xtask perfil`, TCG): 2777 instruções
+e 58 RMW atômicos por ida e volta. Os que se repetem sem necessidade estão
+no `Reply` e na doação. O lote tira 4 por ida e volta, sem mudar o
+protocolo nem a ordem de travas:
+
+- `Reply::take_on`: o caminho rápido de `ipc_reply_recv` confere e consome
+  a resposta numa trava só (antes, `caller_on` e `take`);
+- `Reply::donate(caller, server)`: lê o `SchedContext` de quem chamou sem a
+  trava do `Reply`;
+- quem responde devolve a doação que recebeu sem promover o `Weak`.
+
+| Host do runner | `main` (com o item 1) | Com o lote | Variação |
+|---|---:|---:|---:|
+| Intel Xeon 6975P-C | 846–959 ns (quatro rodadas) | 831 / 832 ns | dentro do ruído |
+| AMD EPYC 7763 | não sorteado | 761 / 761 ns | — |
+| Intel Xeon Platinum 8370C | 1180 / 1190 ns (`232d99c`) | não sorteado | — |
+
+Leitura: quatro atômicos valem ≈ 80 ciclos no Intel, menos de 3% da ida e
+volta, abaixo da variação entre rodadas no mesmo host. No 8370C a `main`
+segue em 1,18 µs; para descer de 1 µs ali faltam ≈ 15% (≈ 500 ciclos), o
+que não sai de cortes locais deste tamanho. O que resta de grande no
+caminho é estrutural (clones de `Arc` que mantêm vivos a thread e o
+`CapSpace` durante a syscall, o `Weak` do endpoint e o `Arc` do `Reply` no
+estado `Recv`, a cobrança do `SchedContext` a cada troca). Mexer nisso
+mudaria a forma como o kernel garante a vida dos objetos no IPC e pede uma
+ADR própria.
+
+Na rodada do AMD 7763 o `timer.mil_no_prazo` falhou em KVM (p99 do atraso
+na faixa de 250 µs, pior caso 136 µs, limite de 100 µs). O teste não passa
+pelo IPC; a mesma falha já tinha aparecido no 8370C com o código da
+`main` (ver acima).
