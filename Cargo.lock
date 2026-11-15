@@ -228,6 +228,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "obcache"
+version = "0.1.0"
+
+[[package]]
 name = "obfs"
 version = "0.1.0"
 dependencies = [
@@ -331,6 +335,7 @@ version = "0.1.0"
 name = "optfs"
 version = "0.1.0"
 dependencies = [
+ "obcache",
  "optcrypt",
  "optfs-format",
 ]
