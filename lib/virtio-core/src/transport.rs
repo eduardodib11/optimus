@@ -175,4 +175,17 @@ impl<M: Mmio> Transport<M> {
         let s = status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK;
         self.common.write8(DEVICE_STATUS, s);
     }
+
+    /// Reseta o dispositivo (status 0): ele para de ler as filas. O driver
+    /// faz isso antes de largar a memória de DMA, senão um dispositivo que
+    /// ainda consulta a fila (a recepção do console com um cliente
+    /// conectado) provoca falta de DMA.
+    pub fn reset(&self) {
+        self.common.write8(DEVICE_STATUS, 0);
+        for _ in 0..RESET_POLLS {
+            if self.status() == 0 {
+                break;
+            }
+        }
+    }
 }

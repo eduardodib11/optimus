@@ -87,6 +87,33 @@ impl ConsoleCliente {
             ))
         }
     }
+
+    /// Método `read` (ordinal 1).
+    pub fn read(
+        &self,
+        buf: &mut ostd::ipc::Buffer,
+        max: u8,
+        prazo_ms: u32,
+    ) -> Result<Result<oidl_rt::Bytes<64>, ConsoleError>, ostd::kabi::Error> {
+        let mut pedido = [0u8; 8];
+        let n = codifica_console_1(&mut pedido, &max, &prazo_ms).map_err(erro_oidl)?;
+        let mut saida = [0u8; 72];
+        let (rotulo, m) = ostd::ipc::call_corpo(
+            self.ep,
+            buf,
+            0x9A70903500000001,
+            &pedido[..n],
+            &mut saida,
+            0,
+        )?;
+        if rotulo >> 62 == 0 {
+            Ok(Ok(decodifica_ok_console_1(&saida[..m]).map_err(erro_oidl)?))
+        } else {
+            Ok(Err(
+                decodifica_err_console_1(&saida[..m]).map_err(erro_oidl)?
+            ))
+        }
+    }
 }
 
 fn codifica_console_0(saida: &mut [u8], texto: &&str) -> Result<usize, Error> {
@@ -104,6 +131,29 @@ fn decodifica_ok_console_0(corpo: &[u8]) -> Result<u32, Error> {
 }
 
 fn decodifica_err_console_0(corpo: &[u8]) -> Result<ConsoleError, Error> {
+    let mut r = Reader::new(corpo, 1)?;
+    let v = ConsoleError::from_raw(r.u8()?).ok_or(Error::BadMessage)?;
+    r.finish()?;
+    Ok(v)
+}
+
+fn codifica_console_1(saida: &mut [u8], max: &u8, prazo_ms: &u32) -> Result<usize, Error> {
+    let mut w = Writer::new(saida, 8)?;
+    w.seek(0);
+    w.u8((*max))?;
+    w.seek(4);
+    w.u32((*prazo_ms))?;
+    Ok(w.finish())
+}
+
+fn decodifica_ok_console_1(corpo: &[u8]) -> Result<oidl_rt::Bytes<64>, Error> {
+    let mut r = Reader::new(corpo, 8)?;
+    let v = oidl_rt::Bytes::<64>::from_slice(r.bytes(64)?)?;
+    r.finish()?;
+    Ok(v)
+}
+
+fn decodifica_err_console_1(corpo: &[u8]) -> Result<ConsoleError, Error> {
     let mut r = Reader::new(corpo, 1)?;
     let v = ConsoleError::from_raw(r.u8()?).ok_or(Error::BadMessage)?;
     r.finish()?;

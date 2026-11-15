@@ -1,6 +1,7 @@
 // Console virtio (T-514; ADR 0046, item 5): o `virtio-console` serve este
 // contrato; o cliente escreve na porta 0 e o QEMU entrega o texto ao seu
-// `chardev`. A entrada (fila 0) e as portas extras vêm depois.
+// `chardev`. A entrada da porta 0 (fila 0) serve o pedido de senha do `keyd`
+// (T-527; ADR 0053, item 4); as portas extras vêm depois.
 package optimus.console @1.0;
 
 enum ConsoleError : u8 { Io, Timeout }
@@ -9,4 +10,8 @@ interface Console {
     // Escreve `texto` na porta 0 e espera o dispositivo consumi-lo; devolve
     // os bytes escritos.
     write(texto: string<128>) -> result<u32, ConsoleError>;
+
+    // Lê até `max` bytes (no máximo 64) digitados na porta 0 e espera por
+    // eles até `prazo_ms`. `Timeout` se nada chegou até lá.
+    read(max: u8, prazo_ms: u32) -> result<vec<u8, 64>, ConsoleError>;
 }
