@@ -1084,6 +1084,7 @@ macro_rules! m4_markers {
             "drvcli: keyd: volume desbloqueado",
             "drvcli: keyd: volume trancado sem a senha",
             "drvcli: display ok",
+            "drvcli: optfs ok",
             "drvcli: storage ok",
             "drvcli: net ok",
             "drvcli: input ok",
