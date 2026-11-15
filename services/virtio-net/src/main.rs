@@ -2,7 +2,7 @@
 //! processo de usuário. Lê o MAC da configuração do dispositivo, monta a
 //! fila de recepção (0) com buffers de 2 KiB e a de transmissão (1), manda
 //! um ARP "quem tem 10.0.2.2" e espera a resposta do QEMU (rede de usuário).
-//! Depois serve o contrato `NetDevice` (T-514; ADR 0062): os quadros vão e
+//! Depois serve o contrato `NetDevice` (T-514; ADR 0064): os quadros vão e
 //! voltam por anéis SPSC, no laço único da ADR 0060 (`recv` de 5 ms).
 
 #![no_std]
@@ -66,7 +66,7 @@ const MAX_FRAME: usize = 1514;
 const POLL_NS: u64 = 5_000_000;
 const RING_KIND: u16 = 0x0E01;
 const REC_KIND: u16 = 1;
-/// Badge da sessão (com `GRANT`), como no `BlockDevice` (ADR 0061).
+/// Badge da sessão (com `GRANT`), como no `BlockDevice` (ADR 0063).
 const SESSION_BADGE: u64 = 1;
 
 struct Nic<'a> {

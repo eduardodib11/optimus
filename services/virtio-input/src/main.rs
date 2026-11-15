@@ -3,18 +3,24 @@
 //! (fila 0) cheia de buffers de 8 bytes que o dispositivo preenche com um
 //! evento `evdev` (`type`, `code`, `value`); cada evento é traduzido por
 //! [`oinput::Evdev`] e vai ao `inputd` por `optimus.input.Sink@1`. O
-//! dispositivo não é de confiança: o que não traduz é descartado.
+//! dispositivo não é de confiança: o que não traduz é descartado. Serve
+//! também o contrato `InputDevice` (T-514; ADR 0064): os eventos `evdev` crus
+//! vão a um anel SPSC do cliente, no laço único da ADR 0060 (`recv` de 5 ms).
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
 #![allow(clippy::cast_possible_truncation)]
 
+mod input_servidor;
+
 use core::cell::RefCell;
 
+use input_servidor::{Contexto, ID_INPUTDEVICE, InputDevice, InputError, InputInfo};
 use oinput::{Evdev, Event};
 use ostd::ipc::{self, Message};
-use ostd::kabi::{Handle, ObjectType};
+use ostd::kabi::{Error, Handle, ObjectType, Rights};
+use ostd::ring::Producer;
 use ostd::rt::Start;
 use ostd::svc::Session;
 use ostd::vm::{Mapping, SELF};
@@ -41,8 +47,16 @@ const EVENT_LEN: usize = 8;
 const EVENT_QUEUE: u16 = 0;
 /// Prazo de uma entrega ao `inputd`.
 const SEND_NS: u64 = 100_000_000;
-/// Espera de IRQ; a fila é checada de novo a cada estouro.
-const WAIT_NS: u64 = 1_000_000_000;
+/// O contrato: prazo do `recv` do laço (ADR 0060), anel de eventos do
+/// cliente (4 KiB de dados), tipo do registro e quantos eventos anteriores ao
+/// `attach_events` o driver guarda.
+const POLL_NS: u64 = 5_000_000;
+const EVENTS_VA: u64 = 0x20_0040_0000;
+const RING_BYTES: u32 = 4096;
+const REC_KIND: u16 = 1;
+const PENDING: usize = 16;
+/// Badge da sessão (com `GRANT`), como no `BlockDevice` (ADR 0063).
+const SESSION_BADGE: u64 = 1;
 
 struct Input<'a> {
     queue: Queue<Dma<'a>, QUEUE_SIZE>,
@@ -54,6 +68,14 @@ struct Input<'a> {
     sink: Handle,
     evdev: Evdev,
     forwarded_key: bool,
+    /// O `inputd` ainda atende.
+    sink_alive: bool,
+    ep: Handle,
+    /// Anel de eventos do cliente, depois do `attach_events`.
+    events: Option<Producer>,
+    /// Eventos crus anteriores ao `attach_events`.
+    pending: [[u8; EVENT_LEN]; PENDING],
+    npending: usize,
 }
 
 impl Input<'_> {
@@ -90,6 +112,32 @@ impl Input<'_> {
         }
     }
 
+    /// Entrega o evento cru ao cliente do contrato, ou o guarda até ele ligar.
+    fn emit(&mut self, kind: u16, code: u16, value: u32) {
+        let mut raw = [0u8; EVENT_LEN];
+        raw[0..2].copy_from_slice(&kind.to_le_bytes());
+        raw[2..4].copy_from_slice(&code.to_le_bytes());
+        raw[4..8].copy_from_slice(&value.to_le_bytes());
+        if let Some(p) = self.events.as_mut() {
+            // Cheio: o anel descarta e conta em `dropped`.
+            let _ = p.push(REC_KIND, &raw);
+        } else if self.npending < PENDING {
+            self.pending[self.npending] = raw;
+            self.npending += 1;
+        }
+    }
+
+    /// Um passo do laço: confirma a IRQ e esvazia a fila de eventos.
+    fn pump(&mut self) {
+        if let Ok(bits) = ostd::cap::ntfy_poll(self.irq.ntfy)
+            && bits & 1 != 0
+        {
+            let _ = ostd::dev::irq_ack(self.irq.irq);
+        }
+        // Se o `inputd` se foi, os eventos só seguem pelo contrato.
+        let _ = self.drain();
+    }
+
     /// Registra a primeira tecla encaminhada (o aceite procura a linha).
     fn log_first_key(&mut self, e: Event) {
         if let Event::Key { code, pressed } = e
@@ -102,8 +150,8 @@ impl Input<'_> {
         }
     }
 
-    /// Esvazia a fila de usados; `Ok(false)` quando o `inputd` se foi.
-    fn drain(&mut self) -> Result<bool, &'static str> {
+    /// Esvazia a fila de usados.
+    fn drain(&mut self) -> Result<(), &'static str> {
         let mut any = false;
         loop {
             let chain = match self.queue.pop() {
@@ -115,12 +163,13 @@ impl Input<'_> {
             if usize::from(slot) >= QUEUE_SIZE {
                 return Err("cadeia fora da fila");
             }
-            if let Some((kind, code, value)) = self.read(slot)
-                && let Some(e) = self.evdev.feed(kind, code, value)
-            {
-                self.log_first_key(e);
-                if !self.send(e) {
-                    return Ok(false);
+            if let Some((kind, code, value)) = self.read(slot) {
+                self.emit(kind, code, value);
+                if let Some(e) = self.evdev.feed(kind, code, value) {
+                    self.log_first_key(e);
+                    if self.sink_alive && !self.send(e) {
+                        self.sink_alive = false;
+                    }
                 }
             }
             self.give(slot)?;
@@ -129,11 +178,79 @@ impl Input<'_> {
         if any {
             self.notify.write16(self.notify_at, EVENT_QUEUE);
         }
-        Ok(true)
+        Ok(())
     }
 }
 
-fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
+impl InputDevice for Input<'_> {
+    fn info(&mut self, _ctx: &Contexto) -> Result<InputInfo, InputError> {
+        Ok(InputInfo {
+            ring_bytes: RING_BYTES,
+        })
+    }
+
+    fn session(&mut self, _ctx: &Contexto) -> Result<u64, InputError> {
+        vdrv::serve::grant(self.ep, Rights::SEND | Rights::GRANT, SESSION_BADGE)
+            .map_err(|_| InputError::Io)
+    }
+
+    fn attach_events(&mut self, ctx: &Contexto, ring: u64, signal: u64) -> Result<(), InputError> {
+        if ctx.badge & 0xFFFF_FFFF != SESSION_BADGE || self.events.is_some() {
+            return Err(InputError::BadRequest);
+        }
+        let (Ok(ring), Ok(signal)) = (u32::try_from(ring), u32::try_from(signal)) else {
+            return Err(InputError::BadRequest);
+        };
+        let mut prod = Producer::open(
+            Handle::from_raw(ring),
+            EVENTS_VA,
+            RING_BYTES,
+            Handle::from_raw(signal),
+            1,
+        )
+        .map_err(|_| InputError::BadRequest)?;
+        for raw in &self.pending[..self.npending] {
+            let _ = prod.push(REC_KIND, raw);
+        }
+        self.npending = 0;
+        self.events = Some(prod);
+        Ok(())
+    }
+}
+
+/// Atende o contrato `InputDevice` em `ep` até o endpoint ser revogado.
+fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, input: &mut Input<'_>) -> Error {
+    let input = RefCell::new(input);
+    vdrv::serve::serve(
+        ep,
+        quota,
+        buf,
+        POLL_NS,
+        &mut || input.borrow_mut().pump(),
+        &mut |req, saida, caps_out| {
+            let entrada = input_servidor::Entrada {
+                rotulo: req.rotulo,
+                badge: req.badge,
+                corpo: req.corpo,
+                caps: req.caps,
+            };
+            let d = input_servidor::despacha_input_device(
+                &mut **input.borrow_mut(),
+                0,
+                &entrada,
+                saida,
+                caps_out,
+            )?;
+            Some(vdrv::serve::Resp {
+                rotulo: d.rotulo,
+                corpo: d.corpo,
+                caps: d.caps,
+            })
+        },
+    )
+}
+
+fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let (Some(irq), Some(domain)) = (vdrv::resource(s, b"irq0"), vdrv::resource(s, b"dma")) else {
         return Err("faltou irq0 ou dma");
     };
@@ -144,6 +261,11 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
         .find(|c| c.kind == KIND_SVC && c.name_hash == oinput::interface_id())
         .map(|c| Handle::from_raw(c.handle))
         .ok_or("sem o Sink do inputd")?;
+    let ep = s
+        .boot
+        .provided(ID_INPUTDEVICE)
+        .map(Handle::from_raw)
+        .ok_or("descritor sem o endpoint do InputDevice")?;
     let caps = vdrv::read_caps(s, CFG_VA)?;
     let bar_map = vdrv::map_bar(s, BAR_VA, &[caps.common, caps.notify, caps.isr])?;
     let queue_obj =
@@ -187,6 +309,11 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
         sink,
         evdev: Evdev::default(),
         forwarded_key: false,
+        sink_alive: true,
+        ep,
+        events: None,
+        pending: [[0; EVENT_LEN]; PENDING],
+        npending: 0,
     };
     for slot in 0..QUEUE_SIZE as u16 {
         input.give(slot)?;
@@ -194,13 +321,9 @@ fn run(s: &Session, quota: Handle) -> Result<(), &'static str> {
     transport.driver_ok();
     input.notify.write16(input.notify_at, EVENT_QUEUE);
     ostd::debug::print("virtio-input: fila de eventos pronta");
-    loop {
-        // Estouro do prazo só reconfere a fila; IRQ perdida não trava.
-        let _ = input.irq.wait(WAIT_NS);
-        if !input.drain()? {
-            return Err("o inputd se foi");
-        }
-    }
+    let e = serve(ep, quota, &mut s.buffer, &mut input);
+    ostd::debug::print_fmt(format_args!("virtio-input: encerrado ({e:?})"));
+    Ok(())
 }
 
 fn main(start: Start) -> ! {
@@ -217,7 +340,7 @@ fn main(start: Start) -> ! {
     }
     let quota = Handle::from_raw(s.boot.quota().unwrap_or(0));
     let _ = s.ready();
-    if let Err(e) = run(&s, quota) {
+    if let Err(e) = run(&mut s, quota) {
         ostd::debug::print_fmt(format_args!("virtio-input: falhou: {e}"));
     }
     ostd::thread::exit()

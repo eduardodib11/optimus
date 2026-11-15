@@ -600,6 +600,7 @@ dependencies = [
 name = "virtio-input"
 version = "0.1.0"
 dependencies = [
+ "oidl-rt",
  "oinput",
  "optcrypt",
  "ostd",

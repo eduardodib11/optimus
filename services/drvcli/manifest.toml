@@ -19,6 +19,7 @@ needs = [
   "svc:optimus.display.DisplayDevice@1?",
   "svc:optimus.block.BlockDevice@1?",
   "svc:optimus.net.NetDevice@1?",
+  "svc:optimus.input.InputDevice@1?",
   "svc:optimus.dev.EntropySource@1?",
 ]
 provides = []

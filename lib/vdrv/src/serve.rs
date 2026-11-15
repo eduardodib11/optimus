@@ -1,4 +1,4 @@
-//! Laço de serviço OIDL dos drivers com laço de eventos (ADR 0060 e 0061):
+//! Laço de serviço OIDL dos drivers com laço de eventos (ADR 0060, 0063 e 0064):
 //! bloqueia em `recv` com prazo curto e, a cada volta (por pedido ou por
 //! prazo), chama `pump` para o driver esvaziar as filas do dispositivo.
 

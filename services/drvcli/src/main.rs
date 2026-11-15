@@ -19,12 +19,14 @@ mod block_cliente;
 mod console_cliente;
 mod display_cliente;
 mod entropy_cliente;
+mod input_cliente;
 mod net_cliente;
 
 use block_cliente::BlockDeviceCliente;
 use console_cliente::ConsoleCliente;
 use display_cliente::DisplayDeviceCliente;
 use entropy_cliente::EntropySourceCliente;
+use input_cliente::InputDeviceCliente;
 use net_cliente::NetDeviceCliente;
 
 ostd::entry!(main);
@@ -326,6 +328,64 @@ fn net(s: &mut Session, quota: Handle) {
     }
 }
 
+/// Anel de eventos do `InputDevice`: 4 KiB de dados (o que `info()` informa).
+const INPUT_VA: u64 = 0x30_0300_0000;
+const INPUT_RING_BYTES: u32 = 4096;
+/// Quanto esperar a tecla que o xtask injeta.
+const KEY_WAIT_NS: u64 = 4_000_000_000;
+
+/// Faz o papel do `inputd`: liga o anel de eventos pelo contrato e
+/// espera a tecla `a` (evdev 30) que o xtask injeta pelo monitor.
+fn input_steps(s: &mut Session, ep: Handle, quota: Handle) -> Option<Consumer> {
+    let cli = InputDeviceCliente::new(ep);
+    let buf = &mut s.buffer;
+    let info = cli.info(buf).ok()?.ok()?;
+    if info.ring_bytes != INPUT_RING_BYTES {
+        return None;
+    }
+    let session = InputDeviceCliente::new(cli.session(buf).ok()?.ok()?);
+    let obj = ostd::cap::create(
+        quota,
+        ObjectType::MemoryObject,
+        ostd::ring::object_bytes(INPUT_RING_BYTES),
+    )
+    .ok()?;
+    let ntfy = ostd::cap::create(quota, ObjectType::Notification, 0).ok()?;
+    let ring = Consumer::create(obj, INPUT_VA, INPUT_RING_BYTES, 0x1502, ntfy).ok()?;
+    let sig = ostd::cap::mint(ntfy, Rights::SIGNAL, 0, None).ok()?;
+    let rw = ostd::cap::mint(obj, Rights::MAP | Rights::READ | Rights::WRITE, 0, None).ok()?;
+    session.attach_events(buf, rw, sig).ok()?.ok()?;
+    if !matches!(session.attach_events(buf, rw, sig), Ok(Err(_))) {
+        return None;
+    }
+    Some(ring)
+}
+
+fn input(s: &mut Session, quota: Handle) {
+    let Some(ep) = connect(s, b"optimus.input.InputDevice") else {
+        ostd::debug::print("drvcli: input: sem driver");
+        return;
+    };
+    let Some(mut ring) = input_steps(s, ep, quota) else {
+        ostd::debug::print("drvcli: input: falhou");
+        return;
+    };
+    ostd::debug::print("drvcli: input ok");
+    let until = ostd::time::now_ns().saturating_add(KEY_WAIT_NS);
+    let mut rec = [0u8; 8];
+    while ostd::time::now_ns() < until {
+        match ring.pop(&mut rec) {
+            Ok(Some((1, 8))) if rec[0..2] == [1, 0] && rec[2..4] == [30, 0] => {
+                ostd::debug::print("drvcli: input evento 0x1e");
+                return;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => ostd::thread::yield_now(),
+            Err(_) => return,
+        }
+    }
+}
+
 fn entropy(s: &mut Session) {
     let Some(ep) = connect(s, b"optimus.dev.EntropySource") else {
         ostd::debug::print("drvcli: entropy: sem driver");
@@ -367,5 +427,6 @@ fn main(start: Start) -> ! {
     block(&mut s, quota);
     net(&mut s, quota);
     entropy(&mut s);
+    input(&mut s, quota);
     ostd::thread::exit()
 }
