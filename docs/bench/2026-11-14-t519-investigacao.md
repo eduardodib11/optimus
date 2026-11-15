@@ -166,3 +166,15 @@ na faixa de 250 µs, pior caso 136 µs, limite de 100 µs). O teste não passa
 pelo IPC e não muda com este lote; a mesma falha já tinha aparecido no
 8370C antes dele, só com o item 1 (ver acima), e a outra rodada do lote
 (no 6975P-C) passou.
+
+## Fechamento da T-519 (2026-11-15)
+
+A meta (mediana da ida e volta ≤ 1 µs em KVM) passa em três dos quatro
+hosts sorteados pelo runner: AMD EPYC 9V74 (640 ns), AMD EPYC 7763
+(761 ns) e Intel Xeon 6975P-C (831 a 959 ns). No Intel Xeon Platinum 8370C
+fica em 1,18 µs, ≈ 18% acima. **Ressalva aceita** em modo autônomo do
+Eduardo (opção mais fiel ao SDD com menor custo; ele pode rever): cortar
+os ≈ 15% que faltam ali pede mudar como o IPC mantém vivos a thread, o
+`CapSpace` e o `Reply`, com ADR própria, e não entra na T-519. O AMD EPYC
+9V45, o host da ressalva da T-430, não foi sorteado nas rodadas desta
+tarefa.
