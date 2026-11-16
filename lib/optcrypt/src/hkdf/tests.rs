@@ -1,7 +1,8 @@
 //! Vetores da RFC 5869 (casos 1 a 3, SHA-256).
 
 use super::*;
-use crate::testutil::hex;
+use crate::secret::Secret;
+use crate::testutil::{hex, unhex, unhex_usize, wycheproof};
 
 fn caso(salt: &[u8], ikm: &[u8], info: &[u8], prk_esp: &str, okm_esp: &str) {
     let prk = extract(salt, ikm);
@@ -58,4 +59,32 @@ fn limite_de_saida() {
     assert_eq!(expand(&prk, b"", &mut longo), Err(Error::TooLong));
     let k: Secret<32> = expand_secret(&prk, b"rotulo").unwrap();
     assert_ne!(k.expose(), &[0u8; 32]);
+}
+
+/// Wycheproof `hkdf_sha384_test` e `hkdf_sha512_test`: os inválidos pedem
+/// mais que 255 blocos e precisam dar [`Error::TooLong`].
+#[test]
+fn wycheproof_sha384_sha512() {
+    type Hkdf = fn(&[u8], &[u8], &[u8], &mut [u8]) -> Result<(), Error>;
+    let h384: Hkdf = |s, k, i, o| sha384::expand(&sha384::extract(s, k), i, o);
+    let h512: Hkdf = |s, k, i, o| sha512::expand(&sha512::extract(s, k), i, o);
+    let arquivos = [
+        (include_str!("../../vetores/hkdf_sha384.txt"), h384),
+        (include_str!("../../vetores/hkdf_sha512.txt"), h512),
+    ];
+    for (texto, f) in arquivos {
+        for c in wycheproof(texto) {
+            let [ikm, salt, info, size, okm] = c.campos[..] else {
+                panic!("tc {}", c.id)
+            };
+            let mut out = vec![0u8; unhex_usize(size)];
+            let r = f(&unhex(salt), &unhex(ikm), &unhex(info), &mut out);
+            if c.res == 'v' {
+                assert_eq!(r, Ok(()), "tc {}", c.id);
+                assert_eq!(out, unhex(okm), "tc {}", c.id);
+            } else {
+                assert_eq!(r, Err(Error::TooLong), "tc {}", c.id);
+            }
+        }
+    }
 }
