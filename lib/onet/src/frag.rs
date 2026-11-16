@@ -5,6 +5,8 @@
 //! Datagrama novo com todas as vagas ocupadas é recusado, e não despeja os
 //! que estão em andamento: um atacante não expulsa os legítimos.
 
+use alloc::boxed::Box;
+
 use crate::ip4::Header;
 
 /// Datagramas em remontagem ao mesmo tempo.
@@ -28,7 +30,9 @@ struct Slot {
     count: usize,
     /// Tamanho total, conhecido ao chegar o último fragmento.
     total: Option<usize>,
-    buf: [u8; MAX_DATAGRAM],
+    /// Alocado no primeiro uso: um `Slot` por valor na pilha de 64 KiB de um
+    /// processo em depuração estoura.
+    buf: Option<Box<[u8; MAX_DATAGRAM]>>,
 }
 
 impl Slot {
@@ -42,7 +46,7 @@ impl Slot {
         ranges: [(0, 0); MAX_FRAGS],
         count: 0,
         total: None,
-        buf: [0; MAX_DATAGRAM],
+        buf: None,
     };
 
     fn matches(&self, h: &Header) -> bool {
@@ -150,7 +154,8 @@ impl Reassembler {
         }
         s.ranges[s.count] = (a, b);
         s.count += 1;
-        s.buf[start..end].copy_from_slice(payload);
+        let buf = s.buf.get_or_insert_with(|| Box::new([0; MAX_DATAGRAM]));
+        buf[start..end].copy_from_slice(payload);
         if !h.more_fragments {
             s.total = Some(end);
         }
@@ -162,7 +167,7 @@ impl Reassembler {
         if have != total || out.len() < total {
             return None;
         }
-        out[..total].copy_from_slice(&s.buf[..total]);
+        out[..total].copy_from_slice(&buf[..total]);
         s.used = false;
         let mut done = *h;
         done.more_fragments = false;

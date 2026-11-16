@@ -24,6 +24,7 @@ mod input_cliente;
 mod keyd_cliente;
 mod optfs_step;
 mod persist_step;
+mod socket_cliente;
 mod storage_cliente;
 
 use console_cliente::ConsoleCliente;
@@ -31,6 +32,7 @@ use display_cliente::DisplayDeviceCliente;
 use entropy_cliente::EntropySourceCliente;
 use input_cliente::InputDeviceCliente;
 use keyd_cliente::{KeydError, KeyringCliente};
+use socket_cliente::SocketCliente;
 use storage_cliente::{BlockStoreCliente, StorageCliente};
 
 /// O que o xtask digita no console (`CONSOLE_INPUT` do xtask).
@@ -501,6 +503,37 @@ fn keyd(s: &mut Session) {
     }
 }
 
+/// Sem `net:access:` no manifesto, o `netd` nega o socket (T-637; ADR 0068,
+/// item 3). O `netcli` é quem tem política e faz o tráfego.
+fn net(s: &mut Session, quota: Handle) {
+    let Some(ep) = connect(s, b"optimus.net.Socket") else {
+        ostd::debug::print("drvcli: net: sem serviço");
+        return;
+    };
+    let rx = ostd::cap::create(
+        quota,
+        ObjectType::MemoryObject,
+        ostd::ring::object_bytes(8192),
+    );
+    let ntfy = ostd::cap::create(quota, ObjectType::Notification, 0);
+    let (Ok(rx), Ok(ntfy)) = (rx, ntfy) else {
+        ostd::debug::print("drvcli: net: falhou (criar o anel)");
+        return;
+    };
+    let rx_rw = ostd::cap::mint(rx, Rights::MAP | Rights::READ | Rights::WRITE, 0, None);
+    let wake = ostd::cap::mint(ntfy, Rights::SIGNAL, 0, None);
+    let (Ok(rx_rw), Ok(wake)) = (rx_rw, wake) else {
+        ostd::debug::print("drvcli: net: falhou (cunhar)");
+        return;
+    };
+    match SocketCliente::new(ep).open(&mut s.buffer, 1, rx_rw, wake) {
+        Ok(Err(e)) if e == socket_cliente::SocketError::Denied => {
+            ostd::debug::print("drvcli: net: sem NetAccess, socket negado");
+        }
+        r => ostd::debug::print_fmt(format_args!("drvcli: net: falhou ({r:?})")),
+    }
+}
+
 fn main(start: Start) -> ! {
     let mut s = match Session::start(start.args) {
         Ok(s) => s,
@@ -524,6 +557,7 @@ fn main(start: Start) -> ! {
     storage(&mut s, quota);
     entropy(&mut s);
     input(&mut s, quota);
+    net(&mut s, quota);
     // Por último: pede senhas no console e é o passo mais demorado do cliente.
     keyd(&mut s);
     ostd::thread::exit()

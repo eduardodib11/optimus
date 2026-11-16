@@ -84,6 +84,7 @@ const CRATES: &[(&str, &str, &str)] = &[
     ("keyd", "services/keyd/src/main.rs", USER_TARGET),
     ("onet", "lib/onet/src/lib.rs", KERNEL_TARGET),
     ("netd", "services/netd/src/main.rs", USER_TARGET),
+    ("netcli", "services/netcli/src/main.rs", USER_TARGET),
     ("utest", "services/utest/src/main.rs", USER_TARGET),
     ("okfuzz", "fuzz/okfuzz/src/main.rs", USER_TARGET),
 ];
@@ -436,7 +437,9 @@ fn rustc_flags(package: &str) -> &'static [&'static str] {
         "root" | "hello" | "svcmgr" | "timed" | "logd" | "memd" | "pcid" | "acpid" | "devmgr"
         | "drvteste" | "virtio-blk" | "virtio-rng" | "virtio-console" | "virtio-input"
         | "virtio-net" | "virtio-gpu" | "rtcd" | "inputd" | "i8042d" | "ps2mouse" | "drvcli"
-        | "keyd" | "storaged" | "netd" | "utest" | "okfuzz" => &["-C", "relocation-model=static"],
+        | "keyd" | "storaged" | "netd" | "netcli" | "utest" | "okfuzz" => {
+            &["-C", "relocation-model=static"]
+        }
         _ => &[],
     }
 }
@@ -495,6 +498,7 @@ const BOOTFS: &[(&str, &str)] = &[
     ("drvcli", "drvcli"),
     ("storaged", "storaged"),
     ("netd", "netd"),
+    ("netcli", "netcli"),
     ("keyd", "keyd"),
     ("utest", "utest"),
     ("okfuzz", "okfuzz"),
@@ -1058,7 +1062,7 @@ const DRIVER_SCENARIO: Scenario = Scenario {
     name: "devmgr parte o drvteste, que faz DMA isolado e recebe a MSI do edu",
     markers: &[
         "okernel: remapeamento de interrupções ligado",
-        "devmgr: 13 drivers no conjunto",
+        "devmgr: 14 drivers no conjunto",
         "1234:11e8 1 BARs: drvteste",
         "devmgr: driver partiu com",
         "svcmgr: drvteste em Running",
@@ -1176,6 +1180,13 @@ macro_rules! m4_markers {
             // T-635: a conexão TCP ao eco do host leva 4000 bytes e eles
             // voltam iguais.
             "netd: tcp: eco do host",
+            // T-637: o `netd` nega o socket a quem não tem `net:access:` (o
+            // `drvcli`) e deixa o `netcli`, com política, falar só com o
+            // eco do host: o destino fora da lista é negado.
+            "drvcli: net: sem NetAccess, socket negado",
+            "netcli: política: destino fora da lista negado",
+            "netcli: tcp: eco do host",
+            "netcli: udp: eco do host",
             "drvcli: input ok",
             "drvcli: input evento 0x1e",
             "drvcli: entropy ok",
@@ -1240,6 +1251,11 @@ const M4_FORBIDDEN: &[&str] = &[
     "storaged: falhou",
     "storaged: GPT inválida",
     "netd: falhou",
+    "drvcli: net: falhou",
+    "drvcli: net: sem serviço",
+    "netcli: tcp: falhou",
+    "netcli: udp: falhou",
+    "netcli: sem serviço",
     "drvcli: input: falhou",
     "drvcli: input: sem driver",
     "drvcli: entropy: falhou",
@@ -1273,6 +1289,11 @@ const M4_IOMMU_FORBIDDEN: &[&str] = &[
     "storaged: falhou",
     "storaged: GPT inválida",
     "netd: falhou",
+    "drvcli: net: falhou",
+    "drvcli: net: sem serviço",
+    "netcli: tcp: falhou",
+    "netcli: udp: falhou",
+    "netcli: sem serviço",
     "drvcli: input: falhou",
     "drvcli: input: sem driver",
     "drvcli: entropy: falhou",
@@ -2489,6 +2510,9 @@ fn test(opts: &Options) -> Result {
                 "virtio-net-pci,netdev=vn0,disable-legacy=on",
                 "virtio-gpu-pci,id=vgpu,disable-legacy=on",
             ],
+            // O `netcli` e as provas do `netd` com o eco do host levam alguns
+            // segundos a mais sob TCG.
+            window: Some(10_000),
             ..opts.clone()
         };
         smoke(&plain, &[VIRTIO_SCENARIO])?;
@@ -2505,6 +2529,9 @@ fn test(opts: &Options) -> Result {
                 "virtio-net-pci,netdev=vn0,disable-legacy=on,iommu_platform=on",
                 "virtio-gpu-pci,id=vgpu,disable-legacy=on,iommu_platform=on",
             ],
+            // O `netcli` e as provas do `netd` com o eco do host levam alguns
+            // segundos a mais sob TCG.
+            window: Some(10_000),
             ..opts.clone()
         };
         smoke(&iommu, &[VIRTIO_IOMMU_SCENARIO])?;
@@ -2580,7 +2607,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "pcid: 00:1f.3 0c05: 8086:2930 (rev 02)",
     "pcid: 7 funções",
     // T-401: cada função vira nó no `devmgr`.
-    "devmgr: 13 drivers no conjunto",
+    "devmgr: 14 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: drvcli",
     "devmgr: nó 00:1f.0 8086:2918 0 BARs: storaged",
     "devmgr: nó 00:1f.3 8086:2930 1 BARs: netd",

@@ -1,0 +1,19 @@
+[package]
+name = "netcli"
+description = "netcli: cliente de teste dos sockets do netd, com NetAccess (T-637; ADR 0068)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "netcli"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+oidl-rt = { path = "../../lib/oidl-rt" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true

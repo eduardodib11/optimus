@@ -1,0 +1,21 @@
+// Configuração de rede (T-637; ADR 0068, item 1), só leitura: o `netd` a
+// serve no mesmo endpoint de `Socket` (nota da ADR 0068). A escrita (DHCP,
+// UI de rede) chega com a T-633.
+package optimus.net @1.0;
+
+enum ConfigError : u8 { Busy }
+
+// `ip`, `mask`, `gateway` e `dns` com o primeiro byte do endereço nos 8 bits
+// altos (zero: sem valor); `mac` nos 48 bits baixos, o primeiro byte do
+// endereço no mais baixo.
+struct NetStatus {
+    mac: u64,
+    ip: u32,
+    mask: u32,
+    gateway: u32,
+    dns: u32
+}
+
+interface Config {
+    status() -> result<NetStatus, ConfigError>;
+}

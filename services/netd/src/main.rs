@@ -20,12 +20,18 @@ use ostd::rt::Start;
 use ostd::svc::Session;
 
 mod net_cliente;
+#[allow(unused_imports, reason = "código gerado")]
+mod netconfig_servidor;
 mod probe;
+mod rings;
+mod servico;
+#[allow(unused_imports, reason = "código gerado")]
+mod socket_servidor;
 
 use net_cliente::NetDeviceCliente;
 use onet::eth::{self, Mac};
-use onet::stack::{Link, Stack};
-use probe::Probes;
+use onet::stack::Link;
+use servico::Net;
 
 ostd::entry!(main);
 
@@ -42,16 +48,14 @@ const RING_BYTES: u32 = 16384;
 const TX_VA: u64 = 0x30_0100_0000;
 const RX_VA: u64 = 0x30_0200_0000;
 /// `kind` do registro de quadro nos dois anéis (ADR 0064).
-const FRAME_KIND: u16 = 1;
-/// Bits da `Notification` do `netd`: o anel de recepção e o relógio.
+pub(crate) const FRAME_KIND: u16 = 1;
+/// Bits da `Notification` do `netd`: o anel de recepção e a espera do `pause`.
 const RX_BIT: u64 = 1;
 const TIMER_BIT: u64 = 2;
-/// Período do relógio da pilha (ARP, e depois TCP e DHCP).
-const TICK_NS: u64 = 50_000_000;
 /// Imagem de teste (`xtask test`, `OPTIMUS_KTEST_DEBUG`): só ela faz as
 /// provas ao roteador do QEMU e as registra; a imagem normal não gera tráfego
 /// que ninguém pediu.
-const TESTE: bool = option_env!("OPTIMUS_KTEST_DEBUG").is_some();
+pub(crate) const TESTE: bool = option_env!("OPTIMUS_KTEST_DEBUG").is_some();
 
 fn hash(text: &[u8]) -> u32 {
     let h = optcrypt::blake3::hash(text);
@@ -103,14 +107,14 @@ fn connect(s: &mut Session, name: &[u8], timer: Handle, ntfy: Handle) -> Option<
 }
 
 /// A interface de rede: MAC e os dois anéis do `NetDevice`.
-struct Nic {
+pub(crate) struct Nic {
     mac: Mac,
     tx: Producer,
     rx: Consumer,
 }
 
 /// Os quadros da pilha saem pelo anel de transmissão.
-struct TxLink<'a>(&'a mut Producer);
+pub(crate) struct TxLink<'a>(pub(crate) &'a mut Producer);
 
 impl Link for TxLink<'_> {
     fn send(&mut self, frame: &[u8]) -> bool {
@@ -162,49 +166,15 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let ntfy = ostd::cap::create(quota, ObjectType::Notification, 0)
         .map_err(|_| "criar a Notification")?;
     let ep = connect(s, b"optimus.net.NetDevice", timer, ntfy).ok_or("sem driver de rede")?;
-    let mut nic = Nic::attach(s, ep, quota, ntfy).ok_or("ligar ao NetDevice")?;
-    // Relógio da pilha: o `Timer` periódico sinaliza a mesma `Notification`
-    // do anel de recepção.
-    ostd::cap::arm_timer(
-        timer,
-        ntfy,
-        TIMER_BIT,
-        TICK_NS,
-        TICK_NS,
-        ostd::kabi::timer::RELATIVE,
-    )
-    .map_err(|_| "armar o Timer")?;
-    let mut stack = Stack::new(nic.mac);
-    // O segredo do ISN do TCP e os `xid` do DHCP vêm do DRBG do kernel; o
-    // endereço, a rota e o DNS, do servidor DHCP (T-633).
-    let mut seed = [0u8; 16];
-    let _ = ostd::rand::secure_fill(&mut seed);
-    stack.seed(seed);
-    stack.start_dhcp();
-    let mut frame = [0u8; eth::MAX_FRAME];
-    let mut probes = Probes::new();
-    loop {
-        let now = ostd::time::now_ns();
-        loop {
-            match nic.rx.pop(&mut frame) {
-                Ok(Some((FRAME_KIND, n))) => {
-                    let link = &mut TxLink(&mut nic.tx);
-                    let ev = stack.input(link, &mut probes, &frame[..n], now);
-                    probes.event(ev);
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => return Err("anel de recepção corrompido"),
-            }
-        }
-        stack.tick(&mut TxLink(&mut nic.tx), now);
-        if TESTE {
-            probes.step(&mut stack, &mut TxLink(&mut nic.tx), now);
-        }
-        if nic.rx.wait().is_err() {
-            return Err("espera no anel de recepção");
-        }
-    }
+    let nic = Nic::attach(s, ep, quota, ntfy).ok_or("ligar ao NetDevice")?;
+    // O endpoint de `Socket@1` que o `svcmgr` cria para o `netd` servir.
+    let ep = s
+        .boot
+        .provided(interface_id(b"optimus.net.Socket"))
+        .map(Handle::from_raw)
+        .ok_or("sem endpoint de sockets")?;
+    let mut net = Net::new(s, nic, quota, ntfy, ep).map_err(|_| "criar o serviço")?;
+    net.run()
 }
 
 fn main(start: Start) -> ! {

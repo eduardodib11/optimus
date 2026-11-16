@@ -229,6 +229,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "netcli"
+version = "0.1.0"
+dependencies = [
+ "oidl-rt",
+ "optcrypt",
+ "ostd",
+]
+
+[[package]]
 name = "netd"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,26 @@
+# Cliente de teste dos sockets do `netd` (T-637; ADR 0068): o único serviço
+# com `NetAccess`. A política deixa ir só aos servidores de eco do host que o
+# `xtask` sobe (UDP 47107 e TCP 47108, no 10.0.2.2 do QEMU): o que sai da lista
+# é negado. Parte pelo `devmgr`, casado com o controlador SATA do q35
+# (`8086:2922`), que existe em toda VM do teste e não tem outro driver; o
+# `netd` só existe depois do casamento dele, então a necessidade é opcional.
+[service]
+name = "netcli"
+binary = "netcli"
+priority = 110
+restart = "never"
+
+[capabilities]
+needs = [
+  "mem:quota:768KiB",
+  "kernel:debug",
+  "svc:optimus.net.Socket@1?",
+  "net:access:connect=tcp:10.0.2.2:47108;connect=udp:10.0.2.2:47107;conns=4;rate=20",
+]
+provides = []
+
+[match]
+pci = ["8086:2922"]
+
+[limits]
+max_threads = 1

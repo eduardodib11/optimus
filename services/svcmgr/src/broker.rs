@@ -53,6 +53,19 @@ pub const SOCKET: &str = "optimus.net.Socket";
 
 /// Direitos do cliente sobre o endpoint de um provedor.
 pub const CLIENT_RIGHTS: Rights = Rights::SEND;
+/// Clientes do `netd` também levam `GRANT`: abrir um socket entrega os anéis
+/// de dados e a `Notification` (ADR 0068, item 3).
+pub const NET_CLIENT_RIGHTS: Rights = Rights::SEND.union(Rights::GRANT);
+
+/// Os direitos de um cliente de `p`.
+fn client_rights(p: &Entry) -> Rights {
+    if p.provide_ids.contains(&interface_id(SOCKET, 1)) {
+        NET_CLIENT_RIGHTS
+    } else {
+        CLIENT_RIGHTS
+    }
+}
+
 /// Direitos do provedor sobre o próprio endpoint.
 pub const PROVIDER_RIGHTS: Rights = Rights::RECV.union(Rights::SEND).union(Rights::GRANT);
 /// Direitos do serviço sobre a própria cota.
@@ -334,7 +347,7 @@ impl Broker {
                     let iid = interface_id(&need.name, need.major);
                     match self.provider(iid) {
                         Some((p, j)) if p.manifest.provides[j].minor >= need.minor => {
-                            steps.push(mint(p.roots[j], CLIENT_RIGHTS, b, KIND_SVC, index, iid));
+                            steps.push(mint(p.roots[j], client_rights(p), b, KIND_SVC, index, iid));
                         }
                         _ if need.optional => {}
                         _ => return Err(DeliverError::NotRunning),
@@ -523,7 +536,7 @@ impl Broker {
         if p.manifest.provides[j].minor < minor {
             return Err(SvcError::VersionTooOld);
         }
-        caps.mint(p.roots[j], CLIENT_RIGHTS, client, None)
+        caps.mint(p.roots[j], client_rights(p), client, None)
             .map_err(|_| SvcError::Busy)
     }
 
