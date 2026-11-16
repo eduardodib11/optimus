@@ -53,6 +53,10 @@ const STATIC: Config = Config {
     mask: [255, 255, 255, 0],
     gateway: [10, 0, 2, 2],
 };
+/// Imagem de teste (`xtask test`, `OPTIMUS_KTEST_DEBUG`): só ela faz as
+/// provas ao roteador do QEMU e as registra; a imagem normal não gera tráfego
+/// que ninguém pediu.
+const TESTE: bool = option_env!("OPTIMUS_KTEST_DEBUG").is_some();
 /// Intervalo entre os `ping` de prova ao roteador (ns) e o identificador.
 const PING_NS: u64 = 500_000_000;
 const PING_ID: u16 = 0x6e64;
@@ -206,12 +210,12 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
         stack.tick(now);
         let link = &mut TxLink(&mut nic.tx);
         if stack.neighbor(link, STATIC.gateway, now).is_some() {
-            if !gateway_seen {
+            if TESTE && !gateway_seen {
                 gateway_seen = true;
                 ostd::debug::print("netd: arp: roteador 10.0.2.2 resolvido");
             }
             // Prova da camada IP: eco ao roteador até ele responder.
-            if !ping_ok && now >= next_ping {
+            if TESTE && !ping_ok && now >= next_ping {
                 seq = seq.wrapping_add(1);
                 let _ = stack.ping(link, STATIC.gateway, PING_ID, seq, b"optimus", now);
                 next_ping = now.saturating_add(PING_NS);
