@@ -107,6 +107,9 @@ pub trait Keyring {
     fn create_volume(&mut self, ctx: &Contexto, uuid: &str) -> Result<&[u8], KeydError>;
     /// Método `unlock` (ordinal 1).
     fn unlock(&mut self, ctx: &Contexto, uuid: &str, slots: &str) -> Result<&[u8], KeydError>;
+    /// Método `dataset_key` (ordinal 2).
+    fn dataset_key(&mut self, ctx: &Contexto, uuid: &str, dataset: u32)
+    -> Result<&[u8], KeydError>;
 }
 
 fn pedido_keyring_0<'a>(r: &mut Reader<'a>, caps: &[u64]) -> Result<(&'a str,), Error> {
@@ -173,6 +176,38 @@ fn resp_err_keyring_1(saida: &mut [u8], v: &KeydError) -> Result<usize, Error> {
     Ok(escritor.finish())
 }
 
+fn pedido_keyring_2<'a>(r: &mut Reader<'a>, caps: &[u64]) -> Result<(&'a str, u32), Error> {
+    let _ = caps;
+    Ok((r.string(32)?, r.u32()?))
+}
+
+fn resp_ok_keyring_2(saida: &mut [u8], v: &&[u8]) -> Result<usize, Error> {
+    let mut escritor = Writer::new(saida, 8)?;
+    {
+        let w = &mut escritor;
+        let off3 = {
+            w.seek(0);
+            w.vec((*v).len(), 1, 32)?
+        };
+        for (i3, el) in (*v).iter().enumerate() {
+            let at2 = off3 + i3 * 1;
+            w.seek(at2);
+            w.u8((*el))?;
+        }
+    }
+    Ok(escritor.finish())
+}
+
+fn resp_err_keyring_2(saida: &mut [u8], v: &KeydError) -> Result<usize, Error> {
+    let mut escritor = Writer::new(saida, 1)?;
+    {
+        let w = &mut escritor;
+        w.seek(0);
+        w.u8((v).0)?;
+    }
+    Ok(escritor.finish())
+}
+
 /// Despacha uma mensagem para `Keyring`; `None` quando não há resposta (oneway).
 #[allow(clippy::too_many_lines)]
 pub fn despacha_keyring<S: Keyring>(
@@ -188,6 +223,9 @@ pub fn despacha_keyring<S: Keyring>(
     let _ = (&saida, &caps_out);
     match (e.rotulo & 0xFFFF) as u16 {
         0 => {
+            if versao_menor < 1 {
+                return protocolo(3);
+            }
             if e.corpo.len() as u64 > 40 {
                 return protocolo(5);
             }
@@ -223,6 +261,9 @@ pub fn despacha_keyring<S: Keyring>(
             }
         }
         1 => {
+            if versao_menor < 1 {
+                return protocolo(3);
+            }
             if e.corpo.len() as u64 > 1664 {
                 return protocolo(5);
             }
@@ -248,6 +289,44 @@ pub fn despacha_keyring<S: Keyring>(
                     Err(_) => protocolo(5),
                 },
                 Err(x) => match resp_err_keyring_1(saida, &x) {
+                    Ok(n) => Some(Despacho {
+                        rotulo: rotulo_resposta(1, 0),
+                        corpo: n,
+                        caps: 0,
+                    }),
+                    Err(_) => protocolo(5),
+                },
+            }
+        }
+        2 => {
+            if versao_menor < 1 {
+                return protocolo(3);
+            }
+            if e.corpo.len() as u64 > 48 {
+                return protocolo(5);
+            }
+            let mut r = match Reader::new(e.corpo, 12) {
+                Ok(r) => r,
+                Err(_) => return protocolo(4),
+            };
+            let (p_uuid, p_dataset) = match pedido_keyring_2(&mut r, e.caps) {
+                Ok(x) => x,
+                Err(_) => return protocolo(4),
+            };
+            if r.finish().is_err() {
+                return protocolo(4);
+            }
+            let ctx = Contexto { badge: e.badge };
+            match s.dataset_key(&ctx, p_uuid, p_dataset) {
+                Ok(x) => match resp_ok_keyring_2(saida, &x) {
+                    Ok(n) => Some(Despacho {
+                        rotulo: rotulo_resposta(0, 0),
+                        corpo: n,
+                        caps: 0,
+                    }),
+                    Err(_) => protocolo(5),
+                },
+                Err(x) => match resp_err_keyring_2(saida, &x) {
                     Ok(n) => Some(Despacho {
                         rotulo: rotulo_resposta(1, 0),
                         corpo: n,

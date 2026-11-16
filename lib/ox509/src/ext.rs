@@ -57,6 +57,8 @@ pub struct ExtKeyUsage {
     pub server_auth: bool,
     /// `anyExtendedKeyUsage`.
     pub any: bool,
+    /// `id-kp-OCSPSigning` (respondedor delegado, RFC 6960, 4.2.2.2).
+    pub ocsp_signing: bool,
 }
 
 /// Lista `GeneralNames` já validada.
@@ -220,6 +222,7 @@ impl<'a> Extensions<'a> {
                 let mut eku = ExtKeyUsage {
                     server_auth: false,
                     any: false,
+                    ocsp_signing: false,
                 };
                 if s.is_empty() {
                     return Err(Error::Malformed);
@@ -228,6 +231,7 @@ impl<'a> Extensions<'a> {
                     match der::oid(s.expect(tag::OID)?.value)? {
                         oid::KP_SERVER_AUTH => eku.server_auth = true,
                         oid::ANY_EXT_KEY_USAGE => eku.any = true,
+                        oid::KP_OCSP_SIGNING => eku.ocsp_signing = true,
                         _ => {}
                     }
                 }

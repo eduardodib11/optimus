@@ -15,6 +15,7 @@ pub mod msg;
 pub mod record;
 pub mod schedule;
 
+use ox509::ocsp::OcspError;
 use ox509::verify::VerifyError;
 use record::RecordError;
 
@@ -47,6 +48,13 @@ pub enum Error {
     UnsupportedCertificate,
     /// Cadeia recusada pela validação.
     Certificate(VerifyError),
+    /// O emissor revogou o certificado (OCSP grampeado, T-655).
+    Revoked,
+    /// Resposta OCSP inválida e a política (ou o `must-staple`) exigia uma
+    /// boa.
+    Ocsp(OcspError),
+    /// Certificado `must-staple` (ou política `Require`) sem resposta OCSP.
+    StapleRequired,
     /// Mensagem de handshake maior que o buffer.
     TooLarge,
     /// Falha interna (`internal_error`).
@@ -75,7 +83,9 @@ impl Error {
             }
             Self::Certificate(VerifyError::Expired | VerifyError::NotYetValid) => 45,
             Self::Certificate(VerifyError::UnknownIssuer) => 48,
-            Self::BadCertificate | Self::Certificate(_) => 42,
+            Self::Revoked => 44,
+            Self::Ocsp(_) => 113,
+            Self::BadCertificate | Self::StapleRequired | Self::Certificate(_) => 42,
             Self::Internal => 80,
             Self::PeerAlert(_) => return None,
         })

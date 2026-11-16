@@ -1,7 +1,7 @@
 #![no_main]
 
-//! Handshake do cliente contra bytes do fuzz, em dois modos (primeiro
-//! byte par ou ímpar):
+//! Handshake do cliente contra bytes do fuzz, em dois modos (bit 0 do
+//! primeiro byte; o bit 1 escolhe a cadeia de teste, ver [`client`]):
 //!
 //! - registros crus logo depois do `ClientHello`: cabeçalhos, alertas, CCS,
 //!   `ServerHello` mal formado;
@@ -20,7 +20,7 @@ use optcrypt::mlkem768;
 use optcrypt::secret::Secret;
 use optcrypt::x25519;
 use otls::Suite;
-use otls::client::{Client, Config};
+use otls::client::{Client, Config, OcspPolicy};
 use otls::msg::Reader;
 use otls::record::{HEADER_LEN, MAX_RECORD, content};
 use otls::schedule::{EarlySecret, Transcript};
@@ -29,6 +29,8 @@ use ox509::{PublicKey, SignatureAlgorithm};
 
 const ROOT: &[u8] = include_bytes!("../../../lib/ox509/testdata/teste-root.der");
 const LEAF: &[u8] = include_bytes!("../../../lib/ox509/testdata/teste-leaf.der");
+const ED_ROOT: &[u8] = include_bytes!("../../../lib/ox509/testdata/teste-edca.der");
+const ED_LEAF: &[u8] = include_bytes!("../../../lib/ox509/testdata/teste-edleaf.der");
 
 struct Aceita;
 
@@ -38,14 +40,23 @@ impl SignatureVerifier for Aceita {
     }
 }
 
-fn client() -> Client<'static, Aceita> {
+/// Cadeia P-256 (`optimus.test`, folha com `must-staple`: exercita o OCSP
+/// grampeado) ou Ed25519 (`casa.lan`, sem `must-staple`: o fuzz chega ao
+/// `CertificateVerify` e ao `Finished`).
+fn client(ed: bool) -> Client<'static, Aceita> {
+    let (name, root, leaf) = if ed {
+        ("casa.lan", ED_ROOT, ED_LEAF)
+    } else {
+        ("optimus.test", ROOT, LEAF)
+    };
     let cfg = Config {
-        name: ServerName::Dns("optimus.test"),
-        anchors: Anchors::parse(ROOT).unwrap(),
+        name: ServerName::Dns(name),
+        anchors: Anchors::parse(root).unwrap(),
         // Um dia depois do `notBefore` da folha de teste.
-        now: ox509::Certificate::parse(LEAF).unwrap().not_before + 86_400,
+        now: ox509::Certificate::parse(leaf).unwrap().not_before + 86_400,
         allow_classic: false,
         pin: None,
+        ocsp: OcspPolicy::Opportunistic,
     };
     let mut n = 0u8;
     Client::new(cfg, Aceita, &mut |b: &mut [u8]| {
@@ -93,7 +104,7 @@ fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
         return;
     };
-    let mut c = client();
+    let mut c = client(mode & 2 != 0);
     let mut out = vec![0u8; 4096];
     let n = c.start(&mut out).unwrap();
     if mode % 2 == 0 {

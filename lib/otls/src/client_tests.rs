@@ -14,11 +14,12 @@
 use optcrypt::mlkem768;
 use optcrypt::secret::Secret;
 use optcrypt::x25519;
+use ox509::ocsp::OcspError;
 use ox509::verify::{Anchors, ServerName, SignatureVerifier, VerifyError};
 use ox509::{PublicKey, SignatureAlgorithm};
 
 use super::*;
-use crate::client::{Client, Config};
+use crate::client::{Client, Config, Ocsp, OcspPolicy};
 use crate::msg::{HRR_RANDOM, Reader, group, kind};
 use crate::record::{HEADER_LEN, RecordKeys, content};
 use crate::schedule::{EarlySecret, Traffic, Transcript};
@@ -26,6 +27,11 @@ use crate::schedule::{EarlySecret, Traffic, Transcript};
 const ROOT: &[u8] = include_bytes!("../../ox509/testdata/teste-root.der");
 const INT: &[u8] = include_bytes!("../../ox509/testdata/teste-int.der");
 const LEAF: &[u8] = include_bytes!("../../ox509/testdata/teste-leaf.der");
+/// Cadeia do OCSP: uma CA e uma folha sem `must-staple` (`ocsp.optimus.test`).
+const OCSP_CA: &[u8] = include_bytes!("../../ox509/testdata/ocsp-ca.der");
+const OCSP_LEAF: &[u8] = include_bytes!("../../ox509/testdata/ocsp-folha-bom.der");
+const OCSP_GOOD: &[u8] = include_bytes!("../../ox509/testdata/ocsp-resp-bom.der");
+const OCSP_STALE: &[u8] = include_bytes!("../../ox509/testdata/ocsp-resp-curta.der");
 
 struct Fake;
 
@@ -39,6 +45,97 @@ fn now() -> i64 {
     ox509::Certificate::parse(LEAF).unwrap().not_before + 86_400
 }
 
+fn ocsp_now() -> i64 {
+    ox509::Certificate::parse(OCSP_LEAF).unwrap().not_before + 86_400
+}
+
+/// DER na mão, para montar respostas OCSP que o `Fake` aceita.
+fn tlv(tag: u8, v: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    match v.len() {
+        n if n < 0x80 => out.push(u8::try_from(n).unwrap()),
+        n if n < 0x100 => out.extend([0x81, u8::try_from(n).unwrap()]),
+        n => {
+            out.push(0x82);
+            out.extend(u16::try_from(n).unwrap().to_be_bytes());
+        }
+    }
+    out.extend(v);
+    out
+}
+
+/// `GeneralizedTime` de `t` (segundos desde 1970).
+fn gtime(t: i64) -> Vec<u8> {
+    let (days, secs) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    // `civil_from_days` de H. Hinnant.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let text = format!(
+        "{y:04}{m:02}{d:02}{:02}{:02}{:02}Z",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    );
+    tlv(0x18, text.as_bytes())
+}
+
+/// Resposta OCSP do `teste-leaf` (série 0xD1), "assinada" com RSA SHA-256:
+/// o `Fake` aceita qualquer assinatura que não seja de `CertificateVerify`.
+fn built_staple(status: Staple, this: i64, next: i64) -> Vec<u8> {
+    let st = match status {
+        Staple::Revoked => tlv(0xA1, &gtime(this - 100)),
+        Staple::Unknown => tlv(0x82, &[]),
+        _ => tlv(0x80, &[]),
+    };
+    let sha1 = tlv(
+        0x30,
+        &[tlv(0x06, &[0x2B, 0x0E, 0x03, 0x02, 0x1A]), tlv(0x05, &[])].concat(),
+    );
+    let id = tlv(
+        0x30,
+        &[
+            sha1,
+            tlv(0x04, &[0; 20]),
+            tlv(0x04, &[0; 20]),
+            tlv(0x02, &[0x00, 0xD1]),
+        ]
+        .concat(),
+    );
+    let single = tlv(
+        0x30,
+        &[id, st, gtime(this), tlv(0xA0, &gtime(next))].concat(),
+    );
+    let tbs = tlv(
+        0x30,
+        &[tlv(0xA1, &tlv(0x30, &[])), gtime(this), tlv(0x30, &single)].concat(),
+    );
+    let rsa_sha256 = tlv(
+        0x30,
+        &[
+            tlv(
+                0x06,
+                &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B],
+            ),
+            tlv(0x05, &[]),
+        ]
+        .concat(),
+    );
+    let basic = tlv(0x30, &[tbs, rsa_sha256, tlv(0x03, &[0, 1, 2, 3])].concat());
+    let basic_oid = tlv(
+        0x06,
+        &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01],
+    );
+    let rb = tlv(0x30, &[basic_oid, tlv(0x04, &basic)].concat());
+    tlv(0x30, &[tlv(0x0A, &[0]), tlv(0xA0, &rb)].concat())
+}
+
 fn rng() -> impl FnMut(&mut [u8]) {
     let mut n = 0u8;
     move |b: &mut [u8]| {
@@ -49,9 +146,39 @@ fn rng() -> impl FnMut(&mut [u8]) {
     }
 }
 
+/// O OCSP que o servidor de teste grampeia.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Staple {
+    /// Resposta boa: do `teste-leaf` (montada) ou do `ocsp-folha-bom` (real).
+    #[default]
+    Good,
+    /// Nada.
+    Absent,
+    /// Revogado.
+    Revoked,
+    /// `unknown`.
+    Unknown,
+    /// `nextUpdate` já passou.
+    Stale,
+    /// Bytes de uma resposta pronta.
+    Raw(&'static [u8]),
+}
+
+/// A cadeia que o servidor de teste apresenta.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Pki {
+    /// `teste-leaf` (com `must-staple`) e `teste-int`.
+    #[default]
+    Teste,
+    /// `ocsp-folha-bom` direto da `ocsp-ca`, sem `must-staple`.
+    Ocsp,
+}
+
 /// O que o servidor de teste faz de diferente.
 #[derive(Clone, Copy, Default)]
 struct Knobs {
+    staple: Staple,
+    pki: Pki,
     classic: bool,
     tls12: bool,
     retry: bool,
@@ -208,11 +335,36 @@ fn serve(ch_record: &[u8], k: Knobs) -> (Option<Server>, Vec<Vec<u8>>) {
             hs_msg(kind::CERTIFICATE_REQUEST, &[2, 0xAB, 0xCD, 0, 0]),
         );
     }
+    let (chain, t_now): (&[&[u8]], i64) = match k.pki {
+        Pki::Teste => (&[LEAF, INT], now()),
+        Pki::Ocsp => (&[OCSP_LEAF], ocsp_now()),
+    };
+    let staple = match (k.staple, k.pki) {
+        (Staple::Absent, _) => None,
+        (Staple::Raw(b), _) => Some(b.to_vec()),
+        (Staple::Good, Pki::Ocsp) => Some(OCSP_GOOD.to_vec()),
+        (Staple::Stale, Pki::Ocsp) => Some(OCSP_STALE.to_vec()),
+        (Staple::Stale, _) => Some(built_staple(Staple::Good, t_now - 7200, t_now - 10)),
+        (st, _) => Some(built_staple(st, t_now - 3600, t_now + 3600)),
+    };
     let mut list = Vec::new();
-    for cert in [LEAF, INT] {
+    for (i, cert) in chain.iter().enumerate() {
         list.extend(&u32::try_from(cert.len()).unwrap().to_be_bytes()[1..]);
-        list.extend(cert);
-        list.extend([0, 0]);
+        list.extend(*cert);
+        match (&staple, i) {
+            // `status_request` na folha: tipo `ocsp` e a resposta.
+            (Some(resp), 0) => {
+                let mut data = vec![1];
+                data.extend(&u32::try_from(resp.len()).unwrap().to_be_bytes()[1..]);
+                data.extend(resp);
+                let mut e = vec![0, 5];
+                e.extend(u16::try_from(data.len()).unwrap().to_be_bytes());
+                e.extend(data);
+                list.extend(u16::try_from(e.len()).unwrap().to_be_bytes());
+                list.extend(e);
+            }
+            _ => list.extend([0, 0]),
+        }
     }
     let mut body = vec![0];
     body.extend(&u32::try_from(list.len()).unwrap().to_be_bytes()[1..]);
@@ -284,6 +436,15 @@ fn config(anchors: &[u8]) -> Config<'_> {
         now: now(),
         allow_classic: false,
         pin: None,
+        ocsp: OcspPolicy::Opportunistic,
+    }
+}
+
+fn ocsp_config(anchors: &[u8]) -> Config<'_> {
+    Config {
+        name: ServerName::Dns("ocsp.optimus.test"),
+        now: ocsp_now(),
+        ..config(anchors)
     }
 }
 
@@ -558,4 +719,114 @@ fn client_hello_oferece_o_que_a_adr_manda() {
             .chunks(2)
             .all(|s| s == [0x13, 0x02] || s == [0x13, 0x03])
     );
+}
+
+#[test]
+fn ocsp_pedido_no_client_hello() {
+    let mut c = Client::new(config(ROOT), Fake, &mut rng());
+    let mut out = vec![0u8; 4096];
+    let n = c.start(&mut out).unwrap();
+    // `status_request` com `ocsp`, sem responder nem extensões.
+    assert!(
+        out[..n]
+            .windows(9)
+            .any(|w| w == [0, 5, 0, 5, 1, 0, 0, 0, 0])
+    );
+}
+
+#[test]
+fn ocsp_bom_passa() {
+    let (c, _, r) = run(config(ROOT), Knobs::default());
+    assert!(r.is_ok(), "{:?}", r.err());
+    assert_eq!(c.ocsp(), Some(Ocsp::Good));
+}
+
+#[test]
+fn must_staple_exige_resposta() {
+    for staple in [Staple::Absent, Staple::Stale, Staple::Unknown] {
+        let k = Knobs {
+            staple,
+            ..Knobs::default()
+        };
+        let e = run(config(ROOT), k).2.unwrap_err();
+        assert_eq!(
+            e,
+            match staple {
+                Staple::Absent => Error::StapleRequired,
+                Staple::Stale => Error::Ocsp(OcspError::Stale),
+                _ => Error::Ocsp(OcspError::UnknownCertificate),
+            }
+        );
+    }
+    assert_eq!(Error::StapleRequired.alert(), Some(42));
+    assert_eq!(Error::Ocsp(OcspError::Stale).alert(), Some(113));
+}
+
+#[test]
+fn certificado_revogado_e_recusado() {
+    let k = Knobs {
+        staple: Staple::Revoked,
+        ..Knobs::default()
+    };
+    let (mut c, _, r) = run(config(ROOT), k);
+    assert_eq!(r.unwrap_err(), Error::Revoked);
+    assert_eq!(Error::Revoked.alert(), Some(44));
+    // Mesmo com a política de aceitar sem resposta.
+    let mut out = [0u8; 64];
+    assert!(c.alert(Error::Revoked, &mut out) > 0);
+}
+
+#[test]
+fn sem_must_staple_aceita_sem_resposta_ou_com_resposta_inutil() {
+    let run_ocsp = |staple, policy| {
+        let k = Knobs {
+            pki: Pki::Ocsp,
+            staple,
+            ..Knobs::default()
+        };
+        let cfg = Config {
+            ocsp: policy,
+            ..ocsp_config(OCSP_CA)
+        };
+        let (c, _, r) = run(cfg, k);
+        (c.ocsp(), r.map(|_| ()))
+    };
+    let opp = OcspPolicy::Opportunistic;
+    assert_eq!(run_ocsp(Staple::Good, opp), (Some(Ocsp::Good), Ok(())));
+    assert_eq!(run_ocsp(Staple::Absent, opp), (Some(Ocsp::Absent), Ok(())));
+    assert_eq!(
+        run_ocsp(Staple::Stale, opp),
+        (Some(Ocsp::Ignored(OcspError::Stale)), Ok(()))
+    );
+    assert_eq!(
+        run_ocsp(Staple::Raw(b"lixo"), opp),
+        (
+            Some(Ocsp::Ignored(OcspError::Parse(ox509::Error::Malformed))),
+            Ok(())
+        )
+    );
+    // `Require` não deixa passar sem uma resposta boa.
+    let req = OcspPolicy::Require;
+    assert_eq!(run_ocsp(Staple::Good, req), (Some(Ocsp::Good), Ok(())));
+    assert_eq!(run_ocsp(Staple::Absent, req).1, Err(Error::StapleRequired));
+    assert_eq!(
+        run_ocsp(Staple::Stale, req).1,
+        Err(Error::Ocsp(OcspError::Stale))
+    );
+}
+
+#[test]
+fn pin_nao_olha_revogacao() {
+    let spki = ox509::Certificate::parse(LEAF).unwrap().spki;
+    let cfg = Config {
+        pin: Some(optcrypt::sha256::hash(spki)),
+        ..config(&[])
+    };
+    let k = Knobs {
+        staple: Staple::Revoked,
+        ..Knobs::default()
+    };
+    let (c, _, r) = run(cfg, k);
+    assert!(r.is_ok());
+    assert_eq!(c.ocsp(), Some(Ocsp::Skipped));
 }

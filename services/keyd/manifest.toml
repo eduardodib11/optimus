@@ -16,7 +16,7 @@ needs = [
   "svc:optimus.dev.EntropySource@1?",
   "svc:optimus.console.Console@1?",
 ]
-provides = ["optimus.keyd.Keyring@1.0"]
+provides = ["optimus.keyd.Keyring@1.1"]
 
 [limits]
 max_threads = 1
