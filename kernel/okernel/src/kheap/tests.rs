@@ -5,6 +5,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use okernel::mm::slab::HeapError;
 
@@ -40,6 +41,10 @@ pub const TESTS: &[Test] = &[
     Test {
         name: "heap.bloco_solto_sai_da_janela",
         run: bloco_solto,
+    },
+    Test {
+        name: "heap.grandes_em_varias_cpus",
+        run: grandes_em_varias_cpus,
     },
 ];
 
@@ -138,5 +143,61 @@ fn bloco_solto() -> Outcome {
     unsafe { dealloc(ptr.as_ptr(), layout) };
     ensure!(mapped);
     ensure!((0..16).all(|i| kmem::translate(addr + i * 4096).is_none()));
+    Ok(())
+}
+
+/// Alocações grandes (ordem acima das que o heap guarda) por todas as CPUs
+/// ao mesmo tempo: nenhuma pode dar falta de memória falsa (T-612). Antes,
+/// quem terminava de crescer a janela desmapeava o bloco grande que outra
+/// CPU acabara de preparar, e perdas seguidas davam `OutOfMemory` com o heap
+/// quase vazio.
+const GRANDES_VOLTAS: usize = 3000;
+const GRANDES_BYTES: usize = 128 << 10;
+
+static GRANDES_FALHAS: AtomicUsize = AtomicUsize::new(0);
+static GRANDES_FEITOS: AtomicUsize = AtomicUsize::new(0);
+
+fn grandes_voltas() {
+    // Cada CPU pede uma ordem diferente, para disputarem os blocos prontos.
+    let cpu = crate::arch::x86_64::percpu::cpu_id() as usize;
+    for _ in 0..GRANDES_VOLTAS {
+        let mut v: Vec<u8> = Vec::new();
+        if v.try_reserve_exact(GRANDES_BYTES << (cpu % 3)).is_err() {
+            GRANDES_FALHAS.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(v);
+    }
+}
+
+fn grandes_job() {
+    grandes_voltas();
+    GRANDES_FEITOS.fetch_add(1, Ordering::AcqRel);
+}
+
+fn grandes_em_varias_cpus() -> Outcome {
+    let n = crate::ksmp::start::online_count();
+    if n < 2 {
+        info!("ktest: · uma CPU só; nada a disputar");
+        return Ok(());
+    }
+    GRANDES_FALHAS.store(0, Ordering::Release);
+    GRANDES_FEITOS.store(0, Ordering::Release);
+    let falhas0 = super::failures();
+    crate::ksmp::start::post_ap_job(grandes_job);
+    grandes_voltas();
+    let end = crate::ktime::now_ns() + 30 * 1_000_000_000;
+    while GRANDES_FEITOS.load(Ordering::Acquire) < n - 1 {
+        ensure!(crate::ktime::now_ns() < end);
+        crate::ksmp::ipi::poll();
+        core::hint::spin_loop();
+    }
+    let falhas = super::failures() - falhas0;
+    info!(
+        "ktest: · {n} CPUs, {GRANDES_VOLTAS} voltas de {} KiB cada: {} recusas, {falhas} falhas no heap",
+        GRANDES_BYTES >> 10,
+        GRANDES_FALHAS.load(Ordering::Acquire)
+    );
+    ensure!(GRANDES_FALHAS.load(Ordering::Acquire) == 0);
+    ensure!(falhas == 0);
     Ok(())
 }
