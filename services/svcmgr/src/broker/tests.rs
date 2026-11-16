@@ -382,3 +382,37 @@ fn driver_recebe_os_recursos_do_no() {
         .collect();
     assert_eq!(dev, [(KIND_DEV, 0, 0xB0), (KIND_DEV, 1, 0x10)]);
 }
+
+/// `netd` (0) provê os sockets; `cli` (1) tem `NetAccess` e `semrede` (2)
+/// pede o serviço sem política (ADR 0068, item 2).
+fn rede() -> Broker {
+    Broker::new(vec![
+        manifest("netd", &["kernel:debug"], &["optimus.net.Socket@1.0"]),
+        manifest(
+            "cli",
+            &[
+                "svc:optimus.net.Socket@1",
+                "net:access:connect=tcp:10.0.2.2:47108;conns=4",
+            ],
+            &[],
+        ),
+        manifest("semrede", &["svc:optimus.net.Socket@1"], &[]),
+    ])
+    .expect("corretor")
+}
+
+#[test]
+fn politica_de_rede_nao_vira_capability_e_o_netd_a_le() {
+    let mut b = rede();
+    let mut caps = Fake::default();
+    sobe(&mut b, 0, &mut caps);
+    let boot = sobe(&mut b, 1, &mut caps);
+    // controle, cota e o endpoint do netd: a política não entra.
+    assert_eq!(boot.caps.len(), 3);
+    assert_eq!(boot.caps[2].kind, KIND_SVC);
+    assert!(b.is_net_server(0) && !b.is_net_server(1));
+    assert_eq!(b.net_policy(1), Some("connect=tcp:10.0.2.2:47108;conns=4"));
+    // Sem a necessidade: sem política (o netd nega tudo).
+    assert_eq!(b.net_policy(2), None);
+    assert_eq!(b.net_policy(99), None);
+}

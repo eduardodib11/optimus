@@ -32,3 +32,11 @@ A ADR 0017 manda a pilha inteira para o `netd` em espaço de usuário e a ADR 00
 - O manifesto precisa de uma necessidade `net:access` com a política; o compilador de manifestos e o corretor aprendem o formato (T-637).
 - O `tlsd` (ADR 0070) é cliente do `netd` e serve TLS aos demais; o cliente de TLS também precisa de `NetAccess`.
 - Qualquer mudança no que está acima exige ADR nova.
+
+## Notas de implementação (T-637, 2026-11-16)
+
+Detalhes que a decisão deixava abertos; nenhum muda o que está acima.
+
+- **Como a política chega ao `netd`.** A necessidade `net:access:<texto>` do manifesto (`NeedKind::Net`, kind 6 no OMAN v1; o campo `name` leva o texto) não vira capability. O `netd` pergunta ao `svcmgr` com `Supervisor.net_policy(id)` (1.4) na primeira chamada de cada badge e guarda a resposta; só quem provê `optimus.net.Socket@1` recebe, e um serviço sem a necessidade recebe o texto vazio, que é "sem política": nada é permitido. Assim o `svcmgr` continua sem ver tráfego nem destinos em tempo de execução, e a política sobrevive ao reinício do `netd`, que a pede de novo.
+- **Formato do texto** (`onet::policy`, validado no build pelo `mkmanifest`): itens separados por `;`: `connect=<tcp|udp>:<destino>:<portas>` (destino: IPv4, faixa `a.b.c.d/n`, `*`, nome ou `*.sufixo`; portas: `80`, `1-1024` ou `*`), `listen=tcp:<portas>`, `conns=N` (sockets abertos, padrão 8) e `rate=N` (novas conexões por segundo, padrão 10). Até 8 regras `connect` e 4 `listen`.
+- **Um endpoint só.** O `netd` atende um endpoint com recepção de prazo curto (como o `storaged`, ADR 0060) e despacha pela interface do rótulo, então `Config@1` (só leitura) é servida no mesmo endpoint de `Socket@1` e o manifesto provê só `Socket@1`. A separação em dois endpoints espera uma espera combinada em mais de um endpoint, que o kernel ainda não tem; a escrita de `Config@1` (DHCP) chega com a T-633.

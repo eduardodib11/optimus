@@ -22,6 +22,7 @@ pub mod eth;
 pub mod frag;
 pub mod icmp;
 pub mod ip4;
+pub mod policy;
 pub mod ports;
 pub mod stack;
 pub mod tcp;

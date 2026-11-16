@@ -579,6 +579,24 @@ impl Svcmgr<'_> {
             && self.started(id).is_none()
     }
 
+    /// Resposta de `net_policy(who)`: só o `netd` lê a política dos clientes.
+    /// Sem a necessidade `net:access:` o texto é vazio: o `netd` entende
+    /// como "sem política" e nega tudo (ADR 0068).
+    fn policy_answer(&self, id: u32, req: &[u8], body: &mut [u8]) -> (u64, usize) {
+        let err = |e, body: &mut [u8]| (osvc::REPLY_ERR, osvc::encode_error(e, body).unwrap_or(0));
+        let Ok(who) = osvc::decode_name_of(req) else {
+            return (osvc::REPLY_BAD_MESSAGE, 0);
+        };
+        if !self.plan.broker.is_net_server(id) {
+            return err(SvcError::NotInManifest, body);
+        }
+        let text = self.plan.broker.net_policy(who).unwrap_or("");
+        match osvc::encode_policy(text, body) {
+            Ok(n) => (osvc::REPLY_OK, n),
+            Err(_) => err(SvcError::Busy, body),
+        }
+    }
+
     /// Resposta de `driver(index)`: só o `devmgr` lê a lista de drivers.
     fn driver_answer(&self, id: u32, index: u16, body: &mut [u8]) -> (u64, usize) {
         let err = |e, body: &mut [u8]| (osvc::REPLY_ERR, osvc::encode_error(e, body).unwrap_or(0));
@@ -713,6 +731,7 @@ impl Svcmgr<'_> {
                 },
                 Err(_) => (osvc::REPLY_BAD_MESSAGE, 0),
             },
+            (true, Some(Method::NetPolicy)) => self.policy_answer(id, &req[..r.corpo], &mut body),
             (
                 true,
                 Some(
