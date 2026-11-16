@@ -10,6 +10,7 @@ publish = false
 optfs = { path = "../lib/optfs" }
 optfs-format = { path = "../lib/optfs-format" }
 optcrypt = { path = "../lib/optcrypt" }
+ox509 = { path = "../lib/ox509" }
 
 [lints]
 workspace = true

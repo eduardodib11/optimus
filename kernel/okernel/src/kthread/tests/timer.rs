@@ -61,8 +61,8 @@ fn late_limit() -> u64 {
 }
 
 /// Aceite da T-349: mil `Timer`s armados nesta CPU, com prazos
-/// embaralhados ao longo de 20 ms, disparam todos, uma vez cada, com os
-/// bits certos, e a cota volta. O atraso (do prazo ao tratador) fica no
+/// embaralhados ao longo de 20 ms (100 ms no TCG), disparam todos, uma vez
+/// cada, com os bits certos, e a cota volta. O atraso (do prazo ao tratador) fica no
 /// limite em 99% deles com KVM; no TCG, na mediana (o pior caso e o p99 só
 /// são registrados: lá o despertar do `hlt` é do QEMU).
 pub fn mil_no_prazo() -> Outcome {
@@ -86,12 +86,18 @@ pub fn mil_no_prazo() -> Outcome {
         // mil passos cada, no build de depuração sob TCG).
         let t0 = ktime::now_ns();
         let base = t0 + 200 * MS;
+        // Entre prazos: 20 µs, de modo que mil prazos cabem em 20 ms. O TCG
+        // leva mais que isso para tratar cada disparo (T-612): com 20 µs a
+        // fila de disparos cresce, o atraso acompanha e a mediana passa do
+        // limite quando o host está lento. Com 100 µs a fila não se forma e
+        // o teste continua medindo o atraso do despertar, não a vazão.
+        let spacing = if cpu::under_tcg() { 100_000 } else { 20_000 };
         let mut want = [0u64; 16];
         for (i, t) in (0..N).zip(&ts) {
             let k = (i % 16) as usize;
             let bit = 1 << (i / 16);
             want[k] |= bit;
-            arm(t, &ns[k], bit, base + (i * 7919 % N) * 20_000, 0);
+            arm(t, &ns[k], bit, base + (i * 7919 % N) * spacing, 0);
         }
         let took = ktime::now_ns() - t0;
         info!("ktest: · {N} timers armados em {} µs", took / 1000);

@@ -49,7 +49,7 @@ mod tests;
 pub use tests::TESTS;
 
 /// Limite padrão do heap, em MiB.
-pub const DEFAULT_LIMIT_MIB: u64 = 52;
+pub const DEFAULT_LIMIT_MIB: u64 = 60;
 
 /// Faixa de objetos e slabs do kernel (SDD v1.0, seção 6.4), até a de
 /// áreas por CPU e pilhas.
@@ -61,9 +61,15 @@ const KEEP_ORDER: usize = 2;
 /// Frames que podem ficar mapeados e livres na fonte: um bloco por ordem
 /// até [`KEEP_ORDER`].
 pub const KEPT_FRAMES: u64 = (2 << KEEP_ORDER) - 1;
-/// Tentativas de mapear e repetir antes de desistir (outra CPU pode levar
-/// o bloco preparado).
-const GROW_TRIES: usize = 4;
+/// Tentativas de mapear e repetir antes de desistir. Cada uma que perde o
+/// bloco preparado para outra CPU deu memória a essa CPU, então a perda não
+/// é falta de memória: só a falta de frames ou de tabelas encerra antes.
+const GROW_TRIES: usize = 64;
+/// Blocos recém-preparados que `with_growth` confere ao terminar (os mais
+/// velhos já foram levados por outras CPUs ou devolvidos).
+const RECENT: usize = 4;
+/// Voltas de espera enquanto outra CPU leva o pedido e cresce a janela.
+const WAIT_TRIES: u32 = 1 << 20;
 
 /// Endereço virtual do físico 0 na janela; zero antes de [`init`].
 static WINDOW_BASE: AtomicU64 = AtomicU64::new(0);
@@ -86,17 +92,6 @@ impl WindowPages {
         self.write(addr, self.retired);
         self.write(addr + 8, order as u64);
         self.retired = addr;
-    }
-
-    /// Manda desmapear os blocos prontos que não são de ordem guardada (um
-    /// pedido grande que mudou de ideia não segura memória fora do limite).
-    fn trim(&mut self) {
-        for order in KEEP_ORDER + 1..=MAX_ORDER {
-            let addr = core::mem::take(&mut self.ready[order]);
-            if addr != 0 {
-                self.retire(addr, order);
-            }
-        }
     }
 }
 
@@ -292,43 +287,72 @@ fn release(mut block: u64) {
 /// Repete `f` enquanto ele for recusado só por falta de bloco mapeado e a
 /// janela conseguir crescer. A recusa adiada não foi contada pelo heap;
 /// se o crescimento desiste, ela conta aqui, uma vez.
+///
+/// Duas CPUs que faltam ao mesmo tempo disputam o bloco: uma leva o pedido
+/// guardado e cresce a janela, e a outra, sem pedido, espera ela terminar e
+/// tenta de novo. O bloco de ordem grande que uma CPU preparou só é
+/// devolvido por ela mesma (e só se ninguém o usou): antes, quem terminava
+/// primeiro mandava desmapear o bloco que a outra acabara de preparar, e
+/// algumas perdas seguidas davam uma falta de memória falsa (T-612).
 fn with_growth(mut f: impl FnMut() -> Result<u64, HeapError>) -> Result<u64, HeapError> {
+    let mut fresh = [(0usize, 0u64); RECENT];
     let mut grows = 0;
-    for _ in 0..GROW_TRIES * 4 {
+    let mut waits = 0;
+    let result = loop {
         let result = f();
         if !matches!(result, Err(HeapError::OutOfMemory)) {
-            if grows != 0 {
-                with_heap(|h| h.pages().trim());
-            }
-            return result;
+            break result;
         }
         // Sem pedido guardado, outra CPU que também faltou o levou e está
-        // crescendo a janela: tentar de novo, em vez de dar a falta (o
-        // `OutOfMemory` só vem da fonte vazia, que sempre deixa o pedido).
+        // crescendo a janela: esperar e tentar de novo, em vez de dar a falta
+        // (o `OutOfMemory` só vem da fonte vazia, que sempre deixa o pedido).
         let Some(order) = with_heap(|h| h.pages().want.take()) else {
+            waits += 1;
+            if waits > WAIT_TRIES {
+                break result;
+            }
+            // Quem cresce a janela pode estar num shootdown esperando esta
+            // CPU: atender o pedido aqui, como faz `tlb::flush`, mesmo com
+            // as interrupções desligadas.
+            crate::ksmp::ipi::poll();
             core::hint::spin_loop();
             continue;
         };
-        if grows == GROW_TRIES || !grow(order) {
-            break;
+        if grows == GROW_TRIES {
+            break result;
         }
-        grows += 1;
-    }
+        match grow(order) {
+            Some(virt) => {
+                fresh[grows % RECENT] = (order, virt);
+                grows += 1;
+            }
+            None => break result,
+        }
+    };
     with_heap(|h| {
-        h.pages().want = None;
-        h.pages().trim();
-        h.count_failure();
+        let src = h.pages();
+        for &(order, virt) in &fresh[..grows.min(RECENT)] {
+            // Bloco que ficou pronto sem uso e é grande demais para ficar
+            // guardado: desmapeia. Se outra CPU o levou, não há o que fazer.
+            if order > KEEP_ORDER && src.ready[order] == virt {
+                src.ready[order] = 0;
+                src.retire(virt, order);
+            }
+        }
+        if result.is_err() {
+            src.want = None;
+            h.count_failure();
+        }
     });
-    Err(HeapError::OutOfMemory)
+    result
 }
 
 /// Mapeia na janela um bloco novo de `2^order` páginas e o deixa pronto
-/// na fonte; `false` sem frames, sem tabela ou antes de [`init`].
-fn grow(order: usize) -> bool {
+/// na fonte; devolve o endereço dele, ou `None` sem frames, sem tabela ou
+/// antes de [`init`].
+fn grow(order: usize) -> Option<u64> {
     let base = WINDOW_BASE.load(Ordering::Relaxed);
-    let Some(frame) = kmem::alloc_frames(order).filter(|_| base != 0) else {
-        return false;
-    };
+    let frame = kmem::alloc_frames(order).filter(|_| base != 0)?;
     let (virt, pages) = (base + frame.0, 1 << order);
     let tables = kmem::map_range(virt, frame, pages, Flags::RW).inspect_err(|e| {
         error!("okernel: heap: mapeando {virt:#x}: {e:?}");
@@ -336,7 +360,7 @@ fn grow(order: usize) -> bool {
         kmem::free_frames(frame, order);
     });
     let Ok(tables) = tables else {
-        return false;
+        return None;
     };
     WINDOW_TABLES.fetch_add(tables, Ordering::Relaxed);
     with_heap(|h| {
@@ -346,7 +370,7 @@ fn grow(order: usize) -> bool {
             _ => src.retire(virt, order),
         }
     });
-    true
+    Some(virt)
 }
 
 /// Base da janela do heap (o endereço do físico 0 nela).
@@ -389,6 +413,11 @@ pub fn set_limit(bytes: u64) {
 pub fn usage() -> (u64, u64) {
     let heap = HEAP.lock();
     (heap.limit(), heap.used())
+}
+
+/// Falhas de alocação contadas pelo heap até agora.
+pub fn failures() -> u64 {
+    HEAP.lock().failures()
 }
 
 /// Blocos vivos no heap: objetos nos slabs (menos os parados nos caches

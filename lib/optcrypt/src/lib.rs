@@ -39,6 +39,7 @@ pub mod keyring;
 pub mod poly1305;
 pub mod secret;
 pub mod sha256;
+pub mod sha3;
 pub mod sha512;
 pub mod x25519;
 

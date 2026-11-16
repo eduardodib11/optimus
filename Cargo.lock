@@ -214,6 +214,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mkroots"
+version = "0.1.0"
+dependencies = [
+ "ox509",
+]
+
+[[package]]
 name = "mktz"
 version = "0.1.0"
 dependencies = [
@@ -328,6 +335,9 @@ dependencies = [
 [[package]]
 name = "onet"
 version = "0.1.0"
+dependencies = [
+ "optcrypt",
+]
 
 [[package]]
 name = "opci"
@@ -691,4 +701,5 @@ dependencies = [
  "optcrypt",
  "optfs",
  "optfs-format",
+ "ox509",
 ]

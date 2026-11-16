@@ -4,11 +4,13 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, sync::mpsc, thread};
 
@@ -1161,9 +1163,16 @@ macro_rules! m4_markers {
             "drvcli: display ok",
             "drvcli: optfs ok",
             "drvcli: storage ok",
-            // T-630: o `netd` liga ao `NetDevice` e troca um quadro (ARP) com o
-            // roteador do QEMU.
-            "netd: quadro enviado e recebido",
+            // T-630 e T-631: o `netd` liga ao `NetDevice` e resolve o MAC do
+            // roteador do QEMU por ARP.
+            "netd: arp: roteador 10.0.2.2 resolvido",
+            // T-632: o eco ICMP ao roteador do QEMU volta.
+            "netd: icmp: roteador 10.0.2.2 respondeu ao eco",
+            // T-634: o datagrama UDP ao servidor de eco do host volta.
+            "netd: udp: eco do host",
+            // T-635: a conexão TCP ao eco do host leva 4000 bytes e eles
+            // voltam iguais.
+            "netd: tcp: eco do host",
             "drvcli: input ok",
             "drvcli: input evento 0x1e",
             "drvcli: entropy ok",
@@ -2464,6 +2473,9 @@ fn test(opts: &Options) -> Result {
         iommu(opts)?;
     }
     if matches!(opts.suite.as_str(), "virtio" | "all") {
+        // Os cenários de drivers têm o `virtio-net`: o `netd` prova UDP e TCP
+        // contra os servidores de eco do host.
+        let _echo = HostEcho::start()?;
         let plain = Options {
             devices: vec![
                 "virtio-blk-pci,drive=vd0,disable-legacy=on",
@@ -2608,6 +2620,89 @@ const INTEGRATION_MARKERS: &[&str] = &[
 
 /// CPUs do cenário de integração sem `--smp`.
 const INTEGRATION_COUNTS: &[u32] = &[1, 4];
+
+/// Servidores de eco do host que a imagem de teste do `netd` procura em
+/// 10.0.2.2 (o roteador do QEMU leva o convidado ao `127.0.0.1` do host).
+/// Para ao sair de escopo.
+struct HostEcho {
+    stop: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Porta UDP do eco (`services/netd/src/probe.rs`).
+const HOST_UDP_ECHO_PORT: u16 = 47107;
+/// Porta TCP do eco (`services/netd/src/probe.rs`).
+const HOST_TCP_ECHO_PORT: u16 = 47108;
+
+impl HostEcho {
+    fn start() -> Result<Self> {
+        let udp = std::net::UdpSocket::bind(("127.0.0.1", HOST_UDP_ECHO_PORT))
+            .map_err(|e| format!("eco UDP do host na porta {HOST_UDP_ECHO_PORT}: {e}"))?;
+        udp.set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| format!("eco UDP do host: {e}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let t = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !flag.load(Ordering::Relaxed) {
+                if let Ok((n, from)) = udp.recv_from(&mut buf) {
+                    let _ = udp.send_to(&buf[..n], from);
+                }
+            }
+        });
+        let tcp = std::net::TcpListener::bind(("127.0.0.1", HOST_TCP_ECHO_PORT))
+            .map_err(|e| format!("eco TCP do host na porta {HOST_TCP_ECHO_PORT}: {e}"))?;
+        tcp.set_nonblocking(true)
+            .map_err(|e| format!("eco TCP do host: {e}"))?;
+        let flag = Arc::clone(&stop);
+        let t2 = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                match tcp.accept() {
+                    Ok((mut conn, _)) => {
+                        let flag = Arc::clone(&flag);
+                        std::thread::spawn(move || {
+                            let _ = conn.set_nonblocking(false);
+                            let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+                            let mut buf = [0u8; 2048];
+                            while !flag.load(Ordering::Relaxed) {
+                                match std::io::Read::read(&mut conn, &mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if std::io::Write::write_all(&mut conn, &buf[..n]).is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e)
+                                        if matches!(
+                                            e.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                        ) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            threads: vec![t, t2],
+        })
+    }
+}
+
+impl Drop for HostEcho {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
 
 /// `cargo xtask test integration [--smp N]` (T-365): boot → `root` →
 /// `svcmgr` → `timed`, `logd` e `memd`, com o `hello` do `root`, em
@@ -3058,7 +3153,7 @@ fn check_fuzz(serial: &str, exit: std::result::Result<Option<i32>, ()>, seed: u6
 /// Formatação, clippy em cada alvo e a regra de `unsafe` da seção 17.1.
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
-    for tool in ["xtask", "mkobfs", "oidlc", "mkmanifest"] {
+    for tool in ["xtask", "mkobfs", "oidlc", "mkmanifest", "mkroots"] {
         status(cargo().args([
             "clippy",
             "--package",
@@ -3103,7 +3198,37 @@ fn check() -> Result {
             "warnings",
         ]))?;
     }
+    check_trust()?;
     check_unsafe()
+}
+
+/// Âncoras do `tlsd` (ADR 0071, item 5): `data/trust/roots.der` tem de bater
+/// com o SHA-256 de `data/trust/roots.der.sha256` e ser lido inteiro pelo
+/// `ox509`. Trocar as raízes é uma mudança visível dos dois arquivos
+/// (`tools/mkroots`, nota em `data/trust/ORIGEM.md`).
+fn check_trust() -> Result {
+    let dir = root().join("data/trust");
+    let der = fs::read(dir.join("roots.der")).map_err(|e| format!("data/trust/roots.der: {e}"))?;
+    let want = fs::read_to_string(dir.join("roots.der.sha256"))
+        .map_err(|e| format!("data/trust/roots.der.sha256: {e}"))?;
+    let got = optcrypt::sha256::hash(&der)
+        .iter()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+    if want.split_whitespace().next() != Some(got.as_str()) {
+        return Err(format!(
+            "data/trust/roots.der: SHA-256 {got} difere de data/trust/roots.der.sha256"
+        ));
+    }
+    let anchors = ox509::verify::Anchors::parse(&der)
+        .map_err(|e| format!("data/trust/roots.der recusado pelo ox509: {e:?}"))?;
+    println!(
+        "xtask: âncoras ok: {} raízes, SHA-256 {got}",
+        anchors.iter().count()
+    );
+    Ok(())
 }
 
 /// Provas Kani da lógica portável do kernel (T-204); `KANI_ALL=1` roda
@@ -3148,6 +3273,7 @@ fn check_unsafe() -> Result {
             "xtask/src/main.rs",
             "tools/mkobfs/src/main.rs",
             "tools/oidlc/src/main.rs",
+            "tools/mkroots/src/main.rs",
         ])
         .collect();
     unsafe_budget::check(&roots)

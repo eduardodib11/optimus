@@ -20,6 +20,7 @@ O M6 entrega o que se testa de ponta a ponta no QEMU, na ordem abaixo. O que sai
 5. **Um `netd` por máquina, um laço por interface.** Uma thread de protocolo (relógio de TCP por temporizador do `timed`, ADR 0035) e uma por interface no M6; multi-fila fica para o Server.
 6. **Entradas externas são hostis.** Todo parser (quadro, IPv4/6, TCP, ICMP, DHCP, DNS, ND) tem alvo de fuzzing (SDD 8.3) e é escrito em Rust seguro; sem `unsafe` no `netd` fora de `ostd`.
 7. **Aleatoriedade.** Números de sequência iniciais, portas efêmeras e IDs de DNS vêm do `keyd` (ADR 0054), nunca do relógio.
+   Nota (T-634, 2026-11-16): o `keyd` não serve bytes aleatórios (ADR 0054 rejeitou um serviço que distribua entropia a todos; só guarda chaves), então o `netd` sorteia direto do DRBG do kernel por `ostd::rand::secure_fill` (ADR 0039), a mesma fonte que semeia o `keyd`. O requisito se mantém: nada de relógio.
 8. **Medição.** `cargo xtask bench-net` mede latência de ida e volta e vazão TCP no QEMU com gate de 5 % sobre contagens determinísticas (pacotes, retransmissões, cópias), como o `bench-io` (T-532). Vazão em Mbit/s é só informativa no QEMU.
 
 ## Alternativas consideradas
