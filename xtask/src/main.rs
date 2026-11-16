@@ -1157,9 +1157,9 @@ macro_rules! m4_markers {
             "drvcli: display ok",
             "drvcli: optfs ok",
             "drvcli: storage ok",
-            // T-630: o `netd` liga ao `NetDevice` e troca um quadro (ARP) com o
-            // roteador do QEMU.
-            "netd: quadro enviado e recebido",
+            // T-630 e T-631: o `netd` liga ao `NetDevice` e resolve o MAC do
+            // roteador do QEMU por ARP.
+            "netd: arp: roteador 10.0.2.2 resolvido",
             "drvcli: input ok",
             "drvcli: input evento 0x1e",
             "drvcli: entropy ok",

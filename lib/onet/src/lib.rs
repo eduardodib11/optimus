@@ -10,7 +10,9 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod arp;
 pub mod eth;
+pub mod stack;
 
 #[cfg(test)]
 mod tests;

@@ -1,11 +1,11 @@
-//! `netd` (T-630; ADR 0017, 0064, 0068 e 0069): a pilha IP em espaço de
-//! usuário. É o único cliente do `NetDevice` do driver de rede: pega a
-//! sessão, liga o anel de recepção que ele consome e escreve no anel de
-//! transmissão que o driver consome (os dois pelo contrato, como a ADR 0064
-//! manda). Nesta tarefa o laço só prova o caminho dos quadros: manda um ARP
-//! ao roteador do QEMU e espera a resposta pelo anel de recepção. Os
-//! protocolos (ARP, IPv4, ICMP, DHCP, UDP, TCP) entram nas tarefas
-//! seguintes (T-631 em diante) sobre este laço.
+//! `netd` (T-630 e T-631; ADR 0017, 0064, 0068 e 0069): a pilha IP em
+//! espaço de usuário. É o único cliente do `NetDevice` do driver de rede:
+//! pega a sessão, liga o anel de recepção que ele consome e escreve no anel
+//! de transmissão que o driver consome (ADR 0064). Os protocolos moram em
+//! `onet` e se testam no host; aqui ficam só a cola com os anéis e o relógio.
+//! O laço dorme na `Notification` do anel de recepção, que um `Timer`
+//! periódico também sinaliza, e a cada volta esvazia o anel e dá a vez ao
+//! relógio da pilha.
 //!
 //! Se o `netd` morre, o `svcmgr` o reinicia e o driver aceita o anel de
 //! recepção do processo novo (ADR 0068, item 6).
@@ -22,7 +22,8 @@ use ostd::svc::Session;
 mod net_cliente;
 
 use net_cliente::NetDeviceCliente;
-use onet::eth::{self, Header, Mac};
+use onet::eth::{self, Mac};
+use onet::stack::{Link, Stack};
 
 ostd::entry!(main);
 
@@ -43,6 +44,11 @@ const FRAME_KIND: u16 = 1;
 /// Bits da `Notification` do `netd`: o anel de recepção e o relógio.
 const RX_BIT: u64 = 1;
 const TIMER_BIT: u64 = 2;
+/// Período do relógio da pilha (ARP, e depois TCP e DHCP).
+const TICK_NS: u64 = 50_000_000;
+/// Endereço e roteador da rede de usuário do QEMU, até o DHCP (T-633).
+const STATIC_IP: [u8; 4] = [10, 0, 2, 15];
+const GATEWAY: [u8; 4] = [10, 0, 2, 2];
 
 fn hash(text: &[u8]) -> u32 {
     let h = optcrypt::blake3::hash(text);
@@ -100,6 +106,15 @@ struct Nic {
     rx: Consumer,
 }
 
+/// Os quadros da pilha saem pelo anel de transmissão.
+struct TxLink<'a>(&'a mut Producer);
+
+impl Link for TxLink<'_> {
+    fn send(&mut self, frame: &[u8]) -> bool {
+        self.0.push(FRAME_KIND, frame).is_ok()
+    }
+}
+
 impl Nic {
     /// Liga ao driver pelo contrato (ADR 0064): `info`, a sessão, o anel de
     /// transmissão do driver e o anel de recepção que o `netd` cria.
@@ -135,69 +150,53 @@ impl Nic {
             rx,
         })
     }
-
-    /// Manda um quadro; `false` se o anel está cheio.
-    fn send(&mut self, frame: &[u8]) -> bool {
-        self.tx.push(FRAME_KIND, frame).is_ok()
-    }
 }
 
-/// ARP "quem tem 10.0.2.2", de 10.0.2.15, em difusão.
-fn probe(mac: Mac, out: &mut [u8]) -> Option<usize> {
-    let mut arp = [0u8; 28];
-    arp[0..8].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
-    arp[8..14].copy_from_slice(&mac.0);
-    arp[14..18].copy_from_slice(&[10, 0, 2, 15]);
-    arp[24..28].copy_from_slice(&[10, 0, 2, 2]);
-    let h = Header {
-        dst: Mac::BROADCAST,
-        src: mac,
-        ethertype: eth::ETHERTYPE_ARP,
-    };
-    eth::build(&h, &arp, out)
-}
-
-/// É a resposta do roteador ao `probe`?
-fn is_probe_reply(frame: &[u8], ours: Mac) -> bool {
-    let Some((h, p)) = eth::parse(frame) else {
-        return false;
-    };
-    h.ethertype == eth::ETHERTYPE_ARP
-        && h.dst == ours
-        && p.len() >= 28
-        && p[6..8] == [0, 2]
-        && p[14..18] == [10, 0, 2, 2]
-        && p[18..24] == ours.0
-}
-
-/// Laço de recepção: o `netd` dorme no anel e trata cada quadro que chega.
+/// Laço da pilha: dorme até chegar quadro ou vencer o relógio, esvazia o
+/// anel de recepção e dá a vez ao relógio.
 fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let timer = ostd::cap::create(quota, ObjectType::Timer, 0).map_err(|_| "criar o Timer")?;
     let ntfy = ostd::cap::create(quota, ObjectType::Notification, 0)
         .map_err(|_| "criar a Notification")?;
     let ep = connect(s, b"optimus.net.NetDevice", timer, ntfy).ok_or("sem driver de rede")?;
     let mut nic = Nic::attach(s, ep, quota, ntfy).ok_or("ligar ao NetDevice")?;
+    // Relógio da pilha: o `Timer` periódico sinaliza a mesma `Notification`
+    // do anel de recepção.
+    ostd::cap::arm_timer(
+        timer,
+        ntfy,
+        TIMER_BIT,
+        TICK_NS,
+        TICK_NS,
+        ostd::kabi::timer::RELATIVE,
+    )
+    .map_err(|_| "armar o Timer")?;
+    let mut stack = Stack::new(nic.mac);
+    stack.set_ip(&mut TxLink(&mut nic.tx), STATIC_IP);
     let mut frame = [0u8; eth::MAX_FRAME];
-    let n = probe(nic.mac, &mut frame).ok_or("montar o ARP")?;
-    if !nic.send(&frame[..n]) {
-        return Err("anel de transmissão cheio");
-    }
-    let mut proved = false;
+    let mut gateway_seen = false;
     loop {
-        match nic.rx.pop(&mut frame) {
-            Ok(Some((FRAME_KIND, n))) => {
-                if !proved && is_probe_reply(&frame[..n], nic.mac) {
-                    proved = true;
-                    ostd::debug::print("netd: quadro enviado e recebido");
+        let now = ostd::time::now_ns();
+        loop {
+            match nic.rx.pop(&mut frame) {
+                Ok(Some((FRAME_KIND, n))) => {
+                    stack.input(&mut TxLink(&mut nic.tx), &frame[..n], now);
                 }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => return Err("anel de recepção corrompido"),
             }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                if nic.rx.wait().is_err() {
-                    return Err("espera no anel de recepção");
-                }
-            }
-            Err(_) => return Err("anel de recepção corrompido"),
+        }
+        if stack
+            .neighbor(&mut TxLink(&mut nic.tx), GATEWAY, now)
+            .is_some()
+            && !gateway_seen
+        {
+            gateway_seen = true;
+            ostd::debug::print("netd: arp: roteador 10.0.2.2 resolvido");
+        }
+        if nic.rx.wait().is_err() {
+            return Err("espera no anel de recepção");
         }
     }
 }
