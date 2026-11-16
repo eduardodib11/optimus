@@ -1,14 +1,16 @@
 //! `otls`: núcleo do TLS 1.3 do `tlsd` (ADR 0070; T-652).
 //!
 //! Aqui ficam a agenda de chaves ([`schedule`]), a camada de registro
-//! protegida ([`record`]) e as mensagens de handshake ([`msg`], T-653). Só
-//! TLS 1.3, só as suítes `TLS_AES_256_GCM_SHA384` e `TLS_CHACHA20_POLY1305_SHA256`
+//! protegida ([`record`]), as mensagens de handshake ([`msg`]) e o cliente
+//! sem E/S ([`client`], T-653). Só TLS 1.3, só
+//! as suítes `TLS_AES_256_GCM_SHA384` e `TLS_CHACHA20_POLY1305_SHA256`
 //! (ADR 0070, item 3), sem PSK nem 0-RTT (item 5). Toda cripto vem do
 //! `optcrypt`; nada aloca.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod msg;
 pub mod record;
 pub mod schedule;
@@ -141,6 +143,8 @@ impl Suite {
     }
 }
 
+#[cfg(test)]
+mod client_tests;
 #[cfg(test)]
 mod msg_tests;
 #[cfg(test)]

@@ -356,8 +356,10 @@ fn check_validity(c: &Certificate<'_>, now: i64) -> Result<(), VerifyError> {
     }
 }
 
-/// Combinações de algoritmo e chave da ADR 0071, item 1.
-fn key_fits(alg: SignatureAlgorithm, key: &PublicKey<'_>) -> bool {
+/// Combinações de algoritmo e chave da ADR 0071, item 1 (o `tlsd` usa no
+/// `CertificateVerify`).
+#[must_use]
+pub fn key_fits(alg: SignatureAlgorithm, key: &PublicKey<'_>) -> bool {
     match (alg, key) {
         (SignatureAlgorithm::Ecdsa(h), PublicKey::EcP256(_)) => h != crate::Hash::Sha512,
         (
