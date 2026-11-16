@@ -5,7 +5,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::buf::Buf;
-use super::wire::{self, ACK, FIN, Header, PSH, RST, SYN, Segment};
+use super::wire::{self, ACK, FIN, Header, Opts, PSH, RST, SYN, Segment};
 use super::{Error, ListenId, MAX_OOO, MSS, Out};
 use crate::arp::Ip4;
 
@@ -34,8 +34,9 @@ pub enum State {
     TimeWait,
 }
 
-/// Tamanho dos buffers de envio e de recepção.
-pub const BUF_BYTES: usize = 65535;
+/// Limite de cada buffer de uma conexão (envio e recepção). A janela de 16
+/// bits só chega a 64 KiB; acima disso a escala (RFC 7323) entra.
+pub const BUF_BYTES: usize = 262_144;
 /// RTO inicial, mínimo e máximo (RFC 6298; mínimo de 200 ms como no Linux).
 const INIT_RTO: u64 = 1_000_000_000;
 const MIN_RTO: u64 = 200_000_000;
@@ -118,6 +119,18 @@ pub struct Conn {
     fin_at: Option<u32>,
     fin_rcvd: bool,
     time_wait_at: u64,
+    // Opções negociadas (RFC 7323 e RFC 2018).
+    pub(super) wscale_ok: bool,
+    /// Escala da janela do outro lado e a nossa.
+    pub(super) snd_shift: u8,
+    pub(super) rcv_shift: u8,
+    pub(super) ts_ok: bool,
+    /// Último `TSval` aceito do outro lado, devolvido em `TSecr`.
+    ts_recent: u32,
+    /// Relógio da última chamada, para o `TSval` dos segmentos.
+    now: u64,
+    /// Limite dos dois buffers, para o `Tcp` devolver a cota.
+    pub(super) limit: usize,
 }
 
 impl Conn {
@@ -130,11 +143,16 @@ impl Conn {
         tuple: (Ip4, u16, Ip4, u16),
         iss: u32,
         irs: u32,
-        peer_mss: Option<u16>,
         peer_wnd: u16,
         ephemeral: bool,
+        limit: usize,
     ) -> Self {
-        let mss = usize::from(peer_mss.unwrap_or(536)).clamp(536, MSS);
+        let mss = 536;
+        // Menor escala que deixa o buffer de recepção inteiro na janela.
+        let mut rcv_shift = 0u8;
+        while (limit >> rcv_shift) > usize::from(u16::MAX) && rcv_shift < 14 {
+            rcv_shift += 1;
+        }
         Self {
             state,
             user_closed: false,
@@ -153,7 +171,7 @@ impl Conn {
             snd_wl1: irs,
             snd_wl2: iss,
             buf_seq: iss.wrapping_add(1),
-            sndbuf: Buf::new(BUF_BYTES),
+            sndbuf: Buf::new(limit),
             fin_queued: false,
             fin_seq: None,
             mss,
@@ -168,12 +186,53 @@ impl Conn {
             rtx_count: 0,
             irs,
             rcv_nxt: irs.wrapping_add(1),
-            rcvbuf: Buf::new(BUF_BYTES),
+            rcvbuf: Buf::new(limit),
             ooo: Vec::new(),
             fin_at: None,
             fin_rcvd: false,
             time_wait_at: 0,
+            wscale_ok: false,
+            snd_shift: 0,
+            rcv_shift,
+            ts_ok: false,
+            ts_recent: 0,
+            now: 0,
+            limit,
         }
+    }
+
+    /// Aplica as opções do SYN do outro lado: MSS, escala, SACK e timestamps.
+    /// Sem a opção na outra ponta, o recurso fica desligado (a escala nossa
+    /// também: sem ela a janela anunciada é a de 16 bits).
+    pub(super) fn negotiate(&mut self, o: &Opts) {
+        self.mss = usize::from(o.mss.unwrap_or(536)).clamp(536, MSS);
+        self.cwnd = INIT_CWND_SEGS * self.mss;
+        if let Some(w) = o.wscale {
+            self.wscale_ok = true;
+            self.snd_shift = w;
+        } else {
+            self.wscale_ok = false;
+            self.snd_shift = 0;
+            self.rcv_shift = 0;
+        }
+        if let Some((v, _)) = o.ts {
+            self.ts_ok = true;
+            self.ts_recent = v;
+        }
+    }
+
+    /// `TSval`: o relógio em milissegundos.
+    fn tsval(&self) -> u32 {
+        u32::try_from((self.now / 1_000_000) & 0xffff_ffff).unwrap_or(0)
+    }
+
+    /// Opções de um segmento comum (sem SYN): timestamps.
+    fn data_opts(&self) -> Opts {
+        let mut o = Opts::NONE;
+        if self.ts_ok {
+            o.ts = Some((self.tsval(), self.ts_recent));
+        }
+        o
     }
 
     /// Estado atual.
@@ -182,9 +241,9 @@ impl Conn {
         self.state
     }
 
-    /// Janela de recepção anunciada.
+    /// Janela de recepção anunciada (já deslocada pela escala).
     fn window(&self) -> u16 {
-        u16::try_from(self.rcvbuf.free()).unwrap_or(u16::MAX)
+        u16::try_from(self.rcvbuf.free() >> self.rcv_shift).unwrap_or(u16::MAX)
     }
 
     fn header(&self, flags: u8, seq: u32) -> Header {
@@ -195,12 +254,12 @@ impl Conn {
             ack: self.rcv_nxt,
             flags,
             window: self.window(),
-            mss: None,
+            opts: self.data_opts(),
         }
     }
 
     fn emit(&self, ob: &mut VecDeque<Out>, h: &Header, data: &[u8]) {
-        let mut seg = alloc::vec![0u8; wire::HEADER_LEN + 4 + data.len()];
+        let mut seg = alloc::vec![0u8; wire::HEADER_LEN + 40 + data.len()];
         if let Some(n) = wire::build(self.lip, self.rip, h, data, &mut seg) {
             seg.truncate(n);
             ob.push_back(Out {
@@ -219,8 +278,21 @@ impl Conn {
             SYN | if self.state == State::SynSent { 0 } else { ACK },
             self.iss,
         );
-        h.mss = Some(u16::try_from(MSS).unwrap_or(1460));
-        if self.state == State::SynSent {
+        // A janela do SYN nunca é escalada (RFC 7323, 2.2).
+        h.window = u16::try_from(self.rcvbuf.free()).unwrap_or(u16::MAX);
+        let active = self.state == State::SynSent;
+        let mut o = Opts::NONE;
+        o.mss = Some(u16::try_from(MSS).unwrap_or(1460));
+        // O ativo oferece tudo; o passivo só responde o que o outro ofereceu.
+        if active || self.wscale_ok {
+            o.wscale = Some(self.rcv_shift);
+        }
+        o.sack_ok = true;
+        if active || self.ts_ok {
+            o.ts = Some((self.tsval(), if active { 0 } else { self.ts_recent }));
+        }
+        h.opts = o;
+        if active {
             h.ack = 0;
         }
         self.emit(ob, &h, &[]);
@@ -242,6 +314,7 @@ impl Conn {
 
     /// Envia o que a janela e o congestionamento deixam.
     pub(super) fn output(&mut self, ob: &mut VecDeque<Out>, now: u64) {
+        self.now = now;
         if !matches!(
             self.state,
             State::Established
@@ -328,6 +401,7 @@ impl Conn {
 
     /// Relógio: retransmissão, sonda de janela zero e fim do `TIME_WAIT`.
     pub(super) fn poll(&mut self, ob: &mut VecDeque<Out>, now: u64) {
+        self.now = now;
         if self.state == State::TimeWait && now >= self.time_wait_at {
             self.state = State::Closed;
             return;
@@ -431,7 +505,17 @@ impl Conn {
                 self.snd_nxt = ack;
             }
             self.dupacks = 0;
-            if let Some((end, at)) = self.rtt_probe
+            if self.ts_ok
+                && let Some((_, ecr)) = seg.opts.ts
+                && ecr != 0
+            {
+                // RTTM (RFC 7323): amostra em toda confirmação nova.
+                let ms = self.tsval().wrapping_sub(ecr);
+                if ms < 60_000 {
+                    self.rtt_sample(u64::from(ms.max(1)) * 1_000_000);
+                }
+                self.rtt_probe = None;
+            } else if let Some((end, at)) = self.rtt_probe
                 && le(end, ack)
             {
                 self.rtt_sample(now.saturating_sub(at).max(1));
@@ -448,7 +532,7 @@ impl Conn {
             && seg.data.is_empty()
             && seg.flags & (SYN | FIN) == 0
             && self.snd_una != self.snd_max
-            && u32::from(seg.window) == self.snd_wnd
+            && u32::from(seg.window) << self.snd_shift == self.snd_wnd
         {
             self.dupacks += 1;
             if self.dupacks == 3 {
@@ -459,7 +543,11 @@ impl Conn {
             }
         }
         if lt(self.snd_wl1, seg.seq) || (self.snd_wl1 == seg.seq && le(self.snd_wl2, ack)) {
-            self.snd_wnd = u32::from(seg.window);
+            self.snd_wnd = if seg.flags & SYN != 0 {
+                u32::from(seg.window)
+            } else {
+                u32::from(seg.window) << self.snd_shift
+            };
             self.snd_wl1 = seg.seq;
             self.snd_wl2 = ack;
         }
@@ -473,7 +561,7 @@ impl Conn {
 
     /// Janela de recepção em bytes (para a checagem de aceitação).
     fn rcv_wnd(&self) -> u32 {
-        u32::from(self.window())
+        u32::from(self.window()) << self.rcv_shift
     }
 
     fn acceptable(&self, seg: &Segment<'_>) -> bool {
@@ -490,6 +578,7 @@ impl Conn {
 
     /// Trata um segmento destinado a esta conexão.
     pub(super) fn segment(&mut self, seg: &Segment<'_>, ob: &mut VecDeque<Out>, now: u64) -> Event {
+        self.now = now;
         if self.state == State::SynSent {
             return self.segment_syn_sent(seg, ob, now);
         }
@@ -498,6 +587,21 @@ impl Conn {
                 self.send_ack(ob);
             }
             return Event::None;
+        }
+        // Timestamps (RFC 7323): sem a opção, o segmento não vale; com TSval
+        // velho (PAWS), responde ACK e descarta.
+        if self.ts_ok && seg.flags & (RST | SYN) == 0 {
+            let Some((tsval, _)) = seg.opts.ts else {
+                return Event::None;
+            };
+            if lt(tsval, self.ts_recent) {
+                self.send_ack(ob);
+                return Event::None;
+            }
+            // Só avança com segmento que não está à frente do que já recebemos.
+            if le(seg.seq, self.rcv_nxt) {
+                self.ts_recent = tsval;
+            }
         }
         if seg.flags & RST != 0 {
             // RFC 5961: só um RST exatamente em `rcv_nxt` derruba a conexão;
@@ -537,7 +641,7 @@ impl Conn {
                         ack: 0,
                         flags: RST,
                         window: 0,
-                        mss: None,
+                        opts: Opts::NONE,
                     },
                     &[],
                 );
@@ -582,7 +686,7 @@ impl Conn {
                         ack: 0,
                         flags: RST,
                         window: 0,
-                        mss: None,
+                        opts: Opts::NONE,
                     },
                     &[],
                 );
@@ -600,8 +704,8 @@ impl Conn {
         }
         self.irs = seg.seq;
         self.rcv_nxt = seg.seq.wrapping_add(1);
-        self.mss = usize::from(seg.mss.unwrap_or(536)).clamp(536, MSS);
-        self.cwnd = INIT_CWND_SEGS * self.mss;
+        self.negotiate(&seg.opts);
+        // A janela do SYN não é escalada.
         self.snd_wnd = u32::from(seg.window);
         self.snd_wl1 = seg.seq;
         self.snd_wl2 = seg.ack;
@@ -711,7 +815,9 @@ impl Conn {
         &mut self,
         out: &mut [u8],
         ob: &mut VecDeque<Out>,
+        now: u64,
     ) -> Result<Option<usize>, Error> {
+        self.now = now;
         if self.rcvbuf.is_empty() {
             if let Some(e) = self.err {
                 return Err(e);
@@ -726,7 +832,7 @@ impl Conn {
         let n = self.rcvbuf.pop(out);
         // Aviso de janela quando a leitura abre espaço relevante.
         let opened = self.rcv_wnd() - before;
-        if opened as usize >= self.mss.min(BUF_BYTES / 2) && self.state != State::Closed {
+        if opened as usize >= self.mss.min(self.limit / 2) && self.state != State::Closed {
             self.send_ack(ob);
         }
         Ok(Some(n))

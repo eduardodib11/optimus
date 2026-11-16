@@ -329,14 +329,15 @@ fn fechamento_simultaneo() {
 fn janela_fecha_e_reabre_com_a_leitura() {
     let mut net = Net::new();
     let (a, b) = net.open();
-    let data = pattern(200_000);
+    let data = pattern(600_000);
     let mut sent = 0;
     // O receptor não lê: o remetente trava no tamanho da janela.
     for _ in 0..5_000 {
         sent += net.a.write(a, &data[sent..], net.now).unwrap();
         net.tick();
     }
-    assert_eq!(net.b.recv_ready(b), super::BUF_BYTES);
+    // A janela escalada anda de 8 em 8 bytes (escala 3).
+    assert!(net.b.recv_ready(b) + 8 > net.b.conns[b].as_ref().unwrap().limit);
     assert!(sent < data.len());
     // Ler abre a janela e o resto chega.
     let mut got = Vec::new();
@@ -370,7 +371,7 @@ fn rst_com_sequencia_errada_nao_derruba() {
             ack: 0,
             flags: RST,
             window: 0,
-            mss: None,
+            opts: wire::Opts::NONE,
         };
         let mut out = [0u8; 20];
         let n = wire::build(A, B, &h, &[], &mut out).unwrap();
@@ -402,7 +403,10 @@ fn syn_numa_conexao_aberta_gera_ack_de_desafio() {
         ack: 0,
         flags: SYN,
         window: 1000,
-        mss: Some(1460),
+        opts: wire::Opts {
+            mss: Some(1460),
+            ..wire::Opts::NONE
+        },
     };
     let mut out = [0u8; 24];
     let n = wire::build(A, B, &h, &[], &mut out).unwrap();
@@ -491,6 +495,7 @@ fn conexoes_ao_mesmo_tempo_tem_portas_distintas() {
 #[test]
 fn tabela_cheia_recusa_a_conexao() {
     let mut net = Net::new();
+    net.a.set_budget(1 << 30);
     for i in 0..super::MAX_CONNS {
         assert!(
             net.a
@@ -528,7 +533,10 @@ fn segmentos_malformados_nao_entram_em_panico() {
         ack: 0,
         flags: SYN,
         window: 100,
-        mss: Some(1460),
+        opts: wire::Opts {
+            mss: Some(1460),
+            ..wire::Opts::NONE
+        },
     };
     let mut seg = [0u8; 64];
     let n = wire::build(A, B, &h, b"lixo", &mut seg).unwrap();
@@ -567,7 +575,7 @@ fn segmento_fin_ack_e_sequencias_curtas() {
         ack: 20,
         flags: FIN | ACK,
         window: 300,
-        mss: None,
+        opts: wire::Opts::NONE,
     };
     let mut out = [0u8; 32];
     let n = wire::build(A, B, &h, b"ab", &mut out).unwrap();
@@ -597,4 +605,134 @@ fn buffer_em_anel() {
     assert_eq!(b.peek(9, &mut all), 0);
     b.consume(100);
     assert!(b.is_empty());
+}
+
+#[test]
+fn memoria_dos_buffers_tem_teto() {
+    let mut net = Net::new();
+    net.a.set_budget(200 * 1024);
+    // Cada conexão leva o que cabe; quando nem o mínimo cabe, recusa.
+    let mut n = 0;
+    while net.a.connect(B, 80, net.now, n).is_ok() {
+        n += 1;
+        assert!(n < 100, "sem teto");
+    }
+    assert!(n >= 3);
+    // Fechar devolve a reserva.
+    net.a.abort(0);
+    net.a.poll(net.now);
+    assert!(net.a.connect(B, 80, net.now, 999).is_ok());
+}
+
+#[test]
+fn janela_escalada_e_negociada() {
+    let mut net = Net::new();
+    let (a, b) = net.open();
+    let ca = net.a.conns[a].as_ref().unwrap();
+    let cb = net.b.conns[b].as_ref().unwrap();
+    assert!(ca.wscale_ok && cb.wscale_ok && ca.ts_ok && cb.ts_ok);
+    // 256 KiB cabem na janela de 16 bits com escala 3.
+    assert_eq!(ca.rcv_shift, 3);
+    assert_eq!(cb.snd_shift, 3);
+    // Sem as opções do outro lado, tudo volta ao básico.
+    let mut c = super::conn::Conn::new(State::SynRcvd, (A, 1, B, 2), 0, 0, 100, false, 1 << 18);
+    c.negotiate(&wire::Opts::NONE);
+    assert!(!c.wscale_ok && !c.ts_ok);
+    assert_eq!(c.rcv_shift, 0);
+}
+
+#[test]
+fn opcoes_ida_e_volta() {
+    let o = wire::Opts {
+        mss: Some(1460),
+        wscale: Some(7),
+        sack_ok: true,
+        ts: Some((0xdead_beef, 0x1234_5678)),
+        ..wire::Opts::NONE
+    };
+    let h = wire::Header {
+        sport: 1,
+        dport: 2,
+        seq: 3,
+        ack: 4,
+        flags: SYN,
+        window: 5,
+        opts: o,
+    };
+    let mut out = [0u8; 64];
+    let n = wire::build(A, B, &h, &[], &mut out).unwrap();
+    assert_eq!(n, 40);
+    assert_eq!(wire::parse(A, B, &out[..n]).unwrap().opts, o);
+    // ACK com timestamps e três blocos SACK: 12 + 28 bytes de opções.
+    let mut o = wire::Opts {
+        ts: Some((1, 2)),
+        nsack: 3,
+        ..wire::Opts::NONE
+    };
+    o.sack[..3].copy_from_slice(&[(10, 20), (30, 40), (50, 60)]);
+    let h = wire::Header {
+        flags: ACK,
+        opts: o,
+        ..h
+    };
+    let n = wire::build(A, B, &h, b"xy", &mut out).unwrap();
+    assert_eq!(n, 20 + 40 + 2);
+    let s = wire::parse(A, B, &out[..n]).unwrap();
+    assert_eq!(s.opts.blocks(), &[(10, 20), (30, 40), (50, 60)]);
+    assert_eq!(s.opts.ts, Some((1, 2)));
+    assert_eq!(s.data, b"xy");
+    // A escala acima de 14 vale 14.
+    let mut raw = out;
+    let h2 = wire::Header {
+        opts: wire::Opts {
+            wscale: Some(9),
+            ..wire::Opts::NONE
+        },
+        ..h
+    };
+    let n = wire::build(A, B, &h2, &[], &mut raw).unwrap();
+    raw[20 + 3] = 30;
+    let c = {
+        raw[16..18].fill(0);
+        crate::ip4::fold(crate::ip4::sum(
+            &raw[..n],
+            crate::udp::pseudo_sum(A, B, crate::ip4::PROTO_TCP, n),
+        ))
+    };
+    raw[16..18].copy_from_slice(&c.to_be_bytes());
+    assert_eq!(wire::parse(A, B, &raw[..n]).unwrap().opts.wscale, Some(14));
+}
+
+#[test]
+fn opcao_malformada_derruba_o_segmento() {
+    let sum = |x: &mut [u8; 28]| {
+        x[16..18].fill(0);
+        let c = crate::ip4::fold(crate::ip4::sum(
+            &x[..],
+            crate::udp::pseudo_sum(A, B, crate::ip4::PROTO_TCP, 28),
+        ));
+        x[16..18].copy_from_slice(&c.to_be_bytes());
+    };
+    for bad in [
+        [3u8, 4, 1, 1, 0, 0, 0, 0],
+        [4, 3, 0, 0, 0, 0, 0, 0],
+        [8, 6, 0, 0, 0, 0, 0, 0],
+        [5, 9, 0, 0, 0, 0, 0, 0],
+        [5, 2, 0, 0, 0, 0, 0, 0],
+        [2, 3, 0, 0, 0, 0, 0, 0],
+    ] {
+        let mut x = [0u8; 28];
+        x[12] = 7 << 4;
+        x[13] = ACK;
+        x[20..28].copy_from_slice(&bad);
+        sum(&mut x);
+        assert!(wire::parse(A, B, &x).is_none(), "aceitou {bad:?}");
+    }
+    // Opção desconhecida se pula.
+    let mut x = [0u8; 28];
+    x[12] = 7 << 4;
+    x[13] = ACK;
+    x[20..28].copy_from_slice(&[99, 4, 0, 0, 1, 1, 1, 1]);
+    sum(&mut x);
+    assert!(wire::parse(A, B, &x).is_some());
 }
