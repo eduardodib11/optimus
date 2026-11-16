@@ -13,7 +13,7 @@ priority = 150
 restart = "always"
 
 [capabilities]
-needs = ["mem:quota:4MiB", "kernel:debug", "svc:optimus.net.NetDevice@1?"]
+needs = ["mem:quota:6MiB", "kernel:debug", "svc:optimus.net.NetDevice@1?"]
 provides = []
 
 [match]

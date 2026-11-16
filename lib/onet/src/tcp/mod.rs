@@ -12,12 +12,14 @@ use crate::ports::Ephemeral;
 
 pub mod buf;
 mod conn;
+mod cubic;
+mod sack;
 pub mod wire;
 
 #[cfg(test)]
 mod tests;
 
-pub use conn::{BUF_BYTES, State};
+pub use conn::{BUF_BYTES, Features, Keepalive, State, Stats};
 use conn::{Conn, Event};
 use wire::{ACK, RST, SYN};
 
@@ -28,7 +30,12 @@ pub const MAX_CONNS: usize = 32;
 /// Escutas ao mesmo tempo.
 pub const MAX_LISTENERS: usize = 8;
 /// Segmentos fora de ordem guardados por conexão.
-pub const MAX_OOO: usize = 8;
+pub const MAX_OOO: usize = 256;
+/// Memória que os buffers de todas as conexões podem reservar (a cota do
+/// `netd` paga o heap; passar disso derrubaria o processo).
+pub const MEM_BUDGET: usize = 2_560 * 1024;
+/// Menor buffer que vale a pena dar a uma conexão.
+const MIN_BUF: usize = 16 * 1024;
 /// Intervalo mínimo entre RST por segmento sem dono (ns).
 const RST_NS: u64 = 5_000_000;
 
@@ -91,6 +98,11 @@ pub struct Tcp {
     secret: [u8; 16],
     ports: Ephemeral,
     rst_at: u64,
+    /// Reserva de memória que ainda cabe em buffers.
+    budget: usize,
+    features: Features,
+    /// Último relógio visto, para o que não recebe `now` (a leitura).
+    now: u64,
     /// Soma ao ISN nos testes, para exercitar a volta do número de sequência.
     #[cfg(test)]
     isn_bias: u32,
@@ -116,6 +128,9 @@ impl Tcp {
             secret,
             ports: Ephemeral::new(),
             rst_at: 0,
+            budget: MEM_BUDGET,
+            features: Features::ALL,
+            now: 0,
             #[cfg(test)]
             isn_bias: 0,
         }
@@ -146,6 +161,57 @@ impl Tcp {
         u32::from_le_bytes([h[0], h[1], h[2], h[3]]).wrapping_add(clock)
     }
 
+    /// Reserva a memória dos dois buffers de uma conexão nova e devolve o
+    /// limite de cada um: o máximo enquanto a cota folga, menos com muitas
+    /// conexões; `None` quando nem o mínimo cabe.
+    fn reserve(&mut self) -> Option<usize> {
+        // Três vezes o limite: envio, recepção e segmentos fora de ordem (que
+        // cabem na janela de recepção).
+        let limit = (self.budget / 6).clamp(MIN_BUF, BUF_BYTES);
+        if self.budget < 3 * limit {
+            return None;
+        }
+        self.budget -= 3 * limit;
+        Some(limit)
+    }
+
+    /// Reserva de memória que ainda cabe em buffers.
+    #[must_use]
+    pub const fn budget_left(&self) -> usize {
+        self.budget
+    }
+
+    /// Escolhe as extensões que as conexões novas oferecem.
+    pub const fn set_features(&mut self, f: Features) {
+        self.features = f;
+    }
+
+    /// Liga ou desliga o Nagle da conexão (`TCP_NODELAY`).
+    pub fn set_nodelay(&mut self, id: ConnId, on: bool) {
+        if let Some(Some(c)) = self.conns.get_mut(id) {
+            c.nodelay = on;
+        }
+    }
+
+    /// Liga (`Some`) ou desliga o `keepalive` da conexão.
+    pub fn set_keepalive(&mut self, id: ConnId, k: Option<Keepalive>) {
+        let now = self.now;
+        if let Some(Some(c)) = self.conns.get_mut(id) {
+            c.set_keepalive(k, now);
+        }
+    }
+
+    /// Contadores de retransmissão da conexão.
+    #[must_use]
+    pub fn stats(&self, id: ConnId) -> Option<Stats> {
+        self.conns.get(id)?.as_ref().map(|c| c.stats)
+    }
+
+    /// Troca o orçamento de memória dos buffers (o `netd` o ajusta à cota).
+    pub const fn set_budget(&mut self, bytes: usize) {
+        self.budget = bytes;
+    }
+
     fn slot(&mut self) -> Option<usize> {
         if let Some(i) = self.conns.iter().position(Option::is_none) {
             return Some(i);
@@ -171,17 +237,23 @@ impl Tcp {
         now: u64,
         random: u32,
     ) -> Result<ConnId, Error> {
+        self.now = now;
         let id = self.slot().ok_or(Error::NoSpace)?;
         let lport = self.ports.alloc(random).ok_or(Error::NoSpace)?;
         let iss = self.isn(dst, dport, lport, now);
+        let Some(limit) = self.reserve() else {
+            self.ports.release(lport);
+            return Err(Error::NoSpace);
+        };
         let mut c = Conn::new(
             State::SynSent,
             (self.ip, lport, dst, dport),
             iss,
             0,
-            None,
             0,
             true,
+            limit,
+            self.features,
         );
         c.start(&mut self.outbox, now);
         self.conns[id] = Some(c);
@@ -269,12 +341,13 @@ impl Tcp {
     /// O erro da conexão (depois de lidos os bytes que sobraram) ou
     /// [`Error::NoSuchId`].
     pub fn read(&mut self, id: ConnId, out: &mut [u8]) -> Result<Read, Error> {
+        let now = self.now;
         let (conns, ob) = (&mut self.conns, &mut self.outbox);
         let c = conns
             .get_mut(id)
             .and_then(Option::as_mut)
             .ok_or(Error::NoSuchId)?;
-        Ok(match c.read(out, ob)? {
+        Ok(match c.read(out, ob, now)? {
             Some(0) if !out.is_empty() => Read::Eof,
             Some(n) => Read::Data(n),
             None => Read::WouldBlock,
@@ -336,6 +409,7 @@ impl Tcp {
             .and_then(Option::as_ref)
             .is_some_and(|c| c.state == State::Closed && c.user_closed);
         if done && let Some(c) = self.conns[id].take() {
+            self.budget += 3 * c.limit;
             if c.ephemeral {
                 self.ports.release(c.lport);
             }
@@ -361,6 +435,7 @@ impl Tcp {
 
     /// Relógio: retransmissões, sondas e `TIME_WAIT`.
     pub fn poll(&mut self, now: u64) {
+        self.now = now;
         for id in 0..self.conns.len() {
             if let Some(c) = self.conns[id].as_mut() {
                 c.poll(&mut self.outbox, now);
@@ -371,6 +446,7 @@ impl Tcp {
 
     /// Trata um segmento recebido de `src` para `dst`.
     pub fn input(&mut self, src: Ip4, dst: Ip4, bytes: &[u8], now: u64) {
+        self.now = now;
         let Some(seg) = wire::parse(src, dst, bytes) else {
             return;
         };
@@ -436,15 +512,20 @@ impl Tcp {
         }
         let Some(id) = self.slot() else { return true };
         let iss = self.isn(src, seg.sport, seg.dport, now);
+        let Some(limit) = self.reserve() else {
+            return true;
+        };
         let mut c = Conn::new(
             State::SynRcvd,
             (dst, seg.dport, src, seg.sport),
             iss,
             seg.seq,
-            seg.mss,
             seg.window,
             false,
+            limit,
+            self.features,
         );
+        c.negotiate(&seg.opts);
         c.listener = Some(l);
         c.start(&mut self.outbox, now);
         self.conns[id] = Some(c);
@@ -466,7 +547,7 @@ impl Tcp {
                 ack: 0,
                 flags: RST,
                 window: 0,
-                mss: None,
+                opts: wire::Opts::NONE,
             }
         } else {
             wire::Header {
@@ -476,7 +557,7 @@ impl Tcp {
                 ack: seg.seq.wrapping_add(seg.seq_len()),
                 flags: RST | ACK,
                 window: 0,
-                mss: None,
+                opts: wire::Opts::NONE,
             }
         };
         let mut out = [0u8; wire::HEADER_LEN];
