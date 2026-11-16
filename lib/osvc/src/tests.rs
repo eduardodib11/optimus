@@ -76,13 +76,15 @@ fn rotulos() {
         Method::DriverGive,
         Method::DriverStart,
         Method::DriverStop,
+        Method::NetPolicy,
     ] {
         assert_eq!(method_of(label(m)), Some(m));
     }
     assert_eq!(label(Method::Driver) >> 16 & 0xFFFF, 1, "driver é da 1.1");
     assert_eq!(label(Method::DriverStart) >> 16 & 0xFFFF, 2);
     assert_eq!(label(Method::DriverStop) >> 16 & 0xFFFF, 3);
-    assert_eq!(method_of(label(Method::Ready) | 4 << 16), None);
+    assert_eq!(label(Method::NetPolicy) >> 16 & 0xFFFF, 4);
+    assert_eq!(method_of(label(Method::Ready) | 5 << 16), None);
     assert_eq!(method_of(4), None);
     assert_eq!(SvcError::from_u8(3), Some(SvcError::Busy));
     assert_eq!(SvcError::from_u8(4), None);
@@ -142,4 +144,20 @@ fn driver_give_e_start_vao_e_voltam() {
     assert!(decode_driver_give(&b[..n], &mut names).is_err());
     let n = encode_driver_start(9, &mut b).unwrap();
     assert_eq!(decode_driver_start(&b[..n]), Ok(9));
+}
+
+#[test]
+fn net_policy_vai_e_volta() {
+    let mut b = [0u8; MAX_POLICY_BYTES];
+    let n = encode_policy("connect=tcp:10.0.2.2:47108;conns=4", &mut b).unwrap();
+    assert_eq!(
+        decode_policy(&b[..n]),
+        Ok("connect=tcp:10.0.2.2:47108;conns=4")
+    );
+    let cheio = "x".repeat(MAX_POLICY);
+    let n = encode_policy(&cheio, &mut b).unwrap();
+    assert!(n <= MAX_POLICY_BYTES);
+    assert_eq!(decode_policy(&b[..n]), Ok(cheio.as_str()));
+    assert!(encode_policy(&"x".repeat(MAX_POLICY + 1), &mut b).is_err());
+    assert!(decode_policy(&b[..4]).is_err());
 }

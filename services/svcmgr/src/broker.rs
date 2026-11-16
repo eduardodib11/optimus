@@ -48,6 +48,8 @@ pub const QUOTA_INDEX: u16 = 0xFFFF;
 
 /// Interface do `devmgr` (ADR 0042, item 1).
 pub const DEVICE_BUS: &str = "optimus.dev.DeviceBus";
+/// A interface de sockets do `netd` (ADR 0068).
+pub const SOCKET: &str = "optimus.net.Socket";
 
 /// Direitos do cliente sobre o endpoint de um provedor.
 pub const CLIENT_RIGHTS: Rights = Rights::SEND;
@@ -238,6 +240,25 @@ impl Broker {
         self.entry(id).is_some_and(|e| e.provide_ids.contains(&bus))
     }
 
+    /// `id` é o `netd`: provê `optimus.net.Socket@1`, o único que pode ler a
+    /// política de rede dos clientes (ADR 0068, item 2).
+    #[must_use]
+    pub fn is_net_server(&self, id: u32) -> bool {
+        let sock = interface_id(SOCKET, 1);
+        self.entry(id)
+            .is_some_and(|e| e.provide_ids.contains(&sock))
+    }
+
+    /// O texto da política `net:access:` de `id`, se o manifesto tem.
+    #[must_use]
+    pub fn net_policy(&self, id: u32) -> Option<&str> {
+        self.manifest(id)?
+            .needs
+            .iter()
+            .find(|n| n.kind == NeedKind::Net)
+            .map(|n| n.name.as_str())
+    }
+
     /// Badge da instância atual de `id`.
     #[must_use]
     pub fn badge_of(&self, id: u32) -> Option<Badge> {
@@ -306,6 +327,9 @@ impl Broker {
                 // recursos do nó casado, não uma capability por regra.
                 NeedKind::Dev if devices.is_some() => {}
                 NeedKind::Dev | NeedKind::Fs => return Err(DeliverError::NotSupported),
+                // A política de rede não vira capability: o `netd` a pede
+                // pelo `net_policy` (ADR 0068, item 2).
+                NeedKind::Net => {}
                 NeedKind::Svc => {
                     let iid = interface_id(&need.name, need.major);
                     match self.provider(iid) {

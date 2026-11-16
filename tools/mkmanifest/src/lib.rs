@@ -69,6 +69,9 @@ pub enum NeedKind {
     Fs = 4,
     /// Capability de origem do kernel (`kernel:`).
     Kernel = 5,
+    /// Política de rede (`net:access:`, ADR 0068): o texto da política vai
+    /// em `name`; não vira capability.
+    Net = 6,
 }
 
 /// Uma necessidade do serviço.
@@ -382,6 +385,18 @@ fn parse_need(service: &str, item: &str) -> Result<Need, Error> {
             };
             Ok(plain(kind))
         }
+        "net" => {
+            let policy = rest
+                .strip_prefix("access:")
+                .ok_or_else(|| Error(format!("{service}: só `net:access:` existe: {item:?}")))?;
+            if onet::policy::Policy::parse(policy).is_err() {
+                return err(format!("{service}: política de rede inválida: {item:?}"));
+            }
+            Ok(Need {
+                name: policy.to_owned(),
+                ..plain(NeedKind::Net)
+            })
+        }
         "kernel" => match kernel_rights(rest) {
             Some(rights) => Ok(Need {
                 value: u64::from(rights.bits()),
@@ -678,6 +693,25 @@ ipc_rate = 10000
         assert!(parse(&LOG.replace("logd", "Logd")).is_err());
         assert!(parse(&LOG.replace("\"mem:quota:8MiB\"", "")).is_err());
         assert!(parse(&LOG.replace("[limits]", "[limites]")).is_err());
+    }
+
+    #[test]
+    fn politica_de_rede_compila_e_valida() {
+        let m = svc(
+            "cli",
+            &["net:access:connect=tcp:10.0.2.2:47108;conns=4"],
+            &[],
+        );
+        let n = m.needs.iter().find(|n| n.kind == NeedKind::Net).unwrap();
+        assert_eq!(n.name, "connect=tcp:10.0.2.2:47108;conns=4");
+        assert!(encode(&m, b"elf").is_ok());
+        let ruim = LOG.replace(
+            "\"mem:quota:8MiB\"",
+            "\"mem:quota:8MiB\", \"net:access:connect=x\"",
+        );
+        assert!(parse(&ruim).is_err());
+        let outro = LOG.replace("\"mem:quota:8MiB\"", "\"mem:quota:8MiB\", \"net:tudo\"");
+        assert!(parse(&outro).is_err());
     }
 
     #[test]

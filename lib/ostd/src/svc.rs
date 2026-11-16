@@ -174,6 +174,36 @@ impl Session {
         Ok(name.len())
     }
 
+    /// `net_policy(id)` (1.4): o texto da necessidade `net:access:` do
+    /// manifesto do serviço `id` (o que vem depois do prefixo), copiado para
+    /// `out`; devolve os bytes (zero se o serviço não tem a necessidade:
+    /// sem `NetAccess`, ADR 0068). Só quem provê `optimus.net.Socket` recebe.
+    ///
+    /// # Errors
+    ///
+    /// Os do kernel, `AccessDenied` se o `svcmgr` recusar e
+    /// `InvalidArgument` se `out` não couber o texto.
+    pub fn net_policy(&mut self, id: u32, out: &mut [u8]) -> Result<usize, Error> {
+        let mut req = [0u8; osvc::MAX_SHORT_BYTES];
+        let n = osvc::encode_name_of(id, &mut req).map_err(|_| Error::InvalidArgument)?;
+        let mut body = [0u8; osvc::MAX_POLICY_BYTES];
+        let (label, m) = ipc::call_corpo(
+            self.control,
+            &mut self.buffer,
+            osvc::label(Method::NetPolicy),
+            &req[..n],
+            &mut body,
+            deadline(),
+        )?;
+        if label != osvc::REPLY_OK {
+            return Err(Error::AccessDenied);
+        }
+        let text = osvc::decode_policy(&body[..m]).map_err(|_| Error::InvalidArgument)?;
+        let dst = out.get_mut(..text.len()).ok_or(Error::InvalidArgument)?;
+        dst.copy_from_slice(text.as_bytes());
+        Ok(text.len())
+    }
+
     /// `driver(index)` (1.1): o driver `index` do conjunto compilado, com
     /// as regras de `[match]`, decodificado de `out` (que precisa de
     /// [`osvc::MAX_DRIVER_BYTES`]). Só o `devmgr` recebe resposta.

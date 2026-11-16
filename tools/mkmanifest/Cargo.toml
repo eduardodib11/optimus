@@ -9,6 +9,7 @@ license.workspace = true
 kabi = { path = "../../kernel/kabi" }
 optcrypt = { path = "../../lib/optcrypt" }
 odev = { path = "../../lib/odev" }
+onet = { path = "../../lib/onet" }
 toml = "0.8"
 
 [lints]
