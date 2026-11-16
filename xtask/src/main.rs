@@ -2560,6 +2560,9 @@ fn test(opts: &Options) -> Result {
         ]))?;
         // A lógica portável do kernel (biblioteca `okernel`) roda no host.
         status(cargo().args(["test", "--package", "okernel", "--lib"]))?;
+        // O cliente TLS do `tlsd` contra o `rustls` do host por soquete (T-657):
+        // crate própria, fora do workspace (`rustls` nunca entra na imagem).
+        status(cargo().args(["test", "--manifest-path", "tools/tlshost/Cargo.toml"]))?;
     }
     if matches!(opts.suite.as_str(), "boot" | "all") {
         smoke(opts, SCENARIOS)?;

@@ -6,15 +6,19 @@
 //! ([`verifier`], T-651). Só TLS 1.3, só
 //! as suítes `TLS_AES_256_GCM_SHA384` e `TLS_CHACHA20_POLY1305_SHA256`
 //! (ADR 0070, item 3), sem PSK nem 0-RTT (item 5). Toda cripto vem do
-//! `optcrypt`; nada aloca.
+//! `optcrypt`. Só o buffer de remontagem do cliente e os da [`session`]
+//! usam a heap.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
 
 pub mod client;
 pub mod msg;
 pub mod record;
 pub mod schedule;
+pub mod session;
 pub mod verifier;
 
 use ox509::ocsp::OcspError;

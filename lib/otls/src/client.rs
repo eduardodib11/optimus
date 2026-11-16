@@ -10,6 +10,8 @@
 
 use core::ops::Range;
 
+use alloc::boxed::Box;
+use alloc::vec;
 use optcrypt::mlkem768::{self, CT_LEN, DK_LEN};
 use optcrypt::secret::Secret;
 use optcrypt::x25519;
@@ -28,6 +30,56 @@ pub const MAX_HANDSHAKE: usize = 32 * 1024;
 const MAX_SPKI: usize = 1024;
 /// Maior `ClientHello` (a partilha híbrida tem 1 216 bytes).
 const MAX_CLIENT_HELLO: usize = 2048;
+/// Maior nome de servidor (um nome DNS tem até 253 bytes).
+pub const MAX_NAME: usize = 253;
+
+/// O nome do servidor, por cópia.
+#[derive(Clone, Copy)]
+struct Name {
+    buf: [u8; MAX_NAME],
+    len: u8,
+    dns: bool,
+}
+
+impl Name {
+    /// Nome vazio e IP vazio, que nenhuma folha casa: o que sobra de um nome
+    /// grande demais (a conexão falha na verificação).
+    fn new(n: ServerName<'_>) -> Self {
+        let mut s = Self {
+            buf: [0; MAX_NAME],
+            len: 0,
+            dns: false,
+        };
+        let (bytes, dns) = match n {
+            ServerName::Dns(d) => (d.as_bytes(), true),
+            ServerName::Ip(i) => (i, false),
+        };
+        if let Some(dst) = s.buf.get_mut(..bytes.len()) {
+            dst.copy_from_slice(bytes);
+            s.len = u8::try_from(bytes.len()).unwrap_or(0);
+            s.dns = dns;
+        }
+        s
+    }
+
+    fn get(&self) -> ServerName<'_> {
+        let b = &self.buf[..usize::from(self.len)];
+        if self.dns {
+            ServerName::Dns(core::str::from_utf8(b).unwrap_or(""))
+        } else {
+            ServerName::Ip(b)
+        }
+    }
+}
+
+/// O que sobra da [`Config`] depois de copiar o nome.
+struct Policy<'a> {
+    anchors: Anchors<'a>,
+    now: i64,
+    allow_classic: bool,
+    pin: Option<[u8; 32]>,
+    ocsp: OcspPolicy,
+}
 
 /// O que fazer sem uma resposta OCSP boa (ADR 0071, item 6).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -54,9 +106,14 @@ pub enum Ocsp {
 }
 
 /// Política da conexão.
-pub struct Config<'a> {
+///
+/// O cliente copia o nome (até [`MAX_NAME`] bytes): só `'a`, as âncoras,
+/// vive o quanto a conexão, e o `tlsd` guarda a conexão sem guardar o
+/// buffer de onde o nome veio.
+#[derive(Clone, Copy)]
+pub struct Config<'a, 'n> {
     /// Nome pedido; também vai no SNI quando é DNS.
-    pub name: ServerName<'a>,
+    pub name: ServerName<'n>,
     /// Âncoras de confiança (`data/trust/roots.der`).
     pub anchors: Anchors<'a>,
     /// Hora de parede confiável do `timed`, segundos desde 1970.
@@ -99,7 +156,8 @@ pub struct Event {
 /// Estado do handshake, separado do buffer de remontagem para que uma
 /// mensagem do buffer seja lida enquanto o estado muda.
 struct Inner<'a, V> {
-    cfg: Config<'a>,
+    cfg: Policy<'a>,
+    name: Name,
     verifier: V,
     state: State,
     session_id: [u8; 32],
@@ -125,18 +183,18 @@ struct Inner<'a, V> {
 /// Cliente TLS 1.3.
 pub struct Client<'a, V> {
     inner: Inner<'a, V>,
-    buf: [u8; MAX_HANDSHAKE],
+    /// Remontagem das mensagens de handshake, na heap: o cliente fica
+    /// pequeno para mudar de lugar na pilha curta de um processo.
+    buf: Box<[u8]>,
     len: usize,
 }
 
 impl<'a, V: SignatureVerifier> Client<'a, V> {
     /// Cliente novo; `rng` enche buffers com bytes do `keyd`.
     ///
-    /// O cliente tem ~40 KiB (o buffer de remontagem cabe uma cadeia
-    /// inteira); sem alocação, quem chama o guarda num estático ou na pilha
-    /// de uma tarefa que caiba.
-    #[allow(clippy::large_stack_arrays)]
-    pub fn new(cfg: Config<'a>, verifier: V, rng: &mut impl FnMut(&mut [u8])) -> Self {
+    /// O buffer de remontagem (32 KiB, cabe uma cadeia inteira) vai para a
+    /// heap; o resto do cliente tem uns 8 KiB.
+    pub fn new(cfg: Config<'a, '_>, verifier: V, rng: &mut impl FnMut(&mut [u8])) -> Self {
         let mut seed = Secret::<64>::zeroed();
         rng(seed.expose_mut());
         let (ek, mlkem_dk) = mlkem768::keygen(&seed);
@@ -154,8 +212,16 @@ impl<'a, V: SignatureVerifier> Client<'a, V> {
                 n += 1;
             }
         }
+        let name = Name::new(cfg.name);
         let mut inner = Inner {
-            cfg,
+            cfg: Policy {
+                anchors: cfg.anchors,
+                now: cfg.now,
+                allow_classic: cfg.allow_classic,
+                pin: cfg.pin,
+                ocsp: cfg.ocsp,
+            },
+            name,
             verifier,
             state: State::Start,
             session_id,
@@ -180,7 +246,7 @@ impl<'a, V: SignatureVerifier> Client<'a, V> {
         inner.hello_len = inner.build_hello(&random, &ek).unwrap_or(0);
         Self {
             inner,
-            buf: [0; MAX_HANDSHAKE],
+            buf: vec![0; MAX_HANDSHAKE].into_boxed_slice(),
             len: 0,
         }
     }
@@ -382,7 +448,7 @@ impl<V: SignatureVerifier> Inner<'_, V> {
             random,
             session_id: &self.session_id,
             suites: &ids[..self.n_suites],
-            server_name: match self.cfg.name {
+            server_name: match self.name.get() {
                 ServerName::Dns(d) => Some(d),
                 ServerName::Ip(_) => None,
             },
@@ -528,7 +594,7 @@ impl<V: SignatureVerifier> Inner<'_, V> {
             let anchor = verify_server(
                 &chain,
                 &self.cfg.anchors,
-                self.cfg.name,
+                self.name.get(),
                 self.cfg.now,
                 &self.verifier,
             )

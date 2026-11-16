@@ -429,7 +429,7 @@ impl Server {
     }
 }
 
-fn config(anchors: &[u8]) -> Config<'_> {
+fn config(anchors: &[u8]) -> Config<'_, 'static> {
     Config {
         name: ServerName::Dns("optimus.test"),
         anchors: Anchors::parse(anchors).unwrap(),
@@ -440,7 +440,7 @@ fn config(anchors: &[u8]) -> Config<'_> {
     }
 }
 
-fn ocsp_config(anchors: &[u8]) -> Config<'_> {
+fn ocsp_config(anchors: &[u8]) -> Config<'_, 'static> {
     Config {
         name: ServerName::Dns("ocsp.optimus.test"),
         now: ocsp_now(),
@@ -449,7 +449,10 @@ fn ocsp_config(anchors: &[u8]) -> Config<'_> {
 }
 
 /// Faz o handshake com `k`; devolve o cliente, o servidor e o erro, se houve.
-fn run(cfg: Config<'_>, k: Knobs) -> (Client<'_, Fake>, Option<Server>, Result<Vec<u8>, Error>) {
+fn run<'a>(
+    cfg: Config<'a, '_>,
+    k: Knobs,
+) -> (Client<'a, Fake>, Option<Server>, Result<Vec<u8>, Error>) {
     let mut c = Client::new(cfg, Fake, &mut rng());
     let mut out = vec![0u8; 4096];
     let n = c.start(&mut out).unwrap();
