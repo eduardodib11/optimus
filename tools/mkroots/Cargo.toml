@@ -1,0 +1,12 @@
+[package]
+name = "mkroots"
+description = "Ferramenta de host que gera data/trust/roots.der a partir do certdata.txt da Mozilla (ADR 0071, item 5)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ox509 = { path = "../../lib/ox509" }
+
+[lints]
+workspace = true

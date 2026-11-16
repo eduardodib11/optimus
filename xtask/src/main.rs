@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -3056,7 +3057,7 @@ fn check_fuzz(serial: &str, exit: std::result::Result<Option<i32>, ()>, seed: u6
 /// Formatação, clippy em cada alvo e a regra de `unsafe` da seção 17.1.
 fn check() -> Result {
     status(cargo().args(["fmt", "--all", "--check"]))?;
-    for tool in ["xtask", "mkobfs", "oidlc", "mkmanifest"] {
+    for tool in ["xtask", "mkobfs", "oidlc", "mkmanifest", "mkroots"] {
         status(cargo().args([
             "clippy",
             "--package",
@@ -3101,7 +3102,37 @@ fn check() -> Result {
             "warnings",
         ]))?;
     }
+    check_trust()?;
     check_unsafe()
+}
+
+/// Âncoras do `tlsd` (ADR 0071, item 5): `data/trust/roots.der` tem de bater
+/// com o SHA-256 de `data/trust/roots.der.sha256` e ser lido inteiro pelo
+/// `ox509`. Trocar as raízes é uma mudança visível dos dois arquivos
+/// (`tools/mkroots`, nota em `data/trust/ORIGEM.md`).
+fn check_trust() -> Result {
+    let dir = root().join("data/trust");
+    let der = fs::read(dir.join("roots.der")).map_err(|e| format!("data/trust/roots.der: {e}"))?;
+    let want = fs::read_to_string(dir.join("roots.der.sha256"))
+        .map_err(|e| format!("data/trust/roots.der.sha256: {e}"))?;
+    let got = optcrypt::sha256::hash(&der)
+        .iter()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+    if want.split_whitespace().next() != Some(got.as_str()) {
+        return Err(format!(
+            "data/trust/roots.der: SHA-256 {got} difere de data/trust/roots.der.sha256"
+        ));
+    }
+    let anchors = ox509::verify::Anchors::parse(&der)
+        .map_err(|e| format!("data/trust/roots.der recusado pelo ox509: {e:?}"))?;
+    println!(
+        "xtask: âncoras ok: {} raízes, SHA-256 {got}",
+        anchors.iter().count()
+    );
+    Ok(())
 }
 
 /// Provas Kani da lógica portável do kernel (T-204); `KANI_ALL=1` roda
@@ -3146,6 +3177,7 @@ fn check_unsafe() -> Result {
             "xtask/src/main.rs",
             "tools/mkobfs/src/main.rs",
             "tools/oidlc/src/main.rs",
+            "tools/mkroots/src/main.rs",
         ])
         .collect();
     unsafe_budget::check(&roots)
