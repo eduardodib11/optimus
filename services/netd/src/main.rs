@@ -199,7 +199,7 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
                 Err(_) => return Err("anel de recepção corrompido"),
             }
         }
-        stack.tick(now);
+        stack.tick(&mut TxLink(&mut nic.tx), now);
         if TESTE {
             probes.step(&mut stack, &mut TxLink(&mut nic.tx), now);
         }

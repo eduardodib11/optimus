@@ -107,7 +107,7 @@ impl core::fmt::Debug for Tcp {
 impl Tcp {
     /// Tabela vazia. `secret` (do DRBG do kernel) mistura o ISN (RFC 6528).
     #[must_use]
-    pub fn new(secret: [u8; 16]) -> Self {
+    pub const fn new(secret: [u8; 16]) -> Self {
         Self {
             ip: [0; 4],
             conns: Vec::new(),
@@ -119,6 +119,11 @@ impl Tcp {
             #[cfg(test)]
             isn_bias: 0,
         }
+    }
+
+    /// Troca o segredo do ISN (o `netd` o tira do DRBG do kernel ao subir).
+    pub const fn set_secret(&mut self, secret: [u8; 16]) {
+        self.secret = secret;
     }
 
     /// O IP local (zero antes do DHCP).

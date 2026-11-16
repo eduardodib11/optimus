@@ -7,6 +7,7 @@ use crate::eth::{self, Header, Mac};
 use crate::frag::{self, Reassembler};
 use crate::icmp::{self, Echo};
 use crate::ip4::{self, Config};
+use crate::tcp::Tcp;
 use crate::udp;
 
 /// Quem recebe o que a pilha entrega acima do IP.
@@ -75,6 +76,8 @@ pub struct Stack {
     ip_id: u16,
     /// Quando o próximo erro ICMP pode sair.
     icmp_error_at: u64,
+    /// O TCP: o `netd` abre, escuta, lê e escreve por aqui.
+    pub tcp: Tcp,
 }
 
 impl Stack {
@@ -92,6 +95,7 @@ impl Stack {
             frags: Reassembler::new(),
             ip_id: 0,
             icmp_error_at: 0,
+            tcp: Tcp::new([0; 16]),
         }
     }
 
@@ -118,15 +122,34 @@ impl Stack {
     pub fn set_config<L: Link>(&mut self, link: &mut L, cfg: Config) {
         self.cfg = cfg;
         self.local.ip = cfg.ip;
+        self.tcp.set_ip(cfg.ip);
         if cfg.ip != [0; 4] {
             let g = self.local.gratuitous();
             self.send_arp(link, Mac::BROADCAST, &g);
         }
     }
 
-    /// Relógio da pilha: descarta o que passou do prazo.
-    pub fn tick(&mut self, now: u64) {
+    /// Relógio da pilha: descarta o que passou do prazo, roda as
+    /// retransmissões do TCP e manda o que ele tem na fila.
+    pub fn tick<L: Link>(&mut self, link: &mut L, now: u64) {
         self.frags.expire(now);
+        self.tcp.poll(now);
+        self.flush_tcp(link, now);
+    }
+
+    /// Leva ao IP os segmentos que o TCP enfileirou. O que não saiu por falta
+    /// de MAC ou de vaga no anel volta para a frente da fila (o relógio do
+    /// TCP retransmite o que se perder); o que não tem rota é descartado.
+    pub fn flush_tcp<L: Link>(&mut self, link: &mut L, now: u64) {
+        while let Some(o) = self.tcp.pop_out() {
+            match self.send_ip(link, o.dst, ip4::PROTO_TCP, &o.data, now) {
+                Err(SendError::Pending | SendError::Busy) => {
+                    self.tcp.push_front_out(o);
+                    break;
+                }
+                Ok(()) | Err(SendError::NoRoute | SendError::TooBig) => {}
+            }
+        }
     }
 
     /// Manda um pacote IPv4 com `payload` de `proto` para `dst`.
@@ -316,6 +339,14 @@ impl Stack {
                 let unicast = h.dst == self.cfg.ip;
                 if !up.udp(h.src, d.sport, d.dport, d.data) && unicast {
                     self.port_unreachable(link, h.src, orig, now);
+                }
+                None
+            }
+            ip4::PROTO_TCP => {
+                // Só unicast para nós: TCP não existe em difusão.
+                if h.dst == self.cfg.ip {
+                    self.tcp.input(h.src, h.dst, payload, now);
+                    self.flush_tcp(link, now);
                 }
                 None
             }

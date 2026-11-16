@@ -2570,6 +2570,9 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "devmgr: nó 00:1f.3 8086:2930 1 BARs: netd",
     // T-634: o `netd` manda um datagrama UDP ao servidor de eco do host.
     "netd: udp: eco do host",
+    // T-635: e abre uma conexão TCP ao eco do host, manda 4000 bytes e
+    // confere que voltam iguais.
+    "netd: tcp: eco do host",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
     // (teclado PS/2 e RTC) viram nós com portas e IRQ.
@@ -2624,6 +2627,8 @@ struct HostEcho {
 
 /// Porta UDP do eco (`services/netd/src/probe.rs`).
 const HOST_UDP_ECHO_PORT: u16 = 47107;
+/// Porta TCP do eco (`services/netd/src/probe.rs`).
+const HOST_TCP_ECHO_PORT: u16 = 47108;
 
 impl HostEcho {
     fn start() -> Result<Self> {
@@ -2641,9 +2646,47 @@ impl HostEcho {
                 }
             }
         });
+        let tcp = std::net::TcpListener::bind(("127.0.0.1", HOST_TCP_ECHO_PORT))
+            .map_err(|e| format!("eco TCP do host na porta {HOST_TCP_ECHO_PORT}: {e}"))?;
+        tcp.set_nonblocking(true)
+            .map_err(|e| format!("eco TCP do host: {e}"))?;
+        let flag = Arc::clone(&stop);
+        let t2 = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                match tcp.accept() {
+                    Ok((mut conn, _)) => {
+                        let flag = Arc::clone(&flag);
+                        std::thread::spawn(move || {
+                            let _ = conn.set_nonblocking(false);
+                            let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+                            let mut buf = [0u8; 2048];
+                            while !flag.load(Ordering::Relaxed) {
+                                match std::io::Read::read(&mut conn, &mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if std::io::Write::write_all(&mut conn, &buf[..n]).is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e)
+                                        if matches!(
+                                            e.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                        ) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
         Ok(Self {
             stop,
-            threads: vec![t],
+            threads: vec![t, t2],
         })
     }
 }
