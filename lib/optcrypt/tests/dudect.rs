@@ -180,6 +180,26 @@ fn aes_gcm_tempo_constante() {
     assert!(t_open.abs() < LIMITE, "abrir: |t| = {t_open}");
 }
 
+/// X25519: classe 0 = escalar de bits baixos, classe 1 = escalar "aleatório".
+#[test]
+#[ignore = "campanha de tempo constante; rode com --ignored em --release"]
+fn x25519_tempo_constante() {
+    use optcrypt::x25519::{BASEPOINT, x25519};
+
+    let baixo = [0u8; 32];
+    let mut rnd = [0u8; 32];
+    for (i, b) in rnd.iter_mut().enumerate() {
+        *b = u8::try_from(i * 151 % 256).unwrap();
+    }
+    let t = mede(|c| {
+        black_box(x25519(
+            black_box(if c == 0 { &baixo } else { &rnd }),
+            &BASEPOINT,
+        ));
+    });
+    assert!(t.abs() < LIMITE, "|t| = {t}");
+}
+
 /// Até três rodadas, ficando com o menor |t|: um vazamento real dá |t|
 /// alto em todas, enquanto o ruído de um host compartilhado (escalonador,
 /// frequência da CPU) raramente se repete.
