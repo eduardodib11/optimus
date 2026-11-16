@@ -1,6 +1,6 @@
 name: Fuzzing dos parsers de dispositivo (noturno)
 
-# T-421 (backlog M4) e T-529 (backlog M5, OptFS e GPT): cada alvo de libFuzzer roda 30 min por noite, sem
+# T-421 (backlog M4), T-529 (backlog M5, OptFS e GPT) e T-650 (backlog M6, X.509): cada alvo de libFuzzer roda 30 min por noite, sem
 # pânico (AML do acpid, varredura PCIe do opci, capabilities e fila do virtio-core). A campanha de 4 h
 # fica para o Gate 2 (`minutes` = 240). Alvos novos entram na matriz.
 # Uma falha grava o artefato em `crash-*` e sai com código diferente de zero.
@@ -39,6 +39,8 @@ jobs:
             target: superbloco
           - dir: fuzz/optfs
             target: arvore
+          - dir: fuzz/ox509
+            target: cert
     steps:
       - uses: actions/checkout@v5
       - name: Nightly e cargo-fuzz (só ferramenta de fuzzing)
@@ -52,6 +54,11 @@ jobs:
         run: |
           set -o pipefail
           secs=$(( ${MINUTES_IN:-30} * 60 ))
+          # Semente versionada, se o alvo tiver uma.
+          if [ -d "seeds/${{ matrix.target }}" ]; then
+            mkdir -p "corpus/${{ matrix.target }}"
+            cp seeds/${{ matrix.target }}/* "corpus/${{ matrix.target }}/"
+          fi
           cargo +nightly fuzz run --fuzz-dir . ${{ matrix.target }} -- -max_total_time="$secs" 2>&1 | tee fuzz.log
       - name: Resumo da rodada
         if: always()
