@@ -1,4 +1,4 @@
-//! `netd` (T-630 e T-631; ADR 0017, 0064, 0068 e 0069): a pilha IP em
+//! `netd` (T-630 a T-632; ADR 0017, 0064, 0068 e 0069): a pilha IP em
 //! espaço de usuário. É o único cliente do `NetDevice` do driver de rede:
 //! pega a sessão, liga o anel de recepção que ele consome e escreve no anel
 //! de transmissão que o driver consome (ADR 0064). Os protocolos moram em
@@ -23,7 +23,8 @@ mod net_cliente;
 
 use net_cliente::NetDeviceCliente;
 use onet::eth::{self, Mac};
-use onet::stack::{Link, Stack};
+use onet::ip4::Config;
+use onet::stack::{Event, Link, Stack};
 
 ostd::entry!(main);
 
@@ -47,8 +48,14 @@ const TIMER_BIT: u64 = 2;
 /// Período do relógio da pilha (ARP, e depois TCP e DHCP).
 const TICK_NS: u64 = 50_000_000;
 /// Endereço e roteador da rede de usuário do QEMU, até o DHCP (T-633).
-const STATIC_IP: [u8; 4] = [10, 0, 2, 15];
-const GATEWAY: [u8; 4] = [10, 0, 2, 2];
+const STATIC: Config = Config {
+    ip: [10, 0, 2, 15],
+    mask: [255, 255, 255, 0],
+    gateway: [10, 0, 2, 2],
+};
+/// Intervalo entre os `ping` de prova ao roteador (ns) e o identificador.
+const PING_NS: u64 = 500_000_000;
+const PING_ID: u16 = 0x6e64;
 
 fn hash(text: &[u8]) -> u32 {
     let h = optcrypt::blake3::hash(text);
@@ -172,28 +179,43 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     )
     .map_err(|_| "armar o Timer")?;
     let mut stack = Stack::new(nic.mac);
-    stack.set_ip(&mut TxLink(&mut nic.tx), STATIC_IP);
+    stack.set_config(&mut TxLink(&mut nic.tx), STATIC);
     let mut frame = [0u8; eth::MAX_FRAME];
-    let mut gateway_seen = false;
+    let (mut gateway_seen, mut ping_ok) = (false, false);
+    let (mut seq, mut next_ping) = (0u16, 0u64);
     loop {
         let now = ostd::time::now_ns();
         loop {
             match nic.rx.pop(&mut frame) {
                 Ok(Some((FRAME_KIND, n))) => {
-                    stack.input(&mut TxLink(&mut nic.tx), &frame[..n], now);
+                    let ev = stack.input(&mut TxLink(&mut nic.tx), &frame[..n], now);
+                    if let Some(Event::EchoReply { src, id, .. }) = ev
+                        && src == STATIC.gateway
+                        && id == PING_ID
+                        && !ping_ok
+                    {
+                        ping_ok = true;
+                        ostd::debug::print("netd: icmp: roteador 10.0.2.2 respondeu ao eco");
+                    }
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(_) => return Err("anel de recepção corrompido"),
             }
         }
-        if stack
-            .neighbor(&mut TxLink(&mut nic.tx), GATEWAY, now)
-            .is_some()
-            && !gateway_seen
-        {
-            gateway_seen = true;
-            ostd::debug::print("netd: arp: roteador 10.0.2.2 resolvido");
+        stack.tick(now);
+        let link = &mut TxLink(&mut nic.tx);
+        if stack.neighbor(link, STATIC.gateway, now).is_some() {
+            if !gateway_seen {
+                gateway_seen = true;
+                ostd::debug::print("netd: arp: roteador 10.0.2.2 resolvido");
+            }
+            // Prova da camada IP: eco ao roteador até ele responder.
+            if !ping_ok && now >= next_ping {
+                seq = seq.wrapping_add(1);
+                let _ = stack.ping(link, STATIC.gateway, PING_ID, seq, b"optimus", now);
+                next_ping = now.saturating_add(PING_NS);
+            }
         }
         if nic.rx.wait().is_err() {
             return Err("espera no anel de recepção");

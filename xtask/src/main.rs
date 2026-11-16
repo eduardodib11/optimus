@@ -1160,6 +1160,8 @@ macro_rules! m4_markers {
             // T-630 e T-631: o `netd` liga ao `NetDevice` e resolve o MAC do
             // roteador do QEMU por ARP.
             "netd: arp: roteador 10.0.2.2 resolvido",
+            // T-632: o eco ICMP ao roteador do QEMU volta.
+            "netd: icmp: roteador 10.0.2.2 respondeu ao eco",
             "drvcli: input ok",
             "drvcli: input evento 0x1e",
             "drvcli: entropy ok",
