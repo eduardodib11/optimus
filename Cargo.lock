@@ -393,6 +393,7 @@ name = "otls"
 version = "0.1.0"
 dependencies = [
  "optcrypt",
+ "ox509",
 ]
 
 [[package]]
