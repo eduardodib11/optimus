@@ -86,7 +86,9 @@ const H0: [u32; 8] = [
     0x5be0_cd19,
 ];
 
-/// Estado incremental do SHA-256.
+/// Estado incremental do SHA-256. `Clone` serve para o hash parcial da
+/// transcrição do TLS (não é segredo).
+#[derive(Clone)]
 pub struct Sha256 {
     h: [u32; 8],
     buf: [u8; BLOCK_LEN],
