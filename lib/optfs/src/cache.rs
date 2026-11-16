@@ -31,6 +31,12 @@ impl<IO: BlockIo> CachedIo<IO> {
         &mut self.cache
     }
 
+    /// O dispositivo de baixo, só para leitura (contadores, por exemplo).
+    #[must_use]
+    pub fn inner(&self) -> &IO {
+        &self.inner
+    }
+
     /// O dispositivo de baixo.
     pub fn into_inner(self) -> IO {
         self.inner

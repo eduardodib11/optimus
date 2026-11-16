@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use super::bench::{GATE_PCT, compare, latest, meta, metrics_comment, parse_metrics};
 use super::{HostSha, Result, root};
-use optfs::{Allocator, BlockIo, Fs, IoError, Tx, mount};
+use optfs::{Allocator, BlockIo, CachedIo, Fs, IoError, Tx, mount};
 use optfs_format::{BLOCK_SIZE, BlockPtr, Integrity, SUPERBLOCKS, Superblock};
 
 const BLOCKS: u64 = 16384;
@@ -24,6 +24,10 @@ const RAND_OPS: usize = 256;
 const RAND_COMMIT_EVERY: usize = 32;
 const KEY: [u8; 32] = [7; 32];
 const SUFFIX: &str = "-optfs-io.md";
+const SUFFIX_CACHE: &str = "-optfs-io-cache.md";
+/// Cota do `CachedIo` da rodada com cache (T-610): 2 MiB, menor que o
+/// arquivo de 4 MiB, então o cache segura a árvore e o `stat`, não os dados.
+const CACHE_BYTES: usize = 2 << 20;
 
 /// Disco na memória com contadores.
 struct Mem {
@@ -73,6 +77,56 @@ impl BlockIo for Mem {
     }
 }
 
+/// O dispositivo medido: o disco com contadores, com ou sem `CachedIo`
+/// na frente (T-610). Os contadores são sempre os do disco de baixo.
+enum Dev {
+    Raw(Mem),
+    Cached(CachedIo<Mem>),
+}
+
+impl Dev {
+    fn new(cache: Option<usize>) -> Self {
+        match cache {
+            None => Self::Raw(Mem::new()),
+            Some(q) => Self::Cached(CachedIo::new(Mem::new(), q)),
+        }
+    }
+
+    fn counts(&self) -> (u64, u64, u64) {
+        match self {
+            Self::Raw(m) => m.counts(),
+            Self::Cached(c) => c.inner().counts(),
+        }
+    }
+}
+
+impl BlockIo for Dev {
+    fn blocks(&self) -> u64 {
+        BLOCKS
+    }
+
+    fn read(&mut self, block: u64, buf: &mut [u8; BLOCK_SIZE]) -> std::result::Result<(), IoError> {
+        match self {
+            Self::Raw(m) => m.read(block, buf),
+            Self::Cached(c) => c.read(block, buf),
+        }
+    }
+
+    fn write(&mut self, block: u64, buf: &[u8; BLOCK_SIZE]) -> std::result::Result<(), IoError> {
+        match self {
+            Self::Raw(m) => m.write(block, buf),
+            Self::Cached(c) => c.write(block, buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::result::Result<(), IoError> {
+        match self {
+            Self::Raw(m) => m.flush(),
+            Self::Cached(c) => c.flush(),
+        }
+    }
+}
+
 /// Uma fase medida: operações no dispositivo e tempo.
 struct Phase {
     name: &'static str,
@@ -96,7 +150,7 @@ fn rng(s: &mut u64) -> u64 {
 }
 
 /// Formata o volume e grava o arquivo `f` vazio. Devolve o superbloco.
-fn format(io: &mut Mem, h: &HostSha) -> Result<(Superblock, u64)> {
+fn format(io: &mut Dev, h: &HostSha) -> Result<(Superblock, u64)> {
     let s1 = Superblock {
         uuid: [9; 16],
         txg: 1,
@@ -124,10 +178,10 @@ fn format(io: &mut Mem, h: &HostSha) -> Result<(Superblock, u64)> {
 
 /// Abre o txg seguinte ao montado e roda `body`; se `commit`, confirma.
 fn with_tx<T>(
-    io: &mut Mem,
+    io: &mut Dev,
     h: &HostSha,
     commit: bool,
-    body: impl FnOnce(&mut Fs, &mut Tx<'_, Mem, HostSha>) -> Result<T>,
+    body: impl FnOnce(&mut Fs, &mut Tx<'_, Dev, HostSha>) -> Result<T>,
 ) -> Result<T> {
     let m = mount(io, h).map_err(|x| e("mount", x))?;
     let mut al = Allocator::new(BLOCKS);
@@ -147,10 +201,10 @@ fn with_tx<T>(
 
 fn phase(
     name: &'static str,
-    io: &mut Mem,
+    io: &mut Dev,
     bytes: u64,
     ops: u64,
-    run: impl FnOnce(&mut Mem) -> Result,
+    run: impl FnOnce(&mut Dev) -> Result,
 ) -> Result<Phase> {
     let (r0, w0, f0) = io.counts();
     let t = Instant::now();
@@ -175,9 +229,9 @@ fn pattern(seed: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-fn run_phases() -> Result<Vec<Phase>> {
+fn run_phases(cache: Option<usize>) -> Result<Vec<Phase>> {
     let h = HostSha;
-    let mut io = Mem::new();
+    let mut io = Dev::new(cache);
     let (_, f) = format(&mut io, &h)?;
     let mut out = Vec::new();
     let chunk = pattern(1, CHUNK);
@@ -308,30 +362,22 @@ fn table(phases: &[Phase]) -> String {
     md
 }
 
-/// Roda os benchmarks, grava o relatório e aplica o gate de 5 %.
-pub fn bench_io() -> Result {
-    let phases = run_phases()?;
-    let metrics = metrics(&phases);
+/// Compara com o relatório anterior do mesmo `suffix`, grava o novo e
+/// devolve a lista de métricas que passaram do gate (vazia se não houve).
+fn emit(
+    mut report: String,
+    metrics: &[(String, u64)],
+    suffix: &str,
+    extra: &str,
+) -> Result<Option<String>> {
     let meta = meta();
-    let mut report = format!(
-        "# Benchmarks de E/S do OptFS (T-532)\n\n\
-         Data: {}. Commit: {}. CPU do host: {}.\n\n\
-         Disco na memória de {} KiB com contadores; hash SHA-256 do `optcrypt`; sem cifra. \
-         O gate de {GATE_PCT}% vale para as contagens de operações no dispositivo \
-         (milésimos por MiB nas fases sequenciais e por operação nas aleatórias); \
-         a vazão varia com a máquina e só informa.\n\n",
-        meta.date,
-        meta.commit,
-        meta.host_cpu,
-        BLOCKS * 4
-    );
-    report.push_str(&table(&phases));
     let dir = root().join("docs/bench");
     fs::create_dir_all(&dir).map_err(|x| format!("criando {}: {x}", dir.display()))?;
-    let previous = latest(&dir, SUFFIX);
+    let previous = latest(&dir, suffix);
     let rows = previous
         .as_ref()
-        .map(|(name, text)| (name.clone(), compare(&parse_metrics(text), &metrics)));
+        .map(|(name, text)| (name.clone(), compare(&parse_metrics(text), metrics)));
+    report.push_str(extra);
     if let Some((name, rows)) = &rows {
         let _ = write!(
             report,
@@ -341,8 +387,8 @@ pub fn bench_io() -> Result {
             let _ = writeln!(report, "| `{k}` | {o} | {v} | {pct:+}% |");
         }
     }
-    report.push_str(&metrics_comment(&metrics));
-    let file = dir.join(format!("{}-{}{SUFFIX}", meta.date, meta.commit));
+    report.push_str(&metrics_comment(metrics));
+    let file = dir.join(format!("{}-{}{suffix}", meta.date, meta.commit));
     fs::write(&file, &report).map_err(|x| format!("gravando {}: {x}", file.display()))?;
     println!("{report}");
     println!("xtask: relatório em {}", file.display());
@@ -353,11 +399,71 @@ pub fn bench_io() -> Result {
             .map(|r| format!("{} (+{}%)", r.0, r.3))
             .collect();
         if !worse.is_empty() {
-            return Err(format!(
+            return Ok(Some(format!(
                 "regressão de mais de {GATE_PCT}% em relação a {name}: {}",
                 worse.join(", ")
-            ));
+            )));
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Tabela de queda das contagens do disco com cache contra as do disco sem
+/// cache, métrica a métrica (as que o cache elimina ficam em zero e somem
+/// do comentário, então entram aqui como 0).
+fn drop_table(plain: &[(String, u64)], cached: &[(String, u64)]) -> String {
+    let mut md = String::from(
+        "\n## Queda com o cache\n\n| Métrica | Sem cache | Com cache | Variação |\n|---|---:|---:|---:|\n",
+    );
+    for (k, o) in plain.iter().filter(|(k, _)| k.contains("leituras")) {
+        let v = cached.iter().find(|(ck, _)| ck == k).map_or(0, |(_, v)| *v);
+        let pct = (i128::from(v) - i128::from(*o)) * 100 / i128::from((*o).max(1));
+        let _ = writeln!(md, "| `{k}` | {o} | {v} | {pct:+}% |");
+    }
+    md
+}
+
+/// Roda os benchmarks sem cache e com `CachedIo` (T-610), grava os dois
+/// relatórios e aplica o gate de 5 % a cada um contra o seu anterior.
+pub fn bench_io() -> Result {
+    let plain = run_phases(None)?;
+    let cached = run_phases(Some(CACHE_BYTES))?;
+    let m_plain = metrics(&plain);
+    let m_cached = metrics(&cached);
+    let meta = meta();
+    let intro = |title: &str, disk: &str| {
+        format!(
+            "# {title}\n\n\
+             Data: {}. Commit: {}. CPU do host: {}.\n\n\
+             Disco na memória de {} KiB com contadores; hash SHA-256 do `optcrypt`; sem cifra. \
+             {disk}\
+             O gate de {GATE_PCT}% vale para as contagens de operações no dispositivo \
+             (milésimos por MiB nas fases sequenciais e por operação nas aleatórias); \
+             a vazão varia com a máquina e só informa.\n\n",
+            meta.date,
+            meta.commit,
+            meta.host_cpu,
+            BLOCKS * 4
+        )
+    };
+    let mut r1 = intro("Benchmarks de E/S do OptFS (T-532)", "");
+    r1.push_str(&table(&plain));
+    let disk = format!(
+        "`CachedIo` de {} KiB na frente do disco (T-610); os contadores são os do disco \
+         de baixo, e o cache vive entre as fases, como num `optfs` de longa vida. ",
+        CACHE_BYTES >> 10
+    );
+    let mut r2 = intro("Benchmarks de E/S do OptFS com cache (T-610)", &disk);
+    r2.push_str(&table(&cached));
+    let e1 = emit(r1, &m_plain, SUFFIX, "")?;
+    let e2 = emit(
+        r2,
+        &m_cached,
+        SUFFIX_CACHE,
+        &drop_table(&m_plain, &m_cached),
+    )?;
+    match (e1, e2) {
+        (None, None) => Ok(()),
+        (a, b) => Err([a, b].into_iter().flatten().collect::<Vec<_>>().join("; ")),
+    }
 }
