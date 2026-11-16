@@ -50,6 +50,7 @@ const H384: [u64; 8] = [
 ];
 
 /// Núcleo comum: estado de 8 palavras de 64 bits e contador de 128 bits.
+#[derive(Clone)]
 struct Core {
     h: [u64; 8],
     buf: [u8; BLOCK_LEN],
@@ -122,6 +123,7 @@ impl Drop for Core {
 }
 
 /// Estado incremental do SHA-512.
+#[derive(Clone)]
 pub struct Sha512(Core);
 
 impl Default for Sha512 {
@@ -150,6 +152,7 @@ impl Sha512 {
 }
 
 /// Estado incremental do SHA-384.
+#[derive(Clone)]
 pub struct Sha384(Core);
 
 impl Default for Sha384 {
