@@ -1,6 +1,6 @@
 # ADR 0065: Snapshots do OptFS com registros na árvore de arquivos e `reclaim` por varredura
 
-- Status: aceita em modo autônomo (2026-11-15), **aguardando revisão do Eduardo**
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-15
 - Origem: SDD v1.0, seção 9.3; backlog do M5, T-525
 - Relaciona-se com: ADR 0052 (layout do OptFS, item 7 e item 3), 0014

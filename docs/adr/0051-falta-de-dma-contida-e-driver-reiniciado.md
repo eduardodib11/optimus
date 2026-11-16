@@ -1,6 +1,6 @@
 # ADR 0051: Falta de DMA contida e driver reiniciado
 
-- Status: aceita sob a execução autônoma autorizada pelo Eduardo (2026-11-04), por ser fiel ao SDD 8.1 e ao item 4 da ADR 0044; fica sinalizada para revisão nos PRs da T-422
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-13
 - Origem: SDD v1.0, seção 8.1 (driver isolado; falha contida e reiniciada); backlog do M4, T-422
 - Relaciona-se com: ADR 0035 (item 6, `obj_bind_notify`), 0042 (itens 4 e 5), 0044 (item 4), 0050

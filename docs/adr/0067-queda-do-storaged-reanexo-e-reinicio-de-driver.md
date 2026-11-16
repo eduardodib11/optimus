@@ -1,6 +1,6 @@
 # ADR 0067: Queda do `storaged`, reanexo do `BlockDevice` e reinício de driver
 
-- Status: aceita sob a execução autônoma autorizada pelo Eduardo (2026-11-04), por ser fiel à ADR 0056 (item "O `storaged` morre") e ao SDD 8.1; fica sinalizada para revisão no PR da T-541
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-15
 - Origem: SDD v1.0, seção 8.1 (falha contida e reiniciada); backlog do M5, T-541
 - Relaciona-se com: ADR 0034 (item 9, fim de instância), 0051 (driver reiniciado), 0056 (item de falhas), 0063 (sessão do `BlockDevice`), 0066
