@@ -162,9 +162,10 @@ impl Fe {
         r
     }
 
-    /// Inverso por Fermat, `self^(p-2)`; zero vai em zero.
+    /// `(self^(2^250 - 1), self^11)`, o tronco comum de `invert` e
+    /// `pow22523`.
     #[allow(clippy::similar_names, reason = "nomes da cadeia de adição")]
-    pub(crate) fn invert(&self) -> Self {
+    fn pow_2_250_1(&self) -> (Self, Self) {
         let z2 = self.square();
         let z9 = z2.pow2k(2).mul(self);
         let z11 = z9.mul(&z2);
@@ -175,9 +176,34 @@ impl Fe {
         let z_50_0 = z_40_0.pow2k(10).mul(&z_10_0);
         let z_100_0 = z_50_0.pow2k(50).mul(&z_50_0);
         let z_200_0 = z_100_0.pow2k(100).mul(&z_100_0);
-        let z_250_0 = z_200_0.pow2k(50).mul(&z_50_0);
+        (z_200_0.pow2k(50).mul(&z_50_0), z11)
+    }
+
+    /// Inverso por Fermat, `self^(p-2)`; zero vai em zero.
+    pub(crate) fn invert(&self) -> Self {
+        let (z_250_0, z11) = self.pow_2_250_1();
         // 2^255 - 32 + 11 = p - 2.
         z_250_0.pow2k(5).mul(&z11)
+    }
+
+    /// `self^((p-5)/8) = self^(2^252 - 3)`, para a raiz quadrada.
+    pub(crate) fn pow22523(&self) -> Self {
+        let (z_250_0, _) = self.pow_2_250_1();
+        z_250_0.pow2k(2).mul(self)
+    }
+
+    pub(crate) fn neg(&self) -> Self {
+        Self::ZERO.sub(self)
+    }
+
+    /// Paridade da forma canônica (o "sinal" da RFC 8032).
+    pub(crate) fn is_negative(&self) -> u8 {
+        self.to_bytes()[0] & 1
+    }
+
+    /// Igualdade em tempo constante (pela forma canônica).
+    pub(crate) fn ct_eq(&self, o: &Self) -> bool {
+        crate::secret::ct_eq(&self.to_bytes(), &o.to_bytes())
     }
 
     /// Troca `a` e `b` se `bit` for 1, sem ramo.

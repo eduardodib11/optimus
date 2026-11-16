@@ -1,16 +1,95 @@
 //! `otls`: núcleo do TLS 1.3 do `tlsd` (ADR 0070; T-652).
 //!
-//! Aqui ficam a agenda de chaves ([`schedule`]) e a camada de registro
-//! protegida ([`record`]). O handshake (T-653) usa as duas. Só TLS 1.3, só
-//! as suítes `TLS_AES_256_GCM_SHA384` e `TLS_CHACHA20_POLY1305_SHA256`
+//! Aqui ficam a agenda de chaves ([`schedule`]), a camada de registro
+//! protegida ([`record`]) e as mensagens de handshake ([`msg`], T-653). Só
+//! TLS 1.3, só as suítes `TLS_AES_256_GCM_SHA384` e `TLS_CHACHA20_POLY1305_SHA256`
 //! (ADR 0070, item 3), sem PSK nem 0-RTT (item 5). Toda cripto vem do
 //! `optcrypt`; nada aloca.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod msg;
 pub mod record;
 pub mod schedule;
+
+use ox509::verify::VerifyError;
+use record::RecordError;
+
+/// Erro de uma conexão. Todo erro é fatal; [`Error::alert`] diz o alerta.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// Mensagem mal formada (`decode_error`).
+    Decode,
+    /// Mensagem fora de ordem ou de tipo errado (`unexpected_message`).
+    UnexpectedMessage,
+    /// Valor inválido (`illegal_parameter`).
+    IllegalParameter,
+    /// Extensão que o cliente não ofereceu (`unsupported_extension`).
+    UnsupportedExtension,
+    /// Extensão obrigatória ausente (`missing_extension`).
+    MissingExtension,
+    /// Sem grupo ou suíte em comum (`handshake_failure`).
+    HandshakeFailure,
+    /// O servidor só fala TLS 1.2 ou anterior (`protocol_version`; ADR 0017).
+    Tls12Only,
+    /// Registro que não autentica (`bad_record_mac`).
+    BadRecordMac,
+    /// Registro grande demais (`record_overflow`).
+    RecordOverflow,
+    /// `Finished` ou `CertificateVerify` inválido (`decrypt_error`).
+    DecryptError,
+    /// Certificado ilegível ou chave fixada diferente (`bad_certificate`).
+    BadCertificate,
+    /// Chave fora da ADR 0071 (`unsupported_certificate`).
+    UnsupportedCertificate,
+    /// Cadeia recusada pela validação.
+    Certificate(VerifyError),
+    /// Mensagem de handshake maior que o buffer.
+    TooLarge,
+    /// Falha interna (`internal_error`).
+    Internal,
+    /// O servidor mandou um alerta fatal.
+    PeerAlert(u8),
+}
+
+impl Error {
+    /// Descrição do alerta a mandar; `None` se o erro veio do par.
+    #[must_use]
+    pub const fn alert(self) -> Option<u8> {
+        Some(match self {
+            Self::Decode => 50,
+            Self::UnexpectedMessage => 10,
+            Self::IllegalParameter => 47,
+            Self::UnsupportedExtension => 110,
+            Self::MissingExtension => 109,
+            Self::HandshakeFailure => 40,
+            Self::Tls12Only => 70,
+            Self::BadRecordMac => 20,
+            Self::RecordOverflow | Self::TooLarge => 22,
+            Self::DecryptError => 51,
+            Self::UnsupportedCertificate | Self::Certificate(VerifyError::UnsupportedSignature) => {
+                43
+            }
+            Self::Certificate(VerifyError::Expired | VerifyError::NotYetValid) => 45,
+            Self::Certificate(VerifyError::UnknownIssuer) => 48,
+            Self::BadCertificate | Self::Certificate(_) => 42,
+            Self::Internal => 80,
+            Self::PeerAlert(_) => return None,
+        })
+    }
+}
+
+impl From<RecordError> for Error {
+    fn from(e: RecordError) -> Self {
+        match e {
+            RecordError::Overflow => Self::RecordOverflow,
+            RecordError::Malformed => Self::UnexpectedMessage,
+            RecordError::BadRecordMac => Self::BadRecordMac,
+            RecordError::SequenceExhausted | RecordError::BufferTooSmall => Self::Internal,
+        }
+    }
+}
 
 /// Suíte de cifra (ADR 0070, item 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,5 +141,7 @@ impl Suite {
     }
 }
 
+#[cfg(test)]
+mod msg_tests;
 #[cfg(test)]
 mod tests;

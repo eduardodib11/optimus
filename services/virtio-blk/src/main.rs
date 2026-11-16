@@ -537,6 +537,19 @@ fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, svc: &mut Servico<'_>
     )
 }
 
+/// Solta, no domínio de DMA, os mapeamentos que uma encarnação anterior do
+/// driver pode ter deixado (o `svcmgr` devolve os mesmos recursos ao
+/// reiniciar, ADR 0067). Sem mapeamento ali o `dma_unmap` falha e nada muda.
+fn release_stale(domain: Handle) {
+    let page = PAGE as u64;
+    for iova in [QUEUE_IOVA, REQ_IOVA, META_IOVA] {
+        let _ = ostd::dev::dma_unmap(domain, iova, page);
+    }
+    for i in 0..DEPTH as u64 {
+        let _ = ostd::dev::dma_unmap(domain, DATA_IOVA + i * page, page);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let (Some(irq), Some(domain)) = (vdrv::resource(s, b"irq0"), vdrv::resource(s, b"dma")) else {
@@ -546,6 +559,13 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let caps = vdrv::read_caps(s, CFG_VA)?;
     let device_cfg = caps.device.ok_or("sem configuração de dispositivo")?;
     let bar_map = vdrv::map_bar(s, BAR_VA, &[caps.common, caps.notify, caps.isr, device_cfg])?;
+    // Driver reiniciado depois de morrer (ADR 0072): o morto deixou o
+    // dispositivo ligado e as páginas dele mapeadas no domínio. Reseta o
+    // dispositivo primeiro (ele para de consultar as filas antigas) e só
+    // então solta os mapeamentos, para o novo mapear nos mesmos endereços.
+    let mut transport = Transport::new(Regs::new(&bar_map, caps.common.offset as usize));
+    transport.reset();
+    release_stale(domain);
     // 2. Memória de DMA: a fila e as requisições.
     let queue_obj =
         ostd::cap::create(quota, ObjectType::MemoryObject, 4096).map_err(|_| "página da fila")?;
@@ -569,7 +589,6 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
         0
     };
     // 3. Negociação, fila e `DRIVER_OK`.
-    let mut transport = Transport::new(Regs::new(&bar_map, caps.common.offset as usize));
     let features = transport
         .negotiate(F_ACCESS_PLATFORM | F_FLUSH | F_RO, required)
         .map_err(|_| "negociar as features")?;

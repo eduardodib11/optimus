@@ -59,8 +59,10 @@ const SVCMGR_LOG_BADGE: u64 = 0x7376_636d;
 /// dá ao `root` 45,5 MiB de cota para o bootfs maior e o `svcmgr`) e
 /// 28 MiB com o `netd` em 4 MiB (T-635: o TCP aloca buffers, e o heap do
 /// `ostd` toma segmentos de 2 MiB; o heap do kernel passa a 60 MiB, porque o
-/// `root` já gasta uns 21 MiB da cota com o bootfs de 13,5 MiB e os dele).
-const SVCMGR_QUOTA: u64 = 28 << 20;
+/// `root` já gasta uns 21 MiB da cota com o bootfs de 13,5 MiB e os dele) e
+/// 30 MiB com o `netd` em 6 MiB (T-636: os buffers crescem até 256 KiB, dentro
+/// de um orçamento de 2,5 MiB; o heap passa a 64 MiB).
+const SVCMGR_QUOTA: u64 = 30 << 20;
 /// Prioridade do `svcmgr`: 200, faixa de drivers, por exceção (ADR 0034).
 const SVCMGR_PRIORITY: u8 = 200;
 /// Badge com que o `root` identifica o `svcmgr` no próprio endpoint.

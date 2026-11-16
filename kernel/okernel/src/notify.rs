@@ -208,20 +208,26 @@ impl Interrupt {
     }
 
     /// `obj_bind_notify`: cada disparo passa a sinalizar o bit `bit` de
-    /// `ntfy`.
+    /// `ntfy`. Ligar de novo troca a ligação (ADR 0072): o driver
+    /// reiniciado com os recursos do `svcmgr` (ADR 0067) religa a linha à
+    /// notificação nova, e a ligação do morto sai. A troca solta a máscara
+    /// e o disparo guardado, que eram do morto.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidArgument`] para `bit` ≥ 64; [`Error::Busy`] se a
-    /// linha já está ligada.
+    /// [`Error::InvalidArgument`] para `bit` ≥ 64.
     pub fn bind(&self, ntfy: Arc<Notification>, bit: u64) -> Result<(), Error> {
         let mask = 1u64.checked_shl(u32::try_from(bit).map_err(|_| Error::InvalidArgument)?);
         let mask = mask.ok_or(Error::InvalidArgument)?;
         let mut line = self.line.lock();
-        if line.binding.is_some() {
-            return Err(Error::Busy);
+        let old = line.binding.replace((ntfy, mask));
+        if old.is_some() {
+            line.masked = false;
+            line.pending = false;
         }
-        line.binding = Some((ntfy, mask));
+        // A ligação trocada é solta sem a trava na mão.
+        drop(line);
+        drop(old);
         Ok(())
     }
 

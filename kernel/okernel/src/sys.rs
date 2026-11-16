@@ -442,8 +442,8 @@ pub fn exit_info(space: &SharedCapSpace, raw: u64) -> Result<Values, Error> {
 /// `obj_bind_notify(obj, ntfy, bits, a3, a4, a5)` (ADR 0035, item 3): exige
 /// `BIND` em `obj` e `SIGNAL` em `ntfy`; `a3` a `a5` têm de ser zero, fora
 /// do `Timer`.
-/// `Interrupt`: `bits` é o número do bit (como antes) e a linha só se liga
-/// uma vez. `Thread` e `CapSpace`: `bits` é a máscara sinalizada quando a
+/// `Interrupt`: `bits` é o número do bit; ligar de novo troca a ligação (ADR
+/// 0072). `Thread` e `CapSpace`: `bits` é a máscara sinalizada quando a
 /// thread ou o processo morre; ligar de novo troca a ligação, `bits = 0`
 /// desliga, e ligar depois da morte sinaliza já (o evento é nível).
 /// `Timer` (item 6): `a3` prazo, `a4` período e `a5` flags ([`timer::parse`]).
