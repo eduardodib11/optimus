@@ -1,4 +1,4 @@
-//! `netd` (T-630 a T-632; ADR 0017, 0064, 0068 e 0069): a pilha IP em
+//! `netd` (T-630 a T-635; ADR 0017, 0064, 0068 e 0069): a pilha IP em
 //! espaço de usuário. É o único cliente do `NetDevice` do driver de rede:
 //! pega a sessão, liga o anel de recepção que ele consome e escreve no anel
 //! de transmissão que o driver consome (ADR 0064). Os protocolos moram em
@@ -24,7 +24,6 @@ mod probe;
 
 use net_cliente::NetDeviceCliente;
 use onet::eth::{self, Mac};
-use onet::ip4::Config;
 use onet::stack::{Link, Stack};
 use probe::Probes;
 
@@ -49,12 +48,6 @@ const RX_BIT: u64 = 1;
 const TIMER_BIT: u64 = 2;
 /// Período do relógio da pilha (ARP, e depois TCP e DHCP).
 const TICK_NS: u64 = 50_000_000;
-/// Endereço e roteador da rede de usuário do QEMU, até o DHCP (T-633).
-const STATIC: Config = Config {
-    ip: [10, 0, 2, 15],
-    mask: [255, 255, 255, 0],
-    gateway: [10, 0, 2, 2],
-};
 /// Imagem de teste (`xtask test`, `OPTIMUS_KTEST_DEBUG`): só ela faz as
 /// provas ao roteador do QEMU e as registra; a imagem normal não gera tráfego
 /// que ninguém pediu.
@@ -182,7 +175,12 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     )
     .map_err(|_| "armar o Timer")?;
     let mut stack = Stack::new(nic.mac);
-    stack.set_config(&mut TxLink(&mut nic.tx), STATIC);
+    // O segredo do ISN do TCP e os `xid` do DHCP vêm do DRBG do kernel; o
+    // endereço, a rota e o DNS, do servidor DHCP (T-633).
+    let mut seed = [0u8; 16];
+    let _ = ostd::rand::secure_fill(&mut seed);
+    stack.seed(seed);
+    stack.start_dhcp();
     let mut frame = [0u8; eth::MAX_FRAME];
     let mut probes = Probes::new();
     loop {

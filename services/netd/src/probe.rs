@@ -64,13 +64,34 @@ impl Probes {
 
     /// Trata um evento da pilha.
     pub fn event(&mut self, ev: Option<Event>) {
-        if let Some(Event::EchoReply { src, id, .. }) = ev
-            && src == GATEWAY
-            && id == PING_ID
-            && !self.ping_ok
-        {
-            self.ping_ok = true;
-            ostd::debug::print("netd: icmp: roteador 10.0.2.2 respondeu ao eco");
+        match ev {
+            Some(Event::EchoReply { src, id, .. })
+                if src == GATEWAY && id == PING_ID && !self.ping_ok =>
+            {
+                self.ping_ok = true;
+                ostd::debug::print("netd: icmp: roteador 10.0.2.2 respondeu ao eco");
+            }
+            Some(Event::Lease(l)) => {
+                let (ip, gw) = (l.config.ip, l.config.gateway);
+                let dns = l.dns[0];
+                ostd::debug::print_fmt(format_args!(
+                    "netd: dhcp: {}.{}.{}.{} via {}.{}.{}.{} dns {}.{}.{}.{} por {} s",
+                    ip[0],
+                    ip[1],
+                    ip[2],
+                    ip[3],
+                    gw[0],
+                    gw[1],
+                    gw[2],
+                    gw[3],
+                    dns[0],
+                    dns[1],
+                    dns[2],
+                    dns[3],
+                    l.lease_secs
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -86,6 +107,9 @@ impl Probes {
 
     /// Um passo das provas, a cada volta do laço.
     pub fn step<L: Link>(&mut self, stack: &mut Stack, link: &mut L, now: u64) {
+        if stack.ip() == [0; 4] {
+            return;
+        }
         if stack.neighbor(link, GATEWAY, now).is_none() {
             return;
         }
