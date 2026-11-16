@@ -290,9 +290,13 @@ impl NetDevice for Servico<'_> {
     }
 
     fn attach_rx(&mut self, ctx: &Contexto, ring: u64, signal: u64) -> Result<(), NetError> {
-        if ctx.badge & 0xFFFF_FFFF != SESSION_BADGE || self.rx_prod.is_some() {
+        if ctx.badge & 0xFFFF_FFFF != SESSION_BADGE {
             return Err(NetError::BadRequest);
         }
+        // Só o `netd` tem a sessão (ADR 0068): um novo pedido é o `netd`
+        // reiniciado depois da morte do antigo. Larga o anel dele (e o mapa
+        // em `RXRING_VA`) antes de abrir o novo.
+        self.rx_prod = None;
         let (Ok(ring), Ok(signal)) = (u32::try_from(ring), u32::try_from(signal)) else {
             return Err(NetError::BadRequest);
         };

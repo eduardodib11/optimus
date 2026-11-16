@@ -1,0 +1,21 @@
+[package]
+name = "netd"
+description = "netd: a pilha IP em espaço de usuário sobre o NetDevice do driver de rede (T-630; ADR 0017, 0064, 0068 e 0069)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "netd"
+test = false
+bench = false
+
+[dependencies]
+ostd = { path = "../../lib/ostd" }
+osvc = { path = "../../lib/osvc" }
+oidl-rt = { path = "../../lib/oidl-rt" }
+onet = { path = "../../lib/onet" }
+optcrypt = { path = "../../lib/optcrypt" }
+
+[lints]
+workspace = true
