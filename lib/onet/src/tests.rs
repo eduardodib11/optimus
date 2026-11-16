@@ -1422,3 +1422,572 @@ mod dhcp {
         assert_eq!(s.dhcp().state(), State::Bound);
     }
 }
+
+mod ipv6 {
+    use crate::eth::{self, Header, Mac};
+    use crate::frag::{MAX_DATAGRAM, Reassembler};
+    use crate::icmp6::{self, Msg, Prefix};
+    use crate::ip6::{self, Ip6};
+    use crate::slaac::{Kind, Slaac, Tx};
+    use crate::stack::{Event, Link, NoUpper, Stack};
+
+    const US: Mac = Mac([2, 0, 0, 0, 0, 1]);
+    const GW: Mac = Mac([2, 0, 0, 0, 0, 2]);
+    const S: u64 = 1_000_000_000;
+    const GW_LL: Ip6 = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const PREFIX: Ip6 = [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    #[derive(Default)]
+    struct Wire(Vec<Vec<u8>>);
+
+    impl Link for Wire {
+        fn send(&mut self, frame: &[u8]) -> bool {
+            self.0.push(frame.to_vec());
+            true
+        }
+    }
+
+    /// Mensagem ICMPv6 de um quadro enviado: (cabeçalho Ethernet, IP, mensagem).
+    fn sent(frame: &[u8]) -> (Header, ip6::Header, Vec<u8>) {
+        let (eh, p) = eth::parse(frame).unwrap();
+        assert_eq!(eh.ethertype, eth::ETHERTYPE_IPV6);
+        let (h, body) = ip6::parse(p).unwrap();
+        assert_eq!(h.next, ip6::PROTO_ICMP6);
+        (eh, h, body.to_vec())
+    }
+
+    fn frame(src_mac: Mac, dst_mac: Mac, h: &ip6::Header, body: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 1500];
+        let n = ip6::build(h, body, &mut pkt).unwrap();
+        let mut out = vec![0u8; 1514];
+        let eh = Header {
+            dst: dst_mac,
+            src: src_mac,
+            ethertype: eth::ETHERTYPE_IPV6,
+        };
+        let len = eth::build(&eh, &pkt[..n], &mut out).unwrap();
+        out.truncate(len);
+        out
+    }
+
+    fn hdr(src: Ip6, dst: Ip6, hop: u8) -> ip6::Header {
+        ip6::Header {
+            traffic_class: 0,
+            flow_label: 0,
+            next: ip6::PROTO_ICMP6,
+            hop_limit: hop,
+            src,
+            dst,
+            frag: None,
+        }
+    }
+
+    /// Anúncio de roteador com um prefixo de SLAAC.
+    fn ra(hop: u8, lifetime: u16, preferred: u32, valid: u32) -> Vec<u8> {
+        let mut m = vec![0u8; 16 + 8 + 32];
+        m[0] = 134;
+        m[6..8].copy_from_slice(&lifetime.to_be_bytes());
+        m[16] = 1;
+        m[17] = 1;
+        m[18..24].copy_from_slice(&GW.0);
+        m[24] = 3;
+        m[25] = 4;
+        m[26] = 64;
+        m[27] = 0xc0;
+        m[28..32].copy_from_slice(&valid.to_be_bytes());
+        m[32..36].copy_from_slice(&preferred.to_be_bytes());
+        m[40..56].copy_from_slice(&PREFIX);
+        let dst = ip6::ALL_NODES;
+        m[2..4].fill(0);
+        let c = crate::ip4::fold(crate::ip4::sum(
+            &m,
+            ip6::pseudo_sum(&GW_LL, &dst, 58, m.len()),
+        ));
+        m[2..4].copy_from_slice(&c.to_be_bytes());
+        frame(GW, ip6::multicast_mac(&dst), &hdr(GW_LL, dst, hop), &m)
+    }
+
+    fn stack() -> Stack {
+        let mut s = Stack::new(US);
+        s.seed([7; 16]);
+        s.start_ipv6();
+        s
+    }
+
+    /// Leva a pilha até o endereço local do enlace pronto e o RA recebido.
+    fn configured(s: &mut Stack, w: &mut Wire) -> u64 {
+        s.tick(w, 0);
+        s.tick(w, S + 1);
+        s.tick(w, 2 * S + 2);
+        let f = ra(255, 1800, 3600, 7200);
+        s.input(w, &mut NoUpper, &f, 2 * S + 3);
+        s.tick(w, 2 * S + 4);
+        s.tick(w, 4 * S);
+        assert!(s.slaac().global(4 * S).is_some());
+        4 * S
+    }
+
+    #[test]
+    fn dad_e_solicitacao_de_roteador() {
+        let mut s = stack();
+        let mut w = Wire::default();
+        s.tick(&mut w, 0);
+        assert_eq!(w.0.len(), 1);
+        let (eh, h, m) = sent(&w.0[0]);
+        let ll = s.slaac().addrs().next().unwrap().ip;
+        assert_eq!(h.src, ip6::UNSPECIFIED);
+        assert_eq!(h.dst, ip6::solicited_node(&ll));
+        assert_eq!(h.hop_limit, 255);
+        assert_eq!(eh.dst, ip6::multicast_mac(&h.dst));
+        assert!(
+            matches!(icmp6::parse(&h, &m), Some(Msg::NeighborSolicit { target, slla: None }) if target == ll)
+        );
+        // Em DAD o endereço ainda não vale como origem.
+        assert!(s.slaac().link_local(S / 2).is_none());
+        w.0.clear();
+        s.tick(&mut w, S + 1);
+        assert!(s.slaac().link_local(S + 1).is_some());
+        // A solicitação de roteador sai dentro de 1 s depois da DAD.
+        s.tick(&mut w, 2 * S + 2);
+        assert_eq!(w.0.len(), 1);
+        let (_, h, m) = sent(&w.0[0]);
+        assert_eq!((h.dst, h.src), (ip6::ALL_ROUTERS, ll));
+        assert!(matches!(icmp6::parse(&h, &m), Some(Msg::RouterSolicit)));
+        // Repete a cada 4 s até 3 vezes.
+        w.0.clear();
+        s.tick(&mut w, 6 * S + 3);
+        s.tick(&mut w, 10 * S + 4);
+        s.tick(&mut w, 20 * S);
+        assert_eq!(w.0.len(), 2);
+    }
+
+    #[test]
+    fn anuncio_de_roteador_gera_estavel_e_temporario() {
+        let mut s = stack();
+        let mut w = Wire::default();
+        let t = configured(&mut s, &mut w);
+        let kinds: Vec<_> = s.slaac().addrs().map(|a| a.kind).collect();
+        assert!(kinds.contains(&Kind::LinkLocal));
+        assert!(kinds.contains(&Kind::Stable));
+        assert!(kinds.contains(&Kind::Temporary));
+        let g = s.slaac().global(t).unwrap();
+        assert_eq!(g[..8], PREFIX[..8]);
+        // O temporário é o preferido e difere do estável.
+        let stable = s
+            .slaac()
+            .addrs()
+            .find(|a| a.kind == Kind::Stable)
+            .unwrap()
+            .ip;
+        assert_ne!(g, stable);
+        assert_eq!(s.slaac().router(t), Some(GW_LL));
+        // Origem para fora do enlace: global; para o roteador: local do enlace.
+        let far: Ip6 = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        assert_eq!(s.slaac().source_for(&far, t), Some(g));
+        assert_eq!(s.slaac().source_for(&GW_LL, t), s.slaac().link_local(t));
+        assert_eq!(s.slaac().next_hop(&far, t), Some(GW_LL));
+        let mut near = PREFIX;
+        near[15] = 5;
+        assert_eq!(s.slaac().next_hop(&near, t), Some(near));
+    }
+
+    #[test]
+    fn ra_com_limite_de_saltos_errado_ou_origem_global_e_ignorado() {
+        let mut s = stack();
+        let mut w = Wire::default();
+        s.tick(&mut w, 0);
+        s.tick(&mut w, S + 1);
+        s.input(&mut w, &mut NoUpper, &ra(64, 1800, 3600, 7200), S + 2);
+        s.tick(&mut w, 2 * S);
+        assert!(s.slaac().router(2 * S).is_none());
+        assert!(s.slaac().global(2 * S).is_none());
+    }
+
+    #[test]
+    fn ping_ao_roteador_e_resposta() {
+        let mut s = stack();
+        let mut w = Wire::default();
+        let t = configured(&mut s, &mut w);
+        w.0.clear();
+        // O MAC do roteador veio no anúncio: o eco sai direto.
+        s.ping6(&mut w, GW_LL, 0x6e64, 1, b"optimus", t).unwrap();
+        assert_eq!(w.0.len(), 1);
+        let (eh, h, m) = sent(&w.0[0]);
+        assert_eq!((eh.dst, h.dst), (GW, GW_LL));
+        let Some(Msg::Echo {
+            kind,
+            id,
+            seq,
+            data,
+        }) = icmp6::parse(&h, &m)
+        else {
+            panic!("não é eco");
+        };
+        assert_eq!(
+            (kind, id, seq, data),
+            (icmp6::ECHO_REQUEST, 0x6e64, 1, &b"optimus"[..])
+        );
+        // A resposta vira evento.
+        let mut r = vec![0u8; 15];
+        icmp6::build_echo(&GW_LL, &h.src, icmp6::ECHO_REPLY, id, seq, data, &mut r).unwrap();
+        let f = frame(GW, US, &hdr(GW_LL, h.src, 64), &r);
+        assert_eq!(
+            s.input(&mut w, &mut NoUpper, &f, t + 1),
+            Some(Event::EchoReply6 {
+                src: GW_LL,
+                id,
+                seq,
+                len: 7
+            })
+        );
+    }
+
+    #[test]
+    fn eco_de_vizinho_resolve_por_solicitacao() {
+        let mut s = stack();
+        let mut w = Wire::default();
+        let t = configured(&mut s, &mut w);
+        w.0.clear();
+        let mut peer = PREFIX;
+        peer[15] = 5;
+        // Desconhecido: sai a solicitação ao nó solicitado, com a nossa opção.
+        assert_eq!(
+            s.ping6(&mut w, peer, 1, 1, b"x", t),
+            Err(crate::stack::SendError::Pending)
+        );
+        let (eh, h, m) = sent(&w.0[0]);
+        assert_eq!(h.dst, ip6::solicited_node(&peer));
+        assert_eq!(eh.dst, ip6::multicast_mac(&h.dst));
+        assert!(
+            matches!(icmp6::parse(&h, &m), Some(Msg::NeighborSolicit { target, slla: Some(US) }) if target == peer)
+        );
+        // O anúncio resolve e o eco passa.
+        let mac = Mac([2, 0, 0, 0, 0, 9]);
+        let mut na = vec![0u8; 32];
+        let n = icmp6::build_na(
+            &peer,
+            &h.src,
+            icmp6::NA_SOLICITED | icmp6::NA_OVERRIDE,
+            &peer,
+            mac,
+            &mut na,
+        )
+        .unwrap();
+        let f = frame(mac, US, &hdr(peer, h.src, 255), &na[..n]);
+        s.input(&mut w, &mut NoUpper, &f, t + 1);
+        w.0.clear();
+        s.ping6(&mut w, peer, 1, 2, b"x", t + 2).unwrap();
+        assert_eq!(sent(&w.0[0]).0.dst, mac);
+    }
+
+    #[test]
+    fn responde_solicitacao_de_vizinho_e_eco() {
+        let mut s = stack();
+        let mut w = Wire::default();
+        let t = configured(&mut s, &mut w);
+        let ours = s.slaac().global(t).unwrap();
+        let peer: Ip6 = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+        let pmac = Mac([2, 0, 0, 0, 0, 7]);
+        // NS para o nosso endereço.
+        let mut ns = vec![0u8; 32];
+        let n = icmp6::build_ns(
+            &peer,
+            &ip6::solicited_node(&ours),
+            &ours,
+            Some(pmac),
+            &mut ns,
+        )
+        .unwrap();
+        let f = frame(
+            pmac,
+            ip6::multicast_mac(&ip6::solicited_node(&ours)),
+            &hdr(peer, ip6::solicited_node(&ours), 255),
+            &ns[..n],
+        );
+        w.0.clear();
+        s.input(&mut w, &mut NoUpper, &f, t + 1);
+        assert_eq!(w.0.len(), 1);
+        let (eh, h, m) = sent(&w.0[0]);
+        assert_eq!((eh.dst, h.src, h.dst), (pmac, ours, peer));
+        assert!(matches!(
+            icmp6::parse(&h, &m),
+            Some(Msg::NeighborAdvert { flags, target, tlla: Some(US) })
+                if target == ours && flags == icmp6::NA_SOLICITED | icmp6::NA_OVERRIDE
+        ));
+        // NS com limite de saltos 254 é ignorada.
+        w.0.clear();
+        let f = frame(
+            pmac,
+            ip6::multicast_mac(&ip6::solicited_node(&ours)),
+            &hdr(peer, ip6::solicited_node(&ours), 254),
+            &ns[..n],
+        );
+        s.input(&mut w, &mut NoUpper, &f, t + 2);
+        assert!(w.0.is_empty());
+        // NS para outro alvo: sem resposta.
+        let mut other = ours;
+        other[15] ^= 1;
+        let n = icmp6::build_ns(
+            &peer,
+            &ip6::solicited_node(&other),
+            &other,
+            Some(pmac),
+            &mut ns,
+        )
+        .unwrap();
+        let f = frame(
+            pmac,
+            ip6::multicast_mac(&ip6::solicited_node(&other)),
+            &hdr(peer, ip6::solicited_node(&other), 255),
+            &ns[..n],
+        );
+        s.input(&mut w, &mut NoUpper, &f, t + 3);
+        assert!(w.0.is_empty());
+        // Eco para nós.
+        let mut e = vec![0u8; 12];
+        icmp6::build_echo(&peer, &ours, icmp6::ECHO_REQUEST, 9, 3, b"ola!", &mut e).unwrap();
+        s.input(
+            &mut w,
+            &mut NoUpper,
+            &frame(pmac, US, &hdr(peer, ours, 64), &e),
+            t + 4,
+        );
+        assert_eq!(w.0.len(), 1);
+        let (eh, h, m) = sent(&w.0[0]);
+        assert_eq!((eh.dst, h.src, h.dst), (pmac, ours, peer));
+        assert!(matches!(
+            icmp6::parse(&h, &m),
+            Some(Msg::Echo {
+                kind: icmp6::ECHO_REPLY,
+                id: 9,
+                seq: 3,
+                ..
+            })
+        ));
+        // Checksum errado: descartado.
+        w.0.clear();
+        e[10] ^= 1;
+        s.input(
+            &mut w,
+            &mut NoUpper,
+            &frame(pmac, US, &hdr(peer, ours, 64), &e),
+            t + 5,
+        );
+        assert!(w.0.is_empty());
+    }
+
+    #[test]
+    fn dad_com_conflito_remove_o_endereco() {
+        let mut s = stack();
+        let mut w = Wire::default();
+        s.tick(&mut w, 0);
+        let ll = s.slaac().addrs().next().unwrap().ip;
+        // Outro nó faz DAD do mesmo endereço (origem ::): conflito.
+        let mut ns = vec![0u8; 24];
+        let n = icmp6::build_ns(
+            &ip6::UNSPECIFIED,
+            &ip6::solicited_node(&ll),
+            &ll,
+            None,
+            &mut ns,
+        )
+        .unwrap();
+        let other = Mac([2, 0, 0, 0, 0, 8]);
+        let f = frame(
+            other,
+            ip6::multicast_mac(&ip6::solicited_node(&ll)),
+            &hdr(ip6::UNSPECIFIED, ip6::solicited_node(&ll), 255),
+            &ns[..n],
+        );
+        s.input(&mut w, &mut NoUpper, &f, S / 2);
+        let again = s.slaac().addrs().next().unwrap().ip;
+        // Refeito com outro identificador (RFC 7217, DAD_Counter).
+        assert_ne!(again, ll);
+        assert_eq!(s.slaac().addrs().count(), 1);
+    }
+
+    #[test]
+    fn temporario_vence_e_e_trocado_no_proximo_anuncio() {
+        let mut s = stack();
+        let mut w = Wire::default();
+        s.tick(&mut w, 0);
+        s.tick(&mut w, S + 1);
+        s.tick(&mut w, 2 * S + 2);
+        let long = ra(255, 1800, 200_000, 400_000);
+        s.input(&mut w, &mut NoUpper, &long, 2 * S + 3);
+        s.tick(&mut w, 2 * S + 4);
+        s.tick(&mut w, 4 * S);
+        let t = 4 * S;
+        let stable = s
+            .slaac()
+            .addrs()
+            .find(|a| a.kind == Kind::Stable)
+            .unwrap()
+            .ip;
+        let first = s
+            .slaac()
+            .addrs()
+            .find(|a| a.kind == Kind::Temporary)
+            .unwrap()
+            .ip;
+        assert_eq!(s.slaac().global(t), Some(first));
+        // Passada a vida preferida máxima do temporário (24 h), a origem é o estável.
+        let later = t + 86_401 * S;
+        assert_eq!(s.slaac().global(later), Some(stable));
+        // O próximo anúncio cria outro temporário, com identificador novo.
+        s.input(&mut w, &mut NoUpper, &long, later);
+        s.tick(&mut w, later + 1);
+        s.tick(&mut w, later + 2 * S);
+        let second = s.slaac().global(later + 2 * S).unwrap();
+        assert_ne!(second, first);
+        assert_ne!(second, stable);
+        assert_eq!(
+            s.slaac()
+                .addrs()
+                .filter(|a| a.kind == Kind::Temporary)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn ip6_parse_e_extensoes() {
+        let h = hdr([1; 16], [2; 16], 7);
+        let mut pkt = [0u8; 200];
+        let n = ip6::build(&h, b"abcd", &mut pkt).unwrap();
+        let (g, body) = ip6::parse(&pkt[..n]).unwrap();
+        assert_eq!((g, body), (h, &b"abcd"[..]));
+        // Cabeçalho de opções de destino (8 bytes) é pulado.
+        let mut ext = vec![58u8, 0, 1, 4, 0, 0, 0, 0];
+        ext.extend_from_slice(b"abcd");
+        let mut hh = h;
+        hh.next = 60;
+        let n = ip6::build(&hh, &ext, &mut pkt).unwrap();
+        let (g, body) = ip6::parse(&pkt[..n]).unwrap();
+        assert_eq!((g.next, body), (58, &b"abcd"[..]));
+        // Truncado, versão errada e roteamento ativo caem.
+        assert!(ip6::parse(&pkt[..n - 1]).is_none());
+        pkt[0] = 0x40;
+        assert!(ip6::parse(&pkt[..n]).is_none());
+        let mut rt = vec![58u8, 0, 2, 1, 0, 0, 0, 0];
+        rt.extend_from_slice(b"abcd");
+        hh.next = 43;
+        let n = ip6::build(&hh, &rt, &mut pkt).unwrap();
+        assert!(ip6::parse(&pkt[..n]).is_none());
+        // Pilha de extensões sem fim.
+        let mut many = Vec::new();
+        for _ in 0..8 {
+            many.extend_from_slice(&[60, 0, 1, 4, 0, 0, 0, 0]);
+        }
+        hh.next = 60;
+        let n = ip6::build(&hh, &many, &mut pkt).unwrap();
+        assert!(ip6::parse(&pkt[..n]).is_none());
+    }
+
+    #[test]
+    fn fragmentos_ipv6_remontam() {
+        let data: Vec<u8> = (0..40u8).collect();
+        let frag = |off: u16, more: bool, part: &[u8]| {
+            let mut ext = vec![17u8, 0];
+            ext.extend_from_slice(&(off | u16::from(more)).to_be_bytes());
+            ext.extend_from_slice(&0xabcd_0001u32.to_be_bytes());
+            ext.extend_from_slice(part);
+            let mut h = hdr([1; 16], [2; 16], 64);
+            h.next = 44;
+            let mut pkt = vec![0u8; 100];
+            let n = ip6::build(&h, &ext, &mut pkt).unwrap();
+            pkt.truncate(n);
+            pkt
+        };
+        let (f2, f1) = (frag(16, false, &data[16..]), frag(0, true, &data[..16]));
+        let mut r = Reassembler::new();
+        let mut out = [0u8; MAX_DATAGRAM];
+        let mut done = None;
+        for pkt in [&f2, &f1] {
+            let (h, body) = ip6::parse(pkt).unwrap();
+            let f = h.frag.unwrap();
+            assert_eq!(h.next, 17);
+            let key = crate::frag::Key {
+                src: h.src,
+                dst: h.dst,
+                id: f.id,
+                proto: h.next,
+                v6: true,
+            };
+            let piece = crate::frag::Piece {
+                offset: usize::from(f.offset),
+                more: f.more,
+            };
+            done = r.add_piece(&key, piece, body, 0, &mut out);
+        }
+        assert_eq!(&out[..done.unwrap()], &data[..]);
+        // Fragmento atômico é o pacote inteiro; extensão dentro do fragmento cai.
+        let atomic = frag(0, false, &data);
+        assert!(ip6::parse(&atomic).unwrap().0.frag.is_none());
+        let mut bad = frag(0, true, &data[..8]);
+        bad[40] = 60;
+        assert!(ip6::parse(&bad).is_none());
+    }
+
+    #[test]
+    fn enderecos_especiais() {
+        let a: Ip6 = [
+            0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x12,
+        ];
+        assert_eq!(ip6::solicited_node(&a)[11..], [1, 0xff, 0xcd, 0xef, 0x12]);
+        assert_eq!(
+            ip6::multicast_mac(&ip6::ALL_NODES).0,
+            [0x33, 0x33, 0, 0, 0, 1]
+        );
+        assert!(ip6::is_link_local(&GW_LL) && !ip6::is_link_local(&a));
+        assert!(ip6::is_multicast(&ip6::ALL_ROUTERS));
+        let h = |dst| Header {
+            dst,
+            src: GW,
+            ethertype: 0,
+        };
+        assert!(eth::for_us(&h(ip6::multicast_mac(&ip6::ALL_NODES)), US));
+        // O prefixo "mesmo enlace" respeita bits que não são múltiplos de 8.
+        let mut s = Slaac::new(US);
+        s.seed([1; 16]);
+        s.start();
+        assert_eq!(s.poll(0, 0), Some(Tx::Dad(s.addrs().next().unwrap().ip)));
+        let p = Prefix {
+            prefix: PREFIX,
+            len: 60,
+            onlink: true,
+            autonomous: false,
+            valid: 100,
+            preferred: 50,
+        };
+        assert!(s.input_ra(&GW_LL, 100, &[Some(p)], 0, 1));
+        let mut inside = PREFIX;
+        inside[7] = 0x0f;
+        let mut outside = PREFIX;
+        outside[7] = 0x10;
+        assert!(s.on_link(&inside, 1) && !s.on_link(&outside, 1));
+        assert!(!s.on_link(&inside, 101 * S));
+    }
+
+    #[test]
+    fn nenhum_comprimento_entra_em_panico_no_icmp6() {
+        let h = hdr(GW_LL, ip6::ALL_NODES, 255);
+        let full = ra(255, 1800, 3600, 7200);
+        let body = &full[eth::HEADER_LEN + ip6::HEADER_LEN..];
+        for n in 0..body.len() {
+            let _ = icmp6::parse(&h, &body[..n]);
+        }
+        // Opção de tamanho zero: recusada.
+        let mut bad = body.to_vec();
+        bad[17] = 0;
+        let _ = icmp6::parse(&h, &bad);
+        for n in 0..70 {
+            let mut p = vec![0xffu8; n];
+            if n > 0 {
+                p[0] = 133 + u8::try_from(n % 4).unwrap();
+            }
+            let _ = icmp6::parse(&h, &p);
+            let _ = ip6::parse(&p);
+        }
+    }
+}

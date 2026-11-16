@@ -1,9 +1,11 @@
 //! Provas da imagem de teste contra o roteador e o host do QEMU (ADR 0069,
-//! item 8): ARP, eco ICMP, eco UDP e, depois, TCP. A imagem normal não gera
+//! item 8): ARP, eco ICMP, eco UDP, TCP e o eco `ICMPv6` ao roteador pelo
+//! endereço do SLAAC. A imagem normal não gera
 //! tráfego que ninguém pediu (veja `TESTE` em `main.rs`); o `xtask` põe no
 //! host os servidores de eco que o roteador do QEMU (10.0.2.2) alcança.
 
 use onet::arp::Ip4;
+use onet::ip6::Ip6;
 use onet::ports::Ephemeral;
 use onet::stack::{Event, Link, Stack, Upper};
 use onet::tcp::{ConnId, Read, State};
@@ -18,6 +20,8 @@ pub const TCP_ECHO_PORT: u16 = 47108;
 const RETRY_NS: u64 = 500_000_000;
 /// Identificador do eco ICMP.
 const PING_ID: u16 = 0x6e64;
+/// Identificador do eco `ICMPv6`.
+const PING6_ID: u16 = 0x6e36;
 /// Carga do eco UDP.
 const UDP_PAYLOAD: &[u8] = b"optimus-udp";
 /// Carga do eco TCP: passa de uma volta do buffer de 1 MSS, para exercitar a
@@ -34,6 +38,10 @@ pub struct Probes {
     udp_port: Option<u16>,
     udp_next: u64,
     gateway_seen: bool,
+    ping6_ok: bool,
+    ping6_seq: u16,
+    ping6_next: u64,
+    router6: Option<Ip6>,
     tcp: Option<ConnId>,
     tcp_sent: usize,
     tcp_got: usize,
@@ -53,6 +61,10 @@ impl Probes {
             udp_port: None,
             udp_next: 0,
             gateway_seen: false,
+            ping6_ok: false,
+            ping6_seq: 0,
+            ping6_next: 0,
+            router6: None,
             tcp: None,
             tcp_sent: 0,
             tcp_got: 0,
@@ -70,6 +82,12 @@ impl Probes {
             {
                 self.ping_ok = true;
                 ostd::debug::print("netd: icmp: roteador 10.0.2.2 respondeu ao eco");
+            }
+            Some(Event::EchoReply6 { src, id, .. })
+                if id == PING6_ID && Some(src) == self.router6 && !self.ping6_ok =>
+            {
+                self.ping6_ok = true;
+                ostd::debug::print("netd: ipv6: roteador respondeu ao eco pelo endereco SLAAC");
             }
             Some(Event::Lease(l)) => {
                 let (ip, gw) = (l.config.ip, l.config.gateway);
@@ -107,6 +125,7 @@ impl Probes {
 
     /// Um passo das provas, a cada volta do laço.
     pub fn step<L: Link>(&mut self, stack: &mut Stack, link: &mut L, now: u64) {
+        self.step6(stack, link, now);
         if stack.ip() == [0; 4] {
             return;
         }
@@ -131,6 +150,21 @@ impl Probes {
             self.tcp_step(stack, now);
             stack.flush_tcp(link, now);
         }
+    }
+
+    /// Prova do IPv6: com endereço global do SLAAC e o roteador do anúncio,
+    /// manda eco ao roteador até ele responder.
+    fn step6<L: Link>(&mut self, stack: &mut Stack, link: &mut L, now: u64) {
+        if self.ping6_ok || now < self.ping6_next || stack.slaac().global(now).is_none() {
+            return;
+        }
+        let Some(router) = stack.slaac().router(now) else {
+            return;
+        };
+        self.router6 = Some(router);
+        self.ping6_seq = self.ping6_seq.wrapping_add(1);
+        let _ = stack.ping6(link, router, PING6_ID, self.ping6_seq, b"optimus", now);
+        self.ping6_next = now.saturating_add(RETRY_NS);
     }
 
     /// Byte `i` da carga do eco TCP.

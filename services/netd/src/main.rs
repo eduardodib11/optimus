@@ -181,6 +181,7 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
     let _ = ostd::rand::secure_fill(&mut seed);
     stack.seed(seed);
     stack.start_dhcp();
+    stack.start_ipv6();
     let mut frame = [0u8; eth::MAX_FRAME];
     let mut probes = Probes::new();
     loop {
