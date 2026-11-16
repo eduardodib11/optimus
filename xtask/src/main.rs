@@ -2564,7 +2564,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "devmgr: 13 drivers no conjunto",
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: drvcli",
     "devmgr: nó 00:1f.0 8086:2918 0 BARs: storaged",
-    "devmgr: nó 00:1f.3 8086:2930 0 BARs: netd",
+    "devmgr: nó 00:1f.3 8086:2930 1 BARs: netd",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
     // (teclado PS/2 e RTC) viram nós com portas e IRQ.

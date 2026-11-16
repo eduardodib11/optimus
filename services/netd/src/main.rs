@@ -40,8 +40,9 @@ const TX_VA: u64 = 0x30_0100_0000;
 const RX_VA: u64 = 0x30_0200_0000;
 /// `kind` do registro de quadro nos dois anéis (ADR 0064).
 const FRAME_KIND: u16 = 1;
-/// Bit do anel de recepção na `Notification` do `netd`.
+/// Bits da `Notification` do `netd`: o anel de recepção e o relógio.
 const RX_BIT: u64 = 1;
+const TIMER_BIT: u64 = 2;
 
 fn hash(text: &[u8]) -> u32 {
     let h = optcrypt::blake3::hash(text);
@@ -56,14 +57,27 @@ fn interface_id(name: &[u8]) -> u32 {
     hash(&full[..name.len() + 2])
 }
 
-/// Dorme `TRY_NS` entre as tentativas. Não pode ceder a vez em laço: o
-/// `netd` tem prioridade 150, acima da do driver (120), que ficaria sem CPU.
-fn pause() {
-    ostd::time::sleep(ostd::time::Duration::from_nanos(TRY_NS));
+/// Espera por `ntfy` até `TRY_NS` passarem, sem `thread_local!` (o `sleep` do
+/// `ostd` aloca no heap, e a cota do `netd` não paga o segmento de 2 MiB) e
+/// sem ceder a vez em laço: o `netd` tem prioridade 150, acima da do driver
+/// (120), que ficaria sem CPU.
+fn pause(timer: Handle, ntfy: Handle) {
+    let _ = ostd::cap::ntfy_poll(ntfy);
+    let armed = ostd::cap::arm_timer(
+        timer,
+        ntfy,
+        TIMER_BIT,
+        TRY_NS,
+        0,
+        ostd::kabi::timer::RELATIVE,
+    );
+    if armed.is_ok() {
+        let _ = ostd::cap::ntfy_wait(ntfy);
+    }
 }
 
 /// Espera o driver partir: `connect` devolve `NotRunning` até ele chamar `ready`.
-fn connect(s: &mut Session, name: &[u8]) -> Option<Handle> {
+fn connect(s: &mut Session, name: &[u8], timer: Handle, ntfy: Handle) -> Option<Handle> {
     let iid = interface_id(name);
     let until = ostd::time::now_ns().saturating_add(WAIT_NS);
     while ostd::time::now_ns() < until {
@@ -74,7 +88,7 @@ fn connect(s: &mut Session, name: &[u8]) -> Option<Handle> {
             Err(Error::TimedOut) | Ok(Err(_)) => {}
             Err(_) => return None,
         }
-        pause();
+        pause(timer, ntfy);
     }
     None
 }
@@ -89,7 +103,7 @@ struct Nic {
 impl Nic {
     /// Liga ao driver pelo contrato (ADR 0064): `info`, a sessão, o anel de
     /// transmissão do driver e o anel de recepção que o `netd` cria.
-    fn attach(s: &mut Session, ep: Handle, quota: Handle) -> Option<Self> {
+    fn attach(s: &mut Session, ep: Handle, quota: Handle, ntfy: Handle) -> Option<Self> {
         let cli = NetDeviceCliente::new(ep);
         let buf = &mut s.buffer;
         let info = cli.info(buf).ok()?.ok()?;
@@ -109,9 +123,8 @@ impl Nic {
             ostd::ring::object_bytes(RING_BYTES),
         )
         .ok()?;
-        let rx_ntfy = ostd::cap::create(quota, ObjectType::Notification, 0).ok()?;
-        let rx = Consumer::create(rx_obj, RX_VA, RING_BYTES, 0x0E02, rx_ntfy).ok()?;
-        let rx_sig = ostd::cap::mint(rx_ntfy, Rights::SIGNAL, 0, None).ok()?;
+        let rx = Consumer::create(rx_obj, RX_VA, RING_BYTES, 0x0E02, ntfy).ok()?;
+        let rx_sig = ostd::cap::mint(ntfy, Rights::SIGNAL, 0, None).ok()?;
         let rx_rw =
             ostd::cap::mint(rx_obj, Rights::MAP | Rights::READ | Rights::WRITE, 0, None).ok()?;
         session.attach_rx(buf, rx_rw, rx_sig).ok()?.ok()?;
@@ -159,8 +172,11 @@ fn is_probe_reply(frame: &[u8], ours: Mac) -> bool {
 
 /// Laço de recepção: o `netd` dorme no anel e trata cada quadro que chega.
 fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
-    let ep = connect(s, b"optimus.net.NetDevice").ok_or("sem driver de rede")?;
-    let mut nic = Nic::attach(s, ep, quota).ok_or("ligar ao NetDevice")?;
+    let timer = ostd::cap::create(quota, ObjectType::Timer, 0).map_err(|_| "criar o Timer")?;
+    let ntfy = ostd::cap::create(quota, ObjectType::Notification, 0)
+        .map_err(|_| "criar a Notification")?;
+    let ep = connect(s, b"optimus.net.NetDevice", timer, ntfy).ok_or("sem driver de rede")?;
+    let mut nic = Nic::attach(s, ep, quota, ntfy).ok_or("ligar ao NetDevice")?;
     let mut frame = [0u8; eth::MAX_FRAME];
     let n = probe(nic.mac, &mut frame).ok_or("montar o ARP")?;
     if !nic.send(&frame[..n]) {
