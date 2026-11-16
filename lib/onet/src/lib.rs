@@ -19,7 +19,9 @@ pub mod eth;
 pub mod frag;
 pub mod icmp;
 pub mod ip4;
+pub mod ports;
 pub mod stack;
+pub mod udp;
 
 #[cfg(test)]
 mod tests;

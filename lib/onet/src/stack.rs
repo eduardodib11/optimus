@@ -7,6 +7,27 @@ use crate::eth::{self, Header, Mac};
 use crate::frag::{self, Reassembler};
 use crate::icmp::{self, Echo};
 use crate::ip4::{self, Config};
+use crate::udp;
+
+/// Quem recebe o que a pilha entrega acima do IP.
+pub trait Upper {
+    /// Entrega um datagrama UDP para a porta `dport`. `false` se ninguém a
+    /// escuta: a pilha responde com "porta inalcançável".
+    fn udp(&mut self, src: Ip4, sport: u16, dport: u16, data: &[u8]) -> bool;
+}
+
+/// Sem ninguém acima: toda porta é inalcançável.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoUpper;
+
+impl Upper for NoUpper {
+    fn udp(&mut self, _: Ip4, _: u16, _: u16, _: &[u8]) -> bool {
+        false
+    }
+}
+
+/// Intervalo mínimo entre mensagens de erro ICMP (ns), RFC 1812 4.3.2.8.
+const ICMP_ERROR_NS: u64 = 100_000_000;
 
 /// Por onde a pilha manda quadros.
 pub trait Link {
@@ -52,6 +73,8 @@ pub struct Stack {
     cfg: Config,
     frags: Reassembler,
     ip_id: u16,
+    /// Quando o próximo erro ICMP pode sair.
+    icmp_error_at: u64,
 }
 
 impl Stack {
@@ -68,6 +91,7 @@ impl Stack {
             },
             frags: Reassembler::new(),
             ip_id: 0,
+            icmp_error_at: 0,
         }
     }
 
@@ -156,6 +180,26 @@ impl Stack {
         }
     }
 
+    /// Manda um datagrama UDP de `sport` para `dst:dport`.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError`].
+    pub fn send_udp<L: Link>(
+        &mut self,
+        link: &mut L,
+        sport: u16,
+        dst: Ip4,
+        dport: u16,
+        data: &[u8],
+        now: u64,
+    ) -> Result<(), SendError> {
+        let mut seg = [0u8; eth::MTU];
+        let n =
+            udp::build(self.cfg.ip, dst, sport, dport, data, &mut seg).ok_or(SendError::TooBig)?;
+        self.send_ip(link, dst, ip4::PROTO_UDP, &seg[..n], now)
+    }
+
     /// Manda um pedido de eco (`ping`).
     ///
     /// # Errors
@@ -209,7 +253,13 @@ impl Stack {
 
     /// Trata um quadro recebido. Quadro curto, de outro destino ou de
     /// protocolo que a pilha ainda não conhece é descartado.
-    pub fn input<L: Link>(&mut self, link: &mut L, frame: &[u8], now: u64) -> Option<Event> {
+    pub fn input<L: Link, U: Upper>(
+        &mut self,
+        link: &mut L,
+        up: &mut U,
+        frame: &[u8],
+        now: u64,
+    ) -> Option<Event> {
         let (h, payload) = eth::parse(frame)?;
         if !eth::for_us(&h, self.local.mac) || h.src == self.local.mac {
             return None;
@@ -221,12 +271,18 @@ impl Stack {
                 self.send_arp(link, p.sha, &reply);
                 None
             }
-            eth::ETHERTYPE_IPV4 => self.input_ip4(link, payload, now),
+            eth::ETHERTYPE_IPV4 => self.input_ip4(link, up, payload, now),
             _ => None,
         }
     }
 
-    fn input_ip4<L: Link>(&mut self, link: &mut L, pkt: &[u8], now: u64) -> Option<Event> {
+    fn input_ip4<L: Link, U: Upper>(
+        &mut self,
+        link: &mut L,
+        up: &mut U,
+        pkt: &[u8],
+        now: u64,
+    ) -> Option<Event> {
         let (h, payload) = ip4::parse(pkt)?;
         if !self.cfg.is_local(h.dst) || h.ttl == 0 {
             return None;
@@ -239,21 +295,45 @@ impl Stack {
         if h.is_fragment() {
             let mut buf = [0u8; frag::MAX_DATAGRAM];
             let (h, n) = self.frags.add(&h, payload, now, &mut buf)?;
-            return self.input_proto(link, &h, &buf[..n], now);
+            return self.input_proto(link, up, &h, &buf[..n], None, now);
         }
-        self.input_proto(link, &h, payload, now)
+        self.input_proto(link, up, &h, payload, Some(pkt), now)
     }
 
-    fn input_proto<L: Link>(
+    fn input_proto<L: Link, U: Upper>(
         &mut self,
         link: &mut L,
+        up: &mut U,
         h: &ip4::Header,
         payload: &[u8],
+        orig: Option<&[u8]>,
         now: u64,
     ) -> Option<Event> {
         match h.proto {
             ip4::PROTO_ICMP => self.input_icmp(link, h, payload, now),
+            ip4::PROTO_UDP => {
+                let d = udp::parse(h.src, h.dst, payload)?;
+                let unicast = h.dst == self.cfg.ip;
+                if !up.udp(h.src, d.sport, d.dport, d.data) && unicast {
+                    self.port_unreachable(link, h.src, orig, now);
+                }
+                None
+            }
             _ => None,
+        }
+    }
+
+    /// "Porta inalcançável" para `to`, citando o pacote original, no máximo
+    /// um a cada [`ICMP_ERROR_NS`].
+    fn port_unreachable<L: Link>(&mut self, link: &mut L, to: Ip4, orig: Option<&[u8]>, now: u64) {
+        let Some(orig) = orig else { return };
+        if now < self.icmp_error_at {
+            return;
+        }
+        let mut msg = [0u8; icmp::ECHO_HEADER + ip4::HEADER_LEN + 60 + 8];
+        if let Some(n) = icmp::build_unreachable(icmp::PORT_UNREACHABLE, orig, &mut msg) {
+            self.icmp_error_at = now.saturating_add(ICMP_ERROR_NS);
+            let _ = self.send_ip(link, to, ip4::PROTO_ICMP, &msg[..n], now);
         }
     }
 

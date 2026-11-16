@@ -214,7 +214,8 @@ mod stack {
     use crate::eth::{self, Header, Mac};
     use crate::icmp;
     use crate::ip4::{self, Config};
-    use crate::stack::{Event, Link, SendError, Stack};
+    use crate::stack::{Event, Link, NoUpper, SendError, Stack, Upper};
+    use crate::udp;
 
     fn cfg() -> Config {
         Config {
@@ -291,7 +292,7 @@ mod stack {
             tha: US,
             tpa: IP,
         };
-        s.input(&mut w, &arp_frame(US, GW, &reply), 2);
+        s.input(&mut w, &mut NoUpper, &arp_frame(US, GW, &reply), 2);
         assert_eq!(s.neighbor(&mut w, GW_IP, 3), Some(GW));
     }
 
@@ -308,7 +309,12 @@ mod stack {
             tha: Mac([0; 6]),
             tpa: IP,
         };
-        s.input(&mut w, &arp_frame(Mac::BROADCAST, GW, &req), 0);
+        s.input(
+            &mut w,
+            &mut NoUpper,
+            &arp_frame(Mac::BROADCAST, GW, &req),
+            0,
+        );
         assert_eq!(w.0.len(), 1);
         let (h, p) = sent_arp(&w.0[0]);
         assert_eq!((h.dst, h.src), (GW, US));
@@ -369,7 +375,12 @@ mod stack {
             tha: Mac([0; 6]),
             tpa: IP,
         };
-        s.input(&mut w, &arp_frame(Mac::BROADCAST, GW, &req), 0);
+        s.input(
+            &mut w,
+            &mut NoUpper,
+            &arp_frame(Mac::BROADCAST, GW, &req),
+            0,
+        );
         w.0.clear();
         (s, w)
     }
@@ -393,7 +404,7 @@ mod stack {
             tha: US,
             tpa: IP,
         };
-        s.input(&mut w, &arp_frame(US, GW, &reply), 1);
+        s.input(&mut w, &mut NoUpper, &arp_frame(US, GW, &reply), 1);
         w.0.clear();
         s.ping(&mut w, GW_IP, 0xabcd, 3, b"ping", 2).unwrap();
         let (h, p) = eth::parse(&w.0[0]).unwrap();
@@ -408,7 +419,7 @@ mod stack {
         // A resposta do roteador vira evento.
         let r = ip_frame(US, GW, &iph(GW_IP, IP), &echo(icmp::ECHO_REPLY, b"ping"));
         assert_eq!(
-            s.input(&mut w, &r, 3),
+            s.input(&mut w, &mut NoUpper, &r, 3),
             Some(Event::EchoReply {
                 src: GW_IP,
                 id: 0xabcd,
@@ -422,7 +433,7 @@ mod stack {
     fn responde_ao_eco_dirigido_a_nos() {
         let (mut s, mut w) = ready();
         let f = ip_frame(US, GW, &iph(GW_IP, IP), &echo(icmp::ECHO_REQUEST, b"oi"));
-        assert_eq!(s.input(&mut w, &f, 1), None);
+        assert_eq!(s.input(&mut w, &mut NoUpper, &f, 1), None);
         assert_eq!(w.0.len(), 1);
         let (h, p) = eth::parse(&w.0[0]).unwrap();
         assert_eq!(h.dst, GW);
@@ -447,7 +458,12 @@ mod stack {
             (IP, [10, 0, 2, 255]),
             (IP, [0; 4]),
         ] {
-            s.input(&mut w, &ip_frame(US, GW, &iph(src, dst), &msg), 1);
+            s.input(
+                &mut w,
+                &mut NoUpper,
+                &ip_frame(US, GW, &iph(src, dst), &msg),
+                1,
+            );
         }
         assert!(w.0.is_empty());
     }
@@ -458,19 +474,20 @@ mod stack {
         let msg = echo(icmp::ECHO_REQUEST, b"oi");
         s.input(
             &mut w,
+            &mut NoUpper,
             &ip_frame(US, GW, &iph(GW_IP, [10, 0, 2, 99]), &msg),
             1,
         );
         let mut h = iph(GW_IP, IP);
         h.ttl = 0;
-        s.input(&mut w, &ip_frame(US, GW, &h, &msg), 1);
+        s.input(&mut w, &mut NoUpper, &ip_frame(US, GW, &h, &msg), 1);
         let mut f = ip_frame(US, GW, &iph(GW_IP, IP), &msg);
         f[14 + 10] ^= 1;
-        s.input(&mut w, &f, 1);
+        s.input(&mut w, &mut NoUpper, &f, 1);
         let mut f = ip_frame(US, GW, &iph(GW_IP, IP), &msg);
         let n = f.len();
         f[n - 1] ^= 1;
-        s.input(&mut w, &f, 1);
+        s.input(&mut w, &mut NoUpper, &f, 1);
         assert!(w.0.is_empty());
     }
 
@@ -481,15 +498,112 @@ mod stack {
         let (a, b) = msg.split_at(16);
         let mut h = iph(GW_IP, IP);
         h.more_fragments = true;
-        s.input(&mut w, &ip_frame(US, GW, &h, a), 1);
+        s.input(&mut w, &mut NoUpper, &ip_frame(US, GW, &h, a), 1);
         assert!(w.0.is_empty());
         h.more_fragments = false;
         h.frag_offset = 16;
-        s.input(&mut w, &ip_frame(US, GW, &h, b), 2);
+        s.input(&mut w, &mut NoUpper, &ip_frame(US, GW, &h, b), 2);
         assert_eq!(w.0.len(), 1);
         let (_, p) = eth::parse(&w.0[0]).unwrap();
         let e = icmp::parse_echo(ip4::parse(p).unwrap().1).unwrap();
         assert_eq!((e.kind, e.data.len()), (icmp::ECHO_REPLY, 24));
+    }
+
+    /// Um `Upper` que guarda o que recebeu e escuta só uma porta.
+    struct Listener {
+        port: u16,
+        got: Vec<(u16, Vec<u8>)>,
+    }
+
+    impl Upper for Listener {
+        fn udp(&mut self, _: [u8; 4], sport: u16, dport: u16, data: &[u8]) -> bool {
+            if dport == self.port {
+                self.got.push((sport, data.to_vec()));
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    fn udp_frame(dst: [u8; 4], sport: u16, dport: u16, data: &[u8]) -> Vec<u8> {
+        let mut seg = [0u8; 600];
+        let n = udp::build(GW_IP, dst, sport, dport, data, &mut seg).unwrap();
+        let mut h = iph(GW_IP, dst);
+        h.proto = ip4::PROTO_UDP;
+        ip_frame(US, GW, &h, &seg[..n])
+    }
+
+    #[test]
+    fn udp_entregue_e_enviado_com_checksum() {
+        let (mut s, mut w) = ready();
+        let mut up = Listener {
+            port: 5000,
+            got: vec![],
+        };
+        s.input(&mut w, &mut up, &udp_frame(IP, 777, 5000, b"eco"), 1);
+        assert_eq!(up.got, vec![(777, b"eco".to_vec())]);
+        assert!(w.0.is_empty());
+        s.send_udp(&mut w, 5000, GW_IP, 777, b"eco", 2).unwrap();
+        let (_, p) = eth::parse(&w.0[0]).unwrap();
+        let (ih, payload) = ip4::parse(p).unwrap();
+        assert_eq!(ih.proto, ip4::PROTO_UDP);
+        let d = udp::parse(IP, GW_IP, payload).unwrap();
+        assert_eq!((d.sport, d.dport, d.data), (5000, 777, &b"eco"[..]));
+    }
+
+    #[test]
+    fn udp_para_porta_fechada_gera_icmp_com_limite_de_taxa() {
+        let (mut s, mut w) = ready();
+        let mut up = Listener {
+            port: 5000,
+            got: vec![],
+        };
+        s.input(&mut w, &mut up, &udp_frame(IP, 777, 9, b"x"), 1);
+        assert_eq!(w.0.len(), 1);
+        let (_, p) = eth::parse(&w.0[0]).unwrap();
+        let (ih, icmp_msg) = ip4::parse(p).unwrap();
+        assert_eq!((ih.proto, ih.dst), (ip4::PROTO_ICMP, GW_IP));
+        assert_eq!(icmp_msg[..2], [3, 3]);
+        assert_eq!(ip4::checksum(icmp_msg), 0);
+        // Cita o cabeçalho IP original (20) mais 8 bytes.
+        assert_eq!(icmp_msg.len(), 8 + 20 + 8);
+        assert_eq!(icmp_msg[8 + 9], ip4::PROTO_UDP);
+        // Dentro de 100 ms não sai outro.
+        s.input(&mut w, &mut up, &udp_frame(IP, 777, 9, b"x"), 2);
+        assert_eq!(w.0.len(), 1);
+        s.input(&mut w, &mut up, &udp_frame(IP, 777, 9, b"x"), 100_000_001);
+        assert_eq!(w.0.len(), 2);
+        // Difusão para porta fechada não gera erro.
+        s.input(
+            &mut w,
+            &mut up,
+            &udp_frame([255; 4], 777, 9, b"x"),
+            200_000_002,
+        );
+        assert_eq!(w.0.len(), 2);
+    }
+
+    #[test]
+    fn udp_com_checksum_ruim_ou_tamanho_incoerente_e_descartado() {
+        let (mut s, mut w) = ready();
+        let mut up = Listener {
+            port: 5000,
+            got: vec![],
+        };
+        let mut f = udp_frame(IP, 777, 5000, b"eco");
+        let n = f.len();
+        f[n - 1] ^= 1;
+        s.input(&mut w, &mut up, &f, 1);
+        assert!(up.got.is_empty() && w.0.is_empty());
+        // Campo de tamanho maior que o recebido.
+        let mut seg = [0u8; 16];
+        let n = udp::build(GW_IP, IP, 1, 5000, b"abcdefgh", &mut seg).unwrap();
+        seg[4..6].copy_from_slice(&200u16.to_be_bytes());
+        let mut h = iph(GW_IP, IP);
+        h.proto = ip4::PROTO_UDP;
+        s.input(&mut w, &mut up, &ip_frame(US, GW, &h, &seg[..n]), 1);
+        assert!(up.got.is_empty() && w.0.is_empty());
     }
 
     #[test]
@@ -537,12 +651,22 @@ mod stack {
             tpa: IP,
         };
         // Destino é outro MAC.
-        s.input(&mut w, &arp_frame(Mac([2, 0, 0, 0, 0, 9]), GW, &req), 0);
+        s.input(
+            &mut w,
+            &mut NoUpper,
+            &arp_frame(Mac([2, 0, 0, 0, 0, 9]), GW, &req),
+            0,
+        );
         // Eco do que nós mesmos mandamos.
-        s.input(&mut w, &arp_frame(Mac::BROADCAST, US, &req), 0);
+        s.input(
+            &mut w,
+            &mut NoUpper,
+            &arp_frame(Mac::BROADCAST, US, &req),
+            0,
+        );
         // Curto e com EtherType desconhecido.
-        s.input(&mut w, &[0u8; 5], 0);
-        s.input(&mut w, &[0xffu8; 60], 0);
+        s.input(&mut w, &mut NoUpper, &[0u8; 5], 0);
+        s.input(&mut w, &mut NoUpper, &[0xffu8; 60], 0);
         assert!(w.0.is_empty());
     }
 }
@@ -789,5 +913,90 @@ mod frag {
         // Passado o prazo, tudo sai.
         r.expire(TIMEOUT_NS);
         assert_eq!(r.pending(), 0);
+    }
+}
+
+mod udp_e_portas {
+    use crate::ip4;
+    use crate::ports::{COUNT, Ephemeral, FIRST};
+    use crate::udp;
+
+    const A: [u8; 4] = [10, 0, 2, 15];
+    const B: [u8; 4] = [10, 0, 2, 2];
+
+    #[test]
+    fn datagrama_ida_e_volta() {
+        let mut out = [0u8; 64];
+        let n = udp::build(A, B, 1234, 53, b"dados", &mut out).unwrap();
+        assert_eq!(n, 13);
+        let d = udp::parse(A, B, &out[..n]).unwrap();
+        assert_eq!((d.sport, d.dport, d.data), (1234, 53, &b"dados"[..]));
+        // Endereço trocado muda o pseudo-cabeçalho e invalida o checksum.
+        assert!(udp::parse(B, A, &out[..n]).is_some());
+        assert!(udp::parse(A, [1, 1, 1, 1], &out[..n]).is_none());
+        // Checksum zero é aceito (sem checksum).
+        out[6..8].fill(0);
+        assert!(udp::parse(A, [1, 1, 1, 1], &out[..n]).is_some());
+        // Preenchimento depois do tamanho é cortado.
+        let mut cheio = [0u8; 64];
+        let n = udp::build(A, B, 1, 2, b"ab", &mut cheio).unwrap();
+        cheio[n..n + 5].fill(9);
+        assert_eq!(udp::parse(A, B, &cheio[..n + 5]).unwrap().data, b"ab");
+    }
+
+    #[test]
+    fn datagrama_malformado() {
+        let mut out = [0u8; 64];
+        let n = udp::build(A, B, 1, 2, b"ab", &mut out).unwrap();
+        assert!(udp::parse(A, B, &out[..7]).is_none());
+        assert!(udp::parse(A, B, &out[..n - 1]).is_none());
+        let mut x = out;
+        x[4..6].copy_from_slice(&7u16.to_be_bytes());
+        assert!(udp::parse(A, B, &x[..n]).is_none());
+        let mut pequeno = [0u8; 9];
+        assert!(udp::build(A, B, 1, 2, b"ab", &mut pequeno).is_none());
+    }
+
+    #[test]
+    fn checksum_nunca_sai_zero() {
+        // Procura dados cujo checksum calculado seria 0 e confere o 0xffff.
+        let mut out = [0u8; 16];
+        for x in 0..=u16::MAX {
+            let n = udp::build(A, B, 1, 2, &x.to_be_bytes(), &mut out).unwrap();
+            assert_ne!(out[6..8], [0, 0]);
+            assert!(udp::parse(A, B, &out[..n]).is_some());
+        }
+        assert_eq!(ip4::PROTO_UDP, 17);
+    }
+
+    #[test]
+    fn portas_efemeras() {
+        let mut p = Ephemeral::new();
+        let a = p.alloc(7).unwrap();
+        assert!(a >= FIRST && p.in_use(a));
+        // Porta ocupada: anda para a seguinte.
+        let b = p.alloc(7).unwrap();
+        assert_ne!(a, b);
+        p.release(a);
+        assert!(!p.in_use(a));
+        assert_eq!(p.alloc(7), Some(a));
+        // A aleatoriedade espalha: outra semente, outra porta.
+        assert_ne!(p.alloc(1000), p.alloc(1000));
+        assert!(!p.reserve(a));
+        assert!(!p.reserve(80));
+        assert!(!p.in_use(80));
+        p.release(80);
+    }
+
+    #[test]
+    fn portas_esgotadas_e_volta() {
+        let mut p = Ephemeral::new();
+        for _ in 0..COUNT {
+            assert!(p.alloc(0).is_some());
+        }
+        assert_eq!(p.alloc(5), None);
+        p.release(65535);
+        assert_eq!(p.alloc(12345), Some(65535));
+        assert!(p.reserve(FIRST) == false);
     }
 }

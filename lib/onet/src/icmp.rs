@@ -61,3 +61,26 @@ pub fn build_echo(e: &Echo<'_>, out: &mut [u8]) -> Option<usize> {
     out[2..4].copy_from_slice(&c.to_be_bytes());
     Some(n)
 }
+
+/// Código de "porta inalcançável" (tipo 3).
+pub const PORT_UNREACHABLE: u8 = 3;
+
+/// Monta um "destino inalcançável" com `code`, que cita o cabeçalho IP e os
+/// 8 primeiros bytes da carga do pacote `orig` (RFC 792). `None` se `out` for
+/// pequeno.
+#[must_use]
+pub fn build_unreachable(code: u8, orig: &[u8], out: &mut [u8]) -> Option<usize> {
+    let ihl = usize::from(*orig.first()? & 0xf) * 4;
+    let quote = orig.len().min(ihl + 8);
+    let n = ECHO_HEADER + quote;
+    if n > out.len() {
+        return None;
+    }
+    out[0] = DEST_UNREACHABLE;
+    out[1] = code;
+    out[2..8].fill(0);
+    out[ECHO_HEADER..n].copy_from_slice(&orig[..quote]);
+    let c = ip4::checksum(&out[..n]);
+    out[2..4].copy_from_slice(&c.to_be_bytes());
+    Some(n)
+}
