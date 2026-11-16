@@ -1,0 +1,13 @@
+[package]
+name = "ox509"
+description = "Parser de certificados X.509 do tlsd (ADR 0071, T-650): DER estrito, sem alocação, com limites."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true
