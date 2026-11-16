@@ -1163,6 +1163,11 @@ macro_rules! m4_markers {
             "netd: arp: roteador 10.0.2.2 resolvido",
             // T-632: o eco ICMP ao roteador do QEMU volta.
             "netd: icmp: roteador 10.0.2.2 respondeu ao eco",
+            // T-634: o datagrama UDP ao servidor de eco do host volta.
+            "netd: udp: eco do host",
+            // T-635: a conexão TCP ao eco do host leva 4000 bytes e eles
+            // voltam iguais.
+            "netd: tcp: eco do host",
             "drvcli: input ok",
             "drvcli: input evento 0x1e",
             "drvcli: entropy ok",
@@ -2062,6 +2067,9 @@ fn check_serial(serial: &str, markers: &[&str], forbidden: &[&str]) -> Result {
 /// `cargo xtask test iommu`: os aceites do kernel e do `devmgr` com VT-d e
 /// com AMD-Vi (T-403, T-404, T-422, T-510, T-511).
 fn iommu(opts: &Options) -> Result {
+    // O cenário de drivers tem o `virtio-net`: o `netd` prova UDP e TCP contra
+    // os servidores de eco do host.
+    let _echo = HostEcho::start()?;
     let vtd = Options {
         devices: vec!["intel-iommu", "edu"],
         ..opts.clone()
@@ -2568,11 +2576,6 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: drvcli",
     "devmgr: nó 00:1f.0 8086:2918 0 BARs: storaged",
     "devmgr: nó 00:1f.3 8086:2930 1 BARs: netd",
-    // T-634: o `netd` manda um datagrama UDP ao servidor de eco do host.
-    "netd: udp: eco do host",
-    // T-635: e abre uma conexão TCP ao eco do host, manda 4000 bytes e
-    // confere que voltam iguais.
-    "netd: tcp: eco do host",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
     // (teclado PS/2 e RTC) viram nós com portas e IRQ.
@@ -2613,11 +2616,7 @@ const INTEGRATION_MARKERS: &[&str] = &[
 /// CPUs do cenário de integração sem `--smp`.
 const INTEGRATION_COUNTS: &[u32] = &[1, 4];
 
-/// `cargo xtask test integration [--smp N]` (T-365): boot → `root` →
-/// `svcmgr` → `timed`, `logd` e `memd`, com o `hello` do `root`, em
-/// `-smp 1` e `-smp 4` (só N com `--smp`). Exige os marcadores do boot
-/// normal e o desligamento ordenado de cada serviço.
-/// Servidor de eco do host que a imagem de teste do `netd` procura em
+/// Servidores de eco do host que a imagem de teste do `netd` procura em
 /// 10.0.2.2 (o roteador do QEMU leva o convidado ao `127.0.0.1` do host).
 /// Para ao sair de escopo.
 struct HostEcho {
@@ -2700,9 +2699,12 @@ impl Drop for HostEcho {
     }
 }
 
+/// `cargo xtask test integration [--smp N]` (T-365): boot → `root` →
+/// `svcmgr` → `timed`, `logd` e `memd`, com o `hello` do `root`, em
+/// `-smp 1` e `-smp 4` (só N com `--smp`). Exige os marcadores do boot
+/// normal e o desligamento ordenado de cada serviço.
 fn integration(opts: &Options) -> Result {
     build_test(opts)?;
-    let _echo = HostEcho::start()?;
     let markers: &'static [&'static str] = Box::leak(
         BOOT_MARKERS
             .iter()
