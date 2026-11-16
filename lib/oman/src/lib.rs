@@ -55,6 +55,9 @@ pub enum NeedKind {
     Fs,
     /// Capability de origem do kernel.
     Kernel,
+    /// Política de rede (`net:access:`, ADR 0068): não vira capability; o
+    /// `netd` a pede ao `svcmgr` (`net_policy`).
+    Net,
 }
 
 /// Uma necessidade.
@@ -198,6 +201,7 @@ pub fn parse(b: &[u8]) -> Result<Oman, Error> {
             3 => NeedKind::Dev,
             4 => NeedKind::Fs,
             5 => NeedKind::Kernel,
+            6 => NeedKind::Net,
             _ => return Err(Error::Format),
         };
         let flags = *b.get(at + 1).ok_or(Error::Format)?;

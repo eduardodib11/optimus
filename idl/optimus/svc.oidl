@@ -1,6 +1,6 @@
 // Protocolo entre os serviços e o `svcmgr` (ADR 0034, item 6). O código
 // à mão em lib/osvc segue esta especificação até os stubs gerados.
-package optimus.svc @1.2;
+package optimus.svc @1.4;
 
 struct CapDesc { kind: u8, index: u16, handle: u32, name_hash: u32 }
 struct Boot { caps: vec<CapDesc, 96>, generation: u16 }
@@ -22,4 +22,11 @@ interface Supervisor {
     // de cada nome) e depois o pedido de partida.
     driver_give(id: u32, names: vec<u32, 4>) -> result<(), SvcError>;
     driver_start(id: u32) -> result<(), SvcError>;
+    // Nasce na 1.3, só para o `devmgr`: para o driver de `id`.
+    driver_stop(id: u32) -> result<(), SvcError>;
+    // Nasce na 1.4 (T-637; ADR 0068, item 2), só para quem provê
+    // `optimus.net.Socket` (o `netd`): o texto da necessidade `net:access:` do
+    // manifesto do serviço `id`, sem o prefixo; vazio se não tem (sem política,
+    // nada é permitido).
+    net_policy(id: u32) -> result<string<480>, SvcError>;
 }

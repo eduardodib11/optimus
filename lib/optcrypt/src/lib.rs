@@ -16,7 +16,8 @@
 //!
 //! Para a rede (M6, ADR 0070): SHA-384 e SHA-512 ([`sha512`]), com HMAC
 //! e HKDF sobre os dois, X25519 ([`x25519`]) sobre o corpo de `f25519`,
-//! SHA-3 e SHAKE ([`sha3`]) e ML-KEM-768 ([`mlkem768`]).
+//! SHA-3 e SHAKE ([`sha3`]), ML-KEM-768 ([`mlkem768`]) e Ed25519
+//! ([`ed25519`]).
 //! Os vetores oficiais dos testes ficam em `vetores/` (CAVP do NIST e
 //! Wycheproof convertido por `vetores/wycheproof.py`).
 
@@ -33,6 +34,7 @@ pub mod blake3;
 pub mod block;
 pub mod chacha20;
 pub mod drbg;
+pub mod ed25519;
 mod f25519;
 pub mod hkdf;
 pub mod hmac;

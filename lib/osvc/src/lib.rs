@@ -32,10 +32,12 @@ pub enum Method {
     DriverStart = 6,
     /// `driver_stop(id)` (1.3; só para o `devmgr`).
     DriverStop = 7,
+    /// `net_policy(id)` (1.4; só para quem provê `optimus.net.Socket`).
+    NetPolicy = 8,
 }
 
 /// Versão menor do protocolo.
-pub const MINOR: u16 = 3;
+pub const MINOR: u16 = 4;
 
 /// `SvcError` no fio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,7 @@ pub fn label(m: Method) -> u64 {
         Method::Driver => 1,
         Method::DriverGive | Method::DriverStart => 2,
         Method::DriverStop => 3,
+        Method::NetPolicy => 4,
         _ => 0,
     };
     (u64::from(interface_id()) << 32) | (minor << 16) | m as u64
@@ -101,6 +104,7 @@ pub fn method_of(label: u64) -> Option<Method> {
         5 => Method::DriverGive,
         6 => Method::DriverStart,
         7 => Method::DriverStop,
+        8 => Method::NetPolicy,
         _ => return None,
     })
 }
@@ -303,6 +307,33 @@ pub fn decode_name(body: &[u8]) -> oidl_rt::Result<&str> {
     Ok(s)
 }
 
+/// Cabeça da resposta de `net_policy`: o ponteiro do texto.
+const POLICY_HEAD: usize = 8;
+/// Maior texto de política de rede (a necessidade `net:access:`).
+pub const MAX_POLICY: usize = 480;
+
+/// Codifica a resposta de `net_policy`: o texto da política `net:access:`
+/// do manifesto (ADR 0068, item 2).
+///
+/// # Errors
+/// [`oidl_rt::Error::TooLarge`] acima de [`MAX_POLICY`] ou sem espaço.
+pub fn encode_policy(text: &str, out: &mut [u8]) -> oidl_rt::Result<usize> {
+    let mut w = Writer::new(out, POLICY_HEAD)?;
+    w.string(text, MAX_POLICY)?;
+    Ok(w.finish())
+}
+
+/// Decodifica a resposta de `net_policy`.
+///
+/// # Errors
+/// [`oidl_rt::Error::BadMessage`] para corpo fora do formato.
+pub fn decode_policy(body: &[u8]) -> oidl_rt::Result<&str> {
+    let mut r = Reader::new(body, POLICY_HEAD)?;
+    let s = r.string(MAX_POLICY)?;
+    r.finish()?;
+    Ok(s)
+}
+
 /// Cabeça de `driver(index: u16)`.
 const DRIVER_HEAD: usize = 2;
 /// Cabeça de `DriverInfo`: `id`, `total` e os ponteiros de `name` e `rules`.
@@ -319,6 +350,8 @@ pub const MAX_REPLY_BYTES: usize = if MAX_BOOT_BYTES > MAX_DRIVER_BYTES {
 } else {
     MAX_DRIVER_BYTES
 };
+/// Maior corpo de `net_policy` (cabeça, texto e arredondamento).
+pub const MAX_POLICY_BYTES: usize = POLICY_HEAD + MAX_POLICY + 8;
 
 /// Um driver do conjunto compilado (ADR 0042, item 3), para o `devmgr`
 /// casar: o id do serviço, quantos drivers há, o nome e as regras.
