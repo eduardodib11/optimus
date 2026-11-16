@@ -13,6 +13,10 @@
 //! HKDF ([`sha256`], [`hmac`], [`hkdf`]) e os tipos de segredo ([`secret`]).
 //! São escritos à mão e conferidos com vetores NIST e RFC; a adaptação de
 //! código verificado (P9 da ADR 0053) continua pendente, como a do BLAKE3.
+//!
+//! Para a rede (M6, ADR 0070), SHA-384 e SHA-512 ([`sha512`]), com HMAC e
+//! HKDF sobre os dois. Os vetores oficiais dos testes ficam em `vetores/`
+//! (CAVP do NIST e Wycheproof convertido por `vetores/wycheproof.py`).
 
 #![cfg_attr(not(test), no_std)]
 // `unsafe` só em `arch` (AES-NI), pelo orçamento de `unsafe-allowlist.toml`.
@@ -33,6 +37,7 @@ pub mod keyring;
 pub mod poly1305;
 pub mod secret;
 pub mod sha256;
+pub mod sha512;
 
 #[cfg(test)]
 mod testutil;
