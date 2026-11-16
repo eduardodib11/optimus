@@ -3,6 +3,7 @@
 //! se testa no host com um [`Link`] de mentira.
 
 use crate::arp::{self, Cache, Ip4, Local, Resolve};
+use crate::dhcp::{self, Lease, Outcome};
 use crate::eth::{self, Header, Mac};
 use crate::frag::{self, Reassembler};
 use crate::icmp::{self, Echo};
@@ -50,6 +51,8 @@ pub enum Event {
         /// Bytes de dados.
         len: usize,
     },
+    /// O DHCP concedeu (ou renovou) a configuração, já aplicada à pilha.
+    Lease(Lease),
 }
 
 /// Por que um pacote não saiu.
@@ -78,6 +81,10 @@ pub struct Stack {
     icmp_error_at: u64,
     /// O TCP: o `netd` abre, escuta, lê e escreve por aqui.
     pub tcp: Tcp,
+    dhcp: dhcp::Client,
+    dhcp_on: bool,
+    /// Gerador (xorshift64*) dos `xid` do DHCP; o `netd` o semeia do DRBG.
+    rng: u64,
 }
 
 impl Stack {
@@ -96,7 +103,39 @@ impl Stack {
             ip_id: 0,
             icmp_error_at: 0,
             tcp: Tcp::new([0; 16]),
+            dhcp: dhcp::Client::new(mac),
+            dhcp_on: false,
+            rng: 0x9e37_79b9_7f4a_7c15,
         }
+    }
+
+    /// Semeia o que precisa ser imprevisível: o segredo do ISN do TCP e os
+    /// `xid` do DHCP. Vem do DRBG do kernel (ADR 0069, item 7).
+    pub fn seed(&mut self, bytes: [u8; 16]) {
+        self.tcp.set_secret(bytes);
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&bytes[..8]);
+        self.rng ^= u64::from_le_bytes(w) | 1;
+    }
+
+    fn next_random(&mut self) -> u32 {
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        u32::try_from(x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32).unwrap_or(0)
+    }
+
+    /// Liga o cliente DHCP: a configuração passa a vir da concessão.
+    pub fn start_dhcp(&mut self) {
+        self.dhcp_on = true;
+    }
+
+    /// O cliente DHCP (estado e concessão).
+    #[must_use]
+    pub const fn dhcp(&self) -> &dhcp::Client {
+        &self.dhcp
     }
 
     /// O MAC da interface.
@@ -133,8 +172,31 @@ impl Stack {
     /// retransmissões do TCP e manda o que ele tem na fila.
     pub fn tick<L: Link>(&mut self, link: &mut L, now: u64) {
         self.frags.expire(now);
+        self.dhcp_step(link, now);
         self.tcp.poll(now);
         self.flush_tcp(link, now);
+    }
+
+    /// Passo do cliente DHCP: concessão vencida tira o endereço; mensagem
+    /// pronta sai pela difusão ou pelo servidor.
+    fn dhcp_step<L: Link>(&mut self, link: &mut L, now: u64) {
+        if !self.dhcp_on {
+            return;
+        }
+        if self.dhcp.take_expired() {
+            self.set_config(link, Config::default());
+        }
+        let r = self.next_random();
+        if let Some(p) = self.dhcp.poll(now, r) {
+            let _ = self.send_udp(
+                link,
+                dhcp::CLIENT_PORT,
+                p.dst,
+                dhcp::SERVER_PORT,
+                p.bytes(),
+                now,
+            );
+        }
     }
 
     /// Leva ao IP os segmentos que o TCP enfileirou. O que não saiu por falta
@@ -336,6 +398,9 @@ impl Stack {
             ip4::PROTO_ICMP => self.input_icmp(link, h, payload, now),
             ip4::PROTO_UDP => {
                 let d = udp::parse(h.src, h.dst, payload)?;
+                if self.dhcp_on && d.dport == dhcp::CLIENT_PORT && d.sport == dhcp::SERVER_PORT {
+                    return self.input_dhcp(link, d.data, now);
+                }
                 let unicast = h.dst == self.cfg.ip;
                 if !up.udp(h.src, d.sport, d.dport, d.data) && unicast {
                     self.port_unreachable(link, h.src, orig, now);
@@ -351,6 +416,26 @@ impl Stack {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn input_dhcp<L: Link>(&mut self, link: &mut L, msg: &[u8], now: u64) -> Option<Event> {
+        match self.dhcp.input(msg, now) {
+            Outcome::Bound(lease) => {
+                if lease.config != self.cfg {
+                    self.set_config(link, lease.config);
+                }
+                Some(Event::Lease(lease))
+            }
+            Outcome::Offered => {
+                self.dhcp_step(link, now);
+                None
+            }
+            Outcome::Nak => {
+                self.set_config(link, Config::default());
+                None
+            }
+            Outcome::None => None,
         }
     }
 

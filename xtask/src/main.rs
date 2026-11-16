@@ -1163,6 +1163,9 @@ macro_rules! m4_markers {
             "drvcli: display ok",
             "drvcli: optfs ok",
             "drvcli: storage ok",
+            // T-633: o `netd` obtém 10.0.2.15, o roteador e o DNS do servidor
+            // DHCP do QEMU (a concessão de 86400 s é a do slirp).
+            "netd: dhcp: 10.0.2.15 via 10.0.2.2 dns 10.0.2.3 por 86400 s",
             // T-630 e T-631: o `netd` liga ao `NetDevice` e resolve o MAC do
             // roteador do QEMU por ARP.
             "netd: arp: roteador 10.0.2.2 resolvido",

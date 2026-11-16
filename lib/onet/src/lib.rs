@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod arp;
+pub mod dhcp;
 pub mod eth;
 pub mod frag;
 pub mod icmp;

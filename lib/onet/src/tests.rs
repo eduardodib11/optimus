@@ -1000,3 +1000,425 @@ mod udp_e_portas {
         assert!(!p.reserve(FIRST));
     }
 }
+
+mod dhcp {
+    use crate::dhcp::{Client, Lease, Outcome, Packet, State};
+    use crate::eth::{self, Header, Mac};
+    use crate::ip4::{self, Config};
+    use crate::stack::{Event, Link, NoUpper, Stack};
+    use crate::udp;
+
+    const US: Mac = Mac([2, 0, 0, 0, 0, 1]);
+    const SRV: [u8; 4] = [10, 0, 2, 2];
+    const IP: [u8; 4] = [10, 0, 2, 15];
+    const SEC: u64 = 1_000_000_000;
+
+    #[derive(Default)]
+    struct Wire(Vec<Vec<u8>>);
+
+    impl Link for Wire {
+        fn send(&mut self, frame: &[u8]) -> bool {
+            self.0.push(frame.to_vec());
+            true
+        }
+    }
+
+    /// Opções que o servidor de teste põe na resposta.
+    struct Opts {
+        lease: Option<u32>,
+        t1: Option<u32>,
+        t2: Option<u32>,
+        mask: Option<[u8; 4]>,
+        router: Option<[u8; 4]>,
+        server: Option<[u8; 4]>,
+    }
+
+    impl Default for Opts {
+        fn default() -> Self {
+            Self {
+                lease: Some(3600),
+                t1: None,
+                t2: None,
+                mask: Some([255, 255, 255, 0]),
+                router: Some(SRV),
+                server: Some(SRV),
+            }
+        }
+    }
+
+    fn reply(req: &[u8], kind: u8, ip: [u8; 4], o: &Opts) -> Vec<u8> {
+        let mut m = vec![0u8; 240];
+        m[0] = 2;
+        m[1] = 1;
+        m[2] = 6;
+        m[4..8].copy_from_slice(&req[4..8]);
+        m[16..20].copy_from_slice(&ip);
+        m[28..34].copy_from_slice(&req[28..34]);
+        m[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        m.extend_from_slice(&[53, 1, kind]);
+        if let Some(s) = o.server {
+            m.extend_from_slice(&[54, 4]);
+            m.extend_from_slice(&s);
+        }
+        if let Some(x) = o.mask {
+            m.extend_from_slice(&[1, 4]);
+            m.extend_from_slice(&x);
+        }
+        if let Some(r) = o.router {
+            m.extend_from_slice(&[3, 4]);
+            m.extend_from_slice(&r);
+        }
+        m.extend_from_slice(&[6, 8, 10, 0, 2, 3, 8, 8, 8, 8]);
+        for (code, v) in [(51, o.lease), (58, o.t1), (59, o.t2)] {
+            if let Some(v) = v {
+                m.extend_from_slice(&[code, 4]);
+                m.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        m.push(255);
+        m
+    }
+
+    fn drive(c: &mut Client, now: u64) -> Option<Packet> {
+        c.poll(now, 0xdead_beef)
+    }
+
+    /// Procura a opção `code` numa mensagem do cliente.
+    fn opt(msg: &[u8], code: u8) -> Option<Vec<u8>> {
+        let mut o = &msg[240..];
+        while let Some(&c) = o.first() {
+            if c == 255 {
+                return None;
+            }
+            if c == 0 {
+                o = &o[1..];
+                continue;
+            }
+            let l = usize::from(o[1]);
+            if c == code {
+                return Some(o[2..2 + l].to_vec());
+            }
+            o = &o[2 + l..];
+        }
+        None
+    }
+
+    /// Leva o cliente até `Bound` às 0 s e devolve o `REQUEST` que ele mandou.
+    fn bind(c: &mut Client, o: &Opts) -> Lease {
+        let d = drive(c, 0).unwrap();
+        assert_eq!(opt(d.bytes(), 53), Some(vec![1]));
+        assert_eq!(d.dst, [255; 4]);
+        assert_eq!(c.input(&reply(d.bytes(), 2, IP, o), 0), Outcome::Offered);
+        let r = drive(c, 0).unwrap();
+        assert_eq!(opt(r.bytes(), 53), Some(vec![3]));
+        assert_eq!(opt(r.bytes(), 50), Some(IP.to_vec()));
+        assert_eq!(opt(r.bytes(), 54), Some(SRV.to_vec()));
+        let Outcome::Bound(l) = c.input(&reply(r.bytes(), 5, IP, o), 0) else {
+            panic!("sem concessão");
+        };
+        l
+    }
+
+    #[test]
+    fn descoberta_oferta_pedido_e_ack() {
+        let mut c = Client::new(US);
+        let l = bind(&mut c, &Opts::default());
+        assert_eq!(c.state(), State::Bound);
+        assert_eq!(
+            l.config,
+            Config {
+                ip: IP,
+                mask: [255, 255, 255, 0],
+                gateway: SRV
+            }
+        );
+        assert_eq!(l.dns[..l.dns_count], [[10, 0, 2, 3], [8, 8, 8, 8]]);
+        assert_eq!(l.lease_secs, 3600);
+        assert!(c.lease().is_some());
+    }
+
+    #[test]
+    fn renova_em_t1_reassocia_em_t2_e_vence() {
+        let mut c = Client::new(US);
+        bind(&mut c, &Opts::default());
+        assert!(drive(&mut c, 1_799 * SEC).is_none());
+        // T1 = metade: pedido unicast ao servidor, com `ciaddr` e sem opção 50.
+        let r = drive(&mut c, 1_800 * SEC).unwrap();
+        assert_eq!(c.state(), State::Renewing);
+        assert_eq!(r.dst, SRV);
+        assert_eq!(&r.bytes()[12..16], &IP);
+        assert_eq!(opt(r.bytes(), 50), None);
+        // Resposta de renovação reinicia o prazo.
+        let Outcome::Bound(_) = c.input(&reply(r.bytes(), 5, IP, &Opts::default()), 1_801 * SEC)
+        else {
+            panic!("renovação não aceita");
+        };
+        assert_eq!(c.state(), State::Bound);
+        assert!(drive(&mut c, 3_500 * SEC).is_none());
+        // Sem resposta até T2 (7/8): difusão.
+        let r = drive(&mut c, 1_801 * SEC + 3_150 * SEC).unwrap();
+        assert_eq!(c.state(), State::Rebinding);
+        assert_eq!(r.dst, [255; 4]);
+        // E no fim da concessão a pilha perde o endereço.
+        assert!(drive(&mut c, 1_801 * SEC + 3_600 * SEC).is_none());
+        assert!(c.take_expired());
+        assert!(!c.take_expired());
+        assert_eq!(c.state(), State::Init);
+        assert!(c.lease().is_none());
+        // Recomeça pelo `DISCOVER` depois da pausa.
+        assert!(drive(&mut c, 1_801 * SEC + 3_600 * SEC + SEC / 2).is_none());
+        assert!(drive(&mut c, 1_801 * SEC + 3_601 * SEC).is_some());
+    }
+
+    #[test]
+    fn t1_e_t2_do_servidor_valem_e_os_incoerentes_nao() {
+        let mut c = Client::new(US);
+        bind(
+            &mut c,
+            &Opts {
+                t1: Some(100),
+                t2: Some(200),
+                ..Opts::default()
+            },
+        );
+        assert!(drive(&mut c, 99 * SEC).is_none());
+        assert!(drive(&mut c, 100 * SEC).is_some());
+        let mut c = Client::new(US);
+        bind(
+            &mut c,
+            &Opts {
+                t1: Some(5000),
+                t2: Some(10),
+                ..Opts::default()
+            },
+        );
+        assert!(drive(&mut c, 1_799 * SEC).is_none());
+        assert!(drive(&mut c, 1_800 * SEC).is_some());
+    }
+
+    #[test]
+    fn discover_repete_com_espera_crescente() {
+        let mut c = Client::new(US);
+        assert!(drive(&mut c, 0).is_some());
+        assert!(drive(&mut c, SEC).is_none());
+        assert!(drive(&mut c, 2 * SEC).is_some());
+        assert!(drive(&mut c, 5 * SEC).is_none());
+        assert!(drive(&mut c, 6 * SEC).is_some());
+        assert!(drive(&mut c, 13 * SEC).is_none());
+        assert!(drive(&mut c, 14 * SEC).is_some());
+    }
+
+    #[test]
+    fn request_sem_ack_recomeca_e_nak_derruba() {
+        let mut c = Client::new(US);
+        let d = drive(&mut c, 0).unwrap();
+        c.input(&reply(d.bytes(), 2, IP, &Opts::default()), 0);
+        let r = drive(&mut c, 0).unwrap();
+        assert_eq!(c.state(), State::Requesting);
+        // Quatro tentativas no total, depois volta ao início.
+        let mut n = 1;
+        let mut t = 0;
+        while c.state() == State::Requesting {
+            t += 70 * SEC;
+            if drive(&mut c, t).is_some() {
+                n += 1;
+            }
+        }
+        assert_eq!(n, 4);
+        assert_eq!(c.state(), State::Init);
+        // `NAK` no pedido.
+        let mut c = Client::new(US);
+        let d = drive(&mut c, 0).unwrap();
+        c.input(&reply(d.bytes(), 2, IP, &Opts::default()), 0);
+        let r2 = drive(&mut c, 0).unwrap();
+        assert_eq!(
+            c.input(&reply(r2.bytes(), 6, [0; 4], &Opts::default()), 0),
+            Outcome::Nak
+        );
+        assert_eq!(c.state(), State::Init);
+        let _ = r;
+    }
+
+    #[test]
+    fn resposta_hostil_e_ignorada() {
+        let mut c = Client::new(US);
+        let d = drive(&mut c, 0).unwrap();
+        let ok = reply(d.bytes(), 2, IP, &Opts::default());
+        let mut trocar = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut m = ok.clone();
+            f(&mut m);
+            assert_eq!(c.input(&m, 0), Outcome::None, "aceitou resposta adulterada");
+        };
+        trocar(&|m| m[4] ^= 1); // xid
+        trocar(&|m| m[28] ^= 1); // chaddr
+        trocar(&|m| m[0] = 1); // op
+        trocar(&|m| m[236] = 0); // cookie
+        trocar(&|m| m[1] = 6); // htype
+        trocar(&|m| m.truncate(200));
+        trocar(&|m| m[16..20].copy_from_slice(&[0; 4])); // yiaddr zero
+        trocar(&|m| m[16..20].copy_from_slice(&[224, 0, 0, 1]));
+        trocar(&|m| m[16..20].copy_from_slice(&[127, 0, 0, 1]));
+        // Máscara não contígua, grande demais ou sem servidor.
+        for o in [
+            Opts {
+                mask: Some([255, 0, 255, 0]),
+                ..Opts::default()
+            },
+            Opts {
+                mask: Some([255, 255, 255, 255]),
+                ..Opts::default()
+            },
+            Opts {
+                mask: Some([0; 4]),
+                ..Opts::default()
+            },
+            Opts {
+                mask: None,
+                ..Opts::default()
+            },
+            Opts {
+                server: None,
+                ..Opts::default()
+            },
+        ] {
+            assert_eq!(c.input(&reply(d.bytes(), 2, IP, &o), 0), Outcome::None);
+        }
+        // Tipo certo no estado errado: `ACK` sem pedido.
+        assert_eq!(
+            c.input(&reply(d.bytes(), 5, IP, &Opts::default()), 0),
+            Outcome::None
+        );
+        // Opção que passa do fim da mensagem.
+        let mut m = ok.clone();
+        m.truncate(m.len() - 3);
+        let n = m.len();
+        m[n - 1] = 200;
+        assert_eq!(c.input(&m, 0), Outcome::None);
+    }
+
+    #[test]
+    fn roteador_fora_da_rede_e_ack_sem_prazo() {
+        let mut c = Client::new(US);
+        let o = Opts {
+            router: Some([192, 168, 0, 1]),
+            ..Opts::default()
+        };
+        let l = bind(&mut c, &o);
+        assert_eq!(l.config.gateway, [0; 4]);
+        // `ACK` sem prazo ou com prazo zero não vale.
+        let mut c = Client::new(US);
+        let d = drive(&mut c, 0).unwrap();
+        c.input(&reply(d.bytes(), 2, IP, &Opts::default()), 0);
+        let r = drive(&mut c, 0).unwrap();
+        for lease in [None, Some(0)] {
+            let o = Opts {
+                lease,
+                ..Opts::default()
+            };
+            assert_eq!(c.input(&reply(r.bytes(), 5, IP, &o), 0), Outcome::None);
+        }
+    }
+
+    #[test]
+    fn concessao_eterna_nao_renova() {
+        let mut c = Client::new(US);
+        bind(
+            &mut c,
+            &Opts {
+                lease: Some(u32::MAX),
+                ..Opts::default()
+            },
+        );
+        assert!(drive(&mut c, 1_000_000 * SEC).is_none());
+        assert_eq!(c.state(), State::Bound);
+    }
+
+    #[test]
+    fn nenhuma_mensagem_entra_em_panico() {
+        let mut c = Client::new(US);
+        let d = drive(&mut c, 0).unwrap();
+        let ok = reply(d.bytes(), 2, IP, &Opts::default());
+        for len in 0..=ok.len() {
+            c.input(&ok[..len], 0);
+        }
+        for i in 0..ok.len() {
+            let mut m = ok.clone();
+            m[i] = m[i].wrapping_add(0x55);
+            c.input(&m, 0);
+        }
+    }
+
+    fn udp_frame(dst: Mac, msg: &[u8]) -> Vec<u8> {
+        let mut seg = vec![0u8; msg.len() + 8];
+        let n = udp::build(SRV, [255; 4], 67, 68, msg, &mut seg).unwrap();
+        let h = ip4::Header {
+            id: 1,
+            dont_fragment: false,
+            more_fragments: false,
+            frag_offset: 0,
+            ttl: 64,
+            proto: ip4::PROTO_UDP,
+            src: SRV,
+            dst: [255; 4],
+        };
+        let mut pkt = vec![0u8; 1500];
+        let pn = ip4::build(&h, &seg[..n], &mut pkt).unwrap();
+        let mut out = vec![0u8; 1514];
+        let eh = Header {
+            dst,
+            src: Mac([2, 0, 0, 0, 0, 2]),
+            ethertype: eth::ETHERTYPE_IPV4,
+        };
+        let len = eth::build(&eh, &pkt[..pn], &mut out).unwrap();
+        out.truncate(len);
+        out
+    }
+
+    /// A pilha, ligada ao DHCP, sai sem endereço e entra na rede com o que
+    /// o servidor concede.
+    #[test]
+    fn pilha_obtem_o_endereco_pelo_dhcp() {
+        let mut s = Stack::new(US);
+        let mut w = Wire::default();
+        // Sem `start_dhcp`, `tick` não manda nada.
+        s.tick(&mut w, 0);
+        assert!(w.0.is_empty());
+        s.start_dhcp();
+        s.tick(&mut w, 0);
+        assert_eq!(w.0.len(), 1);
+        let (h, p) = eth::parse(&w.0[0]).unwrap();
+        assert_eq!(h.dst, Mac::BROADCAST);
+        let (ih, body) = ip4::parse(p).unwrap();
+        assert_eq!((ih.src, ih.dst), ([0; 4], [255; 4]));
+        let u = udp::parse(ih.src, ih.dst, body).unwrap();
+        assert_eq!((u.sport, u.dport), (68, 67));
+        let discover = u.data.to_vec();
+        w.0.clear();
+        // A oferta chega: o `REQUEST` sai na hora.
+        let offer = reply(&discover, 2, IP, &Opts::default());
+        assert_eq!(
+            s.input(&mut w, &mut NoUpper, &udp_frame(Mac::BROADCAST, &offer), 1),
+            None
+        );
+        assert_eq!(w.0.len(), 1);
+        let (_, p) = eth::parse(&w.0[0]).unwrap();
+        let (ih, body) = ip4::parse(p).unwrap();
+        let request = udp::parse(ih.src, ih.dst, body).unwrap().data.to_vec();
+        assert_eq!(opt(&request, 53), Some(vec![3]));
+        w.0.clear();
+        let ack = reply(&request, 5, IP, &Opts::default());
+        let ev = s.input(&mut w, &mut NoUpper, &udp_frame(Mac::BROADCAST, &ack), 2);
+        assert!(matches!(ev, Some(Event::Lease(l)) if l.config.ip == IP));
+        assert_eq!(s.ip(), IP);
+        assert_eq!(s.config().gateway, SRV);
+        // O endereço é anunciado por ARP gratuito.
+        assert_eq!(w.0.len(), 1);
+        assert_eq!(eth::parse(&w.0[0]).unwrap().0.ethertype, eth::ETHERTYPE_ARP);
+        // Resposta repetida não reconfigura nem anuncia de novo.
+        w.0.clear();
+        s.input(&mut w, &mut NoUpper, &udp_frame(Mac::BROADCAST, &ack), 3);
+        assert!(w.0.is_empty());
+        // DHCP de outro servidor/porta é ignorado pela entrada normal.
+        assert_eq!(s.dhcp().state(), State::Bound);
+    }
+}
