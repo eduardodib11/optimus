@@ -1,6 +1,6 @@
 # ADR 0066: `storaged`, descoberta por partição e filas do `BlockStore`
 
-- Status: aceita em modo autônomo (2026-11-15), **aguardando revisão do Eduardo**
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-15
 - Origem: SDD v1.0, seções 9.1 e 9.4; backlog do M5, T-520
 - Relaciona-se com: ADR 0033 (OIDL), 0034 (`svcmgr`), 0036 (anel SPSC), 0056 (itens 1, 3, 4, 6 e 8), 0061 (`BlockDevice`), 0062

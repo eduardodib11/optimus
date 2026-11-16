@@ -1,6 +1,6 @@
 # ADR 0050: Recurso `cfg` para drivers PCI e orçamento de boot
 
-- Status: aceita sob a execução autônoma autorizada pelo Eduardo (2026-11-04), por ser fiel ao SDD 8.1; fica sinalizada para revisão no PR da T-411
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-13
 - Origem: SDD v1.0, seção 8 (drivers); backlog do M4, T-411
 - Relaciona-se com: ADR 0042 (item 4), 0043, 0046, 0034

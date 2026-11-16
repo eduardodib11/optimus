@@ -1,6 +1,6 @@
 # ADR 0059: mouse PS/2 em processo próprio, no controlador 8042 compartilhado
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-14)
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-14
 - Origem: backlog do M5, T-516 (pendência da T-406)
 - Relaciona-se com: ADR 0042 (devmgr, item 4), ADR 0045 (acpid), ADR 0049 (`IoPortRange` e IRQ legada), SDD v1.0 seção 9 (drivers isolados)

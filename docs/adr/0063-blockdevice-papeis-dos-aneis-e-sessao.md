@@ -1,6 +1,6 @@
 # ADR 0063: `BlockDevice`, papéis dos anéis e sessão com `GRANT`
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-14), aguardando a revisão dele
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-14
 - Origem: backlog do M5, T-514 (interface do `virtio-blk`)
 - Relaciona-se com: ADR 0033 (OIDL), 0034 (`svcmgr`), 0036 (anel SPSC), 0056 (item 10), 0060

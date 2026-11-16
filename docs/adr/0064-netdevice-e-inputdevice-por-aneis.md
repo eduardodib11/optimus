@@ -1,6 +1,6 @@
 # ADR 0064: `NetDevice` e `InputDevice` por anéis SPSC
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-15), aguardando a revisão dele
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-15
 - Origem: backlog do M5, T-514 (interfaces dos drivers virtio de rede e de entrada)
 - Relaciona-se com: ADR 0036 (anel SPSC), 0046 (item 5), 0060 (laço do driver), 0063 (`BlockDevice`, sessão com `GRANT`)

@@ -1,6 +1,6 @@
 # ADR 0060: drivers com laço de eventos servem o contrato OIDL no mesmo laço
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-14), aguardando a revisão dele
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-508)
 - Data: 2026-11-14
 - Origem: backlog do M5, T-514 (interfaces OIDL dos drivers virtio)
 - Relaciona-se com: ADR 0033 (OIDL), 0034 (svcmgr), 0046 (virtio), 0047 (DisplayDevice), 0042 (devmgr)
