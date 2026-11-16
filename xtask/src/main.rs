@@ -2067,9 +2067,6 @@ fn check_serial(serial: &str, markers: &[&str], forbidden: &[&str]) -> Result {
 /// `cargo xtask test iommu`: os aceites do kernel e do `devmgr` com VT-d e
 /// com AMD-Vi (T-403, T-404, T-422, T-510, T-511).
 fn iommu(opts: &Options) -> Result {
-    // O cenário de drivers tem o `virtio-net`: o `netd` prova UDP e TCP contra
-    // os servidores de eco do host.
-    let _echo = HostEcho::start()?;
     let vtd = Options {
         devices: vec!["intel-iommu", "edu"],
         ..opts.clone()
@@ -2471,6 +2468,9 @@ fn test(opts: &Options) -> Result {
         iommu(opts)?;
     }
     if matches!(opts.suite.as_str(), "virtio" | "all") {
+        // Os cenários de drivers têm o `virtio-net`: o `netd` prova UDP e TCP
+        // contra os servidores de eco do host.
+        let _echo = HostEcho::start()?;
         let plain = Options {
             devices: vec![
                 "virtio-blk-pci,drive=vd0,disable-legacy=on",
