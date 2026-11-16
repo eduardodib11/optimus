@@ -997,6 +997,6 @@ mod udp_e_portas {
         assert_eq!(p.alloc(5), None);
         p.release(65535);
         assert_eq!(p.alloc(12345), Some(65535));
-        assert!(p.reserve(FIRST) == false);
+        assert!(!p.reserve(FIRST));
     }
 }

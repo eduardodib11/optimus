@@ -8,7 +8,8 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, sync::mpsc, thread};
 
@@ -2567,6 +2568,8 @@ const INTEGRATION_MARKERS: &[&str] = &[
     "devmgr: nó 00:00.0 8086:29c0 0 BARs: drvcli",
     "devmgr: nó 00:1f.0 8086:2918 0 BARs: storaged",
     "devmgr: nó 00:1f.3 8086:2930 1 BARs: netd",
+    // T-634: o `netd` manda um datagrama UDP ao servidor de eco do host.
+    "netd: udp: eco do host",
     "pcid: 7 nós publicados ao devmgr",
     // Aceite da T-405: a DSDT do QEMU é percorrida inteira e os legados
     // (teclado PS/2 e RTC) viram nós com portas e IRQ.
@@ -2611,8 +2614,52 @@ const INTEGRATION_COUNTS: &[u32] = &[1, 4];
 /// `svcmgr` → `timed`, `logd` e `memd`, com o `hello` do `root`, em
 /// `-smp 1` e `-smp 4` (só N com `--smp`). Exige os marcadores do boot
 /// normal e o desligamento ordenado de cada serviço.
+/// Servidor de eco do host que a imagem de teste do `netd` procura em
+/// 10.0.2.2 (o roteador do QEMU leva o convidado ao `127.0.0.1` do host).
+/// Para ao sair de escopo.
+struct HostEcho {
+    stop: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Porta UDP do eco (`services/netd/src/probe.rs`).
+const HOST_UDP_ECHO_PORT: u16 = 47107;
+
+impl HostEcho {
+    fn start() -> Result<Self> {
+        let udp = std::net::UdpSocket::bind(("127.0.0.1", HOST_UDP_ECHO_PORT))
+            .map_err(|e| format!("eco UDP do host na porta {HOST_UDP_ECHO_PORT}: {e}"))?;
+        udp.set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| format!("eco UDP do host: {e}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let t = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !flag.load(Ordering::Relaxed) {
+                if let Ok((n, from)) = udp.recv_from(&mut buf) {
+                    let _ = udp.send_to(&buf[..n], from);
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            threads: vec![t],
+        })
+    }
+}
+
+impl Drop for HostEcho {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
 fn integration(opts: &Options) -> Result {
     build_test(opts)?;
+    let _echo = HostEcho::start()?;
     let markers: &'static [&'static str] = Box::leak(
         BOOT_MARKERS
             .iter()
