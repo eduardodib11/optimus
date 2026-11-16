@@ -367,7 +367,8 @@ fn notificacao_por_handles() {
     assert_eq!(bind(n, n), Err(Error::AccessDenied));
     assert_eq!(bind(irq, irq), Err(Error::AccessDenied));
     assert_eq!(bind(irq, n), Ok([0; 3]));
-    assert_eq!(bind(irq, n), Err(Error::Busy));
+    // Religar troca a ligação (ADR 0072).
+    assert_eq!(bind(irq, n), Ok([0; 3]));
     assert_eq!(
         call(&space, Syscall::IrqAck, [irq, 0, 0, 0, 0, 0]),
         Ok([0; 3])

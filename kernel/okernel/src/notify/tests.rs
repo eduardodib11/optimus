@@ -53,7 +53,8 @@ fn interrupcao_mascara_ate_o_ack() {
         Err(Error::InvalidArgument)
     );
     irq.bind(Arc::clone(&n), 5).unwrap();
-    assert_eq!(irq.bind(Arc::clone(&n), 6), Err(Error::Busy));
+    // Religar troca a ligação (ADR 0072); aqui para o mesmo bit.
+    irq.bind(Arc::clone(&n), 5).unwrap();
     let (target, bits) = irq.fire().unwrap();
     assert!(Arc::ptr_eq(&target, &n) && bits == 1 << 5);
     // Mascarada: o segundo disparo espera o ack.
@@ -64,6 +65,25 @@ fn interrupcao_mascara_ate_o_ack() {
     assert!(irq.ack().is_none());
     assert!(irq.fire().is_some());
     assert_eq!(irq.vector(), 0x40);
+}
+
+/// Religar a linha (driver reiniciado, ADR 0072) troca a notificação e o
+/// bit, e solta a máscara e o disparo guardado do morto.
+#[test]
+fn religar_a_interrupcao_troca_a_ligacao_e_solta_a_mascara() {
+    let quota = MemoryQuota::root(1 << 20);
+    let irq = Interrupt::new(&quota, 0x41).unwrap();
+    let velha = Arc::new(Notification::new(&quota).unwrap());
+    let nova = Arc::new(Notification::new(&quota).unwrap());
+    irq.bind(Arc::clone(&velha), 1).unwrap();
+    assert!(irq.fire().is_some());
+    // Mascarada pelo morto, que nunca deu o ack, com um disparo guardado.
+    assert!(irq.fire().is_none());
+    irq.bind(Arc::clone(&nova), 7).unwrap();
+    let (alvo, bits) = irq.fire().unwrap();
+    assert!(Arc::ptr_eq(&alvo, &nova) && bits == 1 << 7);
+    // O disparo guardado do morto não volta no ack.
+    assert!(irq.ack().is_none());
 }
 
 /// Quem espera numa notificação que morre acorda com `PeerClosed` (ADR

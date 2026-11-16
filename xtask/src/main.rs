@@ -311,7 +311,7 @@ fn parse(args: &[String]) -> Result<Options> {
             }
             "unit" | "boot" | "kernel" | "smp" | "stress" | "hello" | "user" | "fuzz" | "oidlc"
             | "integration" | "chaos" | "iommu" | "virtio" | "keyd" | "storage" | "crash"
-            | "persist" | "caos-storaged" | "all" => {
+            | "persist" | "caos-storaged" | "caos-driver" | "caos-cliente" | "all" => {
                 opts.suite.clone_from(arg);
             }
             other => return Err(format!("opção desconhecida: {other}")),
@@ -2259,12 +2259,97 @@ fn crash(opts: &Options) -> Result {
     Ok(())
 }
 
-/// Aceite da T-541: o `svcmgr` mata o `storaged` no meio da escrita do
+/// O que o `svcmgr` mata no teste de caos do armazenamento e o que o
+/// cenário tem de mostrar na serial.
+struct Caos {
+    /// Serviço morto (`svcmgr.mata`).
+    alvo: &'static str,
+    /// Nome para as mensagens.
+    nome: &'static str,
+    markers: &'static [&'static str],
+    forbidden: &'static [&'static str],
+    /// O cliente tem de ver `Reset` em alguma rodada (com o driver morto, só
+    /// vê quem tem pedido em voo; ver [`CAOS_RESET_EXTRAS`]).
+    reset: bool,
+}
+
+/// Rodadas a mais que `caos_storaged` aceita até ver o `Reset` (T-611): o
+/// `svcmgr` mata o driver num instante sorteado e, se o cliente estava
+/// calculando sem pedido em voo, a rodada recupera sem nenhum `Reset`.
+const CAOS_RESET_EXTRAS: u64 = 3;
+
+/// Queda do `storaged` (T-541, ADR 0067).
+const CAOS_STORAGED: Caos = Caos {
+    alvo: "storaged",
+    nome: "queda do storaged",
+    markers: &[
+        "svcmgr: mata: storaged voltou",
+        "fsstress: queda vista (Some(",
+        "fsstress: recuperado: montou txg",
+        "fsstress: caos do storaged ok",
+    ],
+    forbidden: &[
+        "fsstress: erro",
+        "fsstress: perdeu commit",
+        "svcmgr: mata: storaged não voltou",
+        "svcmgr: mata: storaged não está vivo",
+        "okernel: FALTA",
+        "PÂNICO",
+    ],
+    reset: false,
+};
+
+/// Queda do driver de bloco: o `storaged` conclui com `Reset`, reconecta ao
+/// driver novo e o cliente remonta sem perder commit (T-611, ADR 0072).
+const CAOS_DRIVER: Caos = Caos {
+    alvo: "virtio-blk",
+    nome: "queda do driver de bloco",
+    markers: &[
+        "svcmgr: mata: virtio-blk voltou",
+        "storaged: driver de bloco morreu",
+        "storaged: driver de bloco de volta",
+        "fsstress: caos do storaged ok",
+    ],
+    forbidden: &[
+        "fsstress: erro",
+        "fsstress: perdeu commit",
+        "svcmgr: mata: virtio-blk não voltou",
+        "svcmgr: mata: virtio-blk não está vivo",
+        "okernel: FALTA",
+        "PÂNICO",
+    ],
+    reset: true,
+};
+
+/// Queda do cliente: o `storaged` solta a sessão e as filas do `drvcli`
+/// morto quando o novo abre a dele (T-611, ADR 0072).
+const CAOS_CLIENTE: Caos = Caos {
+    alvo: "drvcli",
+    nome: "queda do cliente",
+    markers: &[
+        "svcmgr: mata: drvcli voltou",
+        "storaged: cliente ",
+        "fsstress: cliente morto: 8 filas abertas",
+        "fsstress: caos do storaged ok",
+    ],
+    forbidden: &[
+        "fsstress: erro",
+        "fsstress: perdeu commit",
+        "svcmgr: mata: drvcli não voltou",
+        "svcmgr: mata: drvcli não está vivo",
+        "okernel: FALTA",
+        "PÂNICO",
+    ],
+    reset: false,
+};
+
+/// Aceite da T-541 e da T-611: o `svcmgr` mata o serviço de `caos` (o
+/// `storaged`, o driver de bloco ou o próprio `drvcli`) no meio da escrita do
 /// `drvcli` (`OPTIMUS_CAOS_ROUNDS` rodadas, 3 por padrão, cada uma com um
-/// atraso diferente). O cliente tem de ver `PeerClosed`, reconectar ao
-/// `storaged` reiniciado e remontar sem perder commit confirmado; no fim o
-/// xtask confere o disco como no teste de queda de energia.
-fn caos_storaged(opts: &Options) -> Result {
+/// atraso diferente). O cliente tem de se recuperar e remontar sem perder
+/// commit confirmado; no fim o xtask confere o disco como no teste de queda
+/// de energia.
+fn caos_storaged(opts: &Options, caos: &Caos) -> Result {
     let rounds: u64 = env::var("OPTIMUS_CAOS_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2273,9 +2358,12 @@ fn caos_storaged(opts: &Options) -> Result {
         .duration_since(UNIX_EPOCH)
         .map_or(1, |d| d.as_secs() ^ u64::from(d.subsec_nanos()))
         | 1;
-    println!("xtask: queda do storaged: {rounds} rodadas, semente {seed}");
+    println!("xtask: {}: {rounds} rodadas, semente {seed}", caos.nome);
     let mut last = 0;
-    for round in 1..=rounds {
+    let mut resets = 0u64;
+    let mut round = 0;
+    while round < rounds || (caos.reset && resets == 0 && round < rounds + CAOS_RESET_EXTRAS) {
+        round += 1;
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
@@ -2291,7 +2379,7 @@ fn caos_storaged(opts: &Options) -> Result {
                 "virtio-net-pci,netdev=vn0,disable-legacy=on",
                 "virtio-gpu-pci,id=vgpu,disable-legacy=on",
             ],
-            kill: Some(format!("storaged {delay}")),
+            kill: Some(format!("{} {delay}", caos.alvo)),
             ..opts.clone()
         };
         build_test(&plain)?;
@@ -2300,21 +2388,9 @@ fn caos_storaged(opts: &Options) -> Result {
             Ordering::SeqCst,
         );
         let sc = Scenario {
-            name: "queda do storaged",
-            markers: &[
-                "svcmgr: mata: storaged voltou",
-                "fsstress: queda vista (Some(",
-                "fsstress: recuperado: montou txg",
-                "fsstress: caos do storaged ok",
-            ],
-            forbidden: &[
-                "fsstress: erro",
-                "fsstress: perdeu commit",
-                "svcmgr: mata: storaged não voltou",
-                "svcmgr: mata: storaged não está vivo",
-                "okernel: FALTA",
-                "PÂNICO",
-            ],
+            name: caos.nome,
+            markers: caos.markers,
+            forbidden: caos.forbidden,
             key: None,
             ..VIRTIO_SCENARIO
         };
@@ -2335,13 +2411,29 @@ fn caos_storaged(opts: &Options) -> Result {
             .max()
             .unwrap_or(0);
         let mounted = crash_verify(confirmed)?;
+        let reset = serial.contains("fsstress: Reset visto");
+        if reset && !serial.contains("fsstress: recuperado: montou txg") {
+            return Err(format!(
+                "{}: Reset visto e o volume não foi conferido",
+                caos.nome
+            ));
+        }
+        resets += u64::from(reset);
         println!(
-            "xtask: queda do storaged {round}/{rounds} (atraso {delay} ms): confirmado txg {confirmed}, montado txg {mounted}"
+            "xtask: {} {round}/{rounds} (atraso {delay} ms{}): confirmado txg {confirmed}, montado txg {mounted}",
+            caos.nome,
+            if reset { ", Reset visto" } else { "" }
         );
         last = confirmed;
     }
+    if caos.reset && resets == 0 {
+        return Err(format!(
+            "{}: nenhum cliente viu `Reset` em {round} rodadas",
+            caos.nome
+        ));
+    }
     DISK_MODE.store(0, Ordering::SeqCst);
-    println!("xtask: queda do storaged: último commit confirmado txg {last}");
+    println!("xtask: {}: último commit confirmado txg {last}", caos.nome);
     Ok(())
 }
 
@@ -2523,7 +2615,13 @@ fn test(opts: &Options) -> Result {
         persist(opts)?;
     }
     if matches!(opts.suite.as_str(), "caos-storaged" | "all") {
-        caos_storaged(opts)?;
+        caos_storaged(opts, &CAOS_STORAGED)?;
+    }
+    if matches!(opts.suite.as_str(), "caos-driver" | "all") {
+        caos_storaged(opts, &CAOS_DRIVER)?;
+    }
+    if matches!(opts.suite.as_str(), "caos-cliente" | "all") {
+        caos_storaged(opts, &CAOS_CLIENTE)?;
     }
     if opts.suite == "smp" {
         smp(opts)?;

@@ -84,7 +84,7 @@ pub fn destroy(h: Handle) -> Result<(), Error> {
 /// na notificação `ntfy`. `Thread` e `CapSpace`: o evento é a morte da
 /// thread ou do processo; ligar de novo troca a ligação, `bits = 0` desliga
 /// e ligar depois da morte sinaliza já. `Interrupt`: `bits` é o número do
-/// bit, e a linha só se liga uma vez.
+/// bit; ligar de novo troca a ligação (ADR 0072).
 ///
 /// # Errors
 ///
