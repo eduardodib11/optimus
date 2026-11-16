@@ -3,8 +3,8 @@
 
 use crate::Error;
 use crate::msg::{
-    ClientHello, HRR_RANDOM, Reader, ServerHello, Writer, certificate, certificate_verify,
-    encrypted_extensions, ext, group, verify_input,
+    ClientHello, HRR_RANDOM, Reader, ServerHello, Writer, certificate, certificate_staple,
+    certificate_verify, encrypted_extensions, ext, group, verify_input,
 };
 
 /// Corpo de `ServerHello` com `random`, suíte e extensões cruas.
@@ -145,6 +145,58 @@ fn lista_de_certificados() {
 }
 
 #[test]
+fn ocsp_grampeado_na_folha() {
+    // Uma entrada: certificado `a` e as extensões dadas.
+    let body = |exts: &[u8], second: &[u8]| {
+        let mut entry = vec![0, 0, 1, b'a'];
+        entry.extend(u16::try_from(exts.len()).unwrap().to_be_bytes());
+        entry.extend(exts);
+        entry.extend(second);
+        let mut v = vec![0];
+        v.extend(&u32::try_from(entry.len()).unwrap().to_be_bytes()[1..]);
+        v.extend(entry);
+        v
+    };
+    let status = |t: u8, resp: &[u8]| {
+        let mut data = vec![t];
+        data.extend(&u32::try_from(resp.len()).unwrap().to_be_bytes()[1..]);
+        data.extend(resp);
+        let mut e = vec![0, 5];
+        e.extend(u16::try_from(data.len()).unwrap().to_be_bytes());
+        e.extend(data);
+        e
+    };
+    assert_eq!(certificate_staple(&body(&[], &[])), Ok(None));
+    let ok = status(1, b"resp");
+    assert_eq!(certificate_staple(&body(&ok, &[])), Ok(Some(&b"resp"[..])));
+    // Outra extensão (SCT) antes: ignorada.
+    let mut sct = vec![0, 18, 0, 1, 7];
+    sct.extend(&ok);
+    assert_eq!(certificate_staple(&body(&sct, &[])), Ok(Some(&b"resp"[..])));
+    // Só a primeira entrada conta.
+    let second = [0, 0, 1, b'b', 0, 0];
+    assert_eq!(certificate_staple(&body(&[], &second)), Ok(None));
+    // Tipo de status que não é OCSP, vazia, repetida, truncada.
+    assert_eq!(
+        certificate_staple(&body(&status(2, b"x"), &[])),
+        Err(Error::IllegalParameter)
+    );
+    assert_eq!(
+        certificate_staple(&body(&status(1, b""), &[])),
+        Err(Error::Decode)
+    );
+    let twice = [ok.clone(), ok.clone()].concat();
+    assert_eq!(
+        certificate_staple(&body(&twice, &[])),
+        Err(Error::IllegalParameter)
+    );
+    let mut cut = status(1, b"resp");
+    cut.pop();
+    cut[3] -= 1;
+    assert_eq!(certificate_staple(&body(&cut, &[])), Err(Error::Decode));
+}
+
+#[test]
 fn texto_do_certificate_verify() {
     let mut buf = [0u8; 64 + 34 + 48];
     let t = verify_input(&[0xEE; 32], &mut buf);
@@ -187,6 +239,7 @@ fn client_hello_e_escritor() {
         ids,
         [
             ext::SERVER_NAME,
+            ext::STATUS_REQUEST,
             ext::SUPPORTED_GROUPS,
             ext::SIGNATURE_ALGORITHMS,
             ext::SIGNATURE_ALGORITHMS_CERT,

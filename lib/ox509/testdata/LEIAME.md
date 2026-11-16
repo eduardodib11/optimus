@@ -23,6 +23,8 @@ Casos ruins da validação (T-651), com as mesmas chaves:
 - `teste-leaf` → `teste-vitima`: emitido por uma folha, que não é CA.
 - `teste-edca` → `teste-edmau` (excluído), `teste-edfora` (fora do permitido) e `teste-edcuringa` (curinga e IP dentro do permitido).
 
+Respostas OCSP (T-655), com o OpenSSL 3.0 e `gerar-ocsp.sh` (2026-11-16): `ocsp-ca` (P-256, `pathlen:0`) emitiu `ocsp-folha-bom` (série 0x101), `-revogado` (0x102, `keyCompromise`), `-ms` (0x104, `must-staple`) e `-desconhecido` (0x103, fora do índice), mais o `ocsp-respondedor` (delegado, `OCSPSigning`). `ocsp-resp-*` são as respostas assinadas de verdade: `bom`, `revogado`, `ms`, `desconhecido`, `delegada` (pelo respondedor), `curta` (`nextUpdate` em 1 hora), `sem-next` (sem `nextUpdate`) e `estranho` (assinada por uma chave que não é do emissor). As folhas têm o SAN `ocsp.optimus.test`.
+
 Para regerar (as chaves são descartadas; as assinaturas mudam):
 
 ```sh

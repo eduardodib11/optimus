@@ -13,8 +13,9 @@ use core::ops::Range;
 use optcrypt::mlkem768::{self, CT_LEN, DK_LEN};
 use optcrypt::secret::Secret;
 use optcrypt::x25519;
+use ox509::ocsp::{self, OcspError};
 use ox509::verify::{Anchors, ServerName, SignatureVerifier, key_fits, verify_server};
-use ox509::{Chain, Hash, PublicKey, SignatureAlgorithm};
+use ox509::{Certificate, Chain, Hash, PublicKey, SignatureAlgorithm};
 
 use crate::msg::{self, Reader, Writer, group, kind, scheme};
 use crate::record::{HEADER_LEN, MAX_PLAINTEXT, RecordKeys, content, parse_header};
@@ -28,6 +29,30 @@ const MAX_SPKI: usize = 1024;
 /// Maior `ClientHello` (a partilha híbrida tem 1 216 bytes).
 const MAX_CLIENT_HELLO: usize = 2048;
 
+/// O que fazer sem uma resposta OCSP boa (ADR 0071, item 6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OcspPolicy {
+    /// Aceita sem resposta, como os navegadores fazem com certificados sem
+    /// `must-staple`; só a revogação provada recusa.
+    #[default]
+    Opportunistic,
+    /// Exige uma resposta boa de toda folha.
+    Require,
+}
+
+/// O que o OCSP grampeado disse desta conexão.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ocsp {
+    /// Modo `pin`: não há cadeia, logo não há revogação a conferir.
+    Skipped,
+    /// O servidor não grampeou (aceito pela política).
+    Absent,
+    /// Havia resposta, mas não valeu (aceita pela política).
+    Ignored(OcspError),
+    /// Resposta válida: o certificado não está revogado.
+    Good,
+}
+
 /// Política da conexão.
 pub struct Config<'a> {
     /// Nome pedido; também vai no SNI quando é DNS.
@@ -40,6 +65,8 @@ pub struct Config<'a> {
     pub allow_classic: bool,
     /// SHA-256 do SPKI do servidor: confere só a chave (modo `pin`).
     pub pin: Option<[u8; 32]>,
+    /// Política do OCSP grampeado.
+    pub ocsp: OcspPolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +119,7 @@ struct Inner<'a, V> {
     cert_request: Option<([u8; 255], usize)>,
     spki: [u8; MAX_SPKI],
     spki_len: usize,
+    ocsp: Option<Ocsp>,
 }
 
 /// Cliente TLS 1.3.
@@ -147,6 +175,7 @@ impl<'a, V: SignatureVerifier> Client<'a, V> {
             cert_request: None,
             spki: [0; MAX_SPKI],
             spki_len: 0,
+            ocsp: None,
         };
         inner.hello_len = inner.build_hello(&random, &ek).unwrap_or(0);
         Self {
@@ -318,6 +347,12 @@ impl<'a, V: SignatureVerifier> Client<'a, V> {
     pub fn suite(&self) -> Option<Suite> {
         self.inner.suite
     }
+
+    /// O que o OCSP grampeado disse; `None` até o `Certificate` chegar.
+    #[must_use]
+    pub fn ocsp(&self) -> Option<Ocsp> {
+        self.inner.ocsp
+    }
 }
 
 impl<V: SignatureVerifier> Inner<'_, V> {
@@ -481,24 +516,24 @@ impl<V: SignatureVerifier> Inner<'_, V> {
 
     fn certificate(&mut self, body: &[u8]) -> Result<(), Error> {
         let (list, n) = msg::certificate(body)?;
+        let staple = msg::certificate_staple(body)?;
         let chain = Chain::parse(list[..n].iter().copied()).map_err(|_| Error::BadCertificate)?;
         let leaf = chain.leaf();
-        match self.cfg.pin {
-            Some(pin) => {
-                if !optcrypt::secret::ct_eq(&optcrypt::sha256::hash(leaf.spki), &pin) {
-                    return Err(Error::BadCertificate);
-                }
+        if let Some(pin) = self.cfg.pin {
+            if !optcrypt::secret::ct_eq(&optcrypt::sha256::hash(leaf.spki), &pin) {
+                return Err(Error::BadCertificate);
             }
-            None => {
-                verify_server(
-                    &chain,
-                    &self.cfg.anchors,
-                    self.cfg.name,
-                    self.cfg.now,
-                    &self.verifier,
-                )
-                .map_err(Error::Certificate)?;
-            }
+            self.ocsp = Some(Ocsp::Skipped);
+        } else {
+            let anchor = verify_server(
+                &chain,
+                &self.cfg.anchors,
+                self.cfg.name,
+                self.cfg.now,
+                &self.verifier,
+            )
+            .map_err(Error::Certificate)?;
+            self.ocsp = Some(self.revocation(&chain, &anchor, staple)?);
         }
         let spki = self
             .spki
@@ -507,6 +542,63 @@ impl<V: SignatureVerifier> Inner<'_, V> {
         spki.copy_from_slice(leaf.spki);
         self.spki_len = leaf.spki.len();
         Ok(())
+    }
+
+    /// Revogação pelo OCSP grampeado (ADR 0071, item 6): só a revogação
+    /// provada recusa, a menos que a política ou o `must-staple` exijam uma
+    /// resposta boa.
+    fn revocation(
+        &self,
+        chain: &Chain<'_>,
+        anchor: &Certificate<'_>,
+        staple: Option<&[u8]>,
+    ) -> Result<Ocsp, Error> {
+        let leaf = chain.leaf();
+        let required = self.cfg.ocsp == OcspPolicy::Require || leaf.extensions.must_staple;
+        let Some(resp) = staple else {
+            return if required {
+                Err(Error::StapleRequired)
+            } else {
+                Ok(Ocsp::Absent)
+            };
+        };
+        // O emissor da folha é quem a assinou: uma intermediária entregue
+        // ou a âncora do caminho. O `verify_server` já provou que existe.
+        let issuer = chain
+            .iter()
+            .skip(1)
+            .chain(core::iter::once(anchor))
+            .find(|c| {
+                c.subject == leaf.issuer
+                    && key_fits(leaf.signature_algorithm, &c.public_key)
+                    && self.verifier.verify(
+                        leaf.signature_algorithm,
+                        &c.public_key,
+                        leaf.tbs,
+                        leaf.signature,
+                    )
+            });
+        let result = match issuer {
+            Some(i) => ocsp::validate(resp, leaf, i, self.cfg.now, &self.verifier),
+            None => Err(OcspError::UnauthorizedSigner),
+        };
+        match result {
+            Ok(ocsp::Status::Good) => Ok(Ocsp::Good),
+            Ok(ocsp::Status::Revoked { .. }) => Err(Error::Revoked),
+            Ok(ocsp::Status::Unknown) => Self::useless(OcspError::UnknownCertificate, required),
+            Err(e) => Self::useless(e, required),
+        }
+    }
+
+    /// Resposta que não vale: erro se a política exige uma boa; senão é como
+    /// se o servidor não a tivesse mandado (um atacante no caminho poderia
+    /// simplesmente tirá-la).
+    fn useless(e: OcspError, required: bool) -> Result<Ocsp, Error> {
+        if required {
+            Err(Error::Ocsp(e))
+        } else {
+            Ok(Ocsp::Ignored(e))
+        }
     }
 
     fn certificate_verify(&mut self, body: &[u8]) -> Result<(), Error> {

@@ -32,6 +32,8 @@ pub mod ext {
     pub const SERVER_NAME: u16 = 0;
     /// `supported_groups`.
     pub const SUPPORTED_GROUPS: u16 = 10;
+    /// `status_request` (RFC 6066, seção 8): pede o OCSP grampeado.
+    pub const STATUS_REQUEST: u16 = 5;
     /// `signature_algorithms`.
     pub const SIGNATURE_ALGORITHMS: u16 = 13;
     /// `supported_versions`.
@@ -293,6 +295,10 @@ impl ClientHello<'_> {
             w.close(list)?;
             w.close(e)?;
         }
+        // `status_request`: `ocsp` (1), sem responder nem extensões.
+        w.uint(2, usize::from(ext::STATUS_REQUEST))?;
+        w.uint(2, 5)?;
+        w.put(&[1, 0, 0, 0, 0])?;
         Self::list(w, ext::SUPPORTED_GROUPS, 2, self.shares.iter().map(|s| s.0))?;
         Self::list(w, ext::SIGNATURE_ALGORITHMS, 2, scheme::VERIFY.into_iter())?;
         Self::list(
@@ -454,8 +460,8 @@ pub fn encrypted_extensions(body: &[u8]) -> Result<(), Error> {
 }
 
 /// `Certificate`: contexto (vazio para o servidor) e a lista de
-/// certificados em DER, folha primeiro. As extensões de cada entrada (OCSP,
-/// SCT) são lidas e ignoradas até a T-655.
+/// certificados em DER, folha primeiro. As extensões de cada entrada são
+/// lidas e ignoradas; o OCSP grampeado da folha sai de [`certificate_staple`].
 ///
 /// # Errors
 ///
@@ -508,4 +514,42 @@ pub fn verify_input<'b>(hash: &[u8], buf: &'b mut [u8; 64 + 34 + 48]) -> &'b [u8
     let n = 64 + LABEL.len();
     buf[n..n + hash.len()].copy_from_slice(hash);
     &buf[..n + hash.len()]
+}
+
+/// A resposta OCSP grampeada na folha (a primeira entrada do `Certificate`,
+/// extensão `status_request`, RFC 8446, seção 4.4.2.1): `status_type` 1 e o
+/// `OCSPResponse` em DER. `None` se a folha não trouxe. O corpo já passou por
+/// [`certificate`].
+///
+/// # Errors
+///
+/// `Decode` se a extensão for mal formada; `IllegalParameter` se aparecer
+/// duas vezes ou com tipo de status que não é OCSP.
+pub fn certificate_staple(body: &[u8]) -> Result<Option<&[u8]>, Error> {
+    let mut r = Reader::new(body);
+    r.vec(1)?;
+    let mut list = Reader::new(r.vec(3)?);
+    list.vec(3)?;
+    let mut exts = Reader::new(list.vec(2)?);
+    let mut staple = None;
+    while !exts.is_empty() {
+        let id = exts.u16()?;
+        let data = exts.vec(2)?;
+        if id != ext::STATUS_REQUEST {
+            continue;
+        }
+        let mut e = Reader::new(data);
+        if e.u8()? != 1 {
+            return Err(Error::IllegalParameter);
+        }
+        let resp = e.vec(3)?;
+        e.finish()?;
+        if resp.is_empty() {
+            return Err(Error::Decode);
+        }
+        if staple.replace(resp).is_some() {
+            return Err(Error::IllegalParameter);
+        }
+    }
+    Ok(staple)
 }

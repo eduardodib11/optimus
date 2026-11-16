@@ -41,6 +41,8 @@ jobs:
             target: arvore
           - dir: fuzz/ox509
             target: cert
+          - dir: fuzz/ox509
+            target: ocsp
     steps:
       - uses: actions/checkout@v5
       - name: Nightly e cargo-fuzz (só ferramenta de fuzzing)

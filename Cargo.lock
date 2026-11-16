@@ -400,6 +400,9 @@ dependencies = [
 [[package]]
 name = "ox509"
 version = "0.1.0"
+dependencies = [
+ "optcrypt",
+]
 
 [[package]]
 name = "pcid"
