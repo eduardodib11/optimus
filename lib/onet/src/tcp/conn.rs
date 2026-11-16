@@ -328,6 +328,12 @@ impl Conn {
             self.ts_recent = v;
         }
         self.sack_ok = o.sack_ok && self.offer.sack;
+        // Os timestamps gastam 12 bytes de cada segmento: sem descontá-los do
+        // MSS, um segmento cheio passa do MTU e a pilha o descarta (RFC 7323).
+        if self.ts_ok {
+            self.mss -= 12;
+            self.cwnd = INIT_CWND_SEGS * self.mss;
+        }
     }
 
     /// `TSval`: o relógio em milissegundos.

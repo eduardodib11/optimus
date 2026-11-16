@@ -1,0 +1,41 @@
+// Sockets (T-637; ADR 0068, itens 2 a 4 e 8): o `netd` serve este contrato
+// aos clientes. Sem `NetAccess` (a necessidade `net:access:` do manifesto,
+// que o `netd` pede ao `svcmgr`), nenhum socket abre; com ela, cada
+// `connect` é conferido contra a política do cliente e auditado.
+//
+// Cada socket tem dois anéis SPSC (ADR 0036) de `RING_BYTES` = 8192 bytes de
+// dados. Quem consome cria o anel:
+//
+// - recepção (`rx`): o cliente o consome e o cria (`MemoryObject` de
+//   `ostd::ring::object_bytes(8192)` bytes, com `Consumer::create`) e o entrega
+//   em `open` com a `Notification` (`SIGNAL`) em que dorme; o `netd` o abre
+//   como produtor;
+// - transmissão (`tx`): o `netd` o consome e o cria; o cliente o pega por
+//   `tx_ring` e o abre como produtor com o `SIGNAL` de `tx_signal`. O `netd`
+//   olha os anéis a cada volta (poucos ms), então o sinal é só cortesia.
+//
+// Registros do `tx` (cliente → `netd`): tipo 1, um datagrama UDP (até 1472
+// bytes) ou um pedaço do fluxo TCP (até 4088). Registros do `rx`: tipo 1,
+// dados (no TCP, no máximo um MSS por registro) e tipo 2, evento de dois
+// bytes (`código`, `argumento`): 1 conectou, 2 o outro lado fechou e tudo foi
+// lido, 3 erro (argumento: 1 recusada, 2 reiniciada, 3 sem resposta, 4 anel
+// de transmissão corrompido). O TCP só anuncia janela do tamanho do espaço
+// livre do `rx`: um cliente que não lê para o fluxo, sem perder dado.
+//
+// `connect` não espera: no TCP volta na hora e o evento 1 (ou 3) chega no
+// `rx`. UDP é "conectado": o `connect` fixa o par e só os datagramas dele
+// chegam. `proto`: 0 UDP, 1 TCP; `ip` tem o primeiro byte do endereço nos 8
+// bits altos.
+package optimus.net @1.0;
+
+enum SocketError : u8 { Denied, Limit, Quota, BadRequest, NoRoute, Busy }
+
+interface Socket {
+    open(proto: u8, rx: handle<MemoryObject>, wake: handle<Notification>) -> result<u32, SocketError>;
+    tx_ring(sock: u32) -> result<handle<MemoryObject>, SocketError>;
+    tx_signal(sock: u32) -> result<handle<Notification>, SocketError>;
+    connect(sock: u32, ip: u32, port: u16) -> result<(), SocketError>;
+    // Fecha o socket e devolve os anéis. TCP: fecha com FIN, ou com RST se
+    // ficou dado sem ler.
+    close(sock: u32) -> result<(), SocketError>;
+}

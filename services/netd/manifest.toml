@@ -14,7 +14,7 @@ restart = "always"
 
 [capabilities]
 needs = ["mem:quota:6MiB", "kernel:debug", "svc:optimus.net.NetDevice@1?"]
-provides = []
+provides = ["optimus.net.Socket@1.0"]
 
 [match]
 pci = ["8086:2930"]

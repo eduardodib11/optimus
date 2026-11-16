@@ -418,6 +418,32 @@ impl Producer {
         Ok(())
     }
 
+    /// Cabe agora um registro de `len` bytes de carga, sem gravar nem contar
+    /// descarte. Serve a quem não pode perder o dado (o fluxo TCP do `netd`):
+    /// confere antes de tirar o dado da origem.
+    pub fn fits(&mut self, len: usize) -> bool {
+        if len > MAX_PAYLOAD {
+            return false;
+        }
+        let size = record_size(len);
+        let data_len = self.shared.data_len;
+        let pos = self.shared.pos(self.tail);
+        let need = if pos + size > data_len {
+            data_len - pos + size
+        } else {
+            size
+        };
+        if data_len - self.tail.wrapping_sub(self.head) >= need {
+            return true;
+        }
+        let head = self.shared.u64_at(OFF_HEAD).load(Ordering::Acquire);
+        if head > self.tail || self.tail - head > data_len {
+            return false;
+        }
+        self.head = head;
+        data_len - (self.tail - head) >= need
+    }
+
     #[allow(clippy::cast_possible_truncation, reason = "len ≤ MAX_PAYLOAD")]
     fn record_head(&self, at: u64, len: usize, kind: u16) {
         let mut head = [0u8; RECORD_HEAD];

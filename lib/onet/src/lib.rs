@@ -32,6 +32,7 @@ pub mod nd;
 pub mod policy;
 pub mod ports;
 pub mod slaac;
+pub mod sock;
 pub mod stack;
 pub mod tcp;
 pub mod udp;
