@@ -1,0 +1,34 @@
+[package]
+name = "otls-fuzz"
+description = "Alvos de fuzz do TLS do tlsd: handshake do cliente e registro (T-658; ADR 0071, item 3). Fora da imagem: só ferramenta de fuzzing, nightly."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Crate própria, fora do workspace principal: `libfuzzer-sys` nunca entra na
+# imagem do sistema nem no `cargo xtask build`.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+optcrypt = { path = "../../lib/optcrypt" }
+otls = { path = "../../lib/otls" }
+ox509 = { path = "../../lib/ox509" }
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registro"
+path = "fuzz_targets/registro.rs"
+test = false
+doc = false
+bench = false
