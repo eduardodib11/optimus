@@ -10,6 +10,8 @@
 
 use core::ops::Range;
 
+use alloc::boxed::Box;
+use alloc::vec;
 use optcrypt::mlkem768::{self, CT_LEN, DK_LEN};
 use optcrypt::secret::Secret;
 use optcrypt::x25519;
@@ -181,17 +183,17 @@ struct Inner<'a, V> {
 /// Cliente TLS 1.3.
 pub struct Client<'a, V> {
     inner: Inner<'a, V>,
-    buf: [u8; MAX_HANDSHAKE],
+    /// Remontagem das mensagens de handshake, na heap: o cliente fica
+    /// pequeno para mudar de lugar na pilha curta de um processo.
+    buf: Box<[u8]>,
     len: usize,
 }
 
 impl<'a, V: SignatureVerifier> Client<'a, V> {
     /// Cliente novo; `rng` enche buffers com bytes do `keyd`.
     ///
-    /// O cliente tem ~40 KiB (o buffer de remontagem cabe uma cadeia
-    /// inteira); sem alocação, quem chama o guarda num estático ou na pilha
-    /// de uma tarefa que caiba.
-    #[allow(clippy::large_stack_arrays)]
+    /// O buffer de remontagem (32 KiB, cabe uma cadeia inteira) vai para a
+    /// heap; o resto do cliente tem uns 8 KiB.
     pub fn new(cfg: Config<'a, '_>, verifier: V, rng: &mut impl FnMut(&mut [u8])) -> Self {
         let mut seed = Secret::<64>::zeroed();
         rng(seed.expose_mut());
@@ -244,7 +246,7 @@ impl<'a, V: SignatureVerifier> Client<'a, V> {
         inner.hello_len = inner.build_hello(&random, &ek).unwrap_or(0);
         Self {
             inner,
-            buf: [0; MAX_HANDSHAKE],
+            buf: vec![0; MAX_HANDSHAKE].into_boxed_slice(),
             len: 0,
         }
     }
