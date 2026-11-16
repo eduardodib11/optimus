@@ -14,6 +14,8 @@
     reason = "protocolo: h, p, s e e são o cabeçalho, o pacote, o estado e o eco, como nas RFCs"
 )]
 
+extern crate alloc;
+
 pub mod arp;
 pub mod eth;
 pub mod frag;
@@ -21,6 +23,7 @@ pub mod icmp;
 pub mod ip4;
 pub mod ports;
 pub mod stack;
+pub mod tcp;
 pub mod udp;
 
 #[cfg(test)]
