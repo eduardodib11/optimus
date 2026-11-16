@@ -5,7 +5,7 @@
 // serialização de `optcrypt::keyring::Slot` (101 bytes cada). O `oidlc` ainda
 // não aceita `vec` em parâmetro (ADR 0033), então o UUID e os slots vão em
 // hexadecimal minúsculo nos pedidos; as respostas são bytes.
-package optimus.keyd @1.0;
+package optimus.keyd @1.1;
 
 enum KeydError : u8 {
     // Sem driver de console para pedir a senha.
@@ -20,7 +20,8 @@ enum KeydError : u8 {
     NoEntropy,
     // Sem memória para o Argon2id.
     Memory,
-    // Espera após senha errada ainda não passou; tente depois.
+    // Trancado: a espera após senha errada ainda não passou (tente depois),
+    // ou o volume não foi desbloqueado por quem pede (`dataset_key`).
     Locked
 }
 
@@ -32,4 +33,8 @@ interface Keyring {
     // Pede a senha (ou a chave de recuperação) e, se algum dos `slots`
     // (até 8) abre, devolve K_cab ‖ K_meta ‖ K_nome (3 × 32 bytes).
     unlock(uuid: string<32>, slots: string<1616>) -> result<vec<u8, 96>, KeydError>;
+    // K_ds(`dataset`) do volume `uuid` (ADR 0053, item 3): só para quem o
+    // desbloqueou por `unlock` (o id do serviço no badge) e só do volume
+    // desbloqueado. A K_mestra continua no `keyd`.
+    dataset_key(uuid: string<32>, dataset: u32) -> result<vec<u8, 32>, KeydError>;
 }

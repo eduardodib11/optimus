@@ -84,7 +84,7 @@ impl KeyringCliente {
         let (rotulo, m) = ostd::ipc::call_corpo(
             self.ep,
             buf,
-            0x7656513400000000,
+            0x7656513400010000,
             &pedido[..n],
             &mut saida,
             0,
@@ -111,7 +111,7 @@ impl KeyringCliente {
         let (rotulo, m) = ostd::ipc::call_corpo(
             self.ep,
             buf,
-            0x7656513400000001,
+            0x7656513400010001,
             &pedido[..n],
             &mut saida,
             0,
@@ -121,6 +121,33 @@ impl KeyringCliente {
         } else {
             Ok(Err(
                 decodifica_err_keyring_1(&saida[..m]).map_err(erro_oidl)?
+            ))
+        }
+    }
+
+    /// Método `dataset_key` (ordinal 2).
+    pub fn dataset_key(
+        &self,
+        buf: &mut ostd::ipc::Buffer,
+        uuid: &str,
+        dataset: u32,
+    ) -> Result<Result<oidl_rt::Bytes<32>, KeydError>, ostd::kabi::Error> {
+        let mut pedido = [0u8; 48];
+        let n = codifica_keyring_2(&mut pedido, &uuid, &dataset).map_err(erro_oidl)?;
+        let mut saida = [0u8; 40];
+        let (rotulo, m) = ostd::ipc::call_corpo(
+            self.ep,
+            buf,
+            0x7656513400010002,
+            &pedido[..n],
+            &mut saida,
+            0,
+        )?;
+        if rotulo >> 62 == 0 {
+            Ok(Ok(decodifica_ok_keyring_2(&saida[..m]).map_err(erro_oidl)?))
+        } else {
+            Ok(Err(
+                decodifica_err_keyring_2(&saida[..m]).map_err(erro_oidl)?
             ))
         }
     }
@@ -164,6 +191,29 @@ fn decodifica_ok_keyring_1(corpo: &[u8]) -> Result<oidl_rt::Bytes<96>, Error> {
 }
 
 fn decodifica_err_keyring_1(corpo: &[u8]) -> Result<KeydError, Error> {
+    let mut r = Reader::new(corpo, 1)?;
+    let v = KeydError::from_raw(r.u8()?).ok_or(Error::BadMessage)?;
+    r.finish()?;
+    Ok(v)
+}
+
+fn codifica_keyring_2(saida: &mut [u8], uuid: &&str, dataset: &u32) -> Result<usize, Error> {
+    let mut w = Writer::new(saida, 12)?;
+    w.seek(0);
+    w.string((*uuid), 32)?;
+    w.seek(8);
+    w.u32((*dataset))?;
+    Ok(w.finish())
+}
+
+fn decodifica_ok_keyring_2(corpo: &[u8]) -> Result<oidl_rt::Bytes<32>, Error> {
+    let mut r = Reader::new(corpo, 8)?;
+    let v = oidl_rt::Bytes::<32>::from_slice(r.bytes(32)?)?;
+    r.finish()?;
+    Ok(v)
+}
+
+fn decodifica_err_keyring_2(corpo: &[u8]) -> Result<KeydError, Error> {
     let mut r = Reader::new(corpo, 1)?;
     let v = KeydError::from_raw(r.u8()?).ok_or(Error::BadMessage)?;
     r.finish()?;

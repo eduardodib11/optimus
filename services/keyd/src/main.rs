@@ -141,7 +141,22 @@ struct Keyd<'a> {
     failures: u32,
     out: [u8; 2 * SLOT_BYTES],
     keys: [u8; 3 * KEY_LEN],
+    /// O volume desbloqueado por último: a `K_mestra` (ADR 0053, item 3: ela
+    /// nunca sai do `keyd`), o UUID e o id do serviço que o desbloqueou. Só
+    /// esse serviço pede `dataset_key`.
+    unlocked: Option<Unlocked>,
 }
+
+/// Volume desbloqueado (ADR 0053).
+struct Unlocked {
+    master: Secret<KEY_LEN>,
+    uuid: [u8; keyring::UUID_LEN],
+    /// Id do serviço (32 bits baixos do badge do `svcmgr`, ADR 0034).
+    owner: u64,
+}
+
+/// Versão menor do contrato `Keyring` que o `keyd` provê (`@1.1`, T-613).
+const VERSAO_MENOR: u16 = 1;
 
 /// Uma linha digitada: segredo, zerada ao sair de escopo.
 struct Line {
@@ -312,7 +327,16 @@ impl Keyring for Keyd<'_> {
         Ok(&self.out)
     }
 
-    fn unlock(&mut self, _ctx: &Contexto, uuid: &str, slots: &str) -> Result<&[u8], KeydError> {
+    fn dataset_key(
+        &mut self,
+        ctx: &Contexto,
+        uuid: &str,
+        dataset: u32,
+    ) -> Result<&[u8], KeydError> {
+        self.dataset(ctx, uuid, dataset)
+    }
+
+    fn unlock(&mut self, ctx: &Contexto, uuid: &str, slots: &str) -> Result<&[u8], KeydError> {
         let uuid = parse_uuid(uuid)?;
         let mut raw = [0u8; MAX_SLOTS * SLOT_BYTES];
         let n = keyring::from_hex(slots.as_bytes(), &mut raw).map_err(|_| KeydError::BadSlot)?;
@@ -336,6 +360,12 @@ impl Keyring for Keyd<'_> {
                 self.keys[..KEY_LEN].copy_from_slice(k.cab.expose());
                 self.keys[KEY_LEN..2 * KEY_LEN].copy_from_slice(k.meta.expose());
                 self.keys[2 * KEY_LEN..].copy_from_slice(k.nome.expose());
+                // A `K_mestra` fica aqui para derivar as `K_ds` de quem abriu.
+                self.unlocked = Some(Unlocked {
+                    master,
+                    uuid,
+                    owner: ctx.badge & 0xFFFF_FFFF,
+                });
                 return Ok(&self.keys);
             }
             // Senha errada: a espera dobra a cada erro (ADR 0053, item 4).
@@ -343,6 +373,23 @@ impl Keyring for Keyd<'_> {
             Self::pause(u64::from(keyring::retry_delay_secs(self.failures)) * DELAY_UNIT_NS);
         }
         Err(KeydError::WrongPassword)
+    }
+}
+
+impl Keyd<'_> {
+    /// `K_ds`(`dataset`) do volume desbloqueado, só para quem o desbloqueou.
+    fn dataset(&mut self, ctx: &Contexto, uuid: &str, dataset: u32) -> Result<&[u8], KeydError> {
+        let uuid = parse_uuid(uuid)?;
+        let Some(u) = self
+            .unlocked
+            .as_ref()
+            .filter(|u| u.uuid == uuid && u.owner == ctx.badge & 0xFFFF_FFFF)
+        else {
+            return Err(KeydError::Locked);
+        };
+        let k = keyring::dataset_key(&u.master, &uuid, dataset);
+        self.keys[..KEY_LEN].copy_from_slice(k.expose());
+        Ok(&self.keys[..KEY_LEN])
     }
 }
 
@@ -397,7 +444,13 @@ fn serve(ep: Handle, quota: Handle, svc: &mut Keyd<'_>) -> Error {
                         corpo: &corpo[..n],
                         caps: &[],
                     };
-                    match keyd_servidor::despacha_keyring(svc, 0, &entrada, &mut saida, &mut []) {
+                    match keyd_servidor::despacha_keyring(
+                        svc,
+                        VERSAO_MENOR,
+                        &entrada,
+                        &mut saida,
+                        &mut [],
+                    ) {
                         Some(d) => ipc::monta(&mut svc.session.buffer, d.rotulo, &saida[..d.corpo]),
                         None => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
                     }
@@ -454,6 +507,7 @@ fn run(s: &mut Session) {
         failures: 0,
         out: [0; 2 * SLOT_BYTES],
         keys: [0; 3 * KEY_LEN],
+        unlocked: None,
     };
     ostd::debug::print("keyd: contrato Keyring pronto");
     let e = serve(ep, quota, &mut svc);
