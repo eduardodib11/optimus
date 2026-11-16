@@ -200,6 +200,23 @@ fn x25519_tempo_constante() {
     assert!(t.abs() < LIMITE, "|t| = {t}");
 }
 
+/// ML-KEM-768: desencapsular texto cifrado legítimo (classe 0) e adulterado
+/// (classe 1, rejeição implícita) precisa levar o mesmo tempo.
+#[test]
+#[ignore = "campanha de tempo constante; rode com --ignored em --release"]
+fn mlkem768_decaps_tempo_constante() {
+    use optcrypt::mlkem768::{decaps, encaps_internal, keygen_internal};
+
+    let (ek, dk) = keygen_internal(&[1; 32], &[2; 32]);
+    let (bom, _) = encaps_internal(&ek, &[3; 32]).unwrap();
+    let mut ruim = bom;
+    ruim[0] ^= 1;
+    let t = mede(|c| {
+        black_box(decaps(&dk, black_box(if c == 0 { &bom } else { &ruim })).is_ok());
+    });
+    assert!(t.abs() < LIMITE, "|t| = {t}");
+}
+
 /// Até três rodadas, ficando com o menor |t|: um vazamento real dá |t|
 /// alto em todas, enquanto o ruído de um host compartilhado (escalonador,
 /// frequência da CPU) raramente se repete.
