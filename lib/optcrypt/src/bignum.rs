@@ -40,6 +40,19 @@ impl<const N: usize> Uint<N> {
         Some(Self(w))
     }
 
+    /// Escreve os `out.len()` bytes baixos em big-endian.
+    pub(crate) fn write_be(&self, out: &mut [u8]) {
+        let n = out.len();
+        for (i, o) in out.iter_mut().enumerate() {
+            let k = n - 1 - i;
+            *o = if k / 8 < N {
+                (self.0[k / 8] >> (8 * (k % 8))) as u8
+            } else {
+                0
+            };
+        }
+    }
+
     pub(crate) fn is_zero(&self) -> bool {
         self.0.iter().all(|&w| w == 0)
     }
@@ -251,6 +264,9 @@ mod tests {
         assert_eq!(u.0, [0x01_0203, 0]);
         assert!(Uint::<1>::from_be(&[1, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
         assert!(Uint::<1>::from_be(&[0, 0, 0, 0, 0, 0, 0, 0, 9]).is_some());
+        let mut out = [0u8; 4];
+        u.write_be(&mut out);
+        assert_eq!(out, [0, 1, 2, 3]);
         assert_eq!(u.bits(), 17);
     }
 }
