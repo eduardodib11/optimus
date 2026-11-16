@@ -199,6 +199,10 @@ fn deliver_and_start(
 /// Supervisão a mais depois de `svcmgr.mata` (T-541), em ns.
 const MATA_EXTRA_NS: u64 = 6_000_000_000;
 
+/// Quanto o desligamento espera um serviço sair sozinho depois de perder o
+/// endpoint, antes de apagá-lo (T-612).
+const SHUTDOWN_GRACE_NS: u64 = 50_000_000;
+
 /// Espera entre duas tentativas de reiniciar um serviço que não partiu.
 const RETRY_NS: u64 = 250_000_000;
 
@@ -331,12 +335,20 @@ impl Svcmgr<'_> {
     /// Fim da instância de `id` (item 9): revoga os endpoints e apaga o
     /// processo.
     fn retire(&mut self, id: u32) {
-        let _ = self.retire_keep(id, false);
+        let _ = self.retire_keep(id, false, 0);
+    }
+
+    /// Como [`Svcmgr::retire`], dando ao serviço até `SHUTDOWN_GRACE_NS`
+    /// para sair sozinho depois de perder o endpoint (ele registra a linha
+    /// de encerramento; sem a espera o processo era apagado antes de
+    /// escrevê-la, e o desligamento do kernel podia vir antes, T-612).
+    fn retire_graceful(&mut self, id: u32) {
+        let _ = self.retire_keep(id, false, SHUTDOWN_GRACE_NS);
     }
 
     /// Como [`Svcmgr::retire`]; com `keep` devolve a cota do filho em vez de
     /// apagá-la.
-    fn retire_keep(&mut self, id: u32, keep: bool) -> Option<Handle> {
+    fn retire_keep(&mut self, id: u32, keep: bool, grace_ns: u64) -> Option<Handle> {
         let s = usize::try_from(id)
             .ok()
             .and_then(|i| self.live.get_mut(i))
@@ -347,6 +359,15 @@ impl Svcmgr<'_> {
             id,
             &mut svcmgr::kernel::Kernel,
         );
+        if grace_ns != 0 {
+            let until = ostd::time::now_ns().saturating_add(grace_ns);
+            while ostd::time::now_ns() < until {
+                if matches!(ostd::cap::death(s.child.cspace), Ok(Some(_)) | Err(_)) {
+                    break;
+                }
+                ostd::thread::yield_now();
+            }
+        }
         for &(h, _) in &s.devices {
             let _ = ostd::cap::delete(h);
         }
@@ -388,7 +409,7 @@ impl Svcmgr<'_> {
                 .as_mut()
                 .map(|s| core::mem::take(&mut s.devices));
             let driver = kept.as_ref().is_some_and(|k| !k.is_empty());
-            let quota = self.retire_keep(id, driver);
+            let quota = self.retire_keep(id, driver, 0);
             if let Some(k) = kept.filter(|k| !k.is_empty()) {
                 self.kept.retain(|(d, _)| *d != id);
                 self.kept.push((id, k));
@@ -851,7 +872,7 @@ impl Svcmgr<'_> {
         let levels = self.plan.levels.clone();
         for level in levels.iter().rev() {
             for &id in level.iter().rev() {
-                self.retire(id);
+                self.retire_graceful(id);
             }
         }
         ostd::debug::print("svcmgr: serviços encerrados");
