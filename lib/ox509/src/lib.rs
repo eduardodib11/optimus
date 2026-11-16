@@ -268,6 +268,17 @@ fn hash_alg(mut r: Reader<'_>) -> Option<Hash> {
     }
 }
 
+impl<'a> PublicKey<'a> {
+    /// Chave de um `SubjectPublicKeyInfo` inteiro em DER (o `Certificate::spki`).
+    ///
+    /// # Errors
+    ///
+    /// `Malformed` se não for um SPKI válido.
+    pub fn from_spki(spki: &'a [u8]) -> Result<Self, Error> {
+        public_key(der::single(spki, tag::SEQUENCE)?.value)
+    }
+}
+
 /// `SubjectPublicKeyInfo` (conteúdo da SEQUENCE).
 fn public_key(spki: &[u8]) -> Result<PublicKey<'_>, Error> {
     let mut info = Reader::new(spki);
