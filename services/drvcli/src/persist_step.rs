@@ -5,8 +5,8 @@
 //! (o `xtask` reaproveita o disco) o `keyd` desbloqueia o mesmo cabeçalho, o
 //! volume monta numa época nova e o conteúdo da época anterior volta igual.
 //!
-//! O contrato do `keyd` devolve `K_cab ‖ K_meta ‖ K_nome`; a chave dos dados
-//! do dataset sai de `K_meta` por HKDF (o contrato não devolve `K_ds` ainda).
+//! O contrato do `keyd` devolve `K_cab ‖ K_meta ‖ K_nome` no `unlock` e a
+//! `K_ds` do dataset em `dataset_key` (ADR 0053, item 3; T-613).
 
 use super::keyd_cliente::KeyringCliente;
 use super::optfs_step::{QueueIo, Sha};
@@ -102,13 +102,6 @@ fn secret(b: &[u8]) -> Option<Secret<KEY_LEN>> {
     Some(Secret::take(&mut k))
 }
 
-/// Chave dos dados: HKDF de `K_meta` com o UUID (o contrato do `keyd` ainda
-/// não devolve `K_ds`).
-fn data_key(meta: &[u8]) -> Option<Secret<KEY_LEN>> {
-    let prk = optcrypt::hkdf::extract(&UUID, meta);
-    optcrypt::hkdf::expand_secret::<KEY_LEN>(&prk, b"optimus/optfs/v1/ds").ok()
-}
-
 /// Gravação do primeiro boot ou conferência do segundo. `None` em qualquer
 /// divergência.
 #[inline(never)]
@@ -155,6 +148,9 @@ pub fn run(
     let cab = secret(&k[..32])?;
     let meta_key = &k[32..64];
     let nome = k.get(64..96)?;
+    // K_ds do dataset 0 vem do `keyd`, que guarda a K_mestra (ADR 0053).
+    let ds = keyring.dataset_key(buf, UUID_HEX, 0).ok()?.ok()?;
+    let ds_key = ds.as_slice();
     let mut name_key = [0u8; 32];
     name_key.copy_from_slice(nome);
     if let Some(mac) = old_mac {
@@ -174,14 +170,7 @@ pub fn run(
     io.write(0, &header.encode(&cab)).ok()?;
     io.flush().ok()?;
     let make_cipher = || {
-        let mut c = VolumeCipher::new(
-            UUID,
-            0,
-            secret(meta_key)?,
-            data_key(meta_key)?,
-            epoch,
-            &salt,
-        );
+        let mut c = VolumeCipher::new(UUID, 0, secret(meta_key)?, secret(ds_key)?, epoch, &salt);
         for (e, s) in &header.epochs {
             c.add_epoch(*e, s);
         }

@@ -113,6 +113,7 @@ impl<'a> Net<'a> {
         let _ = ostd::rand::secure_fill(&mut seed);
         stack.seed(seed);
         stack.start_dhcp();
+        stack.start_ipv6();
         Ok(Self {
             s,
             nic,

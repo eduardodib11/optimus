@@ -1,6 +1,6 @@
 # ADR 0068: `netd`, contrato de sockets e capability `NetAccess`
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-16), aguardando a revisão dele
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-606)
 - Data: 2026-11-16
 - Origem: backlog do M6, T-602 (SDD v1.0, seções 10, 10.2 e 14.4)
 - Relaciona-se com: ADR 0011 (sem root), 0017 (pilha de rede própria), 0034 (manifesto e corretor do `svcmgr`), 0036 (anéis SPSC), 0060 (laço dos drivers), 0064 (`NetDevice`)

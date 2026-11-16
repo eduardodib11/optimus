@@ -1,6 +1,6 @@
 # ADR 0069: Pilha IP do `netd`: escopo e faseamento do M6
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-16), aguardando a revisão dele
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-606)
 - Data: 2026-11-16
 - Origem: backlog do M6, T-603 (SDD v1.0, seções 8.2, 10.1, 10.2 e 19)
 - Relaciona-se com: ADR 0017 (pilha própria), 0046 e 0064 (virtio-net, `NetDevice`), 0068 (contrato do `netd`)

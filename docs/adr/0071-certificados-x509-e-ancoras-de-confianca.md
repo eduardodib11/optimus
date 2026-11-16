@@ -1,6 +1,6 @@
 # ADR 0071: Certificados X.509 e âncoras de confiança
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-16), aguardando a revisão dele
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-606)
 - Data: 2026-11-16
 - Origem: backlog do M6, T-605 (SDD v1.0, seção 10.3)
 - Relaciona-se com: ADR 0004, 0017, 0018 (assinaturas híbridas do sistema), 0070 (`tlsd`)
@@ -32,3 +32,10 @@ O SDD pede parser X.509 próprio sob fuzzing, raízes na imagem de sistema e rev
 - Nova crate `lib/ox509`, com alvo de fuzzing e testes com cadeias reais e malformadas.
 - O arquivo de raízes entra na verificação do `cargo xtask check`.
 - Qualquer mudança no que está acima exige ADR nova.
+
+## Notas de implementação (T-655)
+
+- **Perfil do OCSP.** O cliente oferece `status_request` (RFC 6066, seção 8) e lê a resposta na extensão do `CertificateEntry` da folha. `ox509::ocsp::validate` confere, nesta ordem: `successful` e `id-pkix-ocsp-basic`; a assinatura, pela chave do emissor da folha ou de um respondedor delegado (certificado do próprio emissor, com `id-kp-OCSPSigning`, na validade); uma resposta única para o **número de série** da folha; `thisUpdate` (folga de 5 min) e `nextUpdate` (sem ele, a resposta vale 7 dias).
+- **Sem SHA-1.** O `CertID` leva *hashes* do nome e da chave do emissor, quase sempre SHA-1. Como o signatário já foi provado emissor (ou delegado dele), o número de série basta para saber de qual certificado se fala; o `optcrypt` não ganha SHA-1.
+- **Política.** Revogação provada recusa sempre (alerta 44). Resposta que não vale (assinatura errada, vencida, `unknown`, mal formada) conta como ausente: sem `must-staple` nem `OcspPolicy::Require` a conexão segue e o motivo fica em `Client::ocsp()` para o `logd`; com um dos dois, é erro (alerta 113 para resposta inválida e 42 para ausente). Um atacante no caminho poderia só retirar a resposta, então tratar a inválida como ausente não perde nada.
+- **Pin.** O modo `pin` não tem cadeia e não confere revogação.

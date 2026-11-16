@@ -1187,6 +1187,9 @@ macro_rules! m4_markers {
             "netcli: política: destino fora da lista negado",
             "netcli: tcp: eco do host",
             "netcli: udp: eco do host",
+            // T-640: o SLAAC forma o endereço do prefixo anunciado pelo
+            // roteador do QEMU (slirp IPv6) e o eco ICMPv6 ao roteador volta.
+            "netd: ipv6: roteador respondeu ao eco pelo endereco SLAAC",
             "drvcli: input ok",
             "drvcli: input evento 0x1e",
             "drvcli: entropy ok",
@@ -2578,6 +2581,9 @@ fn test(opts: &Options) -> Result {
         ]))?;
         // A lógica portável do kernel (biblioteca `okernel`) roda no host.
         status(cargo().args(["test", "--package", "okernel", "--lib"]))?;
+        // O cliente TLS do `tlsd` contra o `rustls` do host por soquete (T-657):
+        // crate própria, fora do workspace (`rustls` nunca entra na imagem).
+        status(cargo().args(["test", "--manifest-path", "tools/tlshost/Cargo.toml"]))?;
     }
     if matches!(opts.suite.as_str(), "boot" | "all") {
         smoke(opts, SCENARIOS)?;

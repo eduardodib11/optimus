@@ -1,0 +1,5 @@
+# Saída do cargo-fuzz; a semente versionada fica em `seeds/`.
+/target
+/corpus
+/artifacts
+/coverage

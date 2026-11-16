@@ -85,10 +85,10 @@ pub fn build(h: &Header, payload: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
-/// O quadro é para esta interface: nosso MAC, difusão ou multicast.
-/// (O `netd` ainda não entra em grupos, então só difusão passa; o multicast
-/// do ND vem com o IPv6, T-640.)
+/// O quadro é para esta interface: nosso MAC, difusão ou o multicast do
+/// IPv6 (`33:33:...`, RFC 2464). Quais grupos a interface escuta é decisão
+/// da camada IPv6.
 #[must_use]
 pub fn for_us(h: &Header, ours: Mac) -> bool {
-    h.dst == ours || h.dst == Mac::BROADCAST
+    h.dst == ours || h.dst == Mac::BROADCAST || h.dst.0[..2] == [0x33, 0x33]
 }

@@ -13,6 +13,10 @@
     clippy::many_single_char_names,
     reason = "protocolo: h, p, s e e são o cabeçalho, o pacote, o estado e o eco, como nas RFCs"
 )]
+#![allow(
+    clippy::doc_markdown,
+    reason = "ICMPv6, IPv6 e DHCPv4 são nomes de protocolo, não identificadores"
+)]
 
 extern crate alloc;
 
@@ -21,9 +25,13 @@ pub mod dhcp;
 pub mod eth;
 pub mod frag;
 pub mod icmp;
+pub mod icmp6;
 pub mod ip4;
+pub mod ip6;
+pub mod nd;
 pub mod policy;
 pub mod ports;
+pub mod slaac;
 pub mod sock;
 pub mod stack;
 pub mod tcp;

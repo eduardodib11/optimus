@@ -1,6 +1,6 @@
 # ADR 0072: `Reset` do `storaged` com driver reiniciado e cliente morto
 
-- Status: aceita sob a execução autônoma autorizada pelo Eduardo (2026-11-04), por ser fiel ao SDD 8.1 e às ADRs 0056, 0066 e 0067; fica sinalizada para revisão no PR da T-611
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-611 e T-606)
 - Data: 2026-11-16
 - Origem: SDD v1.0, seção 8.1 (falha contida e reiniciada); backlog do M6, T-611
 - Relaciona-se com: ADR 0034 (item 8, badge e geração), 0035 (item 3, `obj_bind_notify`), 0051 (driver reiniciado), 0056 (item de falhas), 0063, 0066 (item 4), 0067

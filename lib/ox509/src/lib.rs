@@ -8,13 +8,14 @@
 //! `tlsd` não usa são pulados com validação de limites.
 //!
 //! A validação da cadeia (validade, uso de chave, nome, restrições) fica
-//! em [`verify`] (T-651).
+//! em [`verify`] (T-651) e a resposta OCSP grampeada em [`ocsp`] (T-655).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 pub mod der;
 pub mod ext;
+pub mod ocsp;
 mod oid;
 pub mod verify;
 
@@ -209,7 +210,7 @@ fn name<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], Error> {
 }
 
 /// `AlgorithmIdentifier` da assinatura (conteúdo da SEQUENCE).
-fn signature_algorithm(alg: &[u8]) -> Result<SignatureAlgorithm, Error> {
+pub(crate) fn signature_algorithm(alg: &[u8]) -> Result<SignatureAlgorithm, Error> {
     use SignatureAlgorithm as S;
     let mut r = Reader::new(alg);
     let id = der::oid(r.expect(tag::OID)?.value)?;
@@ -265,6 +266,17 @@ fn hash_alg(mut r: Reader<'_>) -> Option<Hash> {
         oid::SHA384 => Some(Hash::Sha384),
         oid::SHA512 => Some(Hash::Sha512),
         _ => None,
+    }
+}
+
+impl<'a> PublicKey<'a> {
+    /// Chave de um `SubjectPublicKeyInfo` inteiro em DER (o `Certificate::spki`).
+    ///
+    /// # Errors
+    ///
+    /// `Malformed` se não for um SPKI válido.
+    pub fn from_spki(spki: &'a [u8]) -> Result<Self, Error> {
+        public_key(der::single(spki, tag::SEQUENCE)?.value)
     }
 }
 
