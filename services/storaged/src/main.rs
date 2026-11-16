@@ -49,6 +49,14 @@ const BUSY_NS: u64 = 50_000;
 const IDLE_NS: u64 = 2_000_000;
 /// Um pedido esperando mais que isso sobe ao topo (ADR 0056, item 6).
 const STARVE_NS: u64 = 100_000_000;
+/// Intervalo da sondagem do driver (ADR 0072): `info` com prazo curto.
+const PROBE_NS: u64 = 250_000_000;
+/// Rótulo do método `info` do `BlockDevice` (corpo vazio).
+const INFO_LABEL: u64 = 0x207C_D811_0000_0000;
+/// Prazo da sondagem: o driver vivo responde em microssegundos.
+const PROBE_CALL_NS: u64 = 100_000_000;
+/// Espera entre duas tentativas de reconexão ao driver.
+const REATTACH_NS: u64 = 50_000_000;
 /// Espera de uma operação do driver durante a leitura da GPT.
 const BOOT_IO_NS: u64 = 1_000_000_000;
 
@@ -81,6 +89,9 @@ const MAX_SLOTS: usize = 16;
 const DEV_SUBMIT_VA: u64 = 0x40_0000_0000;
 const DEV_DONE_VA: u64 = 0x40_0010_0000;
 const DEV_DATA_VA: u64 = 0x40_0020_0000;
+/// O driver reiniciado é mapeado no outro banco, para o novo `Dev` nascer
+/// antes de o velho ser desmapeado (ADR 0072).
+const DEV_BANK_STRIDE: u64 = 0x400_0000;
 const Q_VA: u64 = 0x41_0000_0000;
 const Q_STRIDE: u64 = 0x1000_0000;
 const Q_AREA_OFF: u64 = 0x10_0000;
@@ -179,8 +190,43 @@ struct Slot {
     kind: Kind,
 }
 
+/// As capabilities de uma ligação ao driver: apagadas quando a ligação some
+/// (driver reiniciado, ADR 0072) ou falha no meio.
+struct Held {
+    caps: [Handle; 9],
+    n: usize,
+}
+
+impl Held {
+    fn new() -> Self {
+        Self {
+            caps: [Handle::from_raw(0); 9],
+            n: 0,
+        }
+    }
+
+    /// Guarda `h` para apagar depois e o devolve.
+    fn keep(&mut self, h: Handle) -> Handle {
+        if self.n < self.caps.len() {
+            self.caps[self.n] = h;
+            self.n += 1;
+        }
+        h
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for h in &self.caps[..self.n] {
+            let _ = ostd::cap::delete(*h);
+        }
+    }
+}
+
 /// O disco: os anéis do contrato `BlockDevice` e os pedidos em voo.
 struct Dev {
+    /// O endpoint do driver, para sondá-lo.
+    ep: Handle,
     submit: Producer,
     done: Consumer,
     data: Mapping,
@@ -192,12 +238,17 @@ struct Dev {
     read_only: bool,
     nslots: usize,
     slots: [Option<Slot>; MAX_SLOTS],
+    /// Fica depois dos mapeamentos nos campos: as capabilities saem por último.
+    _held: Held,
 }
 
 impl Dev {
     /// Liga ao driver pelo contrato: `info`, a sessão, os anéis e a região de
     /// dados, e entrega o anel de conclusões (papéis da ADR 0061).
-    fn attach(ep: Handle, buf: &mut ipc::Buffer, quota: Handle) -> Option<Self> {
+    fn attach(ep: Handle, buf: &mut ipc::Buffer, quota: Handle, bank: u64) -> Option<Self> {
+        let mut held = Held::new();
+        let ep = held.keep(ep);
+        let off = bank * DEV_BANK_STRIDE;
         let cli = BlockDeviceCliente::new(ep);
         let info = cli.info(buf).ok()?.ok()?;
         if (info.sector_size != 512 && info.sector_size != 4096)
@@ -208,39 +259,51 @@ impl Dev {
         {
             return None;
         }
-        let session = BlockDeviceCliente::new(cli.session(buf).ok()?.ok()?);
-        let submit_obj = session.submit_ring(buf).ok()?.ok()?;
-        let submit_sig = session.submit_signal(buf).ok()?.ok()?;
-        let data_obj = session.data_region(buf).ok()?.ok()?;
-        let done_obj = ostd::cap::create(
-            quota,
-            ObjectType::MemoryObject,
-            ostd::ring::object_bytes(RING_BYTES),
-        )
-        .ok()?;
-        let done_ntfy = ostd::cap::create(quota, ObjectType::Notification, 0).ok()?;
-        let done =
-            Consumer::create(done_obj, DEV_DONE_VA, RING_BYTES, DEV_DONE_KIND, done_ntfy).ok()?;
-        let done_sig = ostd::cap::mint(done_ntfy, Rights::SIGNAL, 0, None).ok()?;
-        let done_rw = ostd::cap::mint(
+        let session = BlockDeviceCliente::new(held.keep(cli.session(buf).ok()?.ok()?));
+        let submit_obj = held.keep(session.submit_ring(buf).ok()?.ok()?);
+        let submit_sig = held.keep(session.submit_signal(buf).ok()?.ok()?);
+        let data_obj = held.keep(session.data_region(buf).ok()?.ok()?);
+        let done_obj = held.keep(
+            ostd::cap::create(
+                quota,
+                ObjectType::MemoryObject,
+                ostd::ring::object_bytes(RING_BYTES),
+            )
+            .ok()?,
+        );
+        let done_ntfy = held.keep(ostd::cap::create(quota, ObjectType::Notification, 0).ok()?);
+        let done = Consumer::create(
             done_obj,
-            Rights::MAP | Rights::READ | Rights::WRITE,
-            0,
-            None,
+            DEV_DONE_VA + off,
+            RING_BYTES,
+            DEV_DONE_KIND,
+            done_ntfy,
         )
         .ok()?;
+        let done_sig = held.keep(ostd::cap::mint(done_ntfy, Rights::SIGNAL, 0, None).ok()?);
+        let done_rw = held.keep(
+            ostd::cap::mint(
+                done_obj,
+                Rights::MAP | Rights::READ | Rights::WRITE,
+                0,
+                None,
+            )
+            .ok()?,
+        );
         session.attach_done(buf, done_rw, done_sig).ok()?.ok()?;
-        let submit = Producer::open(submit_obj, DEV_SUBMIT_VA, RING_BYTES, submit_sig, 1).ok()?;
+        let submit =
+            Producer::open(submit_obj, DEV_SUBMIT_VA + off, RING_BYTES, submit_sig, 1).ok()?;
         let pages = (info.data_bytes as usize / PAGE).min(MAX_SLOTS);
         let data = Mapping::new(
             SELF,
             data_obj,
-            DEV_DATA_VA,
+            DEV_DATA_VA + off,
             (pages * PAGE) as u64,
             ostd::kabi::vm::WRITE,
         )
         .ok()?;
         Some(Self {
+            ep,
             submit,
             done,
             data,
@@ -251,6 +314,7 @@ impl Dev {
             read_only: info.read_only,
             nslots: pages.min(usize::from(info.depth)),
             slots: [None; MAX_SLOTS],
+            _held: held,
         })
     }
 
@@ -348,6 +412,10 @@ impl Part {
 struct Sess {
     part: usize,
     queues: u8,
+    /// Quem abriu: id do serviço e geração (os 48 bits baixos do badge do
+    /// `svcmgr`, ADR 0034, item 8). Geração diferente do mesmo id é o
+    /// cliente que morreu e foi reiniciado (ADR 0072).
+    owner: u64,
 }
 
 /// Um pedido da fila em andamento.
@@ -402,6 +470,13 @@ struct Servico {
     quota: Handle,
     ep: Handle,
     next_epoch: u32,
+    /// Banco de endereços da ligação atual ao driver (alterna a cada
+    /// reconexão).
+    bank: u64,
+    /// O driver morreu: pedidos concluem com `Reset` até reconectar.
+    down: bool,
+    /// Próxima sondagem do driver (ns) ou, com `down`, próxima tentativa.
+    next_check: u64,
 }
 
 impl Servico {
@@ -729,6 +804,10 @@ impl Servico {
 
     /// Uma volta: colhe o driver e anda as filas.
     fn pump(&mut self) {
+        if self.down {
+            self.reset_queues();
+            return;
+        }
         loop {
             let mut progress = false;
             while let Some((slot, status)) = self.dev.next_done() {
@@ -744,6 +823,108 @@ impl Servico {
                 return;
             }
         }
+    }
+
+    /// Um `open` de `owner` prova que o cliente daquele id está numa geração
+    /// nova: as sessões de gerações antigas do mesmo id são de um cliente
+    /// morto e o `svcmgr` já revogou as capabilities dele. Fecha as filas e
+    /// devolve as sessões (ADR 0072).
+    fn reap_dead(&mut self, owner: u64) {
+        let id = owner & 0xFFFF_FFFF;
+        for sess in 0..MAX_SESSIONS {
+            let Some(s) = self.sess[sess] else { continue };
+            if s.owner & 0xFFFF_FFFF != id || s.owner == owner {
+                continue;
+            }
+            let mut queues = 0;
+            for qi in 0..MAX_QUEUES {
+                if self.queues[qi].as_ref().is_some_and(|q| q.sess == sess) {
+                    self.drop_queue(qi);
+                    queues += 1;
+                }
+            }
+            self.sess[sess] = None;
+            ostd::debug::print_fmt(format_args!(
+                "storaged: cliente {id} morreu (geração {} -> {}): sessão {sess} e {queues} fila(s) liberadas",
+                s.owner >> 32,
+                owner >> 32
+            ));
+        }
+    }
+
+    /// Dá o driver por morto: o que estava em voo e o que está esperando
+    /// concluem com `Reset`; os clientes refazem (ADR 0056, ADR 0072).
+    fn driver_down(&mut self) {
+        ostd::debug::print("storaged: driver de bloco morreu; pedidos concluem com Reset");
+        self.dev.slots = [None; MAX_SLOTS];
+        self.down = true;
+        self.next_check = 0;
+        self.reset_queues();
+    }
+
+    /// Conclui com `Reset` o pedido corrente e tudo o que os clientes já
+    /// submeteram.
+    fn reset_queues(&mut self) {
+        for qi in 0..MAX_QUEUES {
+            self.finish(qi, IoError::Reset.0);
+            let Some(q) = self.queues[qi].as_mut() else {
+                continue;
+            };
+            let mut rec = [0u8; 24];
+            while let Ok(Some((_, n))) = q.submit.pop(&mut rec) {
+                if n >= 8 {
+                    let id = u64::from_le_bytes(rec[..8].try_into().unwrap_or([0; 8]));
+                    q.complete(id, IoError::Reset.0);
+                }
+            }
+        }
+    }
+
+    /// Vigia o driver (ADR 0072): sonda de tempos em tempos e quando há
+    /// pedido em voo há muito tempo; com o driver morto, tenta ligar ao
+    /// novo. Só roda com o buffer livre (laço sem resposta pendente).
+    fn maintain(&mut self, s: &mut Session) {
+        let now = ostd::time::now_ns();
+        if now < self.next_check {
+            return;
+        }
+        if self.down {
+            self.next_check = now.saturating_add(REATTACH_NS);
+            self.reattach(s);
+            return;
+        }
+        self.next_check = now.saturating_add(PROBE_NS);
+        let deadline = now.saturating_add(PROBE_CALL_NS);
+        let r = ipc::call_palavras(
+            self.dev.ep,
+            INFO_LABEL,
+            [0; ostd::kabi::MSG_REG_WORDS],
+            deadline,
+        );
+        if matches!(r, Err(Error::PeerClosed | Error::InvalidHandle)) {
+            self.driver_down();
+        }
+    }
+
+    /// Liga ao `BlockDevice` novo que o `svcmgr` partiu.
+    fn reattach(&mut self, s: &mut Session) {
+        let iid = interface_id(b"optimus.block.BlockDevice");
+        let deadline = ostd::time::now_ns().saturating_add(CALL_NS);
+        let Ok(Ok(ep)) = s.connect_svc_until(iid, 0, deadline) else {
+            return;
+        };
+        let bank = self.bank ^ 1;
+        let Some(dev) = Dev::attach(ep, &mut s.buffer, self.quota, bank) else {
+            return;
+        };
+        if dev.sectors != self.dev.sectors || dev.sector_size != self.dev.sector_size {
+            return;
+        }
+        self.dev = dev;
+        self.bank = bank;
+        self.down = false;
+        self.next_check = ostd::time::now_ns().saturating_add(PROBE_NS);
+        ostd::debug::print("storaged: driver de bloco de volta; E/S retomada");
     }
 
     fn busy(&self) -> bool {
@@ -859,6 +1040,9 @@ impl Storage for Servico {
             .iter()
             .position(|p| p.is_some_and(|p| p.name() == name.as_bytes()))
             .ok_or(IoError::BadRequest)?;
+        // Os 48 bits baixos do badge são o id e a geração do cliente.
+        let owner = ctx.badge & 0xFFFF_FFFF_FFFF;
+        self.reap_dead(owner);
         let slot = self
             .sess
             .iter()
@@ -866,7 +1050,11 @@ impl Storage for Servico {
             .ok_or(IoError::Full)?;
         let badge = BADGE_TAG | (slot as u64) << 8 | part as u64;
         let cap = grant(self.ep, Rights::SEND | Rights::GRANT, badge)?;
-        self.sess[slot] = Some(Sess { part, queues: 0 });
+        self.sess[slot] = Some(Sess {
+            part,
+            queues: 0,
+            owner,
+        });
         Ok(cap)
     }
 }
@@ -976,7 +1164,7 @@ impl BlockStore for Servico {
 }
 
 /// Atende `Storage` e `BlockStore` em `ep` até o endpoint ser revogado.
-fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, svc: &mut Servico) -> Error {
+fn serve(ep: Handle, quota: Handle, s: &mut Session, svc: &mut Servico) -> Error {
     let reply = match ostd::cap::create(quota, ObjectType::Reply, 0) {
         Ok(r) => r,
         Err(e) => return e,
@@ -994,6 +1182,7 @@ fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, svc: &mut Servico) ->
             Ok(rec) => rec,
             Err(Error::TimedOut | Error::PeerClosed) => {
                 svc.pump();
+                svc.maintain(s);
                 continue;
             }
             Err(e) => return e,
@@ -1001,11 +1190,11 @@ fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, svc: &mut Servico) ->
         let ctx_badge = rec.badge;
         let mut caps = [0u64; 4];
         let ncaps = usize::from(rec.msg.info.caps).min(caps.len());
-        for (dst, src) in caps.iter_mut().zip(buf.get().caps.iter()).take(ncaps) {
+        for (dst, src) in caps.iter_mut().zip(s.buffer.get().caps.iter()).take(ncaps) {
             *dst = u64::from(*src);
         }
         let mut caps_out = [0u64; 1];
-        let built = match ipc::copia(buf, &rec.msg, &mut corpo) {
+        let built = match ipc::copia(&mut s.buffer, &rec.msg, &mut corpo) {
             Ok(n) => {
                 let entrada = storage_servidor::Entrada {
                     rotulo: rec.msg.label,
@@ -1021,13 +1210,15 @@ fn serve(ep: Handle, quota: Handle, buf: &mut ipc::Buffer, svc: &mut Servico) ->
                     _ => None,
                 };
                 match despacho {
-                    Some(d) => ipc::monta(buf, d.rotulo, &saida[..d.corpo]).map(|mut m| {
-                        if d.caps == 1 {
-                            buf.get().caps[0] = caps_out[0] as u32;
-                            m.info.caps = 1;
-                        }
-                        m
-                    }),
+                    Some(d) => {
+                        ipc::monta(&mut s.buffer, d.rotulo, &saida[..d.corpo]).map(|mut m| {
+                            if d.caps == 1 {
+                                s.buffer.get().caps[0] = caps_out[0] as u32;
+                                m.info.caps = 1;
+                            }
+                            m
+                        })
+                    }
                     None => Ok(Message::new(osvc::REPLY_BAD_MESSAGE, &[])),
                 }
             }
@@ -1089,7 +1280,7 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
         .map(Handle::from_raw)
         .ok_or("descritor sem o endpoint do Storage")?;
     let dev_ep = connect(s, b"optimus.block.BlockDevice").ok_or("sem disco")?;
-    let mut dev = Dev::attach(dev_ep, &mut s.buffer, quota).ok_or("ligar ao BlockDevice")?;
+    let mut dev = Dev::attach(dev_ep, &mut s.buffer, quota, 0).ok_or("ligar ao BlockDevice")?;
     let parts = load_parts(&mut dev).ok_or("sem GPT")?;
     let mut line = [0u8; 128];
     let mut at = 0;
@@ -1116,9 +1307,12 @@ fn run(s: &mut Session, quota: Handle) -> Result<(), &'static str> {
         quota,
         ep,
         next_epoch: 0,
+        bank: 0,
+        down: false,
+        next_check: ostd::time::now_ns().saturating_add(PROBE_NS),
     };
     ostd::debug::print("storaged: contrato BlockStore pronto");
-    let e = serve(ep, quota, &mut s.buffer, &mut svc);
+    let e = serve(ep, quota, s, &mut svc);
     ostd::debug::print_fmt(format_args!("storaged: encerrado ({e:?})"));
     Ok(())
 }

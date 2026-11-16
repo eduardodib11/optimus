@@ -30,5 +30,5 @@ A ADR 0056 promete que, se o `storaged` morre, os clientes veem o `BlockStore` f
 
 ## Consequências
 
-- Fica fora desta ADR o cliente morto (sessão ocupada até `release`) e o `Reset` com o driver reiniciado: continuam como pendência do M5.
+- Fica fora desta ADR o cliente morto (sessão ocupada até `release`) e o `Reset` com o driver reiniciado: tratados na ADR 0072 (T-611).
 - Qualquer mudança no que está acima exige ADR nova.

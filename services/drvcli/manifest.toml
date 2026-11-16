@@ -9,7 +9,7 @@
 name = "drvcli"
 binary = "drvcli"
 priority = 110
-restart = "never"
+restart = "on-failure"
 
 [capabilities]
 needs = [

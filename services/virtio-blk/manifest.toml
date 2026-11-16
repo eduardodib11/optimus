@@ -5,7 +5,7 @@
 name = "virtio-blk"
 binary = "virtio-blk"
 priority = 120
-restart = "never"
+restart = "on-failure"
 
 [capabilities]
 needs = ["mem:quota:768KiB", "kernel:debug"]
