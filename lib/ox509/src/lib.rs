@@ -8,13 +8,14 @@
 //! `tlsd` não usa são pulados com validação de limites.
 //!
 //! A validação da cadeia (validade, uso de chave, nome, restrições) fica
-//! em [`verify`] (T-651).
+//! em [`verify`] (T-651) e a resposta OCSP grampeada em [`ocsp`] (T-655).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 pub mod der;
 pub mod ext;
+pub mod ocsp;
 mod oid;
 pub mod verify;
 
@@ -209,7 +210,7 @@ fn name<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], Error> {
 }
 
 /// `AlgorithmIdentifier` da assinatura (conteúdo da SEQUENCE).
-fn signature_algorithm(alg: &[u8]) -> Result<SignatureAlgorithm, Error> {
+pub(crate) fn signature_algorithm(alg: &[u8]) -> Result<SignatureAlgorithm, Error> {
     use SignatureAlgorithm as S;
     let mut r = Reader::new(alg);
     let id = der::oid(r.expect(tag::OID)?.value)?;
