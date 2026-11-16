@@ -16,6 +16,13 @@ As cadeias `teste-*`:
 - `teste-root` (P-256, ECDSA SHA-256) → `teste-int` (RSA 2048, `pathlen:0`) → `teste-leaf` (P-256, assinada com RSA-PSS SHA-256; SAN com DNS, curinga, IPv4 e IPv6; `must-staple`).
 - `teste-edca` (Ed25519, `nameConstraints`) → `teste-edleaf` (Ed25519, `casa.lan`).
 
+Casos ruins da validação (T-651), com as mesmas chaves:
+
+- `teste-int` → `teste-int2` (CA) → `teste-leaf2`: estoura o `pathlen:0` da `teste-int`.
+- `teste-int` → `teste-cliente`: só `clientAuth`.
+- `teste-leaf` → `teste-vitima`: emitido por uma folha, que não é CA.
+- `teste-edca` → `teste-edmau` (excluído), `teste-edfora` (fora do permitido) e `teste-edcuringa` (curinga e IP dentro do permitido).
+
 Para regerar (as chaves são descartadas; as assinaturas mudam):
 
 ```sh
@@ -37,7 +44,26 @@ openssl genpkey -algorithm ed25519 -out edl.key
 openssl req -new -key edl.key -subj "/CN=casa.lan" -out edl.csr
 openssl x509 -req -in edl.csr -CA edca.pem -CAkey ed.key -days 365 -set_serial 7 \
   -extfile gerar.cnf -extensions edleaf -out edleaf.pem
-for f in root int leaf edca edleaf; do openssl x509 -in $f.pem -outform der -out teste-$f.der; done
+openssl ecparam -name prime256v1 -genkey -noout -out int2.key
+openssl req -new -key int2.key -subj "/C=BR/O=Optimus Teste/CN=Intermediaria 2" -out int2.csr
+openssl x509 -req -in int2.csr -CA int.pem -CAkey int.key -sha256 -days 3650 -set_serial 0x2002 \
+  -extfile gerar.cnf -extensions int2 -out int2.pem
+openssl ecparam -name prime256v1 -genkey -noout -out leaf2.key
+openssl req -new -key leaf2.key -subj "/CN=fundo.optimus.test" -out leaf2.csr
+openssl x509 -req -in leaf2.csr -CA int2.pem -CAkey int2.key -sha256 -days 365 -set_serial 0x22 \
+  -extfile gerar.cnf -extensions leaf2 -out leaf2.pem
+openssl x509 -req -in leaf.csr -CA int.pem -CAkey int.key -sha256 -days 365 -set_serial 0x33 \
+  -extfile gerar.cnf -extensions cliente -out cliente.pem
+openssl req -new -key leaf2.key -subj "/CN=vitima.optimus.test" -out vit.csr
+openssl x509 -req -in vit.csr -CA leaf.pem -CAkey leaf.key -sha256 -days 365 -set_serial 0x44 \
+  -extfile gerar.cnf -extensions vitima -out vitima.pem
+for x in edmau edfora edcuringa; do
+  openssl x509 -req -in edl.csr -CA edca.pem -CAkey ed.key -days 365 -set_serial 0x55 \
+    -extfile gerar.cnf -extensions $x -out $x.pem
+done
+for f in root int leaf edca edleaf int2 leaf2 cliente vitima edmau edfora edcuringa; do
+  openssl x509 -in $f.pem -outform der -out teste-$f.der
+done
 ```
 
 Conferido também contra as 119 raízes do conjunto da Mozilla (via

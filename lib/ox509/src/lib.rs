@@ -7,8 +7,8 @@
 //! [`ext::MAX_EXTENSIONS`] extensões ou extensões repetidas. Campos que o
 //! `tlsd` não usa são pulados com validação de limites.
 //!
-//! Aqui só se lê. A validação da cadeia (assinaturas, validade, uso de
-//! chave, nome) é da T-651.
+//! A validação da cadeia (validade, uso de chave, nome, restrições) fica
+//! em [`verify`] (T-651).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -16,6 +16,7 @@
 pub mod der;
 pub mod ext;
 mod oid;
+pub mod verify;
 
 use der::{Reader, tag};
 pub use ext::Extensions;
