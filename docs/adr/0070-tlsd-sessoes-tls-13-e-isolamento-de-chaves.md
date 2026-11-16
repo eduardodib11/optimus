@@ -1,6 +1,6 @@
 # ADR 0070: `tlsd`: sessões TLS 1.3 e isolamento de chaves
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-16), aguardando a revisão dele
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-606)
 - Data: 2026-11-16
 - Origem: backlog do M6, T-604 (SDD v1.0, seção 10.3)
 - Relaciona-se com: ADR 0004 (cripto verificada), 0017 (TLS 1.3 híbrido), 0053 (cripto de volume), 0068 (`netd`), 0071 (certificados)

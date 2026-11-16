@@ -1,6 +1,6 @@
 # ADR 0071: Certificados X.509 e âncoras de confiança
 
-- Status: aceita (modo autônomo de Eduardo, 2026-11-16), aguardando a revisão dele
+- Status: aceita; revisada e aprovada pelo Eduardo em 2026-11-16 (T-606)
 - Data: 2026-11-16
 - Origem: backlog do M6, T-605 (SDD v1.0, seção 10.3)
 - Relaciona-se com: ADR 0004, 0017, 0018 (assinaturas híbridas do sistema), 0070 (`tlsd`)
