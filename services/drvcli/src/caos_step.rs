@@ -20,6 +20,11 @@ use ostd::ring::Consumer;
 
 /// Commits depois da recuperação que encerram o cenário.
 const AFTER: u32 = 1;
+/// Sem queda nenhuma até aqui, o cenário encerra: o `svcmgr` mata o alvo até
+/// 9 s depois de pôr os serviços em `Running` e o driver volta em ~100 ms. O
+/// driver morto só dá `Reset` a quem tem pedido em voo; quem estava
+/// calculando não vê nada, e o `xtask` confere o disco do mesmo jeito.
+const QUIET_NS: u64 = 16_000_000_000;
 
 /// Fim de uma tentativa que não foi um erro do cenário.
 enum Fim {
@@ -33,7 +38,13 @@ enum Fim {
 /// verdadeiro depois de uma queda: o volume tem de montar com um txg que não
 /// seja menor que o último confirmado, com o conteúdo desse txg.
 #[inline(never)]
-fn attempt(f: &mut Fila, blocks: u64, confirmed: &mut u64, check: bool) -> Option<Fim> {
+fn attempt(
+    f: &mut Fila,
+    blocks: u64,
+    confirmed: &mut u64,
+    check: bool,
+    deadline: u64,
+) -> Option<Fim> {
     let h = Sha;
     let mut io = QueueIo::new(f, blocks);
     let mounted = mount(&mut io, &h);
@@ -119,7 +130,7 @@ fn attempt(f: &mut Fila, blocks: u64, confirmed: &mut u64, check: bool) -> Optio
         *confirmed = txg;
         k += 1;
         ostd::debug::print_fmt(format_args!("fsstress: commit {k} txg {txg}"));
-        if check && k >= AFTER {
+        if (check && k >= AFTER) || (!check && ostd::time::now_ns() >= deadline) {
             return Some(Fim::Pronto);
         }
     }
@@ -200,6 +211,7 @@ pub fn run(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
     let mut dead = false;
     let mut retries = 0u32;
     let mut resets = 0u32;
+    let deadline = ostd::time::now_ns().saturating_add(QUIET_NS);
     'outer: loop {
         // Uma queda no meio de `open` ou da abertura da fila também vale.
         let Some((mut q, blocks)) = open_caos(s, ep, quota) else {
@@ -212,7 +224,7 @@ pub fn run(s: &mut Session, ep: Handle, quota: Handle) -> Option<()> {
             continue;
         };
         loop {
-            match attempt(&mut q, blocks, &mut confirmed, dead)? {
+            match attempt(&mut q, blocks, &mut confirmed, dead, deadline)? {
                 Fim::Pronto => return Some(()),
                 Fim::Queda => {
                     // O `BlockStore` morreu e o `svcmgr` revogou a instância:

@@ -2262,7 +2262,15 @@ struct Caos {
     nome: &'static str,
     markers: &'static [&'static str],
     forbidden: &'static [&'static str],
+    /// O cliente tem de ver `Reset` em alguma rodada (com o driver morto, só
+    /// vê quem tem pedido em voo; ver [`CAOS_RESET_EXTRAS`]).
+    reset: bool,
 }
+
+/// Rodadas a mais que `caos_storaged` aceita até ver o `Reset` (T-611): o
+/// `svcmgr` mata o driver num instante sorteado e, se o cliente estava
+/// calculando sem pedido em voo, a rodada recupera sem nenhum `Reset`.
+const CAOS_RESET_EXTRAS: u64 = 3;
 
 /// Queda do `storaged` (T-541, ADR 0067).
 const CAOS_STORAGED: Caos = Caos {
@@ -2282,6 +2290,7 @@ const CAOS_STORAGED: Caos = Caos {
         "okernel: FALTA",
         "PÂNICO",
     ],
+    reset: false,
 };
 
 /// Queda do driver de bloco: o `storaged` conclui com `Reset`, reconecta ao
@@ -2293,8 +2302,6 @@ const CAOS_DRIVER: Caos = Caos {
         "svcmgr: mata: virtio-blk voltou",
         "storaged: driver de bloco morreu",
         "storaged: driver de bloco de volta",
-        "fsstress: Reset visto",
-        "fsstress: recuperado: montou txg",
         "fsstress: caos do storaged ok",
     ],
     forbidden: &[
@@ -2305,6 +2312,7 @@ const CAOS_DRIVER: Caos = Caos {
         "okernel: FALTA",
         "PÂNICO",
     ],
+    reset: true,
 };
 
 /// Queda do cliente: o `storaged` solta a sessão e as filas do `drvcli`
@@ -2326,6 +2334,7 @@ const CAOS_CLIENTE: Caos = Caos {
         "okernel: FALTA",
         "PÂNICO",
     ],
+    reset: false,
 };
 
 /// Aceite da T-541 e da T-611: o `svcmgr` mata o serviço de `caos` (o
@@ -2345,7 +2354,10 @@ fn caos_storaged(opts: &Options, caos: &Caos) -> Result {
         | 1;
     println!("xtask: {}: {rounds} rodadas, semente {seed}", caos.nome);
     let mut last = 0;
-    for round in 1..=rounds {
+    let mut resets = 0u64;
+    let mut round = 0;
+    while round < rounds || (caos.reset && resets == 0 && round < rounds + CAOS_RESET_EXTRAS) {
+        round += 1;
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
@@ -2393,11 +2405,26 @@ fn caos_storaged(opts: &Options, caos: &Caos) -> Result {
             .max()
             .unwrap_or(0);
         let mounted = crash_verify(confirmed)?;
+        let reset = serial.contains("fsstress: Reset visto");
+        if reset && !serial.contains("fsstress: recuperado: montou txg") {
+            return Err(format!(
+                "{}: Reset visto e o volume não foi conferido",
+                caos.nome
+            ));
+        }
+        resets += u64::from(reset);
         println!(
-            "xtask: {} {round}/{rounds} (atraso {delay} ms): confirmado txg {confirmed}, montado txg {mounted}",
-            caos.nome
+            "xtask: {} {round}/{rounds} (atraso {delay} ms{}): confirmado txg {confirmed}, montado txg {mounted}",
+            caos.nome,
+            if reset { ", Reset visto" } else { "" }
         );
         last = confirmed;
+    }
+    if caos.reset && resets == 0 {
+        return Err(format!(
+            "{}: nenhum cliente viu `Reset` em {round} rodadas",
+            caos.nome
+        ));
     }
     DISK_MODE.store(0, Ordering::SeqCst);
     println!("xtask: {}: último commit confirmado txg {last}", caos.nome);
