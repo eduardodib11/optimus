@@ -221,6 +221,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "netd"
+version = "0.1.0"
+dependencies = [
+ "oidl-rt",
+ "onet",
+ "optcrypt",
+ "ostd",
+ "osvc",
+]
+
+[[package]]
 name = "oalloc"
 version = "0.1.0"
 dependencies = [
@@ -313,6 +324,10 @@ dependencies = [
  "mkmanifest",
  "odev",
 ]
+
+[[package]]
+name = "onet"
+version = "0.1.0"
 
 [[package]]
 name = "opci"

@@ -1,0 +1,23 @@
+# Manifesto do `netd` (T-630; ADR 0068 e 0069): a pilha IP. Liga ao
+# `NetDevice` do driver de rede e, nas tarefas seguintes, serve os sockets.
+# Mesma partida do `storaged` (ADR 0066): o driver só existe depois que o
+# `devmgr` casa o dispositivo, então o `netd` parte pelo `devmgr`, casado com
+# o controlador SMBus do q35 (`8086:2930`), que existe em toda VM do teste e
+# não tem outro driver. Casar por classe de rede fica para quando o `devmgr`
+# souber. O `netd` religa o dispositivo quando o `svcmgr` o reinicia (ADR
+# 0068, item 6; reanexo como o da ADR 0067).
+[service]
+name = "netd"
+binary = "netd"
+priority = 150
+restart = "always"
+
+[capabilities]
+needs = ["mem:quota:768KiB", "kernel:debug", "svc:optimus.net.NetDevice@1?"]
+provides = []
+
+[match]
+pci = ["8086:2930"]
+
+[limits]
+max_threads = 1

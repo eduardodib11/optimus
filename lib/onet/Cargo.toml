@@ -1,0 +1,13 @@
+[package]
+name = "onet"
+description = "Protocolos da pilha IP do netd: Ethernet, ARP, IPv4, ICMP, UDP e TCP (ADR 0017, 0068 e 0069)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+bench = false
+
+[lints]
+workspace = true

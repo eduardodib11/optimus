@@ -18,7 +18,6 @@ needs = [
   "svc:optimus.console.Console@1?",
   "svc:optimus.display.DisplayDevice@1?",
   "svc:optimus.storage.Storage@1?",
-  "svc:optimus.net.NetDevice@1?",
   "svc:optimus.input.InputDevice@1?",
   "svc:optimus.dev.EntropySource@1?",
   "svc:optimus.keyd.Keyring@1?",
