@@ -958,12 +958,13 @@ fn transferencia_de_64_mib_com_2_por_cento_de_perda() {
     assert!(net.a.budget_left() <= super::MEM_BUDGET);
     // Contagens fixas para o gate da T-674 (a semente da rede simulada é
     // fixa): 2 % de perda em ~45 mil segmentos dão ~920 retransmissões, quase
-    // todas por recuperação rápida (SACK e RACK), nenhuma por RTO.
+    // todas por recuperação rápida (SACK e RACK), nenhuma por RTO. O MSS
+    // efetivo desconta os 12 bytes dos timestamps (1448), por isso o total.
     assert_eq!(
         st,
         super::Stats {
-            retx_segments: 924,
-            fast_recoveries: 779,
+            retx_segments: 913,
+            fast_recoveries: 773,
             timeouts: 0,
             probes: 0,
             keepalives: 0,
