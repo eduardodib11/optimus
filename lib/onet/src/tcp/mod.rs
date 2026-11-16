@@ -12,12 +12,14 @@ use crate::ports::Ephemeral;
 
 pub mod buf;
 mod conn;
+mod cubic;
+mod sack;
 pub mod wire;
 
 #[cfg(test)]
 mod tests;
 
-pub use conn::{BUF_BYTES, State};
+pub use conn::{BUF_BYTES, Features, Keepalive, State, Stats};
 use conn::{Conn, Event};
 use wire::{ACK, RST, SYN};
 
@@ -28,7 +30,7 @@ pub const MAX_CONNS: usize = 32;
 /// Escutas ao mesmo tempo.
 pub const MAX_LISTENERS: usize = 8;
 /// Segmentos fora de ordem guardados por conexão.
-pub const MAX_OOO: usize = 8;
+pub const MAX_OOO: usize = 256;
 /// Memória que os buffers de todas as conexões podem reservar (a cota do
 /// `netd` paga o heap; passar disso derrubaria o processo).
 pub const MEM_BUDGET: usize = 2_560 * 1024;
@@ -98,6 +100,7 @@ pub struct Tcp {
     rst_at: u64,
     /// Reserva de memória que ainda cabe em buffers.
     budget: usize,
+    features: Features,
     /// Último relógio visto, para o que não recebe `now` (a leitura).
     now: u64,
     /// Soma ao ISN nos testes, para exercitar a volta do número de sequência.
@@ -126,6 +129,7 @@ impl Tcp {
             ports: Ephemeral::new(),
             rst_at: 0,
             budget: MEM_BUDGET,
+            features: Features::ALL,
             now: 0,
             #[cfg(test)]
             isn_bias: 0,
@@ -161,12 +165,46 @@ impl Tcp {
     /// limite de cada um: o máximo enquanto a cota folga, menos com muitas
     /// conexões; `None` quando nem o mínimo cabe.
     fn reserve(&mut self) -> Option<usize> {
-        let limit = (self.budget / 4).clamp(MIN_BUF, BUF_BYTES);
-        if self.budget < 2 * limit {
+        // Três vezes o limite: envio, recepção e segmentos fora de ordem (que
+        // cabem na janela de recepção).
+        let limit = (self.budget / 6).clamp(MIN_BUF, BUF_BYTES);
+        if self.budget < 3 * limit {
             return None;
         }
-        self.budget -= 2 * limit;
+        self.budget -= 3 * limit;
         Some(limit)
+    }
+
+    /// Reserva de memória que ainda cabe em buffers.
+    #[must_use]
+    pub const fn budget_left(&self) -> usize {
+        self.budget
+    }
+
+    /// Escolhe as extensões que as conexões novas oferecem.
+    pub const fn set_features(&mut self, f: Features) {
+        self.features = f;
+    }
+
+    /// Liga ou desliga o Nagle da conexão (`TCP_NODELAY`).
+    pub fn set_nodelay(&mut self, id: ConnId, on: bool) {
+        if let Some(Some(c)) = self.conns.get_mut(id) {
+            c.nodelay = on;
+        }
+    }
+
+    /// Liga (`Some`) ou desliga o `keepalive` da conexão.
+    pub fn set_keepalive(&mut self, id: ConnId, k: Option<Keepalive>) {
+        let now = self.now;
+        if let Some(Some(c)) = self.conns.get_mut(id) {
+            c.set_keepalive(k, now);
+        }
+    }
+
+    /// Contadores de retransmissão da conexão.
+    #[must_use]
+    pub fn stats(&self, id: ConnId) -> Option<Stats> {
+        self.conns.get(id)?.as_ref().map(|c| c.stats)
     }
 
     /// Troca o orçamento de memória dos buffers (o `netd` o ajusta à cota).
@@ -215,6 +253,7 @@ impl Tcp {
             0,
             true,
             limit,
+            self.features,
         );
         c.start(&mut self.outbox, now);
         self.conns[id] = Some(c);
@@ -370,7 +409,7 @@ impl Tcp {
             .and_then(Option::as_ref)
             .is_some_and(|c| c.state == State::Closed && c.user_closed);
         if done && let Some(c) = self.conns[id].take() {
-            self.budget += 2 * c.limit;
+            self.budget += 3 * c.limit;
             if c.ephemeral {
                 self.ports.release(c.lport);
             }
@@ -484,6 +523,7 @@ impl Tcp {
             seg.window,
             false,
             limit,
+            self.features,
         );
         c.negotiate(&seg.opts);
         c.listener = Some(l);

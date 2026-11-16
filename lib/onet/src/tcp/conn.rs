@@ -5,7 +5,9 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::buf::Buf;
-use super::wire::{self, ACK, FIN, Header, Opts, PSH, RST, SYN, Segment};
+use super::cubic::Cubic;
+use super::sack::Scoreboard;
+use super::wire::{self, ACK, FIN, Header, MAX_SACK, Opts, PSH, RST, SYN, Segment};
 use super::{Error, ListenId, MAX_OOO, MSS, Out};
 use crate::arp::Ip4;
 
@@ -131,6 +133,87 @@ pub struct Conn {
     now: u64,
     /// Limite dos dois buffers, para o `Tcp` devolver a cota.
     pub(super) limit: usize,
+    // Recuperação de perdas (RFC 6675) e CUBIC (RFC 9438).
+    pub(super) sack_ok: bool,
+    sb: Scoreboard,
+    cubic: Cubic,
+    in_recovery: bool,
+    recovery_point: u32,
+    /// Faixas retransmitidas na recuperação atual: (início, fim, instante).
+    retx: Vec<(u32, u32, u64)>,
+    /// Quando cada segmento novo saiu: (sequência inicial, instante), em ordem
+    /// de sequência. É o relógio do RACK (RFC 8985).
+    sent_log: VecDeque<(u32, u64)>,
+    /// Início do último segmento fora de ordem recebido (vai primeiro no SACK).
+    last_ooo: Option<u32>,
+    /// Contagens para o gate da T-674.
+    pub(super) stats: Stats,
+    /// O que oferecemos no SYN.
+    offer: Features,
+    /// Sem Nagle: segmentos curtos saem na hora.
+    pub(super) nodelay: bool,
+    /// Último avanço da conexão (envio de dados novos ou ACK novo), para o
+    /// temporizador de sonda de cauda.
+    activity: u64,
+    /// Já se mandou a sonda de cauda desde o último avanço.
+    tlp_sent: bool,
+    /// Quando reavaliar a primeira lacuna (RACK): o tempo dela ainda não passou.
+    rack_at: Option<u64>,
+    pub(super) keepalive: Option<Keepalive>,
+    /// Última vez que se ouviu o outro lado.
+    last_rx: u64,
+    /// Sondas de `keepalive` sem resposta e quando sai a próxima.
+    ka_sent: u8,
+    ka_at: u64,
+}
+
+/// Quais extensões o `Tcp` oferece e aceita. Tudo ligado por padrão; os
+/// testes desligam para exercitar o TCP básico (par antigo).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Features {
+    /// Escala de janela (RFC 7323).
+    pub wscale: bool,
+    /// SACK (RFC 2018).
+    pub sack: bool,
+    /// Timestamps (RFC 7323).
+    pub timestamps: bool,
+}
+
+impl Features {
+    /// Todas as extensões.
+    pub const ALL: Self = Self {
+        wscale: true,
+        sack: true,
+        timestamps: true,
+    };
+}
+
+/// Contadores de retransmissão de uma conexão.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Segmentos de dados retransmitidos.
+    pub retx_segments: u32,
+    /// Entradas em recuperação rápida.
+    pub fast_recoveries: u32,
+    /// Estouros do RTO.
+    pub timeouts: u32,
+    /// Sondas de cauda (TLP) enviadas.
+    pub probes: u32,
+    /// Sondas de `keepalive` enviadas.
+    pub keepalives: u32,
+}
+
+/// `keepalive` (RFC 9293, 3.8.4): depois de `idle` ns sem ouvir o outro lado,
+/// manda uma sonda a cada `interval` ns; sem resposta a `count` sondas, a
+/// conexão cai com [`Error::TimedOut`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Keepalive {
+    /// Silêncio até a primeira sonda (ns).
+    pub idle: u64,
+    /// Intervalo entre as sondas (ns).
+    pub interval: u64,
+    /// Sondas sem resposta até desistir.
+    pub count: u8,
 }
 
 impl Conn {
@@ -146,6 +229,7 @@ impl Conn {
         peer_wnd: u16,
         ephemeral: bool,
         limit: usize,
+        offer: Features,
     ) -> Self {
         let mss = 536;
         // Menor escala que deixa o buffer de recepção inteiro na janela.
@@ -198,6 +282,30 @@ impl Conn {
             ts_recent: 0,
             now: 0,
             limit,
+            sack_ok: false,
+            sb: Scoreboard::new(),
+            cubic: Cubic::new(),
+            in_recovery: false,
+            recovery_point: 0,
+            retx: Vec::new(),
+            sent_log: VecDeque::new(),
+            last_ooo: None,
+            stats: Stats {
+                retx_segments: 0,
+                fast_recoveries: 0,
+                timeouts: 0,
+                probes: 0,
+                keepalives: 0,
+            },
+            offer,
+            nodelay: false,
+            activity: 0,
+            tlp_sent: false,
+            rack_at: None,
+            keepalive: None,
+            last_rx: 0,
+            ka_sent: 0,
+            ka_at: 0,
         }
     }
 
@@ -207,7 +315,7 @@ impl Conn {
     pub(super) fn negotiate(&mut self, o: &Opts) {
         self.mss = usize::from(o.mss.unwrap_or(536)).clamp(536, MSS);
         self.cwnd = INIT_CWND_SEGS * self.mss;
-        if let Some(w) = o.wscale {
+        if let (Some(w), true) = (o.wscale, self.offer.wscale) {
             self.wscale_ok = true;
             self.snd_shift = w;
         } else {
@@ -215,10 +323,11 @@ impl Conn {
             self.snd_shift = 0;
             self.rcv_shift = 0;
         }
-        if let Some((v, _)) = o.ts {
+        if let (Some((v, _)), true) = (o.ts, self.offer.timestamps) {
             self.ts_ok = true;
             self.ts_recent = v;
         }
+        self.sack_ok = o.sack_ok && self.offer.sack;
     }
 
     /// `TSval`: o relógio em milissegundos.
@@ -232,7 +341,45 @@ impl Conn {
         if self.ts_ok {
             o.ts = Some((self.tsval(), self.ts_recent));
         }
+        if self.sack_ok && !self.ooo.is_empty() {
+            let max = if self.ts_ok { MAX_SACK - 1 } else { MAX_SACK };
+            o.nsack = self.sack_blocks(&mut o.sack[..max]);
+        }
         o
+    }
+
+    /// Blocos SACK a anunciar: as faixas fora de ordem já unidas, com a do
+    /// segmento mais recente primeiro (RFC 2018, 4).
+    fn sack_blocks(&self, out: &mut [(u32, u32)]) -> usize {
+        let base = self.rcv_nxt;
+        let mut v: Vec<(u32, u32)> = self
+            .ooo
+            .iter()
+            .map(|(s, d)| (*s, s.wrapping_add(u32::try_from(d.len()).unwrap_or(0))))
+            .collect();
+        v.sort_by_key(|r| r.0.wrapping_sub(base));
+        let mut merged: Vec<(u32, u32)> = Vec::new();
+        for (a, b) in v {
+            match merged.last_mut() {
+                Some(l) if le(a, l.1) => {
+                    if lt(l.1, b) {
+                        l.1 = b;
+                    }
+                }
+                _ => merged.push((a, b)),
+            }
+        }
+        if let Some(first) = self.last_ooo
+            && let Some(i) = merged
+                .iter()
+                .position(|&(a, b)| le(a, first) && lt(first, b))
+        {
+            let r = merged.remove(i);
+            merged.insert(0, r);
+        }
+        let n = merged.len().min(out.len());
+        out[..n].copy_from_slice(&merged[..n]);
+        n
     }
 
     /// Estado atual.
@@ -284,11 +431,11 @@ impl Conn {
         let mut o = Opts::NONE;
         o.mss = Some(u16::try_from(MSS).unwrap_or(1460));
         // O ativo oferece tudo; o passivo só responde o que o outro ofereceu.
-        if active || self.wscale_ok {
+        if self.offer.wscale && (active || self.wscale_ok) {
             o.wscale = Some(self.rcv_shift);
         }
-        o.sack_ok = true;
-        if active || self.ts_ok {
+        o.sack_ok = self.offer.sack;
+        if self.offer.timestamps && (active || self.ts_ok) {
             o.ts = Some((self.tsval(), if active { 0 } else { self.ts_recent }));
         }
         h.opts = o;
@@ -326,18 +473,40 @@ impl Conn {
             return;
         }
         loop {
-            let flight = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
+            let flight = self.pipe();
             let wnd = (self.snd_wnd as usize).min(self.cwnd);
+            // Recuperação: primeiro as lacunas que se dão por perdidas.
+            if self.in_recovery
+                && flight < wnd
+                && let Some((seq, n)) = self.next_lost()
+            {
+                self.send_retx(ob, seq, n, now);
+                continue;
+            }
             let unsent = self.unsent_from(self.snd_nxt);
             let fresh = self.snd_nxt == self.snd_max;
             if unsent > 0 && flight < wnd {
                 let n = unsent.min(self.mss).min(wnd - flight);
+                // Segmento curto só se for o fim do que há para mandar e não
+                // houver dados em voo (Nagle, RFC 1122 4.2.3.4), ou se nada
+                // estiver em voo (a janela estreita não pode travar a
+                // conexão). Do contrário espera o ACK a abrir a janela.
+                let tail = n == unsent;
+                if n < self.mss && !(flight == 0 || (tail && (self.nodelay || self.fin_queued))) {
+                    break;
+                }
                 let mut data = alloc::vec![0u8; n];
                 let off = self.snd_nxt.wrapping_sub(self.buf_seq) as usize;
                 self.sndbuf.peek(off, &mut data);
                 let last = n == unsent;
                 let h = self.header(ACK | if last { PSH } else { 0 }, self.snd_nxt);
                 self.emit(ob, &h, &data);
+                if !fresh {
+                    self.stats.retx_segments += 1;
+                }
+                self.sent_log.push_back((self.snd_nxt, now));
+                self.activity = now;
+                self.tlp_sent = false;
                 if fresh && self.rtt_probe.is_none() {
                     let end = self.snd_nxt.wrapping_add(u32::try_from(n).unwrap_or(0));
                     self.rtt_probe = Some((end, now));
@@ -379,6 +548,218 @@ impl Conn {
         }
     }
 
+    /// Bytes que se supõe estarem na rede (RFC 6675, `SetPipe`): o que foi
+    /// enviado menos o confirmado por SACK e o dado por perdido, mais as
+    /// retransmissões em voo. Fora da recuperação é `snd_nxt − snd_una`.
+    fn pipe(&self) -> usize {
+        let nxt = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
+        if !self.in_recovery {
+            return nxt;
+        }
+        let flight = self.snd_max.wrapping_sub(self.snd_una) as usize;
+        if !self.sack_ok {
+            // NewReno: cada ACK duplicado diz que um segmento saiu da rede.
+            return flight.saturating_sub(usize::from(self.dupacks) * self.mss);
+        }
+        let lost: usize = self
+            .sb
+            .holes(self.snd_una)
+            .filter(|&(a, b)| self.hole_lost(a, b))
+            .map(|(a, b)| b.wrapping_sub(a) as usize)
+            .sum();
+        (flight + self.retx_out()).saturating_sub(self.sb.bytes() + lost)
+    }
+
+    /// RACK simplificado (RFC 8985): a lacuna `[a, b)` está perdida quando
+    /// algo enviado depois dela já foi confirmado por SACK e passou o tempo de
+    /// uma ida e volta mais a janela de reordenação (um quarto dela). Reordenar
+    /// por menos que isso não dispara retransmissão.
+    fn hole_lost(&self, a: u32, b: u32) -> bool {
+        if self.sb.above(b) == 0 {
+            return false;
+        }
+        let Some(sent) = self.send_time(a) else {
+            return true;
+        };
+        let rtt = if self.srtt == 0 { self.rto } else { self.srtt };
+        self.now >= sent.saturating_add(rtt + rtt / 4)
+    }
+
+    /// Quando o byte `seq` saiu pela última vez (novo envio).
+    fn send_time(&self, seq: u32) -> Option<u64> {
+        self.sent_log
+            .iter()
+            .rev()
+            .find(|&&(s, _)| le(s, seq))
+            .map(|&(_, t)| t)
+    }
+
+    /// Quando a primeira lacuna (com algo confirmado acima dela) passa a ser
+    /// dada por perdida, se ainda não é. É o temporizador do RACK.
+    fn next_rack(&self) -> Option<u64> {
+        if !self.sack_ok {
+            return None;
+        }
+        let (a, b) = self.sb.holes(self.snd_una).next()?;
+        if self.sb.above(b) == 0 || self.hole_lost(a, b) {
+            return None;
+        }
+        let rtt = if self.srtt == 0 { self.rto } else { self.srtt };
+        Some(self.send_time(a)?.saturating_add(rtt + rtt / 4))
+    }
+
+    /// A primeira lacuna se dá por perdida.
+    fn first_hole_lost(&self) -> bool {
+        self.sb
+            .holes(self.snd_una)
+            .next()
+            .is_some_and(|(a, b)| self.hole_lost(a, b))
+    }
+
+    /// Bytes retransmitidos nesta recuperação que ainda não foram
+    /// confirmados nem por SACK.
+    fn retx_out(&self) -> usize {
+        let mut total = 0usize;
+        for &(a, b, _) in &self.retx {
+            if le(b, self.snd_una) {
+                continue;
+            }
+            let a = if lt(a, self.snd_una) { self.snd_una } else { a };
+            let mut len = b.wrapping_sub(a) as usize;
+            for &(x, y) in self.sb.ranges() {
+                // Parte de [a, b) dentro de [x, y).
+                let lo = if lt(a, x) { x } else { a };
+                let hi = if lt(b, y) { b } else { y };
+                if lt(lo, hi) {
+                    len = len.saturating_sub(hi.wrapping_sub(lo) as usize);
+                }
+            }
+            total += len;
+        }
+        total
+    }
+
+    /// Próxima faixa perdida ainda não retransmitida: (início, bytes).
+    fn next_lost(&self) -> Option<(u32, usize)> {
+        if !self.sack_ok {
+            return None;
+        }
+        for (a, b) in self.sb.holes(self.snd_una) {
+            if !self.hole_lost(a, b) {
+                continue;
+            }
+            let mut c = a;
+            while let Some(&(_, e, _)) = self.retx.iter().find(|&&(x, y, _)| le(x, c) && lt(c, y)) {
+                c = e;
+            }
+            if lt(c, b) {
+                let n = (b.wrapping_sub(c) as usize).min(self.mss);
+                return Some((c, n));
+            }
+        }
+        None
+    }
+
+    /// Retransmite `n` bytes a partir de `seq` e anota a faixa.
+    fn send_retx(&mut self, ob: &mut VecDeque<Out>, seq: u32, n: usize, now: u64) {
+        let mut data = alloc::vec![0u8; n];
+        let off = seq.wrapping_sub(self.buf_seq) as usize;
+        let got = self.sndbuf.peek(off, &mut data);
+        data.truncate(got);
+        if data.is_empty() {
+            return;
+        }
+        self.emit(ob, &self.header(ACK, seq), &data);
+        let end = seq.wrapping_add(u32::try_from(data.len()).unwrap_or(0));
+        self.retx.push((seq, end, now));
+        self.stats.retx_segments += 1;
+    }
+
+    /// Liga ou desliga o `keepalive`.
+    pub(super) fn set_keepalive(&mut self, k: Option<Keepalive>, now: u64) {
+        self.keepalive = k;
+        self.last_rx = now;
+        self.ka_sent = 0;
+    }
+
+    /// Sonda uma conexão parada: um segmento com a sequência anterior à
+    /// próxima, que o outro lado responde com um ACK.
+    fn keepalive_step(&mut self, ob: &mut VecDeque<Out>, now: u64) {
+        let Some(k) = self.keepalive else { return };
+        if !matches!(self.state, State::Established | State::CloseWait)
+            || self.snd_una != self.snd_max
+        {
+            return;
+        }
+        let due = if self.ka_sent == 0 {
+            now >= self.last_rx.saturating_add(k.idle)
+        } else {
+            now >= self.ka_at
+        };
+        if !due {
+            return;
+        }
+        if self.ka_sent >= k.count {
+            self.fail(Error::TimedOut);
+            return;
+        }
+        self.ka_sent += 1;
+        self.ka_at = now.saturating_add(k.interval);
+        self.emit(ob, &self.header(ACK, self.snd_nxt.wrapping_sub(1)), &[]);
+        self.stats.keepalives += 1;
+    }
+
+    /// Sonda de cauda (TLP, RFC 8985): se nada avançou em `2·SRTT` e há dados
+    /// em voo, reenvia o último segmento. Se ele chegar, o SACK de volta revela
+    /// as perdas da cauda sem esperar o RTO.
+    fn probe_tail(&mut self, ob: &mut VecDeque<Out>, now: u64) {
+        if self.tlp_sent
+            || self.in_recovery
+            || self.srtt == 0
+            || self.snd_una == self.snd_max
+            || !matches!(self.state, State::Established | State::CloseWait)
+        {
+            return;
+        }
+        let pto = (2 * self.srtt).max(10_000_000);
+        if now < self.activity.saturating_add(pto) {
+            return;
+        }
+        let Some(&(start, _)) = self.sent_log.back() else {
+            return;
+        };
+        let n = (self.snd_max.wrapping_sub(start) as usize).min(self.mss);
+        if n == 0 || lt(start, self.snd_una) {
+            return;
+        }
+        self.tlp_sent = true;
+        self.activity = now;
+        let mut data = alloc::vec![0u8; n];
+        let off = start.wrapping_sub(self.buf_seq) as usize;
+        let got = self.sndbuf.peek(off, &mut data);
+        data.truncate(got);
+        if !data.is_empty() {
+            self.emit(ob, &self.header(ACK, start), &data);
+            self.stats.probes += 1;
+            self.stats.retx_segments += 1;
+        }
+    }
+
+    /// Entra em recuperação rápida: reduz a janela (CUBIC) e marca o ponto
+    /// em que ela termina.
+    fn enter_recovery(&mut self, ob: &mut VecDeque<Out>) {
+        self.in_recovery = true;
+        self.recovery_point = self.snd_max;
+        self.ssthresh = self.cubic.on_loss(self.cwnd, self.mss);
+        self.cwnd = self.ssthresh;
+        self.retx.clear();
+        self.stats.fast_recoveries += 1;
+        if !self.sack_ok {
+            self.retransmit_one(ob);
+            self.stats.retx_segments += 1;
+        }
+    }
+
     /// Reenvia o que está em `snd_una` (um segmento).
     fn retransmit_one(&mut self, ob: &mut VecDeque<Out>) {
         match self.state {
@@ -406,6 +787,18 @@ impl Conn {
             self.state = State::Closed;
             return;
         }
+        if let Some(t) = self.rack_at
+            && now >= t
+        {
+            self.rack_at = None;
+            if !self.in_recovery && self.first_hole_lost() {
+                self.enter_recovery(ob);
+            }
+            self.output(ob, now);
+            self.rack_at = self.next_rack();
+        }
+        self.probe_tail(ob, now);
+        self.keepalive_step(ob, now);
         let Some(at) = self.rtx_at else { return };
         if now < at {
             return;
@@ -432,11 +825,17 @@ impl Conn {
             self.snd_max = self.snd_nxt;
             return;
         }
-        // Perda por tempo: janela de um segmento e recomeça de `snd_una`.
-        let flight = self.snd_max.wrapping_sub(self.snd_una) as usize;
-        self.ssthresh = (flight / 2).max(2 * self.mss);
+        // Perda por tempo: janela de um segmento e recomeça de `snd_una`. O
+        // receptor pode ter desistido do que confirmou por SACK (RFC 2018),
+        // então o placar se perde.
+        self.ssthresh = self.cubic.on_timeout(self.cwnd, self.mss);
         self.cwnd = self.mss;
         self.dupacks = 0;
+        self.in_recovery = false;
+        self.retx.clear();
+        self.sb.clear();
+        self.sent_log.clear();
+        self.stats.timeouts += 1;
         if matches!(self.state, State::SynSent | State::SynRcvd) {
             self.retransmit_one(ob);
         } else {
@@ -473,11 +872,18 @@ impl Conn {
         self.rto = (self.srtt + (4 * self.rttvar).max(1_000_000)).clamp(MIN_RTO, MAX_RTO);
     }
 
-    fn grow_cwnd(&mut self, acked: usize) {
+    /// Cresce a janela: partida lenta até `ssthresh` e CUBIC depois. Só
+    /// cresce se a conexão usou a janela (RFC 7661).
+    fn grow_cwnd(&mut self, acked: usize, flight_before: usize, now: u64) {
+        if self.in_recovery || flight_before < self.cwnd / 2 {
+            return;
+        }
         if self.cwnd < self.ssthresh {
-            self.cwnd += acked.min(self.mss);
+            self.cwnd = (self.cwnd + acked.min(2 * self.mss)).min(self.ssthresh.max(self.mss));
         } else {
-            self.cwnd += (self.mss * self.mss / self.cwnd).max(1);
+            self.cwnd = self
+                .cubic
+                .on_ack(self.cwnd, acked, self.mss, now, self.srtt);
         }
     }
 
@@ -488,6 +894,17 @@ impl Conn {
             self.send_ack(ob);
             return false;
         }
+        if self.sack_ok {
+            for &(a, b) in seg.opts.blocks() {
+                self.sb.insert(self.snd_una, self.snd_max, a, b);
+            }
+        }
+        // Retransmissão que não foi confirmada em duas idas e voltas se perdeu:
+        // sai da lista para a lacuna poder ser retransmitida de novo.
+        let rtt = if self.srtt == 0 { self.rto } else { self.srtt };
+        self.retx
+            .retain(|&(_, _, t)| now < t.saturating_add(2 * rtt + rtt / 4));
+        let flight_before = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
         if lt(self.snd_una, ack) {
             let advanced = ack.wrapping_sub(self.snd_una) as usize;
             // O SYN e o FIN ocupam sequência mas não ocupam `sndbuf`.
@@ -521,7 +938,27 @@ impl Conn {
                 self.rtt_sample(now.saturating_sub(at).max(1));
                 self.rtt_probe = None;
             }
-            self.grow_cwnd(advanced);
+            self.activity = now;
+            self.tlp_sent = false;
+            self.sb.advance(ack);
+            self.retx.retain(|&(_, e, _)| lt(ack, e));
+            while self.sent_log.len() > 1 && le(self.sent_log[1].0, ack) {
+                self.sent_log.pop_front();
+            }
+            if self.in_recovery {
+                if le(self.recovery_point, ack) {
+                    // Tudo o que estava em voo na perda foi confirmado.
+                    self.in_recovery = false;
+                    self.retx.clear();
+                    self.cwnd = self.ssthresh;
+                } else if !self.sack_ok {
+                    // ACK parcial (NewReno): a próxima lacuna.
+                    self.retransmit_one(ob);
+                    self.stats.retx_segments += 1;
+                }
+            } else {
+                self.grow_cwnd(advanced, flight_before, now);
+            }
             self.rtx_count = 0;
             if self.snd_una == self.snd_max {
                 self.rtx_at = None;
@@ -534,14 +971,15 @@ impl Conn {
             && self.snd_una != self.snd_max
             && u32::from(seg.window) << self.snd_shift == self.snd_wnd
         {
-            self.dupacks += 1;
-            if self.dupacks == 3 {
-                let flight = self.snd_max.wrapping_sub(self.snd_una) as usize;
-                self.ssthresh = (flight / 2).max(2 * self.mss);
-                self.cwnd = self.ssthresh;
-                self.retransmit_one(ob);
-            }
+            self.dupacks = self.dupacks.saturating_add(1);
         }
+        if !self.in_recovery
+            && self.snd_una != self.snd_max
+            && ((!self.sack_ok && self.dupacks >= 3) || (self.sack_ok && self.first_hole_lost()))
+        {
+            self.enter_recovery(ob);
+        }
+        self.rack_at = self.next_rack();
         if lt(self.snd_wl1, seg.seq) || (self.snd_wl1 == seg.seq && le(self.snd_wl2, ack)) {
             self.snd_wnd = if seg.flags & SYN != 0 {
                 u32::from(seg.window)
@@ -579,6 +1017,8 @@ impl Conn {
     /// Trata um segmento destinado a esta conexão.
     pub(super) fn segment(&mut self, seg: &Segment<'_>, ob: &mut VecDeque<Out>, now: u64) -> Event {
         self.now = now;
+        self.last_rx = now;
+        self.ka_sent = 0;
         if self.state == State::SynSent {
             return self.segment_syn_sent(seg, ob, now);
         }
@@ -754,8 +1194,18 @@ impl Conn {
             let n = self.rcvbuf.push(data);
             self.rcv_nxt = self.rcv_nxt.wrapping_add(u32::try_from(n).unwrap_or(0));
             self.drain_ooo();
-        } else if !data.is_empty() && self.ooo.len() < MAX_OOO {
-            self.ooo.push((start, data.to_vec()));
+        } else if !data.is_empty() {
+            let dup = self.ooo.iter().any(|(s, d)| {
+                le(*s, start)
+                    && le(
+                        start.wrapping_add(u32::try_from(data.len()).unwrap_or(0)),
+                        s.wrapping_add(u32::try_from(d.len()).unwrap_or(0)),
+                    )
+            });
+            if !dup && self.ooo.len() < MAX_OOO {
+                self.ooo.push((start, data.to_vec()));
+            }
+            self.last_ooo = Some(start);
         }
         if fin {
             self.fin_at = Some(fin_pos);
