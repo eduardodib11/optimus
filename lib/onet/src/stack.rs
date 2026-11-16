@@ -7,7 +7,11 @@ use crate::dhcp::{self, Lease, Outcome};
 use crate::eth::{self, Header, Mac};
 use crate::frag::{self, Reassembler};
 use crate::icmp::{self, Echo};
+use crate::icmp6::{self, Msg};
 use crate::ip4::{self, Config};
+use crate::ip6::{self, Ip6};
+use crate::nd;
+use crate::slaac::{Slaac, Tx};
 use crate::tcp::Tcp;
 use crate::udp;
 
@@ -53,6 +57,17 @@ pub enum Event {
     },
     /// O DHCP concedeu (ou renovou) a configuração, já aplicada à pilha.
     Lease(Lease),
+    /// Chegou a resposta de um eco IPv6 que a pilha mandou.
+    EchoReply6 {
+        /// Quem respondeu.
+        src: Ip6,
+        /// Identificador do pedido.
+        id: u16,
+        /// Sequência do pedido.
+        seq: u16,
+        /// Bytes de dados.
+        len: usize,
+    },
 }
 
 /// Por que um pacote não saiu.
@@ -85,6 +100,9 @@ pub struct Stack {
     dhcp_on: bool,
     /// Gerador (xorshift64*) dos `xid` do DHCP; o `netd` o semeia do DRBG.
     rng: u64,
+    v6: Slaac,
+    nd: nd::Cache,
+    v6_on: bool,
 }
 
 impl Stack {
@@ -106,6 +124,9 @@ impl Stack {
             dhcp: dhcp::Client::new(mac),
             dhcp_on: false,
             rng: 0x9e37_79b9_7f4a_7c15,
+            v6: Slaac::new(mac),
+            nd: nd::Cache::new(),
+            v6_on: false,
         }
     }
 
@@ -116,6 +137,10 @@ impl Stack {
         let mut w = [0u8; 8];
         w.copy_from_slice(&bytes[..8]);
         self.rng ^= u64::from_le_bytes(w) | 1;
+        let h = optcrypt::blake3::hash(&bytes);
+        let mut k = [0u8; 16];
+        k.copy_from_slice(&h[..16]);
+        self.v6.seed(k);
     }
 
     fn next_random(&mut self) -> u32 {
@@ -130,6 +155,18 @@ impl Stack {
     /// Liga o cliente DHCP: a configuração passa a vir da concessão.
     pub fn start_dhcp(&mut self) {
         self.dhcp_on = true;
+    }
+
+    /// Liga o IPv6: endereço local do enlace, DAD, solicitação de roteador e
+    /// SLAAC com endereços temporários (RFC 4862, 7217 e 8981).
+    pub fn start_ipv6(&mut self) {
+        self.v6_on = true;
+    }
+
+    /// A configuração automática do IPv6.
+    #[must_use]
+    pub const fn slaac(&self) -> &Slaac {
+        &self.v6
     }
 
     /// O cliente DHCP (estado e concessão).
@@ -173,6 +210,7 @@ impl Stack {
     pub fn tick<L: Link>(&mut self, link: &mut L, now: u64) {
         self.frags.expire(now);
         self.dhcp_step(link, now);
+        self.v6_step(link, now);
         self.tcp.poll(now);
         self.flush_tcp(link, now);
     }
@@ -197,6 +235,183 @@ impl Stack {
                 now,
             );
         }
+    }
+
+    /// Passo do IPv6: DAD e solicitação de roteador que o SLAAC pede.
+    fn v6_step<L: Link>(&mut self, link: &mut L, now: u64) {
+        if !self.v6_on {
+            return;
+        }
+        self.v6.start();
+        for _ in 0..=crate::slaac::MAX_ADDRS {
+            let r = self.next_random();
+            match self.v6.poll(now, r) {
+                Some(Tx::Dad(t)) => {
+                    let _ =
+                        self.send_ns(link, &ip6::UNSPECIFIED, &ip6::solicited_node(&t), &t, false);
+                }
+                Some(Tx::RouterSolicit(src)) => {
+                    let mut m = [0u8; 16];
+                    if let Some(n) =
+                        icmp6::build_rs(&src, &ip6::ALL_ROUTERS, Some(self.local.mac), &mut m)
+                    {
+                        let _ = self.emit6(
+                            link,
+                            ip6::multicast_mac(&ip6::ALL_ROUTERS),
+                            &src,
+                            &ip6::ALL_ROUTERS,
+                            255,
+                            &m[..n],
+                        );
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Monta e manda um pacote ICMPv6 já pronto (`payload`) no quadro para `mac`.
+    fn emit6<L: Link>(
+        &self,
+        link: &mut L,
+        mac: Mac,
+        src: &Ip6,
+        dst: &Ip6,
+        hop_limit: u8,
+        payload: &[u8],
+    ) -> Result<(), SendError> {
+        self.emit6_proto(link, mac, src, dst, ip6::PROTO_ICMP6, hop_limit, payload)
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "um quadro IPv6 tem esses campos")]
+    fn emit6_proto<L: Link>(
+        &self,
+        link: &mut L,
+        mac: Mac,
+        src: &Ip6,
+        dst: &Ip6,
+        next: u8,
+        hop_limit: u8,
+        payload: &[u8],
+    ) -> Result<(), SendError> {
+        let h = ip6::Header {
+            traffic_class: 0,
+            flow_label: 0,
+            next,
+            hop_limit,
+            src: *src,
+            dst: *dst,
+            frag: None,
+        };
+        let mut pkt = [0u8; eth::MTU];
+        let n = ip6::build(&h, payload, &mut pkt).ok_or(SendError::TooBig)?;
+        let mut out = [0u8; eth::MAX_FRAME];
+        let eh = Header {
+            dst: mac,
+            src: self.local.mac,
+            ethertype: eth::ETHERTYPE_IPV6,
+        };
+        let len = eth::build(&eh, &pkt[..n], &mut out).ok_or(SendError::TooBig)?;
+        if link.send(&out[..len]) {
+            Ok(())
+        } else {
+            Err(SendError::Busy)
+        }
+    }
+
+    /// Solicitação de vizinho para `target`, no enlace do nó solicitado.
+    fn send_ns<L: Link>(
+        &self,
+        link: &mut L,
+        src: &Ip6,
+        dst: &Ip6,
+        target: &Ip6,
+        slla: bool,
+    ) -> Result<(), SendError> {
+        let mut m = [0u8; 32];
+        let n = icmp6::build_ns(src, dst, target, slla.then_some(self.local.mac), &mut m)
+            .ok_or(SendError::TooBig)?;
+        self.emit6(link, ip6::multicast_mac(dst), src, dst, 255, &m[..n])
+    }
+
+    /// Manda um pacote IPv6 com `payload` de `next` para `dst`, com a origem
+    /// que o SLAAC escolhe.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError`].
+    pub fn send_ip6<L: Link>(
+        &mut self,
+        link: &mut L,
+        dst: Ip6,
+        next: u8,
+        payload: &[u8],
+        now: u64,
+    ) -> Result<(), SendError> {
+        let src = self.v6.source_for(&dst, now).ok_or(SendError::NoRoute)?;
+        self.send_ip6_from(link, src, dst, next, payload, now)
+    }
+
+    fn send_ip6_from<L: Link>(
+        &mut self,
+        link: &mut L,
+        src: Ip6,
+        dst: Ip6,
+        next: u8,
+        payload: &[u8],
+        now: u64,
+    ) -> Result<(), SendError> {
+        if payload.len() + ip6::HEADER_LEN > eth::MTU {
+            return Err(SendError::TooBig);
+        }
+        let hop = self.v6.next_hop(&dst, now).ok_or(SendError::NoRoute)?;
+        let mac = self
+            .neighbor6(link, &hop, &src, now)
+            .ok_or(SendError::Pending)?;
+        self.emit6_proto(link, mac, &src, &dst, next, ip6::HOP_LIMIT, payload)
+    }
+
+    /// MAC do vizinho IPv6 `ip` se se sabe; senão manda a solicitação (a
+    /// cada tentativa que o cache permite) e devolve `None`.
+    pub fn neighbor6<L: Link>(
+        &mut self,
+        link: &mut L,
+        ip: &Ip6,
+        src: &Ip6,
+        now: u64,
+    ) -> Option<Mac> {
+        if ip6::is_multicast(ip) {
+            return Some(ip6::multicast_mac(ip));
+        }
+        match self.nd.resolve(*ip, now) {
+            Resolve::Hit(m) => Some(m),
+            Resolve::Ask => {
+                let _ = self.send_ns(link, src, &ip6::solicited_node(ip), ip, true);
+                None
+            }
+            Resolve::Wait | Resolve::Failed => None,
+        }
+    }
+
+    /// Manda um pedido de eco ICMPv6.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError`].
+    pub fn ping6<L: Link>(
+        &mut self,
+        link: &mut L,
+        dst: Ip6,
+        id: u16,
+        seq: u16,
+        data: &[u8],
+        now: u64,
+    ) -> Result<(), SendError> {
+        let src = self.v6.source_for(&dst, now).ok_or(SendError::NoRoute)?;
+        let mut msg = [0u8; eth::MTU];
+        let n = icmp6::build_echo(&src, &dst, icmp6::ECHO_REQUEST, id, seq, data, &mut msg)
+            .ok_or(SendError::TooBig)?;
+        self.send_ip6_from(link, src, dst, ip6::PROTO_ICMP6, &msg[..n], now)
     }
 
     /// Leva ao IP os segmentos que o TCP enfileirou. O que não saiu por falta
@@ -357,6 +572,7 @@ impl Stack {
                 None
             }
             eth::ETHERTYPE_IPV4 => self.input_ip4(link, up, payload, now),
+            eth::ETHERTYPE_IPV6 => self.input_ip6(link, h.src, payload, now),
             _ => None,
         }
     }
@@ -481,6 +697,162 @@ impl Stack {
                 len: e.data.len(),
             }),
             _ => None,
+        }
+    }
+
+    fn input_ip6<L: Link>(
+        &mut self,
+        link: &mut L,
+        from: Mac,
+        pkt: &[u8],
+        now: u64,
+    ) -> Option<Event> {
+        if !self.v6_on {
+            return None;
+        }
+        let (h, payload) = ip6::parse(pkt)?;
+        if ip6::is_multicast(&h.src)
+            || !(self.v6.owns_ready(&h.dst, now) || self.v6.listens(&h.dst))
+        {
+            return None;
+        }
+        let Some(f) = h.frag else {
+            return self.input_proto6(link, from, &h, payload, now);
+        };
+        let key = frag::Key {
+            src: h.src,
+            dst: h.dst,
+            id: f.id,
+            proto: h.next,
+            v6: true,
+        };
+        let piece = frag::Piece {
+            offset: usize::from(f.offset),
+            more: f.more,
+        };
+        let mut buf = [0u8; frag::MAX_DATAGRAM];
+        let n = self.frags.add_piece(&key, piece, payload, now, &mut buf)?;
+        let whole = ip6::Header { frag: None, ..h };
+        self.input_proto6(link, from, &whole, &buf[..n], now)
+    }
+
+    fn input_proto6<L: Link>(
+        &mut self,
+        link: &mut L,
+        from: Mac,
+        h: &ip6::Header,
+        payload: &[u8],
+        now: u64,
+    ) -> Option<Event> {
+        // TCP e UDP sobre IPv6 chegam com os soquetes (T-637); hoje só ICMPv6.
+        if h.next != ip6::PROTO_ICMP6 {
+            return None;
+        }
+        match icmp6::parse(h, payload)? {
+            Msg::Echo {
+                kind: icmp6::ECHO_REQUEST,
+                id,
+                seq,
+                data,
+            } => {
+                if self.v6.owns_ready(&h.dst, now) && h.src != ip6::UNSPECIFIED {
+                    let mut msg = [0u8; eth::MTU];
+                    let n = icmp6::build_echo(
+                        &h.dst,
+                        &h.src,
+                        icmp6::ECHO_REPLY,
+                        id,
+                        seq,
+                        data,
+                        &mut msg,
+                    )?;
+                    let _ =
+                        self.send_ip6_from(link, h.dst, h.src, ip6::PROTO_ICMP6, &msg[..n], now);
+                }
+                None
+            }
+            Msg::Echo {
+                kind: icmp6::ECHO_REPLY,
+                id,
+                seq,
+                data,
+            } => Some(Event::EchoReply6 {
+                src: h.src,
+                id,
+                seq,
+                len: data.len(),
+            }),
+            Msg::Echo { .. } | Msg::RouterSolicit => None,
+            Msg::NeighborSolicit { target, slla } => {
+                self.input_ns(link, from, h, &target, slla, now);
+                None
+            }
+            Msg::NeighborAdvert { target, tlla, .. } => {
+                if self.v6.owns(&target) {
+                    self.v6.conflict(&target);
+                } else {
+                    self.nd.learn(target, tlla.unwrap_or(from), now, true);
+                }
+                None
+            }
+            Msg::RouterAdvert {
+                lifetime,
+                prefixes,
+                slla,
+            } => {
+                let r = (u64::from(self.next_random()) << 32) | u64::from(self.next_random());
+                if self.v6.input_ra(&h.src, lifetime, &prefixes, now, r) {
+                    self.nd.learn(h.src, slla.unwrap_or(from), now, false);
+                }
+                None
+            }
+        }
+    }
+
+    /// Solicitação de vizinho: DAD alheia (origem `::`) ou pergunta pelo
+    /// nosso endereço, que se responde com um anúncio.
+    fn input_ns<L: Link>(
+        &mut self,
+        link: &mut L,
+        from: Mac,
+        h: &ip6::Header,
+        target: &Ip6,
+        slla: Option<Mac>,
+        now: u64,
+    ) {
+        let mut m = [0u8; 32];
+        if h.src == ip6::UNSPECIFIED {
+            if self.v6.owns_ready(target, now) {
+                // Defende o endereço: anúncio para todos os nós.
+                if let Some(n) = icmp6::build_na(
+                    target,
+                    &ip6::ALL_NODES,
+                    icmp6::NA_OVERRIDE,
+                    target,
+                    self.local.mac,
+                    &mut m,
+                ) {
+                    let _ = self.emit6(
+                        link,
+                        ip6::multicast_mac(&ip6::ALL_NODES),
+                        target,
+                        &ip6::ALL_NODES,
+                        255,
+                        &m[..n],
+                    );
+                }
+            } else {
+                self.v6.conflict(target);
+            }
+        } else if self.v6.owns_ready(target, now) {
+            if let Some(mac) = slla {
+                self.nd.learn(h.src, mac, now, false);
+            }
+            let flags = icmp6::NA_SOLICITED | icmp6::NA_OVERRIDE;
+            if let Some(n) = icmp6::build_na(target, &h.src, flags, target, self.local.mac, &mut m)
+            {
+                let _ = self.emit6(link, slla.unwrap_or(from), target, &h.src, 255, &m[..n]);
+            }
         }
     }
 }

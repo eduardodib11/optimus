@@ -1176,6 +1176,9 @@ macro_rules! m4_markers {
             // T-635: a conexão TCP ao eco do host leva 4000 bytes e eles
             // voltam iguais.
             "netd: tcp: eco do host",
+            // T-640: o SLAAC forma o endereço do prefixo anunciado pelo
+            // roteador do QEMU (slirp IPv6) e o eco ICMPv6 ao roteador volta.
+            "netd: ipv6: roteador respondeu ao eco pelo endereco SLAAC",
             "drvcli: input ok",
             "drvcli: input evento 0x1e",
             "drvcli: entropy ok",

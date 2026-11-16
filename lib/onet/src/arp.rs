@@ -127,8 +127,8 @@ enum State {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Entry {
-    ip: Ip4,
+struct Entry<const N: usize> {
+    ip: [u8; N],
     state: State,
     /// Última vez que a entrada foi tocada, para escolher a vítima.
     touched: u64,
@@ -147,32 +147,36 @@ pub enum Resolve {
     Failed,
 }
 
-/// Cache de vizinhos.
+/// Cache de vizinhos de endereços de `N` bytes: 4 para o ARP, 16 para o ND
+/// do IPv6 (`nd`).
 #[derive(Debug)]
-pub struct Cache {
-    entries: [Entry; CAP],
+pub struct Table<const N: usize> {
+    entries: [Entry<N>; CAP],
 }
 
-impl Default for Cache {
+/// Cache do ARP.
+pub type Cache = Table<4>;
+
+impl<const N: usize> Default for Table<N> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Cache {
+impl<const N: usize> Table<N> {
     /// Cache vazio.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             entries: [Entry {
-                ip: [0; 4],
+                ip: [0; N],
                 state: State::Free,
                 touched: 0,
             }; CAP],
         }
     }
 
-    fn find(&self, ip: Ip4) -> Option<usize> {
+    fn find(&self, ip: [u8; N]) -> Option<usize> {
         self.entries
             .iter()
             .position(|e| !matches!(e.state, State::Free) && e.ip == ip)
@@ -180,11 +184,11 @@ impl Cache {
 
     /// A entrada para `ip`, criando-a se faltar: usa uma livre ou expirada e,
     /// sem nenhuma, a menos recente.
-    fn slot(&mut self, ip: Ip4, now: u64) -> usize {
+    fn slot(&mut self, ip: [u8; N], now: u64) -> usize {
         if let Some(i) = self.find(ip) {
             return i;
         }
-        let expired = |e: &Entry| match e.state {
+        let expired = |e: &Entry<N>| match e.state {
             State::Free => true,
             State::Resolved { until, .. } | State::Failed { until } => now >= until,
             State::Pending { .. } => false,
@@ -206,7 +210,7 @@ impl Cache {
 
     /// MAC de `ip` se a resolução ainda vale.
     #[must_use]
-    pub fn lookup(&self, ip: Ip4, now: u64) -> Option<Mac> {
+    pub fn lookup(&self, ip: [u8; N], now: u64) -> Option<Mac> {
         match self.find(ip).map(|i| self.entries[i].state) {
             Some(State::Resolved { mac, until }) if now < until => Some(mac),
             _ => None,
@@ -215,7 +219,7 @@ impl Cache {
 
     /// Resolve `ip`: dá o MAC, manda perguntar (no máximo [`MAX_TRIES`] vezes,
     /// uma por [`RETRY_NS`]), manda esperar ou desiste.
-    pub fn resolve(&mut self, ip: Ip4, now: u64) -> Resolve {
+    pub fn resolve(&mut self, ip: [u8; N], now: u64) -> Resolve {
         if let Some(mac) = self.lookup(ip, now) {
             if let Some(i) = self.find(ip) {
                 self.entries[i].touched = now;
@@ -256,8 +260,8 @@ impl Cache {
     /// Guarda `ip -> mac`. `only_known` limita o aprendizado a quem já está
     /// no cache (pendente ou resolvido): uma resposta que ninguém pediu não
     /// cria entrada, para não deixar um vizinho encher o cache.
-    fn learn(&mut self, ip: Ip4, mac: Mac, now: u64, only_known: bool) {
-        if ip == [0; 4] || mac.is_group() {
+    pub fn learn(&mut self, ip: [u8; N], mac: Mac, now: u64, only_known: bool) {
+        if ip == [0; N] || mac.is_group() {
             return;
         }
         if only_known && self.find(ip).is_none() {
@@ -270,7 +274,9 @@ impl Cache {
             until: now.saturating_add(TTL_NS),
         };
     }
+}
 
+impl Table<4> {
     /// Trata um pacote recebido. Devolve a resposta quando é um pedido para o
     /// IP da interface. Aprende o remetente de um pedido para nós (vamos
     /// precisar falar com ele) e de uma resposta que esperávamos ou que
