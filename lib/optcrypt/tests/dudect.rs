@@ -217,6 +217,29 @@ fn mlkem768_decaps_tempo_constante() {
     assert!(t.abs() < LIMITE, "|t| = {t}");
 }
 
+/// Ed25519: assinar com duas sementes diferentes (classe 0 = zeros,
+/// classe 1 = outros bytes) precisa levar o mesmo tempo.
+#[test]
+#[ignore = "campanha de tempo constante; rode com --ignored em --release"]
+fn ed25519_sign_tempo_constante() {
+    use optcrypt::ed25519::sign;
+    use optcrypt::secret::Secret;
+
+    let zeros = Secret::take(&mut [0u8; 32]);
+    let mut b = [0u8; 32];
+    for (i, x) in b.iter_mut().enumerate() {
+        *x = u8::try_from(i * 89 % 256).unwrap();
+    }
+    let rnd = Secret::take(&mut b);
+    let t = mede(|c| {
+        black_box(sign(
+            black_box(if c == 0 { &zeros } else { &rnd }),
+            b"mensagem",
+        ));
+    });
+    assert!(t.abs() < LIMITE, "|t| = {t}");
+}
+
 /// Até três rodadas, ficando com o menor |t|: um vazamento real dá |t|
 /// alto em todas, enquanto o ruído de um host compartilhado (escalonador,
 /// frequência da CPU) raramente se repete.
